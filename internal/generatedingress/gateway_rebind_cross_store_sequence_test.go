@@ -138,17 +138,19 @@ func TestGatewayRebindCoordinatorCommitsAfterRetainedRollback(t *testing.T) {
 			ctx := context.Background()
 			f, firstInput, templateDriver := newGatewayRebindCoordinatorFixture(t)
 			firstDriver := gatewayRebindSequencePhysicalDriver(t, templateDriver.template, 1)
-			observe := f.manager.gatewayRebindV2NetworkObserver
 			if afterIntent {
 				firstDriver.rollback = true
 			} else {
-				f.manager.gatewayRebindV2NetworkObserver = func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
-					return gatewayRebindSuccessorNetworkObservation{}, errors.New("test-only network admission refusal")
+				f.manager.gatewayRebindAfterPreparedCheckpoint = func(context.Context) error {
+					return errors.New("test-only interruption after durable predecessor checkpoint")
 				}
 			}
 			aborted, err := f.manager.commitGatewayRebindWithDriver(ctx, f.repository, firstInput, firstDriver)
 			if err != nil || aborted.FinalPhase != appaccess.GatewayRebindRolledBack || !aborted.FenceReleased {
 				t.Fatalf("first rollback: %+v error=%v", aborted, err)
+			}
+			if !afterIntent && (firstDriver.abortCalls != 1 || firstDriver.commitCalls != 0) {
+				t.Fatal("checkpoint rollback did not prove absence before retaining its abort")
 			}
 			before, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
 			if err != nil || len(before.History) != 1 || before.Active != nil || before.CurrentSource == nil ||
@@ -159,7 +161,7 @@ func TestGatewayRebindCoordinatorCommitsAfterRetainedRollback(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			f.manager.gatewayRebindV2NetworkObserver = observe
+			f.manager.gatewayRebindAfterPreparedCheckpoint = nil
 			next := gatewayRebindSequenceNextInput(t, f, firstInput.Inspection.Spec.SuccessorProfileRevisionNumber,
 				firstInput.Inspection.Spec.SuccessorProfile)
 			if next.Inspection.ProtectedGeneration <= firstInput.Inspection.ProtectedGeneration ||

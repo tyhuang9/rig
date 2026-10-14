@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -66,22 +67,10 @@ func (d *gatewayRebindRecoveryChangedNoEffectDriver) proveNoSuccessorEffectsLock
 }
 
 func TestRecoverGatewayRebindStartupRefusesFirstNoEffectAbortAfterSnapshotDrift(t *testing.T) {
-	fixture, input, driver := newGatewayRebindCoordinatorFixture(t)
-	fixture.manager.gatewayRebindAfterClaim = func(context.Context, appaccess.GatewayRebindClaimV2) error {
-		return errors.New("injected crash after SQL prepared claim")
-	}
-	if _, err := fixture.manager.commitGatewayRebindWithDriver(context.Background(), fixture.repository,
-		input, driver); err == nil {
-		t.Fatal("post-claim interruption unexpectedly completed")
-	}
+	fixture, driver := newGatewayRebindStartupCheckpointFixture(t)
 	fresh := freshGatewayRebindRecoveryManager(fixture.manager)
 	fresh.gatewayRebindFailStop = &atomic.Bool{}
 	fresh.gatewayRebindCommitBarrier = &atomic.Bool{}
-	fresh.gatewayRebindV2NetworkObserver = func(context.Context,
-		appaccess.GatewayRebindClaimV2,
-	) (gatewayRebindSuccessorNetworkObservation, error) {
-		return gatewayRebindSuccessorNetworkObservation{}, errors.New("successor network unavailable after restart")
-	}
 	drifting := &gatewayRebindRecoverySnapshotDriftRepository{Repository: fixture.repository}
 	driftDriver := &gatewayRebindRecoveryChangedNoEffectDriver{
 		gatewayRebindBoundedPhysicalDriver: &gatewayRebindBoundedPhysicalDriver{t: t, template: driver.template},
@@ -92,6 +81,9 @@ func TestRecoverGatewayRebindStartupRefusesFirstNoEffectAbortAfterSnapshotDrift(
 	if result, err := fresh.recoverGatewayRebindStartupWithDriver(context.Background(), drifting,
 		driftDriver); err == nil || result != (GatewayRebindStartupRecoveryResult{}) {
 		t.Fatalf("first no-effect snapshot drift result=%#v error=%v", result, err)
+	}
+	if !drifting.drift || driftDriver.abortCalls != 1 {
+		t.Fatal("snapshot drift refusal did not reach the no-effect proof")
 	}
 	snapshot, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
 	if err != nil || snapshot.Active == nil || snapshot.Phase != appaccess.GatewayRebindPrepared ||
@@ -136,7 +128,7 @@ func TestRecoverGatewayRebindStartupNoHistoryOwnsAndReleasesAdmissionLocks(t *te
 	}
 }
 
-func TestRecoverGatewayRebindStartupRepairsPreparedClaimThenSafelyAbortsNoEffects(t *testing.T) {
+func TestRecoverGatewayRebindStartupRefusesUnprovenPreparedClaimWithoutCheckpoint(t *testing.T) {
 	fixture, input, driver := newGatewayRebindCoordinatorFixture(t)
 	fixture.manager.gatewayRebindAfterClaim = func(context.Context, appaccess.GatewayRebindClaimV2) error {
 		return errors.New("injected crash after SQL prepared claim")
@@ -154,12 +146,58 @@ func TestRecoverGatewayRebindStartupRepairsPreparedClaimThenSafelyAbortsNoEffect
 		t.Fatalf("post-claim boundary wrote protected admission evidence: %#v error=%v", history, err)
 	}
 
-	fresh := freshGatewayRebindRecoveryManager(fixture.manager)
-	fresh.gatewayRebindV2NetworkObserver = func(context.Context,
-		appaccess.GatewayRebindClaimV2,
-	) (gatewayRebindSuccessorNetworkObservation, error) {
-		return gatewayRebindSuccessorNetworkObservation{}, errors.New("successor network unavailable after restart")
+	beforeFiles, err := readGatewayHistorySnapshotMode(fixture.manager.store, true)
+	if err != nil {
+		t.Fatal(err)
 	}
+	fresh := freshGatewayRebindRecoveryManager(fixture.manager)
+	recoveryDriver := &gatewayRebindBoundedPhysicalDriver{t: t, template: driver.template}
+	result, err := fresh.recoverGatewayRebindStartupWithDriver(context.Background(), fixture.repository, recoveryDriver)
+	if err == nil || result != (GatewayRebindStartupRecoveryResult{}) ||
+		recoveryDriver.abortCalls != 0 || recoveryDriver.commitCalls != 0 {
+		t.Fatalf("unproven A0 recovery result=%#v calls=%d/%d error=%v",
+			result, recoveryDriver.abortCalls, recoveryDriver.commitCalls, err)
+	}
+	afterFiles, filesErr := readGatewayHistorySnapshotMode(fresh.store, true)
+	afterSQL, sqlErr := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
+	if filesErr != nil || sqlErr != nil || !sameGatewayHistorySnapshot(beforeFiles, afterFiles) ||
+		!reflect.DeepEqual(snapshot, afterSQL) || fixture.repository.CheckGatewayRebindFence(context.Background()) == nil {
+		t.Fatalf("unproven A0 recovery changed durable state: files=%v sql=%v", filesErr, sqlErr)
+	}
+}
+
+// No-effect aborts require a durable predecessor checkpoint. An A0 claim with
+// no physical proof must instead remain fenced without inventing that evidence.
+func newGatewayRebindStartupCheckpointFixture(t *testing.T) (gatewayRebindPredecessorFixture,
+	*gatewayRebindBoundedPhysicalDriver) {
+	t.Helper()
+	fixture, input, driver := newGatewayRebindCoordinatorFixture(t)
+	fixture.manager.gatewayRebindAfterPreparedCheckpoint = func(context.Context) error {
+		return errors.New("injected crash after durable predecessor checkpoint")
+	}
+	if _, err := withCrossStoreFixtureEffectLocks(t, fixture.manager,
+		func() (gatewayRebindPreparedAttempt, error) {
+			return fixture.manager.prepareGatewayRebindLocked(context.Background(), fixture.repository, input)
+		}); err == nil {
+		t.Fatal("checkpoint interruption unexpectedly completed")
+	}
+	snapshot, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
+	if err != nil || snapshot.Active == nil || snapshot.Phase != appaccess.GatewayRebindPrepared ||
+		fixture.repository.CheckGatewayRebindFence(context.Background()) == nil {
+		t.Fatalf("checkpoint boundary did not retain prepared fence: %v", err)
+	}
+	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.Checkpoints) != 1 || len(history.IntentsV2) != 0 ||
+		len(history.Progress) != 0 || len(history.TerminalsV2) != 0 {
+		t.Fatalf("checkpoint boundary evidence counts=%d/%d/%d/%d error=%v",
+			len(history.Checkpoints), len(history.IntentsV2), len(history.Progress), len(history.TerminalsV2), err)
+	}
+	return fixture, driver
+}
+
+func TestRecoverGatewayRebindStartupSafelyAbortsPreparedCheckpointWithoutEffects(t *testing.T) {
+	fixture, driver := newGatewayRebindStartupCheckpointFixture(t)
+	fresh := freshGatewayRebindRecoveryManager(fixture.manager)
 	recoveryDriver := &gatewayRebindBoundedPhysicalDriver{t: t, template: driver.template}
 	result, err := fresh.recoverGatewayRebindStartupWithDriver(context.Background(), fixture.repository, recoveryDriver)
 	if err != nil || !result.RebindHistoryPresent || !result.Recovered ||
@@ -179,22 +217,10 @@ func TestRecoverGatewayRebindStartupRepairsPreparedClaimThenSafelyAbortsNoEffect
 func TestRecoverGatewayRebindStartupReprovesRetainedNoEffectReceiptBeforeSQLRollback(t *testing.T) {
 	newInterrupted := func(t *testing.T) (gatewayRebindPredecessorFixture, gatewayCurrentStateFixture) {
 		t.Helper()
-		fixture, input, driver := newGatewayRebindCoordinatorFixture(t)
-		fixture.manager.gatewayRebindAfterClaim = func(context.Context, appaccess.GatewayRebindClaimV2) error {
-			return errors.New("injected crash after SQL prepared claim")
-		}
-		if _, err := fixture.manager.commitGatewayRebindWithDriver(context.Background(), fixture.repository,
-			input, driver); err == nil {
-			t.Fatal("post-claim interruption unexpectedly completed")
-		}
+		fixture, driver := newGatewayRebindStartupCheckpointFixture(t)
 		interrupted := freshGatewayRebindRecoveryManager(fixture.manager)
 		interrupted.gatewayRebindFailStop = &atomic.Bool{}
 		interrupted.gatewayRebindCommitBarrier = &atomic.Bool{}
-		interrupted.gatewayRebindV2NetworkObserver = func(context.Context,
-			appaccess.GatewayRebindClaimV2,
-		) (gatewayRebindSuccessorNetworkObservation, error) {
-			return gatewayRebindSuccessorNetworkObservation{}, errors.New("successor network unavailable after restart")
-		}
 		rejecting := &gatewayRebindRecoveryRejectTransitionRepository{Repository: fixture.repository}
 		if result, err := interrupted.recoverGatewayRebindStartupWithDriver(context.Background(), rejecting,
 			&gatewayRebindBoundedPhysicalDriver{t: t, template: driver.template}); err == nil ||

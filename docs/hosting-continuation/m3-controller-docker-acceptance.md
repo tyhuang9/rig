@@ -138,6 +138,112 @@ matrix, and physical second-device LAN qualification. No local result here
 claims those outcomes. No UI change was made; manual user-facing activation
 was not attempted.
 
+## PR #153 CI follow-up: checkpoint fixtures and Node startup
+
+Follow-up code is `04ed6226a4db91f1c0a120d7124b6e183de683b2`, comprising
+checkpoint fixture repair `b899640` and the Node watchdog repair `04ed622`.
+These commits change five test files only. The production admission proof,
+history, recovery coordinator and runtime safeguards are unchanged.
+
+On candidate `76cf574`, Windows job `116091530455` and Linux race job
+`116091528830` exposed recovery fixtures that expected an unavailable network
+to create a predecessor checkpoint. Admission now correctly requires fresh
+physical proof before writing that checkpoint. The repaired tests distinguish
+an unproven A0 claim, which must retain identical SQL/protected files and its
+fence, from an existing checkpoint that permits a proved no-effect abort.
+The drift test now verifies that it reached the no-effect proof; the Docker
+absence test requires an operation-scoped inventory read. Emergency jobs
+`116091530343`, `116091528837` and `116091530290` exposed the same fixture
+assumption in native withdrawal and retained-history controls. Their shared
+fixture now interrupts after the actual durable checkpoint.
+
+The old immutable Linux binary reproduced the recovery and emergency/absence
+failures. Raw RED logs and their original binary/source provenance remain in
+`temp/m3-pr153-hosted-20261014/`. These failures were not fixed by weakening a
+production check or constructing a fabricated terminal receipt.
+
+The Windows Node failure occurred at the old five-second parent deadline,
+before any JavaScript startup record. The host-side control now grants up to
+15 seconds for a validated startup record, then five seconds for completion.
+Its JavaScript request timeout remains 1,500 ms; CA verification, peer name,
+`rejectUnauthorized: true` and the request itself are unchanged. Both deadline
+paths kill and reap the child before reading its output, with a bounded pipe
+wait. Subprocess tests exercise no startup and a stall after startup. There
+are no retries or additional skip conditions.
+
+Both platforms were freshly compiled with the pinned Go 1.26.7 toolchain and
+the same read-only flags documented above. Verification selected:
+
+```text
+^(TestRecoverGatewayRebindStartup.*|TestRecoverGatewayRebindPreparedA0RequiresStablePhysicalProof|TestGatewayCurrentNativeEmergency.*|TestGatewayRebindNoEffectRuntimeProvesAbsenceBeforePreparedRollback|TestLiveExternalTLS.*|TestLiveNodeTLS.*|TestRunLiveNodeTLSProbeBoundsStartupAndCompletion)$
+^TestGatewayCurrentNativeAbortEmergencyRequiresCompleteBoundHistory$
+```
+
+Each binary ran with `-test.count=1 -test.timeout=10m` and test2json capture.
+Inputs and binaries remained unchanged throughout every run; every discovered
+parent was executed. The Windows runs passed all **28 parents / 36 children**,
+including actual Node TLS trust, with no failures or skips. Linux passed
+**27 parents / 36 children**; `TestLiveExternalTLSNodeTrust` additionally
+reported its existing optional skip because WSL has no Node executable.
+The Linux all-selected gate is therefore recorded as **incomplete**, not green.
+
+| Run | Seconds | Raw test log SHA-256 |
+| --- | ---: | --- |
+| Windows affected suite | 186.906 | `65574814d20fedf7394550618c03e281c845b7296cce3110531198962a40080f` |
+| Windows retained abort history | 24.234 | `3f3eb8354ae18732e6e6308fb5729af105415d8253c16af1a0cbdcda51aa99c0` |
+| Linux affected suite, Node skipped | 21.515 | `217b118b3f22f6dfbf93882607b93ddacedbf8799699ace49c283253b4fc2175` |
+| Linux retained abort history | 4.484 | `9aaaaed531cd84b57149df07540f1b7e926184134a1c4c64f62b1156031d9b65` |
+
+Scoped `go vet ./internal/generatedingress`, formatting and diff checks passed.
+Independent manual review of the recovery fixture changes found no issues;
+root review caught and corrected an output-before-reap race in the Node
+watchdog before these final runs. Full repository, race and actual hosted
+Windows cold-start verification remain CI gates for the updated head.
+
+At `76cf574`, existing hosted LAN (one parent), migration (two parents), and
+generated-runtime (ten parents / nine children) journeys passed with their
+independent cleanup steps. Their evidence is retained with that exact source
+and merge tree; it is not a claim that the updated draft has passed CI.
+The new private controller recovery/replay Docker parent and full supported
+hostd/physical-device acceptance remain separately required.
+
+## PR #153 retained-history fixture follow-up
+
+Code `b65b47afab4dd8e81ba9dab4485a35341141aa1f` adds two test-only corrections
+after the first repair batch above. Windows rebind-history job `116091530341`
+exposed another retained-rollback fixture using the obsolete network-refusal
+prefix, and a malformed-input case that panicked in fixture setup before
+production validation. The rollback test now interrupts after its real durable
+checkpoint and asserts the no-effect abort call. The inventory fixture parses
+the address only when the inventory is requested and returns a parse error;
+production can reject the malformed claim first. Existing immutable-history,
+generation, current-authority and retry assertions remain in place.
+
+The previous immutable Linux binary reproduced both failures. Fresh Windows
+and Linux binaries each passed **four parents / four children**, with no
+failures or skips, using the same pinned toolchain and flags as above:
+
+```text
+^(TestGatewayRebindCoordinatorCommitsAfterRetainedRollback|TestGatewayRebindLegacyCompositionRetirementCensus|TestGatewayRebindProposalAndAdmissionUseRealRepository|TestGatewayRebindConcreteCompositionLegacySource)$
+```
+
+Both runs used `-test.count=1 -test.timeout=10m`, explicit discovery and
+test2json capture. All 933 Go/SQL/module input hashes and binary hashes remained
+unchanged during execution and match this code commit. Windows completed in
+491.547 seconds (log SHA-256
+`2c549bf8b0f751111790af039b6bb1dbdfca6b37346bcaf00fd80a30572c1273`);
+Linux completed in 88.219 seconds (log SHA-256
+`bbb738d6babcce73ff9f44a71dc127531575fa2689012cddf50341b177dc03bd`).
+Receipts are `history-green-windows.result.json` and
+`history-green-wsl.result.json` in the same evidence directory above.
+
+Independent static review found no issues in these two corrections. CodeRabbit
+CLI was unavailable; this is manual review evidence. The earlier 28-parent
+Windows / 27-parent Linux results remain attributed to `04ed622`, before these
+two fixture edits. They are not rerun results for `b65b47a`. The newer four-parent
+suite covers the changed helper and retained-history sequence. Formatting and
+diff checks passed. Full candidate Docker, race and Windows CI remain required.
+
 ## Disablement and data integrity
 
 Keep production registration and capability assembly dormant while acceptance

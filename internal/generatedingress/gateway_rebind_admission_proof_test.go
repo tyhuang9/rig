@@ -86,9 +86,12 @@ func gatewayRebindAdmissionTestReads(spec appaccess.GatewayRebindSpecV2) gateway
 func gatewayRebindCrossStoreAdmissionTestReads(spec appaccess.GatewayRebindSpecV2,
 	predecessorSubnet string,
 ) gatewayRebindSuccessorPreflightReads {
-	selected := netip.MustParseAddr(spec.SuccessorProfile.SelectedIPv4)
 	return gatewayRebindSuccessorPreflightReads{network: gatewayV2NetworkPlanReads{
 		candidates: func() ([]hostNetworkCandidate, error) {
+			selected, err := netip.ParseAddr(spec.SuccessorProfile.SelectedIPv4)
+			if err != nil {
+				return nil, err
+			}
 			return []hostNetworkCandidate{{InterfaceID: spec.SuccessorProfile.InterfaceID,
 				IPv4: selected.String(), Prefix: netip.PrefixFrom(selected, 24).Masked()}}, nil
 		},
