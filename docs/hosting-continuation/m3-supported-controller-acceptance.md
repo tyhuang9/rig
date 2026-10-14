@@ -3,8 +3,8 @@
 Status: implementation candidate for draft CI; M3 acceptance is incomplete.
 Core source `ed9bc5a966032263e3c27a61745708d58ea26ada` and full-hostd harness
 `8206fd87dfd59196ee5bfe8e7097112bee655592` are integrated with published PR #153
-`7d03eaf9db7c1742a1d5fb176255992f41900ca4`, preserving history. Local integration
-`b24bf249e00645149eddd9471f989dfe9052e638` includes the reviewed A0 correction
+`386bad5f62686e1f5a7bd549ef367ec0fc26dad8`, preserving history. Local integration
+`3ef1cf4a48dbb52e58ae88ce8c08db9391ef9464` includes the reviewed A0 correction
 `88ea2a8`. The full hostd harness compiles and its local controls pass; live
 Docker execution remains pending behind prerequisites. No controller was installed
 or restarted. These results do not authorize a GitHub merge or deployment.
@@ -182,9 +182,26 @@ At published parent `7d03eaf`, the diagnostic hosted
 [job 116124828686](https://github.com/tyhuang9/rig/actions/runs/38643459027/job/116124828686)
 reported `problem-unavailable` after approved reconcile while retained state showed
 no active SQL claim, a commit receipt, a current artifact and successor authority.
-This narrows the failure to a path that can occur after committed state exists;
-it does not yet identify the failed check or prove a successful HTTP journey.
-The controller recovery prerequisite remains failed and under investigation.
+The root cause was then traced to missing constructor assembly on that parent:
+preterminal attestation had a managed fallback, but committed-current retirement
+required an interface missing from the ordinary nil-driver fallback. Parent fix
+`20f0d37` installs the coherent adapter pair and preserves every retirement guard;
+its constructor regression failed before repair and passed afterward. The same
+wiring was already present in this supported candidate.
+
+History-preserving integration `3ef1cf4` incorporates published parent `386bad5`.
+It changes no Go, SQL, schema, frontend or CI source relative to the first draft
+`7c20485`; the final API/diagnostic source hashes still match exactly. The older
+CLI receipt differs only in the two documented diagnostic test files, with all
+production hashes unchanged. This is source equivalence, not a new test run.
+Actual hosted verification of the repaired private journey remains required.
+
+The dashboard also passed its lockfile-respecting offline install and
+`pnpm --dir web build` (TypeScript build plus Vite production build). Receipt
+`web.result.json` pins unchanged tracked frontend inputs; build log SHA-256 is
+`88d00228c0e8cd433f4fd79c396edf15291222dd463eb54c001d833c5bd5054a`.
+This checks generated contract compatibility, without claiming browser or live
+controller verification.
 
 ## Remaining acceptance and rollback
 
