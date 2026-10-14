@@ -28,14 +28,21 @@ func TestGatewayRebindNoEffectRuntimeProvesAbsenceBeforePreparedRollback(t *test
 			fixture, input, _ := newGatewayRebindCoordinatorFixture(t)
 			runner := &gatewayRebindNoEffectRuntimeRunner{owned: test.owned}
 			fixture.manager.runner = runner
-			fixture.manager.gatewayRebindV2NetworkObserver = func(context.Context,
-				appaccess.GatewayRebindClaimV2,
-			) (gatewayRebindSuccessorNetworkObservation, error) {
-				return gatewayRebindSuccessorNetworkObservation{}, errors.New("injected successor network unavailable")
+			fixture.manager.gatewayRebindAfterPreparedCheckpoint = func(context.Context) error {
+				return errors.New("injected failure after durable predecessor checkpoint")
 			}
 			driver := managerGatewayRebindCrossStoreDriver{manager: fixture.manager}
 			result, err := fixture.manager.commitGatewayRebindWithDriver(context.Background(),
 				fixture.repository, input, driver)
+			scopedInventoryRead := false
+			for _, request := range runner.requests {
+				if len(request) >= 2 && request[1] == "ls" && containsGatewayRebindNoEffectLabelFilter(request) {
+					scopedInventoryRead = true
+				}
+			}
+			if !scopedInventoryRead {
+				t.Fatal("no-effect proof did not inspect operation-scoped Docker inventory")
+			}
 			if test.wantAbort {
 				if err != nil {
 					t.Fatalf("prove physical absence and rollback: %v; Docker requests=%#v", err, runner.requests)
