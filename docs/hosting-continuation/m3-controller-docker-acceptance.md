@@ -285,10 +285,53 @@ Independent bounded review found no additional credential, authority or parser
 issue. Formatting and diff checks passed. Full hosted Docker, race and Windows
 acceptance remain required.
 
+## PR #153 supported constructor repair
+
+Code `20f0d37d43d6c29f84722af126476f9935b9e5a0` repairs the concrete cause
+identified after the diagnostic run above. `New` previously returned a Manager
+without the coherent physical adapter pair. Preterminal rebind attestation had a
+managed fallback, while committed-current predecessor retirement required an
+interface unavailable on the ordinary nil-driver fallback. Recovery could therefore
+record the immutable commit, then fail the mandatory retirement check and return
+HTTP 503. The observed commit receipt and successor authority must not be rolled
+back to conceal that error.
+
+`New` now installs the existing rebind/current adapters on the same Manager,
+runner, protected stores, locks and fail-stop identity. This is the same reviewed
+constructor wiring already present in the supported-controller candidate. It
+performs no Docker action during construction and does not bypass any invocation,
+retirement, ownership, fence, session, proof or release guard. Raw `newManager`
+remains an explicitly incomplete test seam. Production rebind routes remain
+unregistered on this prerequisite branch; full supported hostd acceptance is
+tracked separately. Factory comments and the controller contract now distinguish
+candidate wiring from acceptance and release.
+
+The exact constructor regression failed on the prior source with both drivers
+nil (raw RED log SHA-256
+`56763fafdc146e199cd8efafecd7c99e53fe21a7d6cc3eb23793c15fc5b57f12`).
+Fresh focused checks then passed without skips or failures, using the same Go
+1.26.7 discovery, read-only flags, ten-minute timeout and immutable input/log
+accounting described above. Linux additionally covers concrete commit/replay,
+committed-history attestation and private-directory refusal; both platforms cover
+retirement chains, guard rechecks and exact shared constructor identity.
+
+| Receipt / raw log prefix | Parents / children | Test log SHA-256 |
+| --- | ---: | --- |
+| `constructor-green-wsl` | 8 / 7 | `c2c9574c4d526aced90d783185480d6066cb9afd834d98a364657d48ea38f605` |
+| `constructor-green-windows` | 5 / 5 | `1677701725dba8aa4e450c98dc76371541571415eb62c61a8bd086f751b27d24` |
+
+Receipts remain under `temp/m3-pr153-hosted-20261014/`. The only source delta
+after these green runs is the factory's explanatory comment; executable code is
+unchanged. Fresh CLI builds and scoped vet cover the final comment-normalized
+source. Independent bounded code/security review found no guard or scope regression.
+The repaired private HTTP journey still requires actual hosted Docker verification;
+these focused tests do not claim that outcome or complete M3 acceptance.
+
 ## Disablement and data integrity
 
-Keep production registration and capability assembly dormant while acceptance
-is incomplete. To stop candidate testing, stop its disposable harness and
+Keep new production rebind routes unavailable while acceptance is incomplete.
+The candidate Manager now installs its coherent guarded physical adapter pair;
+that wiring does not itself establish supported hostd acceptance. To stop candidate testing, stop its disposable harness and
 require independent fixture cleanup. Do not delete migration/audit rows,
 protected decision history, retained recovery evidence or application data
 to simulate rollback. Any later production activation requires its own
