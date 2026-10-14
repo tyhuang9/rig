@@ -34,13 +34,41 @@ import (
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/docker"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
 const bootstrapSecretFilename = "bootstrap-token.secret"
 
+type hostdDaemonReady struct {
+	Address      string
+	RecoveryOnly bool
+	RecoveryKind string
+	OperationID  string
+}
+
+// hostdDaemonAssemblyOptions is a package-private construction seam. Tests can
+// supply a command runner and observe completed listener/handler assembly, but
+// they still execute this production startup, controller, handler and worker
+// path. No command-line, environment or HTTP switch exposes these controls.
+type hostdDaemonAssemblyOptions struct {
+	runner runtimeprocess.CommandRunner
+	listen func(string, string) (net.Listener, error)
+	ready  func(hostdDaemonReady)
+}
+
 func runServer(args []string) int {
+	return runServerWithAssembly(args, hostdDaemonAssemblyOptions{})
+}
+
+func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) int {
+	if assembly.runner == nil {
+		assembly.runner = runtimeprocess.ExecRunner{}
+	}
+	if assembly.listen == nil {
+		assembly.listen = net.Listen
+	}
 	cfg, err := startupConfig(args)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -51,7 +79,7 @@ func runServer(args []string) int {
 		return 1
 	}
 	logger := newStructuredLogger(os.Stderr, cfg.LogLevel)
-	listener, err := net.Listen("tcp", cfg.ListenAddress)
+	listener, err := assembly.listen("tcp", cfg.ListenAddress)
 	if err != nil {
 		logger.Error("controller listener reservation failed", "error", err)
 		return 1
@@ -80,7 +108,8 @@ func runServer(args []string) int {
 	var startupAdmission *deploymentEffectsStartupLease
 	emergencyStop := func() {
 		stopErr := runGatewayStartupEmergencyStop(startupAdmission, func(stopCtx context.Context) error {
-			return stopOwnedGatewayOnStartupFailure(stopCtx, cfg, dockerExecutable, ownerDirectories)
+			return stopOwnedGatewayOnStartupFailureWithRunner(stopCtx, cfg, dockerExecutable, ownerDirectories,
+				assembly.runner)
 		})
 		if stopErr != nil {
 			logger.Error("owned gateway emergency stop could not be verified", "error", stopErr)
@@ -95,11 +124,36 @@ func runServer(args []string) int {
 		return 1
 	}
 	defer db.Close()
-	preparedGateway, err := prepareGatewayRebindStartup(context.Background(), cfg, db, dockerExecutable, ownerDirectories)
+	preparedGateway, err := prepareGatewayRebindStartupWithRunner(context.Background(), cfg, db,
+		dockerExecutable, ownerDirectories, assembly.runner)
 	if err != nil {
 		logger.Error("gateway rebind startup preparation failed", "error", err)
 		emergencyStop()
 		return 1
+	}
+	if preparedGateway.disposition == gatewayRebindStartupRefuse {
+		logger.Error("gateway rebind startup returned a refusing decision")
+		emergencyStop()
+		return 1
+	}
+	if preparedGateway.disposition == gatewayRebindStartupRecoveryOnly {
+		gate, gateErr := gatewayStartupForRebindRecovery(preparedGateway)
+		if gateErr != nil {
+			logger.Error("gateway rebind recovery startup decision failed validation", "error", gateErr)
+			emergencyStop()
+			return 1
+		}
+		a := auth.New(db)
+		bootstrapCompleted, bootstrapErr := prepareControllerBootstrap(a, cfg, logger)
+		if bootstrapErr != nil {
+			logger.Error("recovery controller authentication setup failed", "error", bootstrapErr)
+			return 1
+		}
+		defer bootstrapCompleted()
+		logger.Warn("controller entering gateway rebind recovery mode", "kind", gate.recoveryKind,
+			"operation_id", gate.recoveryID)
+		return runRecoveryOnlyControllerWithAssembly(cfg, logger, listener, a, appaccess.New(db), gate,
+			bootstrapCompleted, assembly.ready)
 	}
 	var workerAdmission func(context.Context) (func() error, error)
 	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
@@ -134,7 +188,8 @@ func runServer(args []string) int {
 		}()
 	}
 	rebindCheck := rebindFenceCheck(db)
-	gate, err := inspectGatewayStartupAfterPreparation(context.Background(), cfg, db, dockerExecutable, ownerDirectories, preparedGateway)
+	gate, err := inspectGatewayStartupAfterPreparationWithRunner(context.Background(), cfg, db,
+		dockerExecutable, ownerDirectories, preparedGateway, assembly.runner)
 	if err != nil {
 		logger.Error("gateway startup inspection failed", "error", err)
 		emergencyStop()
@@ -149,31 +204,10 @@ func runServer(args []string) int {
 		}
 	}
 	a := auth.New(db)
-	token, err := a.EnsureBootstrapToken()
+	bootstrapCompleted, err := prepareControllerBootstrap(a, cfg, logger)
 	if err != nil {
-		logger.Error("bootstrap token setup failed", "error", err)
+		logger.Error("controller authentication setup failed", "error", err)
 		return 1
-	}
-	bootstrapCompleted, err := prepareBootstrapToken(os.Stdout, cfg.DataRoot, token, auth.BootstrapTokenLifetime, func(err error) {
-		logger.Error("bootstrap token file cleanup failed", "error", err)
-	})
-	if err != nil {
-		logger.Error("bootstrap token file setup failed", "error", err)
-		return 1
-	}
-	if token != "" {
-		removeLocator, locatorErr := bootstraplocator.DefaultStore().Register(cfg.DataRoot, auth.BootstrapTokenLifetime)
-		if locatorErr != nil {
-			logger.Warn("bootstrap token command discovery unavailable; use the printed protected file path", "error", locatorErr)
-		} else {
-			removeToken := bootstrapCompleted
-			bootstrapCompleted = func() {
-				removeToken()
-				if err := removeLocator(); err != nil {
-					logger.Error("bootstrap token locator cleanup failed", "error", err)
-				}
-			}
-		}
 	}
 	defer bootstrapCompleted()
 	if err := rebindCheck(context.Background()); err != nil {
@@ -191,7 +225,8 @@ func runServer(args []string) int {
 			startupAdmission = nil
 		}
 		logger.Warn("controller entering gateway recovery mode", "kind", gate.recoveryKind, "operation_id", gate.recoveryID)
-		return runRecoveryOnlyController(cfg, logger, listener, a, appaccess.New(db), gate, bootstrapCompleted)
+		return runRecoveryOnlyControllerWithAssembly(cfg, logger, listener, a, appaccess.New(db), gate,
+			bootstrapCompleted, assembly.ready)
 	}
 	m := machines.New(db)
 	if _, err := m.EnsureLocal(); err != nil {
@@ -251,7 +286,8 @@ func runServer(args []string) int {
 	runtime, err := prepareRuntimeComposition(context.Background(), cfg, runtimeCompositionDependencies{
 		db: db, applications: applications, snapshots: snapshots, configuration: applicationConfiguration,
 		deployments: deploymentRepository, plans: planStore,
-	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, preinspectedIngress: gate.ingress})
+	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, runner: assembly.runner,
+		preinspectedIngress: gate.ingress})
 	if err != nil {
 		logger.Error("runtime composition failed", "error", err)
 		return 1
@@ -331,6 +367,10 @@ func runServer(args []string) int {
 	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, GeneratedIngress: runtime.ingress, GeneratedRuntimeState: runtime.state, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, GatewayProfiles: appAccessRepository, GatewayUpgrades: appAccessRepository, AppAccess: appAccessRepository, AppGrants: appAccessRepository, AppDisables: appAccessRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
 	if runtime.ingress != nil {
 		controllerServer.GatewayUpgradeRuntime = runtime.ingress
+		controllerServer.GatewayRebinds = appAccessRepository
+		controllerServer.GatewayRebindRuntime = runtime.ingress
+		controllerServer.GatewayRebindRecoveries = appAccessRepository
+		controllerServer.GatewayRebindRecoveryRuntime = runtime.ingress
 		controllerServer.LANGrantRuntime = runtime.ingress
 		controllerServer.LANDisableRuntime = runtime.ingress
 	}
@@ -343,6 +383,9 @@ func runServer(args []string) int {
 		_ = s.Shutdown(shutdown)
 	}()
 	logger.Info("hostd listening", "address", cfg.ListenAddress, "fake_runtime", capabilities.fake, "compose_runtime", capabilities.compose, "generated_runtime", capabilities.generated)
+	if assembly.ready != nil {
+		assembly.ready(hostdDaemonReady{Address: listener.Addr().String()})
+	}
 	serveErr := s.Serve(listener)
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		logger.Error("server stopped", "error", serveErr)
@@ -359,14 +402,58 @@ func runServer(args []string) int {
 	return 0
 }
 
+func prepareControllerBootstrap(authentication *auth.Service, cfg config.Config, logger *slog.Logger) (func(), error) {
+	if authentication == nil || logger == nil {
+		return nil, errors.New("controller authentication dependencies are required")
+	}
+	token, err := authentication.EnsureBootstrapToken()
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap token setup: %w", err)
+	}
+	bootstrapCompleted, err := prepareBootstrapToken(os.Stdout, cfg.DataRoot, token,
+		auth.BootstrapTokenLifetime, func(err error) {
+			logger.Error("bootstrap token file cleanup failed", "error", err)
+		})
+	if err != nil {
+		return nil, fmt.Errorf("bootstrap token file setup: %w", err)
+	}
+	if token != "" {
+		removeLocator, locatorErr := bootstraplocator.DefaultStore().Register(cfg.DataRoot, auth.BootstrapTokenLifetime)
+		if locatorErr != nil {
+			logger.Warn("bootstrap token command discovery unavailable; use the printed protected file path", "error", locatorErr)
+		} else {
+			removeToken := bootstrapCompleted
+			bootstrapCompleted = func() {
+				removeToken()
+				if err := removeLocator(); err != nil {
+					logger.Error("bootstrap token locator cleanup failed", "error", err)
+				}
+			}
+		}
+	}
+	return bootstrapCompleted, nil
+}
+
 func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener net.Listener, authentication *auth.Service,
 	upgrades *appaccess.Repository, gate gatewayStartup,
 	bootstrapCompleted func(),
 ) int {
+	return runRecoveryOnlyControllerWithAssembly(cfg, logger, listener, authentication, upgrades, gate,
+		bootstrapCompleted, nil)
+}
+
+func runRecoveryOnlyControllerWithAssembly(cfg config.Config, logger *slog.Logger, listener net.Listener,
+	authentication *auth.Service, upgrades *appaccess.Repository, gate gatewayStartup,
+	bootstrapCompleted func(), ready func(hostdDaemonReady),
+) int {
 	if gate.recoveryID == "" || gate.ingress == nil || upgrades == nil || listener == nil ||
-		(gate.recoveryKind != controller.RecoveryGatewayUpgrade && gate.recoveryKind != controller.RecoveryLANGrant && gate.recoveryKind != controller.RecoveryLANDisable) ||
+		(gate.recoveryKind != controller.RecoveryGatewayUpgrade && gate.recoveryKind != controller.RecoveryGatewayRebind &&
+			gate.recoveryKind != controller.RecoveryLANGrant && gate.recoveryKind != controller.RecoveryLANDisable) ||
 		((gate.recoveryKind == controller.RecoveryLANGrant || gate.recoveryKind == controller.RecoveryLANDisable) && gate.recoveryAppID == "") ||
-		(gate.recoveryBatch && gate.recoveryKind != controller.RecoveryLANGrant && gate.recoveryKind != controller.RecoveryLANDisable) {
+		(gate.recoveryBatch && gate.recoveryKind != controller.RecoveryLANGrant && gate.recoveryKind != controller.RecoveryLANDisable) ||
+		(gate.recoveryKind == controller.RecoveryGatewayRebind &&
+			(gate.rebindRecoveryPin.OperationID != gate.recoveryID ||
+				gate.rebindRecoveryPin.SQLPhase != appaccess.GatewayRebindUnresolved)) {
 		logger.Error("gateway recovery controller is missing its pinned operation")
 		return 1
 	}
@@ -382,14 +469,23 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	server := &controller.Server{
-		Auth: authentication, GatewayUpgrades: upgrades, GatewayUpgradeRuntime: gate.ingress,
-		AppAccess: upgrades, AppGrants: upgrades, LANGrantRuntime: gate.ingress,
-		AppDisables: upgrades, LANDisableRuntime: gate.ingress, LANRecoveryHeads: recoveryHeads,
-		GeneratedRuntime: true, RecoveryOnly: true, RecoveryKind: gate.recoveryKind,
+		Auth: authentication, GeneratedRuntime: true, RecoveryOnly: true, RecoveryKind: gate.recoveryKind,
 		RecoveryOperationID: gate.recoveryID, RecoveryAppID: gate.recoveryAppID,
 		RecoveryLANBatch: gate.recoveryBatch, RecoveryBatchHead: gate.recoveryBatchHead,
 		RecoveryBatchCount: gate.recoveryBatchCount,
 		Logger:             logger, BootstrapCompleted: bootstrapCompleted,
+	}
+	switch gate.recoveryKind {
+	case controller.RecoveryGatewayUpgrade:
+		server.GatewayUpgrades, server.GatewayUpgradeRuntime = upgrades, gate.ingress
+	case controller.RecoveryGatewayRebind:
+		server.GatewayRebindRecoveries, server.GatewayRebindRecoveryRuntime = upgrades, gate.ingress
+	case controller.RecoveryLANGrant:
+		server.AppAccess, server.AppGrants, server.LANGrantRuntime = upgrades, upgrades, gate.ingress
+		server.LANRecoveryHeads = recoveryHeads
+	case controller.RecoveryLANDisable:
+		server.AppAccess, server.AppDisables, server.LANDisableRuntime = upgrades, upgrades, gate.ingress
+		server.LANRecoveryHeads = recoveryHeads
 	}
 	httpServer := &http.Server{Addr: cfg.ListenAddress, Handler: server.Handler(), ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 60 * time.Second}
 	go func() {
@@ -399,6 +495,10 @@ func runRecoveryOnlyController(cfg config.Config, logger *slog.Logger, listener 
 		_ = httpServer.Shutdown(shutdown)
 	}()
 	logger.Info("hostd recovery controller listening", "address", cfg.ListenAddress, "operation_id", gate.recoveryID)
+	if ready != nil {
+		ready(hostdDaemonReady{Address: listener.Addr().String(), RecoveryOnly: true,
+			RecoveryKind: gate.recoveryKind, OperationID: gate.recoveryID})
+	}
 	err := httpServer.Serve(listener)
 	if err != nil && err != http.ErrServerClosed {
 		logger.Error("recovery controller stopped", "error", err)

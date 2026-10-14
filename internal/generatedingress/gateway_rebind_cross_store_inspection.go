@@ -61,6 +61,7 @@ const (
 // valid while a later prepared operation remains active.
 type GatewayRebindCurrentInspection struct {
 	SelectedCurrentAuthority appaccess.GatewayCurrentAuthorityRef
+	SelectedCurrentEvidence  appaccess.GatewayRebindSelectedCurrentEvidence
 	CurrentStateVersion      uint64
 	CurrentStateRevision     uint64
 	CurrentStateDigest       string
@@ -68,8 +69,15 @@ type GatewayRebindCurrentInspection struct {
 	ActiveOperationID        string
 	ActiveSpecVersion        int
 	ActivePhase              appaccess.GatewayRebindState
-	FenceReleased            bool
-	Retained                 []GatewayRebindRetainedOperationInspection
+	// ActiveDatabaseCommittedEvent is copied from the validated immutable SQL
+	// event chain. It remains populated when the mutable phase is unresolved.
+	ActiveDatabaseCommittedEvent *appaccess.GatewayRebindEvent
+	ActiveDatabaseCommitObserved bool
+	ActiveRollbackAllowed        bool
+	ActiveRecoveryPolicy         appaccess.GatewayRebindRecoveryPolicy
+	ActiveProtectedEvidence      appaccess.GatewayRebindProtectedRecoveryEvidence
+	FenceReleased                bool
+	Retained                     []GatewayRebindRetainedOperationInspection
 }
 
 type gatewayRebindCurrentInspectionRepository interface {
@@ -106,6 +114,10 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 		return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
 	}
 	result := GatewayRebindCurrentInspection{SelectedCurrentAuthority: *snapshot.CurrentSource}
+	result.SelectedCurrentEvidence, err = gatewayRebindSelectedCurrentEvidence(selection)
+	if err != nil {
+		return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
+	}
 	switch selection.Kind {
 	case gatewayCurrentSelectionUpgrade:
 		if selection.Upgrade == nil {
@@ -151,6 +163,41 @@ func (m *Manager) inspectGatewayRebindCurrentLocked(ctx context.Context,
 	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil {
 		return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
+	}
+	if snapshot.Active != nil {
+		protected, _, complete, protectedErr := gatewayRebindProtectedRecoveryProjection(history, *snapshot.Active)
+		if protectedErr != nil || snapshot.DatabaseCommitObserved != (snapshot.DatabaseCommittedEvent != nil) {
+			return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
+		}
+		if snapshot.DatabaseCommittedEvent != nil {
+			committed := *snapshot.DatabaseCommittedEvent
+			result.ActiveDatabaseCommittedEvent = &committed
+		}
+		result.ActiveDatabaseCommitObserved = snapshot.DatabaseCommitObserved
+		result.ActiveRollbackAllowed = snapshot.RollbackAllowed
+		if complete {
+			trusted := appaccess.GatewayRebindTrustedRecoverySnapshot{
+				Protected: protected, SelectedCurrent: result.SelectedCurrentEvidence,
+			}
+			policy, policyErr := appaccess.GatewayRebindRecoveryPolicyForSnapshot(snapshot, trusted)
+			if policyErr != nil {
+				return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
+			}
+			result.ActiveRecoveryPolicy = policy
+			result.ActiveProtectedEvidence = protected
+		} else {
+			if snapshot.Phase != appaccess.GatewayRebindPrepared || !snapshot.RollbackAllowed ||
+				snapshot.DatabaseCommitObserved || protected.Presence != appaccess.GatewayRebindProtectedEvidencePresent ||
+				protected.OperationID != result.ActiveOperationID || protected.Generation == 0 ||
+				protected.ScanDigest == "" || protected.IntentDigest == "" || protected.RecordSequence != 0 ||
+				protected.RecordDigest != "" || protected.FixedDisposition != appaccess.GatewayRebindDispositionNone {
+				return GatewayRebindCurrentInspection{}, gatewayRebindProposalError(ctx)
+			}
+			// The only admitted incomplete projection is the exact durable P1
+			// intent-before-progress prefix. Keep its evidence internal so it can
+			// reach the prepared coordinator, but cannot become a recovery-only
+			// direction pin until the coordinator installs and validates progress.
+		}
 	}
 	result.Retained = make([]GatewayRebindRetainedOperationInspection, 0, len(history.Terminals)+len(history.TerminalsV2))
 	for _, terminal := range history.Terminals {

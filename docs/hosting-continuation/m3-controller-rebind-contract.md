@@ -1,14 +1,14 @@
 # M3 controller rebind admission and recovery contract
 
-Status: contract with dormant implementation checkpoints; the supported
-controller flow and its acceptance gates remain incomplete. Source baseline:
-`cb83fa480c16eec33c8b38e9846ae421139bbce0`. This document resolves the
+Status: supported-controller candidate implementation in progress; the
+controller/API wiring described below is present on the continuation based at
+`76cf574dce603793ff2509e4a90ac6cc9de47bc5`, while runtime, crash-matrix and
+physical-platform acceptance remain incomplete. This document resolves the
 controller request and recovery choice identified in the [cutover
 contract](./m3-rebind-cutover-contract.md#unresolved-implementation-choices).
-The branch includes the additive audit migration described below, but registers
-no rebind route and enables no writer, factory, listener, or deployment.
-Existing cutover, ownership, authorization, and acceptance
-requirements continue to apply. Review acceptance is not runtime acceptance.
+The earlier dormant checkpoint sections remain historical evidence for their
+recorded sources. Existing cutover, ownership, authorization and acceptance
+requirements continue to apply. Candidate source is not runtime acceptance.
 
 ## Decisions
 
@@ -31,6 +31,38 @@ requirements continue to apply. Review acceptance is not runtime acceptance.
 6. This is one supported-controller implementation and acceptance unit. A0 is
    the first full-controller crash case, not a substitute milestone or a claim
    that the remaining crash matrix is complete.
+
+## Current supported-controller candidate status
+
+The controller now registers the five canonical rebind operations in the
+OpenAPI-backed route table: proposal, commit, exact status, recovery proposal
+and reconcile. Normal mode can expose all five only when their separate commit
+and recovery dependencies are supplied. Recovery-only mode exposes necessary
+authentication plus status, recovery proposal and reconcile for the one
+startup-validated `gateway_rebind` operation ID. New proposal and commit remain
+unavailable there. The static gate remains restricted after a terminal response
+until a fresh process proves normal startup.
+
+Every recovery handler checks the recovery kind, canonical startup pin and path
+operation before a repository, runtime, audit or effect call. The existing
+authenticated principal, live same-session administrator recheck and CSRF rule
+remain in force; POST review and reconcile require CSRF. Commit preserves the
+two distinct original configure and rebind approvals, while recovery preserves
+the separate request-scoped reconcile consent. No handler clears a fence,
+releases workers or turns a retained terminal response into ordinary runtime
+authority.
+
+`api/openapi.yaml` is the canonical source for these operations, their bounded
+request and curated response schemas, sensitive `no-store` responses and fixed
+problem catalog. Generated Go and web bindings must be produced only by the
+repository generator and checked against the registered routes. This candidate
+does not provision databases: application external databases remain app-owned,
+and no managed database or Neon capability is introduced.
+
+This status records candidate source wiring only. The complete actual-hostd
+crash matrix, hosted Docker and race gates, full aggregate review and physical
+second-device/app-owned-external-database qualification remain required before
+the supported flow can be accepted or activated.
 
 ## Existing implementation and remaining work
 
@@ -62,11 +94,10 @@ of the existing coordinator and startup dispatch. It must retain the real SQL
 phase and immutable events. Merely casting `unresolved` to `prepared`, bypassing
 the validator, or exposing the current public startup method is insufficient.
 
-## Proposed controller surface
+## Canonical controller surface
 
-These names and shapes are proposed additions to `api/openapi.yaml`, with
-generated bindings following the existing contract toolchain. They are not
-currently registered. All operations require a current administrator and
+These names and shapes are defined in `api/openapi.yaml`, with generated
+bindings following the existing contract toolchain. All operations require a current administrator and
 `Cache-Control: no-store`; all POSTs also require the existing session CSRF
 check, including the read-only preview POSTs. No endpoint accepts raw paths,
 commands, configs, labels, client-built rosters, or claims of physical proof.

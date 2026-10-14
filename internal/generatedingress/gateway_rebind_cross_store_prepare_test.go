@@ -271,6 +271,13 @@ func TestPrepareGatewayRebindLockedIntentBoundaryRetainsFence(t *testing.T) {
 	if !gatewayRebindAdmissionHistoryRetained(beforeFiles, intentOnly) || len(f.runner.commands) != beforeCommands {
 		t.Fatal("intent boundary replaced predecessor files or issued an external effect")
 	}
+	current, err := f.manager.InspectGatewayRebindCurrent(ctx, f.repository)
+	if err != nil || current.ActiveOperationID != inspection.Spec.OperationID ||
+		current.ActivePhase != appaccess.GatewayRebindPrepared || current.ActiveRecoveryPolicy != "" ||
+		current.ActiveProtectedEvidence != (appaccess.GatewayRebindProtectedRecoveryEvidence{}) ||
+		current.ActiveDatabaseCommitObserved || !current.ActiveRollbackAllowed {
+		t.Fatalf("intent-only prepared prefix was not admitted for coordinator repair: current=%+v error=%v", current, err)
+	}
 	fresh, err := New(f.runner, f.manager.options)
 	if err != nil {
 		t.Fatal(err)

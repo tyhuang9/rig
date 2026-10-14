@@ -32,6 +32,16 @@ func runGatewayStartupEmergencyStop(admission *deploymentEffectsStartupLease, st
 func stopOwnedGatewayOnStartupFailure(ctx context.Context, cfg config.Config, dockerExecutable string,
 	directories docker.ControllerDirectories,
 ) error {
+	return stopOwnedGatewayOnStartupFailureWithRunner(ctx, cfg, dockerExecutable, directories,
+		runtimeprocess.ExecRunner{})
+}
+
+func stopOwnedGatewayOnStartupFailureWithRunner(ctx context.Context, cfg config.Config, dockerExecutable string,
+	directories docker.ControllerDirectories, runner runtimeprocess.CommandRunner,
+) error {
+	if runner == nil {
+		return errors.New("gateway emergency stop runner is required")
+	}
 	options := generatedingress.Options{
 		DockerExecutable: dockerExecutable, DockerEndpoint: cfg.DockerEndpoint,
 		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
@@ -39,9 +49,9 @@ func stopOwnedGatewayOnStartupFailure(ctx context.Context, cfg config.Config, do
 	}
 	return stopOwnedGatewayWithStartupHistory(ctx,
 		func(ctx context.Context) (generatedingress.GatewayCurrentStartupEmergencyStopResult, error) {
-			return generatedingress.StopOwnedGatewayCurrentOnStartupFailure(ctx, runtimeprocess.ExecRunner{}, options)
+			return generatedingress.StopOwnedGatewayCurrentOnStartupFailure(ctx, runner, options)
 		}, func(ctx context.Context) error {
-			return generatedingress.StopOwnedGatewayV2OnStartupFailure(ctx, runtimeprocess.ExecRunner{}, options)
+			return generatedingress.StopOwnedGatewayV2OnStartupFailure(ctx, runner, options)
 		})
 }
 

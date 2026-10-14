@@ -233,6 +233,7 @@ func (m *Manager) RetireGatewayCurrentPredecessorsStartup(ctx context.Context,
 		}
 		return false, err
 	}
+	m.gatewayRebindTerminalReleaseEvent = GatewayRebindDurableBoundaryEvent{}
 	defer func() { resultErr = m.releaseGatewayRebindTerminalLocks(releaseEffects, releaseGateway, resultErr) }()
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || snapshot.Active != nil {

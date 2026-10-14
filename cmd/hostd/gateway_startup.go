@@ -30,6 +30,22 @@ type gatewayStartup struct {
 	recoveryKind       string
 	recoveryID         string
 	recoveryAppID      string
+	rebindRecoveryPin  gatewayRebindRecoveryPin
+}
+
+func gatewayStartupForRebindRecovery(decision gatewayRebindStartupDecision) (gatewayStartup, error) {
+	if decision.disposition != gatewayRebindStartupRecoveryOnly || decision.preparation.ingress == nil ||
+		decision.recoveryPin.OperationID == "" || decision.recoveryPin.SQLPhase != appaccess.GatewayRebindUnresolved ||
+		decision.recoveryPin.OperationID != decision.preparation.current.ActiveOperationID {
+		return gatewayStartup{}, errors.New("gateway rebind recovery startup decision is invalid")
+	}
+	expected, err := gatewayRebindRecoveryPinForInspection(decision.preparation.current)
+	if err != nil || !reflect.DeepEqual(decision.recoveryPin, expected) {
+		return gatewayStartup{}, errors.New("gateway rebind recovery startup pin changed before dispatch")
+	}
+	return gatewayStartup{ingress: decision.preparation.ingress,
+		recoveryKind: controller.RecoveryGatewayRebind, recoveryID: decision.recoveryPin.OperationID,
+		rebindRecoveryPin: decision.recoveryPin}, nil
 }
 
 type gatewayStartupBatchIngress interface {
@@ -66,6 +82,14 @@ func inspectGatewayStartupUsingIngress(ctx context.Context, cfg config.Config, d
 	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
 	ingress *generatedingress.Manager,
 ) (gatewayStartup, error) {
+	return inspectGatewayStartupUsingIngressWithRunner(ctx, cfg, db, dockerExecutable, directories,
+		fenceCheck, ingress, runtimeprocess.ExecRunner{})
+}
+
+func inspectGatewayStartupUsingIngressWithRunner(ctx context.Context, cfg config.Config, db *sql.DB,
+	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+	ingress *generatedingress.Manager, runner runtimeprocess.CommandRunner,
+) (gatewayStartup, error) {
 	if fenceCheck == nil {
 		return gatewayStartup{}, errors.New("gateway rebind fence check is required")
 	}
@@ -88,7 +112,7 @@ func inspectGatewayStartupUsingIngress(ctx context.Context, cfg config.Config, d
 		return gatewayStartup{snapshot: snapshot}, nil
 	}
 	if ingress == nil {
-		ingress, err = newGatewayStartupIngress(cfg, dockerExecutable, directories, fenceCheck, repository)
+		ingress, err = newGatewayStartupIngressWithRunner(cfg, dockerExecutable, directories, fenceCheck, repository, runner)
 		if err != nil {
 			return gatewayStartup{}, err
 		}
@@ -154,7 +178,18 @@ func newGatewayStartupIngress(cfg config.Config, dockerExecutable string,
 	directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
 	repository generatedingress.GatewayRebindCurrentStateRepository,
 ) (*generatedingress.Manager, error) {
-	ingress, err := generatedingress.New(runtimeprocess.ExecRunner{}, generatedingress.Options{
+	return newGatewayStartupIngressWithRunner(cfg, dockerExecutable, directories, fenceCheck, repository,
+		runtimeprocess.ExecRunner{})
+}
+
+func newGatewayStartupIngressWithRunner(cfg config.Config, dockerExecutable string,
+	directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+	repository generatedingress.GatewayRebindCurrentStateRepository, runner runtimeprocess.CommandRunner,
+) (*generatedingress.Manager, error) {
+	if runner == nil {
+		return nil, errors.New("generated ingress runner is required")
+	}
+	ingress, err := generatedingress.New(runner, generatedingress.Options{
 		DockerExecutable: dockerExecutable, DockerEndpoint: cfg.DockerEndpoint,
 		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
 		DataRoot: cfg.DataRoot, RebindFenceCheck: fenceCheck, RebindCurrentStateRepository: repository,

@@ -214,6 +214,10 @@ func (m *Manager) claimGatewayRebindAdmissionLocked(ctx context.Context,
 	if err != nil {
 		return appaccess.GatewayRebindClaimV2{}, gatewayRebindProposalError(ctx)
 	}
+	m.observeGatewayRebindDurableBoundary(ctx, GatewayRebindDurableBoundaryEvent{
+		Boundary: GatewayRebindBoundarySQLClaimReadback, OperationID: claim.Spec.OperationID,
+		SQLPhase: claim.State, ProtectedGeneration: claim.Spec.SuccessorProtectedGeneration,
+	})
 	if m.gatewayRebindAfterClaim != nil {
 		if err := m.gatewayRebindAfterClaim(ctx, claim); err != nil {
 			return appaccess.GatewayRebindClaimV2{}, gatewayRebindProposalError(ctx)
@@ -233,6 +237,10 @@ func (m *Manager) claimGatewayRebindStrictAcceptedLocked(ctx context.Context,
 	if !validGatewayRebindAcceptedClaim(accepted, candidate) {
 		return gatewayRebindAcceptedClaim{}, gatewayRebindProposalError(ctx)
 	}
+	m.observeGatewayRebindDurableBoundary(ctx, GatewayRebindDurableBoundaryEvent{
+		Boundary: GatewayRebindBoundarySQLClaimReadback, OperationID: claim.Spec.OperationID,
+		SQLPhase: claim.State, ProtectedGeneration: claim.Spec.SuccessorProtectedGeneration,
+	})
 	if m.gatewayRebindAfterClaim != nil {
 		if err := m.gatewayRebindAfterClaim(ctx, claim); err != nil {
 			return accepted, gatewayRebindProposalError(ctx)
@@ -357,6 +365,11 @@ func (m *Manager) installGatewayRebindPreparedProtectedWithNetworkLocked(ctx con
 	if err != nil || ensureGatewayRebindCheckpoint(checkpointStore, checkpoint) != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
+	m.observeGatewayRebindDurableBoundary(ctx, GatewayRebindDurableBoundaryEvent{
+		Boundary: GatewayRebindBoundaryProtectedCheckpointReadback, OperationID: checkpoint.OperationID,
+		SQLPhase: appaccess.GatewayRebindPrepared, ProtectedGeneration: checkpoint.Generation,
+		Digest: checkpoint.Digest,
+	})
 	if m.gatewayRebindAfterPreparedCheckpoint != nil {
 		if err := m.gatewayRebindAfterPreparedCheckpoint(ctx); err != nil {
 			return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
@@ -384,6 +397,11 @@ func (m *Manager) installGatewayRebindPreparedProtectedWithNetworkLocked(ctx con
 	if err != nil || ensureGatewayRebindIntentV2(intentStore, intent) != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
+	m.observeGatewayRebindDurableBoundary(ctx, GatewayRebindDurableBoundaryEvent{
+		Boundary: GatewayRebindBoundaryProtectedIntentReadback, OperationID: intent.OperationID,
+		SQLPhase: appaccess.GatewayRebindPrepared, ProtectedGeneration: intent.Generation,
+		Digest: intent.Digest,
+	})
 	if m.gatewayRebindAfterPreparedIntent != nil {
 		if err := m.gatewayRebindAfterPreparedIntent(ctx); err != nil {
 			return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
@@ -404,6 +422,12 @@ func (m *Manager) installGatewayRebindPreparedProtectedWithNetworkLocked(ctx con
 			return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 		}
 	}
+	m.observeGatewayRebindDurableBoundary(ctx, GatewayRebindDurableBoundaryEvent{
+		Boundary: GatewayRebindBoundaryProtectedProgressReadback, OperationID: progress.OperationID,
+		SQLPhase: appaccess.GatewayRebindPrepared, ProtectedPhase: string(progress.Phase),
+		ProtectedGeneration: progress.Generation,
+		ProtectedSequence:   progress.Sequence, Digest: progress.Digest,
+	})
 	return gatewayRebindPreparedAttempt{Claim: claim, Checkpoint: checkpoint, Intent: intent, Progress: progress}, nil
 }
 

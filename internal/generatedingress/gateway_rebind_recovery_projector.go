@@ -554,6 +554,21 @@ func gatewayRebindProtectedRecoveryProjection(history gatewayRebindProtectedInte
 			TerminalReceiptDigest: terminal.Digest,
 		}, "", true, nil
 	}
+	if intent != nil && len(progress) == 0 && terminal == nil {
+		checkpoint, checkpointErr := gatewayRebindActiveCheckpoint(history, claim)
+		if checkpointErr != nil || !sameGatewayRebindClaimV2Admission(intent.Claim, claim) ||
+			!sameGatewayRebindRosterV2(intent.Roster, entry.RosterV2) ||
+			!sameGatewayRebindRuntimeHeads(intent.RuntimeHeads, entry.RuntimeHeads) ||
+			intent.Predecessor != checkpoint.sourceRef() {
+			return appaccess.GatewayRebindProtectedRecoveryEvidence{}, "", false,
+				errors.New("partial protected intent does not match retained SQL history")
+		}
+		return appaccess.GatewayRebindProtectedRecoveryEvidence{
+			Presence: appaccess.GatewayRebindProtectedEvidencePresent, OperationID: operationID,
+			Generation: generation, ScanDigest: digest, IntentDigest: intent.Digest,
+			FixedDisposition: appaccess.GatewayRebindDispositionNone,
+		}, "", false, nil
+	}
 	if intent == nil || len(progress) == 0 {
 		return appaccess.GatewayRebindProtectedRecoveryEvidence{}, "", false, nil
 	}

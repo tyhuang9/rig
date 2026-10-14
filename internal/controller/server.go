@@ -155,6 +155,11 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute(operationConfigureLANGatewayProfile, noStore(s.requireOperation(operationConfigureLANGatewayProfile, s.configureLANGatewayProfile))),
 		contractRoute(operationGetLANGatewayUpgrade, noStore(s.requireOperation(operationGetLANGatewayUpgrade, s.getLANGatewayUpgrade))),
 		contractRoute(operationUpgradeLANGateway, noStore(s.requireOperation(operationUpgradeLANGateway, s.upgradeLANGateway))),
+		contractRoute(operationInspectLANGatewayRebind, noStore(s.requireOperation(operationInspectLANGatewayRebind, s.inspectLANGatewayRebind))),
+		contractRoute(operationCommitLANGatewayRebind, noStore(s.requireOperation(operationCommitLANGatewayRebind, s.commitLANGatewayRebind))),
+		contractRoute(operationGetLANGatewayRebind, noStore(s.requireOperation(operationGetLANGatewayRebind, s.getLANGatewayRebind))),
+		contractRoute(operationInspectLANGatewayRebindRecovery, noStore(s.requireOperation(operationInspectLANGatewayRebindRecovery, s.inspectLANGatewayRebindRecovery))),
+		contractRoute(operationReconcileLANGatewayRebind, noStore(s.requireOperation(operationReconcileLANGatewayRebind, s.reconcileLANGatewayRebind))),
 		contractRoute(operationGetLANRecoveryHead, noStore(s.requireOperation(operationGetLANRecoveryHead, s.getLANRecoveryHead))),
 		contractRoute("listApplications", s.require(s.listApps)),
 		contractRoute("createApplication", s.require(s.createApp)),
@@ -243,6 +248,7 @@ func (s *Server) routes() http.Handler {
 
 const (
 	RecoveryGatewayUpgrade = "gateway_upgrade"
+	RecoveryGatewayRebind  = "gateway_rebind"
 	RecoveryLANGrant       = "lan_grant"
 	RecoveryLANDisable     = "lan_disable"
 )
@@ -262,6 +268,9 @@ func (s *Server) recoveryGate(next http.Handler) http.Handler {
 			permit = true
 		case operationGetLANGatewayUpgrade, operationUpgradeLANGateway:
 			permit = s.RecoveryKind == "" || s.RecoveryKind == RecoveryGatewayUpgrade
+		case operationGetLANGatewayRebind, operationInspectLANGatewayRebindRecovery,
+			operationReconcileLANGatewayRebind:
+			permit = s.RecoveryKind == RecoveryGatewayRebind && validCanonicalUUID(s.RecoveryOperationID)
 		case operationGetApplicationLANGrant, operationGrantApplicationLANAccess:
 			permit = s.RecoveryKind == RecoveryLANGrant
 		case operationGetApplicationLANDisable, operationDisableApplicationLANAccess:

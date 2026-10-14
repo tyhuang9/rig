@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"sort"
 	"strings"
@@ -741,8 +742,22 @@ func TestGatewayRebindTypedCommitTerminalScansAndSelectsActualLineage(t *testing
 		t.Fatal(err)
 	}
 	store, err := newGatewayRebindTerminalStoreV2(fixture.dataRoot, receipt.Generation, receipt.OperationID)
-	if err != nil || store.installExact(context.Background(), receipt) != nil {
-		t.Fatalf("install typed terminal: %v", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	installCtx, cancelInstall := context.WithCancel(context.Background())
+	installCallbacks := 0
+	installErr := store.installExactObserved(installCtx, receipt, func() {
+		installCallbacks++
+		cancelInstall()
+	})
+	if !errors.Is(installErr, context.Canceled) || installCallbacks != 1 {
+		t.Fatalf("post-install cancellation bypassed mandatory terminal verification: callbacks=%d error=%v",
+			installCallbacks, installErr)
+	}
+	if err := store.installExactObserved(context.Background(), receipt, func() { installCallbacks++ }); err != nil ||
+		installCallbacks != 1 {
+		t.Fatalf("exact terminal replay reported a new durable install: callbacks=%d error=%v", installCallbacks, err)
 	}
 	history, err := fixture.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil || len(history.Terminals) != 1 || len(history.TerminalsV2) != 1 ||
@@ -773,6 +788,10 @@ func TestGatewayRebindTypedCommitTerminalScansAndSelectsActualLineage(t *testing
 	if err != nil || !validGatewayRebindTerminalReceiptV2(changedResources) ||
 		gatewayRebindTerminalV2MatchesIntentHistory(changedResources, intent, checkpoint, typedProgress) {
 		t.Fatalf("rehashed alternate terminal resources were not isolated from retained progress: %v", err)
+	}
+	if err := store.installExactObserved(context.Background(), changedResources,
+		func() { installCallbacks++ }); err == nil || installCallbacks != 1 {
+		t.Fatalf("conflicting terminal reported a durable install: callbacks=%d error=%v", installCallbacks, err)
 	}
 	changedProof := receipt
 	proofCopy := *receipt.PhysicalProof

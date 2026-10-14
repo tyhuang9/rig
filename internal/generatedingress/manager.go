@@ -141,6 +141,10 @@ type Manager struct {
 	// gatewayRebindCrossStoreDriver is replaceable only by package tests. The
 	// production adapter performs the normalized typed-source physical flow.
 	gatewayRebindCrossStoreDriver gatewayRebindCrossStoreDriver
+	// Written only under the Manager and gateway locks after fresh final-census
+	// and database-fence readbacks, then cleared after the matching terminal
+	// release sequence.
+	gatewayRebindTerminalReleaseEvent GatewayRebindDurableBoundaryEvent
 }
 
 // contextMutex lets a route observation abandon lock contention when its
@@ -183,7 +187,19 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 	if options.RebindFenceCheck == nil {
 		return nil, errors.New("generated ingress rebind fence check is required")
 	}
-	return newManager(runner, options)
+	manager, err := newManager(runner, options)
+	if err != nil {
+		return nil, err
+	}
+	// A supported Manager always owns one coherent pair of physical adapters.
+	// Both adapters retain this exact manager, runner, protected store, lock and
+	// fail-stop identity. Interactive commit/reconcile still wrap the rebind
+	// adapter per invocation to add request-local authorization; they do not
+	// replace the startup/current capability installed here.
+	rebind, current := newGatewayRebindRuntimeDrivers(manager)
+	manager.gatewayRebindCrossStoreDriver = rebind
+	manager.gatewayCurrentPhysicalDriver = current
+	return manager, nil
 }
 
 func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager, error) {
