@@ -207,6 +207,43 @@ and merge tree; it is not a claim that the updated draft has passed CI.
 The new private controller recovery/replay Docker parent and full supported
 hostd/physical-device acceptance remain separately required.
 
+## PR #153 retained-history fixture follow-up
+
+Code `b65b47afab4dd8e81ba9dab4485a35341141aa1f` adds two test-only corrections
+after the first repair batch above. Windows rebind-history job `116091530341`
+exposed another retained-rollback fixture using the obsolete network-refusal
+prefix, and a malformed-input case that panicked in fixture setup before
+production validation. The rollback test now interrupts after its real durable
+checkpoint and asserts the no-effect abort call. The inventory fixture parses
+the address only when the inventory is requested and returns a parse error;
+production can reject the malformed claim first. Existing immutable-history,
+generation, current-authority and retry assertions remain in place.
+
+The previous immutable Linux binary reproduced both failures. Fresh Windows
+and Linux binaries each passed **four parents / four children**, with no
+failures or skips, using the same pinned toolchain and flags as above:
+
+```text
+^(TestGatewayRebindCoordinatorCommitsAfterRetainedRollback|TestGatewayRebindLegacyCompositionRetirementCensus|TestGatewayRebindProposalAndAdmissionUseRealRepository|TestGatewayRebindConcreteCompositionLegacySource)$
+```
+
+Both runs used `-test.count=1 -test.timeout=10m`, explicit discovery and
+test2json capture. All 933 Go/SQL/module input hashes and binary hashes remained
+unchanged during execution and match this code commit. Windows completed in
+491.547 seconds (log SHA-256
+`2c549bf8b0f751111790af039b6bb1dbdfca6b37346bcaf00fd80a30572c1273`);
+Linux completed in 88.219 seconds (log SHA-256
+`bbb738d6babcce73ff9f44a71dc127531575fa2689012cddf50341b177dc03bd`).
+Receipts are `history-green-windows.result.json` and
+`history-green-wsl.result.json` in the same evidence directory above.
+
+Independent static review found no issues in these two corrections. CodeRabbit
+CLI was unavailable; this is manual review evidence. The earlier 28-parent
+Windows / 27-parent Linux results remain attributed to `04ed622`, before these
+two fixture edits. They are not rerun results for `b65b47a`. The newer four-parent
+suite covers the changed helper and retained-history sequence. Formatting and
+diff checks passed. Full candidate Docker, race and Windows CI remain required.
+
 ## Disablement and data integrity
 
 Keep production registration and capability assembly dormant while acceptance
