@@ -244,6 +244,47 @@ two fixture edits. They are not rerun results for `b65b47a`. The newer four-pare
 suite covers the changed helper and retained-history sequence. Formatting and
 diff checks passed. Full candidate Docker, race and Windows CI remain required.
 
+## PR #153 private recovery diagnostic follow-up
+
+At `d013ecf99cbea94b6ab04f7ed3a353432886c56e`, hosted Docker run
+[38640034376, job 116113486680](https://github.com/tyhuang9/rig/actions/runs/38640034376/job/116113486680)
+failed `TestLiveGatewayRebindControllerRecoveryCommitAndReplay` after
+`approved-reconcile`. Independent cleanup passed. The child output was deliberately
+suppressed because it handles a fixture session; no retained artifact identified
+the exact response or failure. This result does not establish the root cause.
+
+Test-only code `d8fd418fe389f0532371095b9b1abd47b690a194` adds finite outcome
+labels for commit, abort and curated HTTP problems; a whitelist parser clamps
+unknown output and marks duplicate outcomes ambiguous. Failure reporting also
+uses the existing bounded, read-only SQL/protected-state inspection. Raw child
+output, response bodies, credentials, operation identifiers and digests remain
+suppressed. Existing happy-path assertions, timeouts, immutable binary checks,
+cleanup and runtime behavior are unchanged. No retry or acceptance relaxation was
+introduced. These diagnostics still require a new hosted run; they are not a
+recovery repair or evidence that the Docker journey succeeds.
+
+Go 1.26.7 with the read-only flags above compiled both packages on Windows and
+Linux. Explicit test discovery and test2json capture passed five parents / twenty
+children per platform, with no failures or skips. All source and binary pins were
+stable. Exact selectors and raw-log hashes:
+
+```text
+^TestLiveLANGatewayRebindRecoveryApprovedOutcomeIsFinite$
+^(TestLiveControllerRecoveryDiagnosticsAreFinite|TestGatewayRebindRuntimeFailureStateDiagnostic.*)$
+```
+
+| Receipt / raw log prefix | Parents / children | Test log SHA-256 |
+| --- | ---: | --- |
+| `recovery-diagnostic-controller-wsl` | 1 / 7 | `5c398f92bc3f7b619957db8be11d9b007a03572502884fdc61e9ec9dbd5e3222` |
+| `recovery-diagnostic-ingress-wsl` | 4 / 13 | `587c88b70519efa7e3bc362e1ed7dd49a32ace26beac175dcc05d2b63857f5e3` |
+| `recovery-diagnostic-controller-native` | 1 / 7 | `5b632aa2b4f2b31aa7050bab5bc118d83589995104e280b6aee0f91f714f57da` |
+| `recovery-diagnostic-ingress-native` | 4 / 13 | `91244b6fa3e1775f440a46f98c36b3202c102547e0f20e7dae17e44f9a70549e` |
+
+Receipts and logs are retained under `temp/m3-pr153-hosted-20261014/`.
+Independent bounded review found no additional credential, authority or parser
+issue. Formatting and diff checks passed. Full hosted Docker, race and Windows
+acceptance remain required.
+
 ## Disablement and data integrity
 
 Keep production registration and capability assembly dormant while acceptance
