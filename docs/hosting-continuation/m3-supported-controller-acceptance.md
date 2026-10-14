@@ -1,11 +1,13 @@
 # M3 supported controller candidate: acceptance evidence
 
-Status: implementation candidate; M3 acceptance is incomplete. Core source is
-`ed9bc5a966032263e3c27a61745708d58ea26ada`, based on the original PR #153 candidate
-`76cf574dce603793ff2509e4a90ac6cc9de47bc5`. The full hostd harness compiles and its
-local controls pass; live Docker execution remains pending. No controller was
-installed or restarted, and no merge or deployment
-is authorized by these results.
+Status: implementation candidate for draft CI; M3 acceptance is incomplete.
+Core source `ed9bc5a966032263e3c27a61745708d58ea26ada` and full-hostd harness
+`8206fd87dfd59196ee5bfe8e7097112bee655592` are integrated with published PR #153
+`7d03eaf9db7c1742a1d5fb176255992f41900ca4`, preserving history. Local integration
+`b24bf249e00645149eddd9471f989dfe9052e638` includes the reviewed A0 correction
+`88ea2a8`. The full hostd harness compiles and its local controls pass; live
+Docker execution remains pending behind prerequisites. No controller was installed
+or restarted. These results do not authorize a GitHub merge or deployment.
 
 ## Scope and invariants
 
@@ -131,6 +133,58 @@ Independent QA reports no remaining blocking static finding and allows draft CI
 publication after these fresh checks. The ordinary queued-job isolation sentinel
 is a live scenario; auto-deploy/relay omission is structural startup evidence,
 not a separately seeded live acceptance result.
+
+## Integrated-source review and verification
+
+The combined Windows and Linux runs at `553c349` both exposed the same real
+repository inspection defect: an absent protected projection omitted the required
+explicit `none` disposition. Strict validation correctly rejected that empty
+value. Correction `88ea2a8` fixes the producer, retains strict validation and
+extends the real SQL/protected-state test to require `evidence_decides`, a held
+fence, no advertised action and rejection of a mutated empty disposition. Its
+existing assertions still require no protected-file changes or Docker commands.
+The original failing binaries, raw logs and receipts are preserved as
+`combined-ingress-*`; they are not passing acceptance evidence.
+
+Focused verification passed with no skips or failures:
+
+| Receipt / raw log prefix | Parents / children | Test log SHA-256 |
+| --- | ---: | --- |
+| `a0-projection-green-wsl` | 14 / 27 | `06d3f85abbc86181f9dff12a83af3c9ee7986dbca1cff3112d203e1a5e37874e` |
+| `a0-projection-focused-windows` | 3 / 10 | `3caddc2372efe09a7455abe6c569ba773fcf3eb89034a58e9ce61e20f014e069` |
+| `final-api-wsl` | 37 / 322 | `a8adc73044fb48b383ff3e8f99c7f2cf7d1286d5d232fb33ef392e7caea48437` |
+| `final-diagnostic-windows` | 7 / 23 | `badbdc004f6bf18a9ced4db0a0db97a88306ec588df8ca115a254638c0093d30` |
+
+The first two rows contain the A0 correction before the diagnostic-only parent
+integration. The last two rows run against `b24bf249e00645149eddd9471f989dfe9052e638`
+and verify the integrated authenticated API, schema, finite diagnostics and
+A0 behavior. Each receipt records its exact selector, discovery and source/binary
+pins. The fresh `final-cli.result.json` builds all four CLI targets and runs scoped
+vet on both Windows and Linux. Its production source hashes match this integrated
+candidate; the subsequent parent integration changed only two test files and docs.
+This supersedes the earlier production-build snapshot for compilation evidence.
+
+A broader Windows selection of fourteen parents reached its unchanged ten-minute
+timeout in the database-heavy audited-reconcile test. Eleven parents and fourteen
+children had passed, but two discovered parents never started. The strict runner
+rejected incomplete discovery accounting; the raw timeout log, original progress
+and `a0-projection-green-windows.incomplete.json` are preserved. The log SHA-256 is
+`094ac9c9d665aca8220aa7356d09bdcc84e4c604df5ba45ccd6afc52f0a2ae6b`.
+This broad Windows run is incomplete, not green. The targeted Windows A0 check and
+later seven-parent integration check above passed; Linux completed the broader
+fourteen-parent selection. Full hosted Windows and race gates remain required.
+
+Independent final review found the A0 source defect resolved with executable
+coverage and cleared draft CI publication, while retaining all remaining gates.
+The new crash matrix depends on every `rebind-cross-store-live` matrix member.
+
+At published parent `7d03eaf`, the diagnostic hosted
+[job 116124828686](https://github.com/tyhuang9/rig/actions/runs/38643459027/job/116124828686)
+reported `problem-unavailable` after approved reconcile while retained state showed
+no active SQL claim, a commit receipt, a current artifact and successor authority.
+This narrows the failure to a path that can occur after committed state exists;
+it does not yet identify the failed check or prove a successful HTTP journey.
+The controller recovery prerequisite remains failed and under investigation.
 
 ## Remaining acceptance and rollback
 
