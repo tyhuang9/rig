@@ -38,6 +38,26 @@ type gatewayRebindCompositionRunner struct {
 	currentAutosave  []byte
 }
 
+func TestGatewayRebindSupportedConstructorInstallsConcreteDrivers(t *testing.T) {
+	manager, _ := newManagerFixture(t, false)
+	rebind, rebindOK := manager.gatewayRebindCrossStoreDriver.(managerGatewayRebindCrossStoreDriver)
+	current, currentOK := manager.gatewayCurrentPhysicalDriver.(managedGatewayCurrentPhysicalDriver)
+	if !rebindOK || rebind.manager != manager || !currentOK || current.manager() != manager {
+		t.Fatalf("supported drivers rebind=%T current=%T", manager.gatewayRebindCrossStoreDriver,
+			manager.gatewayCurrentPhysicalDriver)
+	}
+	// Raw package construction remains an explicit incomplete-dependency test
+	// seam; it must still fail closed instead of silently gaining another
+	// manager, store or effect coordinator.
+	raw, err := newManager(manager.runner, manager.options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw.gatewayRebindCrossStoreDriver != nil || raw.gatewayCurrentPhysicalDriver != nil {
+		t.Fatal("incomplete raw construction installed production physical authority")
+	}
+}
+
 type gatewayRebindCompositionDriver struct {
 	managerGatewayRebindCrossStoreDriver
 	t              *testing.T
