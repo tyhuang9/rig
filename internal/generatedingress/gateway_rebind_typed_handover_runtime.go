@@ -21,6 +21,7 @@ import (
 type gatewayRebindTypedHandoverRuntime struct {
 	manager        *Manager
 	stage          gatewayRebindTypedStageRuntime
+	repository     gatewayRebindTypedBoundaryRepository
 	hostProbe      gatewayV2HostStatusProbe
 	containerProbe gatewayV2ContainerChallengeProbe
 	listenerAbsent func(context.Context, string, uint16) bool

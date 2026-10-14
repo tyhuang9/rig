@@ -28,6 +28,7 @@ import (
 	"github.com/hostd/hostd/internal/controllerrelay"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/hostnetwork"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
@@ -40,47 +41,51 @@ import (
 var web embed.FS
 
 type Server struct {
-	Auth                  authenticationService
-	Apps                  *apps.Store
-	Jobs                  *jobs.Service
-	Machines              *machines.Store
-	Caddy                 bool
-	FakeRuntime           bool
-	ComposeRuntime        bool
-	GeneratedRuntime      bool
-	DockerEndpoint        string
-	DataRoot              string
-	Logger                *slog.Logger
-	BootstrapCompleted    func()
-	Sources               *sourceconnections.Service
-	Configuration         *appconfig.Store
-	Deployments           *deployments.Repository
-	GeneratedIngress      LocalRouteIngress
-	GeneratedRuntimeState LocalRouteRuntimeState
-	DeploymentPlans       *deploymentplans.Store
-	RelayManagement       RelayManagementService
-	AutoDeploy            AutoDeployService
-	GatewayProfiles       GatewayProfileService
-	GatewayUpgrades       GatewayUpgradeService
-	GatewayUpgradeRuntime GatewayUpgradeRuntime
-	AppAccess             LANAppAccessService
-	AppGrants             LANAppGrantService
-	LANGrantRuntime       LANAppGrantRuntime
-	AppDisables           LANAppDisableService
-	LANDisableRuntime     LANAppDisableRuntime
-	LANRecoveryHeads      LANRecoveryHeadService
-	RecoveryOnly          bool
-	RecoveryLANBatch      bool
-	RecoveryBatchHead     int
-	RecoveryBatchCount    int
-	RecoveryKind          string
-	RecoveryOperationID   string
-	RecoveryAppID         string
-	GatewayCandidates     func() ([]hostnetwork.Candidate, error)
-	AutoDeployAvailable   bool
-	RelayReconcile        func()
-	AutoDeployReconcile   func()
-	authenticationWork    *authenticationWorkGate
+	Auth                         authenticationService
+	Apps                         *apps.Store
+	Jobs                         *jobs.Service
+	Machines                     *machines.Store
+	Caddy                        bool
+	FakeRuntime                  bool
+	ComposeRuntime               bool
+	GeneratedRuntime             bool
+	DockerEndpoint               string
+	DataRoot                     string
+	Logger                       *slog.Logger
+	BootstrapCompleted           func()
+	Sources                      *sourceconnections.Service
+	Configuration                *appconfig.Store
+	Deployments                  *deployments.Repository
+	GeneratedIngress             LocalRouteIngress
+	GeneratedRuntimeState        LocalRouteRuntimeState
+	DeploymentPlans              *deploymentplans.Store
+	RelayManagement              RelayManagementService
+	AutoDeploy                   AutoDeployService
+	GatewayProfiles              GatewayProfileService
+	GatewayUpgrades              GatewayUpgradeService
+	GatewayUpgradeRuntime        GatewayUpgradeRuntime
+	GatewayRebinds               generatedingress.GatewayRebindCommitRepository
+	GatewayRebindRuntime         GatewayRebindRuntime
+	GatewayRebindRecoveries      generatedingress.GatewayRebindRecoveryRepository
+	GatewayRebindRecoveryRuntime GatewayRebindRecoveryRuntime
+	AppAccess                    LANAppAccessService
+	AppGrants                    LANAppGrantService
+	LANGrantRuntime              LANAppGrantRuntime
+	AppDisables                  LANAppDisableService
+	LANDisableRuntime            LANAppDisableRuntime
+	LANRecoveryHeads             LANRecoveryHeadService
+	RecoveryOnly                 bool
+	RecoveryLANBatch             bool
+	RecoveryBatchHead            int
+	RecoveryBatchCount           int
+	RecoveryKind                 string
+	RecoveryOperationID          string
+	RecoveryAppID                string
+	GatewayCandidates            func() ([]hostnetwork.Candidate, error)
+	AutoDeployAvailable          bool
+	RelayReconcile               func()
+	AutoDeployReconcile          func()
+	authenticationWork           *authenticationWorkGate
 }
 
 // RelayManagementService is the controller-safe relay management boundary.

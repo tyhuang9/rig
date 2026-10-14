@@ -474,6 +474,42 @@ func gatewayRebindV2ProposalForFixture(t *testing.T,
 	}
 }
 
+func TestValidateGatewayRebindClaimV2ForProposalRequiresCanonicalRequestDigests(t *testing.T) {
+	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	finishGatewayRebindFixtureWork(t, fixture.db)
+	proposal := gatewayRebindV2ProposalForFixture(t, fixture)
+	claim, created, err := fixture.repository.ClaimGatewayRebindV2(context.Background(), proposal)
+	if err != nil || !created || ValidateGatewayRebindClaimV2ForProposal(claim, proposal) != nil {
+		t.Fatalf("canonical returned claim: created=%t error=%v", created, err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*GatewayRebindClaimV2)
+	}{
+		{name: "claim request", mutate: func(value *GatewayRebindClaimV2) {
+			value.RequestDigest = strings.Repeat("f", 64)
+		}},
+		{name: "successor request", mutate: func(value *GatewayRebindClaimV2) {
+			value.SuccessorProfileRequestDigest = strings.Repeat("f", 64)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := claim
+			test.mutate(&changed)
+			if err := ValidateGatewayRebindClaimV2ForProposal(changed, proposal); !errors.Is(err, ErrInvalidStoredState) {
+				t.Fatalf("well-formed noncanonical digest accepted: %v", err)
+			}
+		})
+	}
+	progressed := claim
+	progressed.State = GatewayRebindSuccessorReady
+	progressed.StateSequence++
+	progressed.UpdatedAt = progressed.UpdatedAt.Add(time.Second)
+	if err := ValidateGatewayRebindClaimV2ForProposal(progressed, proposal); err != nil {
+		t.Fatalf("canonical progressed replay claim rejected: %v", err)
+	}
+}
+
 func assertNoGatewayRebindClaim(t *testing.T, fixture gatewayRebindFixture, operationID string) {
 	t.Helper()
 	var count int

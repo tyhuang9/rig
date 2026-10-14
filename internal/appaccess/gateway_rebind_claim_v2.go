@@ -360,6 +360,24 @@ func gatewayRebindClaimV2RequestDigest(spec GatewayRebindSpecV2,
 	}{Spec: spec, Rebind: rebind, Configure: configure})
 }
 
+// ValidateGatewayRebindClaimV2ForProposal validates a repository-returned V2
+// claim against the exact proposal that produced it. It reuses the stored
+// claim validator so callers cannot substitute merely well-formed request
+// digests for the two canonical request identities.
+func ValidateGatewayRebindClaimV2ForProposal(claim GatewayRebindClaimV2,
+	proposal GatewayRebindPreclaimProposalV2,
+) error {
+	if validateGatewayRebindProposalV2(proposal) != nil {
+		return ErrInvalidInput
+	}
+	if claim.Spec != proposal.Spec || claim.RebindApproval != proposal.RebindApproval ||
+		claim.ConfigureApproval != proposal.ConfigureApproval ||
+		validateStoredGatewayRebindClaimV2(claim, proposal.Roster, proposal.RuntimeHeads) != nil {
+		return ErrInvalidStoredState
+	}
+	return nil
+}
+
 func readGatewayRebindClaimV2(ctx context.Context, query rowQuerier,
 	operationID string,
 ) (GatewayRebindClaimV2, error) {

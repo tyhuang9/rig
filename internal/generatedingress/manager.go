@@ -103,6 +103,10 @@ type Manager struct {
 	// gatewayRebindAfterClaim is a package-test crash boundary after the SQL
 	// prepared commit and before any protected checkpoint write.
 	gatewayRebindAfterClaim func(context.Context, appaccess.GatewayRebindClaimV2) error
+	// gatewayRebindAfterPreparedCheckpoint is a package-test crash boundary
+	// after the exact predecessor checkpoint is durable and before the typed
+	// protected intent is installed.
+	gatewayRebindAfterPreparedCheckpoint func(context.Context) error
 	// gatewayRebindAfterPreparedIntent is a package-test crash boundary after
 	// the typed protected intent is durable and before progress is installed.
 	gatewayRebindAfterPreparedIntent func(context.Context) error

@@ -79,13 +79,17 @@ func validGatewayRebindPhysicalReconcileRequest(value gatewayRebindPhysicalRecon
 			!value.DatabaseCommitObserved && value.Terminal == nil
 	case gatewayRebindPhysicalReconcileForwardOnly:
 		return value.Terminal != nil && value.Terminal.Disposition == appaccess.GatewayRebindDispositionCommit &&
-			(value.SQLPhase == appaccess.GatewayRebindPrepared ||
+			((!value.DatabaseCommitObserved && (value.SQLPhase == appaccess.GatewayRebindPrepared ||
 				value.SQLPhase == appaccess.GatewayRebindSuccessorReady ||
-				(value.SQLPhase == appaccess.GatewayRebindDatabaseCommitted && value.DatabaseCommitObserved))
+				value.SQLPhase == appaccess.GatewayRebindUnresolved)) ||
+				(value.DatabaseCommitObserved && (value.SQLPhase == appaccess.GatewayRebindDatabaseCommitted ||
+					value.SQLPhase == appaccess.GatewayRebindUnresolved)))
 	case gatewayRebindPhysicalReconcileRollbackOnly:
 		return value.Terminal != nil && value.Terminal.Disposition == appaccess.GatewayRebindDispositionAbort &&
 			value.RollbackAllowed && !value.DatabaseCommitObserved &&
-			(value.SQLPhase == appaccess.GatewayRebindPrepared || value.SQLPhase == appaccess.GatewayRebindSuccessorReady)
+			(value.SQLPhase == appaccess.GatewayRebindPrepared ||
+				value.SQLPhase == appaccess.GatewayRebindSuccessorReady ||
+				value.SQLPhase == appaccess.GatewayRebindUnresolved)
 	default:
 		return false
 	}
@@ -132,20 +136,53 @@ func (m *Manager) commitGatewayRebind(ctx context.Context, repository gatewayReb
 
 func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository gatewayRebindCrossStoreRepository,
 	input gatewayRebindCommitInput, driver gatewayRebindCrossStoreDriver,
-) (result GatewayRebindCommitResult, resultErr error) {
+) (GatewayRebindCommitResult, error) {
 	if m == nil || ctx == nil || repository == nil || driver == nil {
 		return GatewayRebindCommitResult{}, &Error{Code: DiagnosticValidationFailed}
 	}
+	var result GatewayRebindCommitResult
+	err := m.runGatewayRebindCommitLocked(ctx, func() (bool, error) {
+		prepared, prepareErr := m.prepareGatewayRebindLocked(ctx, repository, input)
+		if prepareErr != nil {
+			abort, abortErr := m.abortGatewayRebindPreparedWithoutIntentLocked(ctx, repository, driver,
+				input.Inspection.Spec.OperationID)
+			terminalSQL := m.gatewayRebindCommitBarrierLatch().Load()
+			if abortErr != nil {
+				return terminalSQL, prepareErr
+			}
+			result = abort
+			return terminalSQL, nil
+		}
+		var terminalSQL bool
+		result, terminalSQL, prepareErr = m.continueGatewayRebindPreparedLocked(ctx, repository, prepared, driver)
+		return terminalSQL, prepareErr
+	})
+	if err != nil {
+		return GatewayRebindCommitResult{}, err
+	}
+	return result, nil
+}
+
+// runGatewayRebindCommitLocked provides the one lock and release envelope for
+// both the legacy private coordinator and the strict request facade. The
+// callback alone decides whether SQL reached a terminal state; it cannot
+// acquire a second Manager or OS lock around the continuation.
+func (m *Manager) runGatewayRebindCommitLocked(ctx context.Context,
+	locked func() (bool, error),
+) (resultErr error) {
+	if m == nil || ctx == nil || locked == nil {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
 	releaseEffects, err := gatewayRebindAcquireDeploymentEffects(ctx, m.options.WorkingDirectory)
 	if err != nil {
-		return GatewayRebindCommitResult{}, gatewayRebindEffectBoundaryError(ctx)
+		return gatewayRebindEffectBoundaryError(ctx)
 	}
 	releaseGateway, err := m.lockGatewayRaw(ctx)
 	if err != nil {
 		if releaseErr := releaseEffects(); releaseErr != nil {
 			m.gatewayRebindFailStopLatch().Store(true)
 		}
-		return GatewayRebindCommitResult{}, err
+		return err
 	}
 	terminalSQL := false
 	defer func() {
@@ -166,21 +203,18 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 				}
 			}
 		}
-		if resultErr != nil {
-			result = GatewayRebindCommitResult{}
-		}
 	}()
+	terminalSQL, resultErr = locked()
+	return resultErr
+}
 
-	prepared, err := m.prepareGatewayRebindLocked(ctx, repository, input)
-	if err != nil {
-		abort, abortErr := m.abortGatewayRebindPreparedWithoutIntentLocked(ctx, repository, driver,
-			input.Inspection.Spec.OperationID)
-		terminalSQL = m.gatewayRebindCommitBarrierLatch().Load()
-		if abortErr != nil {
-			return GatewayRebindCommitResult{}, err
-		}
-		return abort, nil
-	}
+// continueGatewayRebindPreparedLocked owns the existing post-admission
+// coordinator while its caller retains the deployment-effects lease, Manager
+// mutex and gateway OS lock. It never acquires or releases those locks.
+func (m *Manager) continueGatewayRebindPreparedLocked(ctx context.Context,
+	repository gatewayRebindCrossStoreRepository, prepared gatewayRebindPreparedAttempt,
+	driver gatewayRebindCrossStoreDriver,
+) (result GatewayRebindCommitResult, terminalSQL bool, resultErr error) {
 	result.OperationID, result.InitialPhase = prepared.Claim.Spec.OperationID, appaccess.GatewayRebindPrepared
 	appendProgress := func(appendCtx context.Context, record gatewayRebindProgressRecord) error {
 		store, storeErr := newGatewayRebindProgressStore(m.options.DataRoot, record.Generation,
@@ -195,19 +229,19 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 		SQLPhase: appaccess.GatewayRebindPrepared, RollbackAllowed: true,
 	}
 	if !validGatewayRebindPhysicalReconcileRequest(request) {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	physical, err := driver.reconcileSuccessorLocked(ctx, request, appendProgress)
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	if physical.Disposition == appaccess.GatewayRebindDispositionAbort {
 		result, err = m.finishGatewayRebindRollbackAfterIntentLocked(ctx, repository, driver, prepared, physical.Last)
 		terminalSQL = m.gatewayRebindCommitBarrierLatch().Load()
-		return result, err
+		return result, terminalSQL, err
 	}
 	if physical.Disposition != appaccess.GatewayRebindDispositionCommit {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	// Completed physical history is a direction fence before receipt creation.
 	// Keep ownership-only withdrawal armed through all later failures, while
@@ -222,126 +256,126 @@ func (m *Manager) commitGatewayRebindWithDriver(ctx context.Context, repository 
 		physical.Last.TypedEffect.PhysicalProof == nil ||
 		!reflect.DeepEqual(*physical.Last.TypedEffect.Resources, physical.Resources) ||
 		!reflect.DeepEqual(*physical.Last.TypedEffect.PhysicalProof, physical.Proof) {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	receipt, err := newGatewayRebindCommitTerminalV2(prepared.Intent, physical.Last, physical.Resources,
 		physical.Proof, gatewayRebindTimeStrictlyAfter(m.gatewayRebindProgressTime(), physical.Last.OccurredAt))
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	terminalStore, err := newGatewayRebindTerminalStoreV2(m.options.DataRoot, receipt.Generation, receipt.OperationID)
 	if err != nil {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	request.Mode, request.Terminal = gatewayRebindPhysicalReconcileForwardOnly, &receipt
 	if installErr := terminalStore.installExact(ctx, receipt); installErr != nil {
-		return GatewayRebindCommitResult{}, installErr
+		return GatewayRebindCommitResult{}, terminalSQL, installErr
 	}
 
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	proof, err := gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt, appaccess.GatewayRebindSuccessorReady,
 		gatewayCurrentRouteState{}, nil, "")
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	request = gatewayRebindForwardConfirmationRequest(prepared, receipt, snapshot)
 	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	transfers, err := newGatewayRebindTransfersV2(prepared.Intent, receipt, prepared.Checkpoint)
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	baseline, err := newGatewayCurrentRouteBaselineFromV2Terminal(prepared.Intent, receipt, prepared.Checkpoint, transfers)
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	currentStore, err := newGatewayCurrentRouteStateStore(m.options.DataRoot, baseline.Lineage)
 	if err != nil || currentStore.installBaseline(baseline) != nil {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 
 	snapshot, err = repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	proof, err = gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt,
 		appaccess.GatewayRebindDatabaseCommitted, baseline, transfers, "")
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	request = gatewayRebindForwardConfirmationRequest(prepared, receipt, snapshot)
 	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 
 	snapshot, err = repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	selection, err := m.selectGatewayCurrentLocked(ctx, snapshot)
 	if err != nil || selection.Lineage != baseline.Lineage || selection.State == nil ||
 		!reflect.DeepEqual(*selection.State, baseline) {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	attestation, err := driver.attestCommittedCurrentLocked(ctx, selection)
 	if err != nil || !validSHA256(attestation) {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	// Physical proof is only evidence for the exact state that was observed.
 	// Re-read both stores before releasing the SQL fence so an ordinary current
 	// route write cannot be acknowledged by a stale local attestation.
 	freshSnapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(snapshot, freshSnapshot) {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	freshSelection, err := m.selectGatewayCurrentLocked(ctx, freshSnapshot)
 	if err != nil || !sameGatewayCurrentSelection(selection, freshSelection) {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	snapshot = freshSnapshot
 	request = gatewayRebindForwardConfirmationRequest(prepared, receipt, snapshot)
 	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	terminalSQL = true
 	proof, err = gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt,
 		appaccess.GatewayRebindCommitted, gatewayCurrentRouteState{}, nil, attestation)
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
 		m.gatewayRebindFailStopLatch().Store(true)
-		return GatewayRebindCommitResult{}, err
+		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	confirmed, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || confirmed.Active != nil || confirmed.CurrentSource == nil ||
 		*confirmed.CurrentSource != gatewayCurrentAuthority(baseline.Lineage) {
 		m.gatewayRebindFailStopLatch().Store(true)
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	confirmedSelection, selectErr := m.selectGatewayCurrentLocked(ctx, confirmed)
 	if selectErr != nil || !sameGatewayCurrentSelection(selection, confirmedSelection) {
 		m.gatewayRebindFailStopLatch().Store(true)
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	result.FinalPhase, result.Disposition = appaccess.GatewayRebindCommitted, appaccess.GatewayRebindDispositionCommit
 	result.TerminalReceiptDigest = receipt.Digest
 	result.SelectedCurrentAuthority = *confirmed.CurrentSource
 	result.FenceReleased = true
-	return result, nil
+	return result, terminalSQL, nil
 }
 
 func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Context,
@@ -445,43 +479,70 @@ func (m *Manager) abortGatewayRebindPreparedWithoutIntentLocked(ctx context.Cont
 ) (GatewayRebindCommitResult, error) {
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil ||
-		snapshot.Active.Claim.V2.Spec.OperationID != operationID || snapshot.Phase != appaccess.GatewayRebindPrepared ||
-		!snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved {
+		snapshot.Active.Claim.V2.Spec.OperationID != operationID {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
-	claim := *snapshot.Active.Claim.V2
-	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	return m.abortGatewayRebindPreparedWithoutIntentClaimLocked(ctx, repository, driver,
+		*snapshot.Active.Claim.V2)
+}
+
+func (m *Manager) abortGatewayRebindPreparedWithoutIntentClaimLocked(ctx context.Context,
+	repository gatewayRebindTransitionRepository, driver gatewayRebindCrossStoreDriver,
+	claim appaccess.GatewayRebindClaimV2,
+) (GatewayRebindCommitResult, error) {
+	evidence, err := m.proveGatewayRebindPreparedWithoutIntentAbortLocked(ctx, repository, driver, claim)
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
-	var checkpoint *gatewayRebindPredecessorCheckpoint
-	for index := range history.Checkpoints {
-		candidate := history.Checkpoints[index].Checkpoint
-		if candidate.Generation == claim.Spec.SuccessorProtectedGeneration && candidate.OperationID == operationID {
-			copy := candidate
-			checkpoint = &copy
-		}
+	return m.completeGatewayRebindPreparedWithoutIntentAbortLocked(ctx, repository, evidence)
+}
+
+type gatewayRebindPreparedWithoutIntentAbortEvidence struct {
+	claim      appaccess.GatewayRebindClaimV2
+	snapshot   appaccess.GatewayRebindRecoverySnapshot
+	history    gatewayRebindProtectedIntentHistory
+	files      gatewayHistorySnapshot
+	checkpoint gatewayRebindPredecessorCheckpoint
+	proof      gatewayRebindNoEffectAbortProof
+}
+
+func (m *Manager) proveGatewayRebindPreparedWithoutIntentAbortLocked(ctx context.Context,
+	repository gatewayRebindTransitionRepository, driver gatewayRebindCrossStoreDriver,
+	claim appaccess.GatewayRebindClaimV2,
+) (gatewayRebindPreparedWithoutIntentAbortEvidence, error) {
+	zero := gatewayRebindPreparedWithoutIntentAbortEvidence{}
+	operationID := claim.Spec.OperationID
+	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil ||
+		!reflect.DeepEqual(*snapshot.Active.Claim.V2, claim) || snapshot.Phase != appaccess.GatewayRebindPrepared ||
+		!snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved || snapshot.DatabaseCommittedEvent != nil {
+		return zero, gatewayRebindProposalError(ctx)
+	}
+	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil {
+		return zero, err
 	}
 	for _, intent := range history.IntentsV2 {
 		if intent.Intent.OperationID == operationID {
-			return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+			return zero, gatewayRebindProposalError(ctx)
 		}
 	}
 	for _, record := range history.Progress {
 		if record.Record.OperationID == operationID {
-			return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+			return zero, gatewayRebindProposalError(ctx)
 		}
 	}
-	if checkpoint == nil || checkpoint.sourceRef() != claim.Spec.Predecessor {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	checkpoint, err := gatewayRebindActiveCheckpoint(history, claim)
+	if err != nil {
+		return zero, gatewayRebindProposalError(ctx)
 	}
 	beforeFiles, err := readGatewayHistorySnapshotMode(m.store, true)
 	if err != nil {
-		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+		return zero, gatewayRebindProposalError(ctx)
 	}
-	proofValue, err := driver.proveNoSuccessorEffectsLocked(ctx, claim, snapshot.Active.RosterV2, *checkpoint)
+	proofValue, err := driver.proveNoSuccessorEffectsLocked(ctx, claim, snapshot.Active.RosterV2, checkpoint)
 	if err != nil {
-		return GatewayRebindCommitResult{}, err
+		return zero, err
 	}
 	freshSnapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(ctx)
 	freshHistory, historyErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
@@ -490,12 +551,31 @@ func (m *Manager) abortGatewayRebindPreparedWithoutIntentLocked(ctx context.Cont
 	if snapshotErr != nil || !reflect.DeepEqual(snapshot, freshSnapshot) || historyErr != nil ||
 		!sameGatewayRebindCurrentHistory(history, freshHistory) || afterFilesErr != nil ||
 		!sameGatewayHistorySnapshot(beforeFiles, afterFiles) || checkpointErr != nil ||
-		!reflect.DeepEqual(*checkpoint, freshCheckpoint) || ctx.Err() != nil {
+		!reflect.DeepEqual(checkpoint, freshCheckpoint) || ctx.Err() != nil {
+		return zero, gatewayRebindProposalError(ctx)
+	}
+	return gatewayRebindPreparedWithoutIntentAbortEvidence{claim: claim, snapshot: freshSnapshot,
+		history: freshHistory, files: afterFiles, checkpoint: freshCheckpoint, proof: proofValue}, nil
+}
+
+func (m *Manager) completeGatewayRebindPreparedWithoutIntentAbortLocked(ctx context.Context,
+	repository gatewayRebindTransitionRepository, evidence gatewayRebindPreparedWithoutIntentAbortEvidence,
+) (GatewayRebindCommitResult, error) {
+	claim := evidence.claim
+	operationID := claim.Spec.OperationID
+	freshSnapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(ctx)
+	freshHistory, historyErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	freshFiles, filesErr := readGatewayHistorySnapshotMode(m.store, true)
+	freshCheckpoint, checkpointErr := gatewayRebindActiveCheckpoint(freshHistory, claim)
+	if snapshotErr != nil || !reflect.DeepEqual(evidence.snapshot, freshSnapshot) || historyErr != nil ||
+		!sameGatewayRebindCurrentHistory(evidence.history, freshHistory) || filesErr != nil ||
+		!sameGatewayHistorySnapshot(evidence.files, freshFiles) || checkpointErr != nil ||
+		!reflect.DeepEqual(evidence.checkpoint, freshCheckpoint) || ctx.Err() != nil {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
 	receipt, err := newGatewayRebindNoEffectAbortTerminalV2(claim, freshSnapshot.Active.RosterV2,
-		freshSnapshot.Active.RuntimeHeads, freshCheckpoint,
-		proofValue, gatewayRebindTimeStrictlyAfter(m.gatewayRebindProgressTime(), proofValue.CreatedAt))
+		freshSnapshot.Active.RuntimeHeads, freshCheckpoint, evidence.proof,
+		gatewayRebindTimeStrictlyAfter(m.gatewayRebindProgressTime(), evidence.proof.CreatedAt))
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}

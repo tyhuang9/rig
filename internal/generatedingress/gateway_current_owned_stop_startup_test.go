@@ -112,8 +112,10 @@ func TestGatewayCurrentStartupEmergencyStopRefusesNonterminalProtectedHistory(t 
 	if err != nil || snapshot.Active == nil {
 		t.Fatalf("prepared snapshot unavailable: %#v error=%v", snapshot, err)
 	}
-	if _, err := fixture.manager.recoverGatewayRebindPreparedAdmissionLocked(context.Background(),
-		fixture.repository, snapshot); err != nil {
+	proofReader := gatewayRebindPreparedFixtureProofReader(t, fixture.manager, snapshot,
+		gatewayRebindNativeFixtureInspector(t, fixture))
+	if _, err := fixture.manager.recoverGatewayRebindPreparedAdmissionWithProofLocked(context.Background(),
+		fixture.repository, snapshot, proofReader); err != nil {
 		t.Fatalf("install prepared protected admission: %v", err)
 	}
 	fixture.manager.gatewayRebindFailStop = &atomic.Bool{}

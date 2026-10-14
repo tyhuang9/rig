@@ -3,7 +3,6 @@ package generatedingress
 import (
 	"context"
 	"errors"
-	"net/netip"
 	"reflect"
 	"strings"
 	"testing"
@@ -144,6 +143,9 @@ func TestGatewayRebindPreparedAdmissionAndRecoveryUseRealRepository(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
+			admissionProof := gatewayRebindAdmissionFixtureProof(t, f.manager, beforeSQL, inspection,
+				gatewayRebindNativeFixtureInspector(t, f),
+				gatewayRebindCrossStoreAdmissionTestReads(inspection.Spec, f.state.Network.Subnet))
 			beforeFiles, err := readGatewayHistorySnapshotMode(f.manager.store, true)
 			if err != nil {
 				t.Fatal(err)
@@ -190,8 +192,10 @@ func TestGatewayRebindPreparedAdmissionAndRecoveryUseRealRepository(t *testing.T
 				t.Fatal(err)
 			}
 			installCrossStoreFixtureNetworkObserver(fresh, f.state.Network.Subnet)
+			proofReader := gatewayRebindImmutableFixtureProofReader(admissionProof)
 			recovered, err := withCrossStoreFixtureEffectLocks(t, fresh, func() (gatewayRebindPreparedAttempt, error) {
-				return fresh.recoverGatewayRebindPreparedAdmissionLocked(ctx, f.repository, preparedSQL)
+				return fresh.recoverGatewayRebindPreparedAdmissionWithProofLocked(ctx, f.repository,
+					preparedSQL, proofReader)
 			})
 			if err != nil {
 				t.Fatalf("fresh manager cannot recover real prepared claim: %v", err)
@@ -307,21 +311,7 @@ func installCrossStoreFixtureNetworkObserver(manager *Manager, predecessorSubnet
 	// Only external inventory is simulated. The production network selector and
 	// observation canonicalizer still bind it to the actual admitted SQL claim.
 	manager.gatewayRebindV2NetworkObserver = func(ctx context.Context, claim appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
-		profile := claim.Spec.SuccessorProfile
-		reads := gatewayRebindSuccessorPreflightReads{
-			network: gatewayV2NetworkPlanReads{
-				candidates: func() ([]hostNetworkCandidate, error) {
-					address := netip.MustParseAddr(profile.SelectedIPv4)
-					return []hostNetworkCandidate{{InterfaceID: profile.InterfaceID, IPv4: profile.SelectedIPv4,
-						Prefix: netip.PrefixFrom(address, 24).Masked()}}, nil
-				},
-				host: func() (gatewayV2HostNetworkSnapshot, error) { return gatewayV2HostNetworkSnapshot{}, nil },
-				docker: func(context.Context) ([]netip.Prefix, error) {
-					return []netip.Prefix{netip.MustParsePrefix(predecessorSubnet)}, nil
-				},
-			},
-			dockerIDs: func(context.Context) ([]string, error) { return []string{strings.Repeat("a", 64)}, nil },
-		}
+		reads := gatewayRebindCrossStoreAdmissionTestReads(claim.Spec, predecessorSubnet)
 		observed, err := readGatewayRebindV2SuccessorNetwork(ctx, claim, reads)
 		if err != nil {
 			return gatewayRebindSuccessorNetworkObservation{}, err
