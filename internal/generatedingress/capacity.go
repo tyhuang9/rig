@@ -31,7 +31,7 @@ func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedruntime.Capac
 			snapshot = generatedruntime.CapacitySnapshot{}
 		}
 	}()
-	if _, state, journal, committed, err := m.committedV2Locked(); err != nil {
+	if _, state, journal, committed, err := m.committedV2Locked(ctx); err != nil {
 		return generatedruntime.CapacitySnapshot{}, err
 	} else if committed {
 		if err := m.attestCommittedV2Locked(ctx, state, journal); err != nil {

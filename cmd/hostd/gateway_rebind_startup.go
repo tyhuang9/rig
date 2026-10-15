@@ -234,12 +234,50 @@ func inspectGatewayStartupAfterPreparationWithRunner(ctx context.Context, cfg co
 		}
 		ingress = prepared.ingress
 	}
-	gate, err := inspectGatewayStartupUsingIngressWithRunner(ctx, cfg, db, dockerExecutable, directories,
-		fenceCheck, ingress, runner)
+	var (
+		gate gatewayStartup
+		err  error
+	)
+	if ingress == nil {
+		gate, err = inspectGatewayStartupUsingIngressWithRunner(ctx, cfg, db, dockerExecutable, directories,
+			fenceCheck, nil, runner)
+	} else {
+		gate, err = inspectGatewayStartupUsingPreparedIngressWithRunner(ctx, cfg, db, dockerExecutable, directories,
+			fenceCheck, ingress, runner, prepared.current)
+	}
 	if err != nil {
 		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticUpgradeInspection, err)
 	}
 	return gate, nil
+}
+
+func refreshGatewayRebindStartupProof(ctx context.Context, ingress *generatedingress.Manager,
+	repository *appaccess.Repository, prepared generatedingress.GatewayRebindCurrentInspection,
+) (generatedingress.GatewayRebindCurrentInspection, error) {
+	refuse := func() (generatedingress.GatewayRebindCurrentInspection, error) {
+		return generatedingress.GatewayRebindCurrentInspection{},
+			errors.New("prepared gateway startup proof changed after runtime recovery")
+	}
+	if ctx == nil || ingress == nil || repository == nil || !gatewayRebindStartupTerminalInspection(prepared) {
+		return refuse()
+	}
+	current, err := ingress.InspectGatewayRebindCurrent(ctx, repository)
+	if err != nil || ctx.Err() != nil || !gatewayRebindStartupProofRefreshMatches(prepared, current) {
+		return refuse()
+	}
+	return current, nil
+}
+
+func gatewayRebindStartupProofRefreshMatches(prepared, current generatedingress.GatewayRebindCurrentInspection) bool {
+	return gatewayRebindStartupTerminalInspection(prepared) && gatewayRebindStartupTerminalInspection(current) &&
+		len(prepared.Retained) != 0 &&
+		current.SelectedCurrentAuthority == prepared.SelectedCurrentAuthority &&
+		current.SelectedCurrentEvidence.Lineage == prepared.SelectedCurrentEvidence.Lineage &&
+		current.CurrentStateVersion == prepared.CurrentStateVersion &&
+		current.CurrentStateRevision >= prepared.CurrentStateRevision &&
+		(current.CurrentStateRevision > prepared.CurrentStateRevision ||
+			current.CurrentStateDigest == prepared.CurrentStateDigest) &&
+		reflect.DeepEqual(current.Retained, prepared.Retained)
 }
 
 func prepareGatewayRebindRecovery(ctx context.Context, presence generatedingress.GatewayRebindStartupPresence,

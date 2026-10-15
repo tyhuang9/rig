@@ -43,7 +43,7 @@ func (m *Manager) HasGatewayV2LANRecoveryBatch(ctx context.Context) (present boo
 		}
 		return current.State.LANRecovery != nil, nil
 	}
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(ctx)
 	if err != nil {
 		return false, gatewayV2LANDisableError(ctx)
 	}
@@ -83,7 +83,7 @@ func (m *Manager) ObserveGatewayV2LANRecoveryHead(ctx context.Context,
 	if currentHead, currentPresent, handled, currentErr := m.observeGatewayCurrentLANRecoveryHeadLocked(proofCtx, claims); currentErr != nil || handled {
 		return currentHead, currentPresent, currentErr
 	}
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(proofCtx)
 	if err != nil {
 		return GatewayV2LANRecoveryHead{}, false, gatewayV2LANDisableError(proofCtx)
 	}
@@ -191,7 +191,7 @@ func (m *Manager) withGatewayV2LANRecoveryHead(ctx context.Context,
 	if handled, currentErr := current(workCtx); currentErr != nil || handled {
 		return currentErr
 	}
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(workCtx)
 	if err != nil || !committed || store == nil || state.LANRecovery == nil ||
 		state.LANRecovery.Head >= len(state.LANRecovery.Items) {
 		return gatewayV2LANDisableError(workCtx)
@@ -282,7 +282,7 @@ func (m *Manager) RetireGatewayV2LANRecoveryBatch(ctx context.Context,
 	if handled, currentErr := m.retireGatewayCurrentLANRecoveryBatchLocked(workCtx, claims); currentErr != nil || handled {
 		return currentErr
 	}
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(workCtx)
 	if err != nil || !committed || store == nil || state.LANRecovery == nil ||
 		state.LANRecovery.Head != len(state.LANRecovery.Items) ||
 		!gatewayV2LANRecoveryCensusMatchesHead(state, claims) {

@@ -33,7 +33,7 @@ func (m *Manager) inspectGatewayRebindPredecessor(ctx context.Context, repositor
 	if err != nil || len(firstDatabase.Claims) != 1 {
 		return gatewayRebindPredecessorInspectionError(ctx)
 	}
-	firstStore, firstState, firstJournal, committed, err := m.committedV2Locked()
+	firstStore, firstState, firstJournal, committed, err := m.committedV2Locked(ctx)
 	if err != nil || !committed || firstStore == nil ||
 		!gatewayRebindPredecessorMatches(firstDatabase, firstState, firstJournal) {
 		return gatewayRebindPredecessorInspectionError(ctx)
@@ -50,7 +50,7 @@ func (m *Manager) inspectGatewayRebindPredecessor(ctx context.Context, repositor
 	if err != nil || !reflect.DeepEqual(firstDatabase, secondDatabase) {
 		return gatewayRebindPredecessorInspectionError(ctx)
 	}
-	secondStore, secondState, secondJournal, committed, err := m.committedV2Locked()
+	secondStore, secondState, secondJournal, committed, err := m.committedV2Locked(ctx)
 	if err != nil || !committed || secondStore == nil ||
 		!sameGatewayV2PreparationAbortStore(firstStore, secondStore) ||
 		!reflect.DeepEqual(firstState, secondState) || !reflect.DeepEqual(firstJournal, secondJournal) ||

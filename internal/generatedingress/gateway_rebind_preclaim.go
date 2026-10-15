@@ -72,7 +72,7 @@ func (m *Manager) inspectGatewayRebindPreclaimWithDocker(ctx context.Context,
 	if err != nil {
 		return gatewayRebindPredecessorInspectionError(ctx)
 	}
-	firstStore, firstState, firstJournal, committed, err := m.committedV2Locked()
+	firstStore, firstState, firstJournal, committed, err := m.committedV2Locked(ctx)
 	if err != nil || !committed || firstStore == nil ||
 		!gatewayRebindPreclaimMatches(firstDatabase, firstState, firstJournal) {
 		return gatewayRebindPredecessorInspectionError(ctx)
@@ -105,7 +105,7 @@ func (m *Manager) inspectGatewayRebindPreclaimWithDocker(ctx context.Context,
 	if err != nil || !reflect.DeepEqual(firstDatabase, secondDatabase) {
 		return gatewayRebindPredecessorInspectionError(ctx)
 	}
-	secondStore, secondState, secondJournal, committed, err := m.committedV2Locked()
+	secondStore, secondState, secondJournal, committed, err := m.committedV2Locked(ctx)
 	if err != nil || !committed || secondStore == nil ||
 		!sameGatewayV2PreparationAbortStore(firstStore, secondStore) ||
 		!reflect.DeepEqual(firstState, secondState) || !reflect.DeepEqual(firstJournal, secondJournal) ||

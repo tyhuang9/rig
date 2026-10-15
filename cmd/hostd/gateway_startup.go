@@ -90,6 +90,24 @@ func inspectGatewayStartupUsingIngressWithRunner(ctx context.Context, cfg config
 	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
 	ingress *generatedingress.Manager, runner runtimeprocess.CommandRunner,
 ) (gatewayStartup, error) {
+	return inspectGatewayStartupUsingIngressModeWithRunner(ctx, cfg, db, dockerExecutable, directories,
+		fenceCheck, ingress, runner, nil)
+}
+
+func inspectGatewayStartupUsingPreparedIngressWithRunner(ctx context.Context, cfg config.Config, db *sql.DB,
+	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+	ingress *generatedingress.Manager, runner runtimeprocess.CommandRunner,
+	prepared generatedingress.GatewayRebindCurrentInspection,
+) (gatewayStartup, error) {
+	return inspectGatewayStartupUsingIngressModeWithRunner(ctx, cfg, db, dockerExecutable, directories,
+		fenceCheck, ingress, runner, &prepared)
+}
+
+func inspectGatewayStartupUsingIngressModeWithRunner(ctx context.Context, cfg config.Config, db *sql.DB,
+	dockerExecutable string, directories docker.ControllerDirectories, fenceCheck func(context.Context) error,
+	ingress *generatedingress.Manager, runner runtimeprocess.CommandRunner,
+	prepared *generatedingress.GatewayRebindCurrentInspection,
+) (gatewayStartup, error) {
 	if fenceCheck == nil {
 		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticOrdinaryFence,
 			errors.New("gateway rebind fence check is required"))
@@ -122,7 +140,13 @@ func inspectGatewayStartupUsingIngressWithRunner(ctx context.Context, cfg config
 			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticStartupManager, err)
 		}
 	}
-	inspection, err := ingress.InspectGatewayV2Startup(ctx, gatewayStartupClaims(snapshot.Upgrades))
+	var inspection generatedingress.GatewayV2StartupInspection
+	if prepared == nil {
+		inspection, err = ingress.InspectGatewayV2Startup(ctx, gatewayStartupClaims(snapshot.Upgrades))
+	} else {
+		inspection, err = ingress.InspectGatewayV2StartupPreparedRebind(ctx,
+			gatewayStartupClaims(snapshot.Upgrades), *prepared)
+	}
 	if err != nil {
 		return gatewayStartup{}, gatewayStartupDiagnosticWrapIngress(gatewayStartupDiagnosticUpgradeInspection,
 			fmt.Errorf("inspect gateway upgrade startup: %w", err), err)

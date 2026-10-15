@@ -429,6 +429,63 @@ func TestGatewayRebindStartupFreshDatabaseAndManagerReuse(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindStartupProofRefreshAllowsBoundOperationalRecovery(t *testing.T) {
+	for _, mode := range []generatedingress.GatewayCurrentRecoveryMode{
+		generatedingress.GatewayCurrentRecoveryRoute,
+		generatedingress.GatewayCurrentRecoveryLAN,
+		generatedingress.GatewayCurrentRecoveryLANBatch,
+		generatedingress.GatewayCurrentRecoveryLANBatchDone,
+	} {
+		t.Run(string(mode), func(t *testing.T) {
+			fixture := newGatewayStartupRecoveryFixture(false)
+			prepared := fixture.before
+			prepared.CurrentRecoveryMode = mode
+			prepared.CurrentStateRevision = 4
+			prepared.CurrentStateDigest = strings.Repeat("a", 64)
+			prepared.Retained = []generatedingress.GatewayRebindRetainedOperationInspection{{
+				Generation: 2, OperationID: uuid.NewString(), Disposition: appaccess.GatewayRebindDispositionCommit,
+				TerminalReceiptDigest: strings.Repeat("b", 64),
+			}}
+			current := prepared
+			current.CurrentRecoveryMode = generatedingress.GatewayCurrentRecoveryStable
+			current.CurrentStateRevision++
+			current.CurrentStateDigest = strings.Repeat("c", 64)
+			if !gatewayRebindStartupProofRefreshMatches(prepared, current) {
+				t.Fatalf("bound %s recovery was rejected: before=%+v after=%+v", mode, prepared, current)
+			}
+
+			for _, mutation := range []string{
+				"authority", "lineage", "version", "revision rollback", "same revision digest drift",
+				"retained receipt", "active attempt",
+			} {
+				t.Run(mutation, func(t *testing.T) {
+					changed := current
+					changed.Retained = append([]generatedingress.GatewayRebindRetainedOperationInspection(nil), current.Retained...)
+					switch mutation {
+					case "authority":
+						changed.SelectedCurrentAuthority.OperationID = uuid.NewString()
+					case "lineage":
+						changed.SelectedCurrentEvidence.Lineage.OperationID = uuid.NewString()
+					case "version":
+						changed.CurrentStateVersion++
+					case "revision rollback":
+						changed.CurrentStateRevision = prepared.CurrentStateRevision - 1
+					case "same revision digest drift":
+						changed.CurrentStateRevision = prepared.CurrentStateRevision
+					case "retained receipt":
+						changed.Retained[0].TerminalReceiptDigest = strings.Repeat("d", 64)
+					case "active attempt":
+						changed.ActiveOperationID = uuid.NewString()
+					}
+					if gatewayRebindStartupProofRefreshMatches(prepared, changed) {
+						t.Fatalf("%s drift was accepted", mutation)
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestGatewayRebindRecoveryPinBindsImmutableDirection(t *testing.T) {
 	operationID := uuid.NewString()
 	committed := &appaccess.GatewayRebindEvent{OperationID: operationID, Sequence: 3,

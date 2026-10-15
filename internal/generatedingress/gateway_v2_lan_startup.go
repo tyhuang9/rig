@@ -82,7 +82,7 @@ func (m *Manager) InspectGatewayV2LANStartup(ctx context.Context, claims []Gatew
 		return GatewayV2LANStartupInspection{Disposition: current.Disposition, AttemptID: current.OperationID}, nil
 	}
 
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(proofCtx)
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return GatewayV2LANStartupInspection{}, gatewayV2StartupInspectionError(proofCtx)
 	}
@@ -224,7 +224,7 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 	}); err != nil || handled {
 		return err
 	}
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(recoveryCtx)
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) {
 		return gatewayV2StartupInspectionError(recoveryCtx)
 	}
