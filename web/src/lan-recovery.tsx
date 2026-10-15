@@ -13,6 +13,7 @@ import {
   type LANRecoveryHead,
 } from "./api";
 import { LANGatewayRebindRecoveryScreen } from "./lan-gateway-rebind";
+import { LANGatewayUpgradeRecoveryScreen } from "./lan-gateway-upgrade-recovery";
 
 type SignOut = () => void | Promise<void>;
 type RecoveryReview =
@@ -476,6 +477,9 @@ function ControllerRecoveryEntry({ role, onSignOut, onCheckSystemStatus }: {
   if (entry.state === "locator") {
     if (entry.locator.kind === "gateway_rebind") {
       return <LANGatewayRebindRecoveryScreen key={entry.locator.operationId} operationId={entry.locator.operationId} onSignOut={onSignOut} onCheckSystemStatus={onCheckSystemStatus}/>;
+    }
+    if (entry.locator.kind === "gateway_upgrade") {
+      return <LANGatewayUpgradeRecoveryScreen key={entry.locator.operationId} operationId={entry.locator.operationId} onSignOut={onSignOut} onCheckSystemStatus={onCheckSystemStatus}/>;
     }
     if (entry.locator.kind === "lan_grant" || entry.locator.kind === "lan_disable") {
       const expectedRecovery: LegacyRecoveryLocator = { kind: entry.locator.kind, operationId: entry.locator.operationId };

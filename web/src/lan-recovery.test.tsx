@@ -178,6 +178,22 @@ describe("authenticated operator mode gate", () => {
     expect(screen.queryByText("Normal operator routes")).toBeNull();
   });
 
+  it("dispatches an exact gateway upgrade locator without probing normal or legacy recovery reads", async () => {
+    vi.spyOn(api, "status").mockRejectedValue(recoveryRequired());
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({
+      version: 1, mode: "recovery_only", recovery: { kind: "gateway_upgrade", operationId },
+    } as never);
+    const legacyHead = vi.spyOn(api, "lanRecoveryHead");
+    const upgradeRead = vi.spyOn(api, "lanGatewayUpgrade");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(<QueryClientProvider client={client}><AuthenticatedOperatorGate onSignOut={() => undefined}><div>Normal operator routes</div></AuthenticatedOperatorGate></QueryClientProvider>);
+
+    expect(await screen.findByRole("heading", { name: "LAN gateway upgrade recovery required" })).not.toBeNull();
+    expect(upgradeRead).not.toHaveBeenCalled();
+    expect(legacyHead).not.toHaveBeenCalled();
+    expect(screen.queryByText("Normal operator routes")).toBeNull();
+  });
   it("keeps a viewer isolated without an administrator recovery read", async () => {
     vi.spyOn(api, "status").mockRejectedValue(recoveryRequired());
     const locator = vi.spyOn(api, "getControllerRecovery");

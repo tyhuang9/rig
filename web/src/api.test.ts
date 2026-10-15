@@ -46,6 +46,30 @@ describe("API client", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(2, `/api/v1/system/lan-gateway-rebind/${operationId}/reconcile`, expect.objectContaining({ method: "POST" }));
   });
 
+  it("does not resubmit a gateway upgrade recovery after CSRF failure", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: "csrf_failed", detail: "CSRF validation failed" }), { status: 403 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const request = {
+      operationId: "11111111-1111-4111-8111-111111111111",
+      profileRevisionId: "22222222-2222-4222-8222-222222222222",
+      profileRevisionNumber: 5,
+      actionDigest: "a".repeat(64),
+    };
+
+    await expect(api.recoverLANGatewayUpgrade(request)).rejects.toEqual(expect.objectContaining<Partial<APIError>>({
+      status: 403,
+      code: "csrf_failed",
+    }));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/system/lan-gateway-upgrade", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify(request),
+      headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }),
+    }));
+  });
   it("sends browser CSRF protection for mutations", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: "a" }), { status: 201 }),

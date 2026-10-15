@@ -548,6 +548,11 @@ export const api = {
       method: operations.upgradeLANGateway.method,
       body: JSON.stringify(data),
     }),
+  recoverLANGatewayUpgrade: (data: UpgradeLANGatewayRequest) =>
+    request<LANGatewayUpgradeMutation>(operations.upgradeLANGateway.path, {
+      method: operations.upgradeLANGateway.method,
+      body: JSON.stringify(data),
+    }, false),
   inspectLANGatewayRebind: (data: InspectLANGatewayRebindRequest) =>
     request<LANGatewayRebindReview>(operations.inspectLANGatewayRebind.path, {
       method: operations.inspectLANGatewayRebind.method,
