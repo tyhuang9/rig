@@ -30,9 +30,9 @@ const (
 )
 
 // TestLiveHostdRebindControlProcessHelper is a no-Docker process control for
-// its separately named parent test. It writes a handshake before either
-// stalling, exiting, or writing a ready marker, so parent controls do not rely
-// on a fixed startup sleep.
+// its separately named parent test. It finishes any ready marker before its
+// handshake, then stalls or exits, so parent controls neither read a partial
+// marker nor rely on a fixed startup sleep.
 func TestLiveHostdRebindControlProcessHelper(t *testing.T) {
 	if os.Getenv(liveHostdRebindStartupControlEnvironment) != "1" {
 		return
@@ -41,11 +41,8 @@ func TestLiveHostdRebindControlProcessHelper(t *testing.T) {
 	if marker == "" || started == "" {
 		t.Fatal("startup control is missing its private paths")
 	}
-	if err := os.WriteFile(started, []byte("started"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	switch os.Getenv(liveHostdRebindStartupControlMode) {
-	case "ready":
+	mode := os.Getenv(liveHostdRebindStartupControlMode)
+	if mode == "ready" {
 		body, err := json.Marshal(liveHostdRebindReadyMarker{Address: os.Getenv(liveHostdRebindStartupControlAddress)})
 		if err != nil {
 			t.Fatal(err)
@@ -53,6 +50,12 @@ func TestLiveHostdRebindControlProcessHelper(t *testing.T) {
 		if err := os.WriteFile(marker, body, 0o600); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.WriteFile(started, []byte("started"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	switch mode {
+	case "ready":
 		<-time.After(time.Hour)
 	case "exit":
 		_, _ = fmt.Fprintf(os.Stderr, `{"msg":"runtime composition failed","error":%q}`+"\n",
@@ -191,6 +194,27 @@ func TestLiveHostdRebindChildStartupControls(t *testing.T) {
 			liveHostdRebindAssertChildReaped(t, child)
 		})
 	}
+
+	t.Run("positive readiness budget expires and reaps stalled child", func(t *testing.T) {
+		fixture, server := liveHostdRebindStartupControlFixture(t, context.Background(), nil)
+		defer server.Close()
+		child := liveHostdRebindStartStartupControlChild(t, t.TempDir(), fixture.listen, "stall", "")
+		result := make(chan error, 1)
+		go func() {
+			_, err := liveHostdRebindWaitReadyResult(fixture, child,
+				time.Now().Add(liveHostdRebindStartupCleanupReserve+200*time.Millisecond), true)
+			result <- err
+		}()
+		select {
+		case err := <-result:
+			if err == nil || !strings.Contains(err.Error(), "timeout waiting for daemon assembly: "+context.DeadlineExceeded.Error()) {
+				t.Fatalf("positive-budget readiness error=%q", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("positive readiness budget was not applied")
+		}
+		liveHostdRebindAssertChildReaped(t, child)
+	})
 
 	t.Run("cleanup fallback reaps stalled child", func(t *testing.T) {
 		fixture, server := liveHostdRebindStartupControlFixture(t, context.Background(), nil)

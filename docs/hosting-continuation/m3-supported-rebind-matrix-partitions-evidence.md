@@ -46,10 +46,11 @@ it cannot select a sibling as an acceptable substitute. Each invocation keeps
 `live_docker`, `-count=1`, verbose JSON events, the real runtime flags and the
 existing `COMMIT`/`ABORT` assertions in the test harness.
 
-Each exact invocation has a 30-minute Go package deadline. The companion child
-readiness repair reserves ten minutes for cleanup during startup waits, leaving
-up to twenty minutes of case working time; this CI-only change does not itself
-enforce that reserve. The helper adds a two-minute compilation/completion
+Each exact invocation has a 30-minute Go package deadline. The integrated child
+readiness repair caps each startup wait at ten minutes and also stops it at
+least ten minutes before the test deadline. This reserve applies to readiness
+waits; other case operations retain their existing deadlines. The helper adds
+a two-minute compilation/completion
 allowance and will not start a case unless its full
 32-minute window fits before the 110-minute group deadline. The CI step has a
 115-minute deadline and its job has a 130-minute deadline. All are below the
@@ -62,8 +63,9 @@ Other observed cases were at most about 489 seconds. The reserve covers rebind,
 older-fixture and network cleanup plus child reap; it does not relax case
 assertions or permit a runner to exceed its group deadline.
 
-Before resources are created, every matrix job runs the existing 23
-manifest/runner control parents and their 192 descendant checks. The job
+Before resources are created, every matrix job runs 24 control parents: the
+existing 23 manifest/runner parents and 192 descendants plus the new child
+readiness parent and its 12 descendants. The job
 retains the full owned-resource and child-process cleanup census under
 `if: always()`. A failed case retains its individual JSON log and command exit
 record in a seven-day failure artifact after cleanup executes.
@@ -136,3 +138,30 @@ cleanup after both zero and nonzero parent exits; a zero exit with remaining
 children was rejected with the original exit evidence retained. The updated
 parser also accepted the previously recorded F A0 event stream. That replay
 checks parsing only and is not another Docker execution.
+
+## Combined child-readiness verification
+
+The CI branch integrates `2db337f312063e76eb590d92422eb320eb59c79c`
+with history preserved. Review identified a partial-marker race in the new
+test helper; the final helper closes its ready marker before publishing its
+startup handshake. A further control applies a positive 200 ms readiness
+budget to an already-started stalled child and requires deadline expiry and
+reaping. Readiness failure diagnostics read stderr only after child reaping.
+
+The combined Windows selector used the same command above with
+`TestLiveHostdRebindChildStartupControls` added. It passed all 24 parents and
+204 descendants with no failures or skips. Raw JSON SHA256:
+`5c70e5a062414eebf0017380abe571e1c5491faeb478f32a9a571c4e61f2b474`.
+The Linux `live_docker` test binary was cross-compiled with `CGO_ENABLED=0`
+and actually executed under WSL with:
+
+```text
+hostd-controls-linux.test -test.run=^TestLiveHostdRebindChildStartupControls$ -test.count=1 -test.timeout=2m -test.v
+```
+
+Its parent and all 12 descendants passed; raw output SHA256:
+`e12a76054a442c2d262a1d2b5228840c8722e06ceb0c411b6032229fbb0ab16a`.
+`pwsh -NoProfile -File scripts/check-generation.ps1` also exited zero.
+These are no-Docker controls. Linux race detection and actual Docker recovery
+remain hosted checks; this branch does not repair the separate production
+startup refusal after a retained rebind ABORT.
