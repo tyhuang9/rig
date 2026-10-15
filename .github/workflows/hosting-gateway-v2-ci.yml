@@ -28,6 +28,7 @@ jobs:
           - TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery
           - TestLiveGatewayRebindRuntimeCommitAndReplay
           - TestLiveGatewayRebindRuntimeRollbackAndReplay
+          - TestLiveGatewayRebindControllerRecoveryCommitAndReplay
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -56,6 +57,7 @@ jobs:
           RIG_RUN_LIVE_GATEWAY_V2: "1"
           RIG_RUN_LIVE_GATEWAY_REBIND_CROSS_STORE: "1"
           RIG_RUN_LIVE_GATEWAY_REBIND_RUNTIME: "1"
+          RIG_RUN_LIVE_LAN_GATEWAY_REBIND_RECOVERY: "1"
           TEST_NAME: ${{ matrix.test }}
         run: |
           set -euo pipefail
@@ -65,6 +67,7 @@ jobs:
           go test -json -v -count=1 -timeout=35m ./internal/generatedingress -run "^${TEST_NAME}$" | tee "$output"
           jq -e -s --arg package_name "$package_name" --arg test_name "$TEST_NAME" '
             [.[] | select(.Package == $package_name and .Test == $test_name)] as $events |
+            ([$events[] | select(.Action == "run")] | length) == 1 and
             ([$events[] | select(.Action == "pass")] | length) == 1 and
             ([$events[] | select(.Action == "fail" or .Action == "skip")] | length) == 0
           ' "$output" > /dev/null

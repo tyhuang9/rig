@@ -71,11 +71,12 @@ func checkGatewayCurrentNativeEmergencyRetainedAbort(t *testing.T, corruptRoute 
 func gatewayCurrentNativeEmergencyAbortedFixture(t *testing.T) gatewayRebindPredecessorFixture {
 	t.Helper()
 	f, input, physical := newGatewayRebindCoordinatorFixture(t)
-	f.manager.gatewayRebindV2NetworkObserver = func(context.Context, appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
-		return gatewayRebindSuccessorNetworkObservation{}, errors.New("successor network unavailable")
+	f.manager.gatewayRebindAfterPreparedCheckpoint = func(context.Context) error {
+		return errors.New("injected failure after durable predecessor checkpoint")
 	}
 	result, err := f.manager.commitGatewayRebindWithDriver(context.Background(), f.repository, input, physical)
-	if err != nil || result.FinalPhase != appaccess.GatewayRebindRolledBack || !result.FenceReleased {
+	if err != nil || result.FinalPhase != appaccess.GatewayRebindRolledBack || !result.FenceReleased ||
+		physical.abortCalls != 1 || physical.commitCalls != 0 {
 		t.Fatalf("real SQL/protected no-effect abort: result=%+v err=%v", result, err)
 	}
 	return f

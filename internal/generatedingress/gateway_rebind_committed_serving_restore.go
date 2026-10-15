@@ -31,7 +31,8 @@ func gatewayRebindCommittedServingRestoreActionDigest(action gatewayRebindCommit
 func validGatewayRebindCommittedServingRestoreRequest(request gatewayRebindPhysicalReconcileRequest) bool {
 	return validGatewayRebindPhysicalReconcileRequest(request) &&
 		request.Mode == gatewayRebindPhysicalReconcileForwardOnly &&
-		request.SQLPhase == appaccess.GatewayRebindDatabaseCommitted &&
+		(request.SQLPhase == appaccess.GatewayRebindDatabaseCommitted ||
+			request.SQLPhase == appaccess.GatewayRebindUnresolved) &&
 		request.DatabaseCommitObserved && !request.RollbackAllowed
 }
 
@@ -56,14 +57,14 @@ func gatewayRebindCommittedServingSnapshotMatches(request gatewayRebindPhysicalR
 ) bool {
 	if !validGatewayRebindCommittedServingRestoreRequest(request) || snapshot.Active == nil ||
 		snapshot.Active.Claim.SpecVersion != appaccess.GatewayRebindSpecVersionV2 || snapshot.Active.Claim.Legacy != nil ||
-		snapshot.Active.Claim.V2 == nil || snapshot.Phase != appaccess.GatewayRebindDatabaseCommitted ||
+		snapshot.Active.Claim.V2 == nil || snapshot.Phase != request.SQLPhase ||
 		!snapshot.DatabaseCommitObserved || snapshot.RollbackAllowed || snapshot.CurrentSource == nil ||
 		snapshot.DatabaseCommittedEvent == nil || snapshot.CurrentDatabaseCommittedEvent == nil {
 		return false
 	}
 	claim := *snapshot.Active.Claim.V2
 	lineage, err := gatewayRebindCurrentLineageV2(*request.Terminal)
-	return err == nil && claim.State == appaccess.GatewayRebindDatabaseCommitted &&
+	return err == nil && claim.State == request.SQLPhase &&
 		sameGatewayRebindClaimV2Admission(request.Attempt.Claim, claim) &&
 		sameGatewayRebindRosterV2(request.Attempt.Intent.Roster, snapshot.Active.RosterV2) &&
 		sameGatewayRebindRuntimeHeads(request.Attempt.Intent.RuntimeHeads, snapshot.Active.RuntimeHeads) &&

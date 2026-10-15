@@ -15,7 +15,8 @@ func gatewayRebindTypedPrecommitServingSnapshotMatches(attempt gatewayRebindPrep
 	rebind := snapshot.Rebind
 	if rebind.Active == nil || rebind.Active.Claim.V2 == nil ||
 		rebind.DatabaseCommitObserved || rebind.DatabaseCommittedEvent != nil ||
-		(rebind.Phase != appaccess.GatewayRebindPrepared && rebind.Phase != appaccess.GatewayRebindSuccessorReady) ||
+		(rebind.Phase != appaccess.GatewayRebindPrepared && rebind.Phase != appaccess.GatewayRebindSuccessorReady &&
+			rebind.Phase != appaccess.GatewayRebindUnresolved) ||
 		!sameGatewayRebindClaimV2Admission(*rebind.Active.Claim.V2, attempt.Claim) ||
 		rebind.CurrentSource == nil || *rebind.CurrentSource != gatewayCurrentAuthority(attempt.Checkpoint.Lineage) ||
 		!snapshot.ActiveRebindApprovalsAuthorizeServing() ||
@@ -90,7 +91,11 @@ func (d gatewayRebindTypedHandoverRuntime) authorizedRollbackPredecessor(ctx con
 	if d.manager == nil || ctx == nil || ctx.Err() != nil || guard == nil || guard(ctx) != nil {
 		return invalid()
 	}
-	repository, ok := d.manager.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
+	repository, ok := d.typedBoundaryRepository()
+	if !ok {
+		return invalid()
+	}
+	snapshotRepository, ok := repository.(GatewayRebindCurrentStateRepository)
 	if !ok {
 		return invalid()
 	}
@@ -98,7 +103,7 @@ func (d gatewayRebindTypedHandoverRuntime) authorizedRollbackPredecessor(ctx con
 	if err != nil || !first.Rebind.RollbackAllowed || !gatewayRebindTypedPrecommitServingSnapshotMatches(attempt, first) {
 		return invalid()
 	}
-	ownedSQL, err := d.manager.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(ctx)
+	ownedSQL, err := snapshotRepository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(first.Rebind, ownedSQL) {
 		return invalid()
 	}
@@ -119,15 +124,53 @@ func (d gatewayRebindTypedHandoverRuntime) authorizedRollbackPredecessor(ctx con
 	return predecessor, nil
 }
 
-func (d gatewayRebindTypedHandoverRuntime) confirmRollbackServing(ctx context.Context,
-	attempt gatewayRebindPreparedAttempt, current gatewayCurrentSelection, guard gatewayRebindTypedEffectGuard,
-) error {
-	predecessor, err := d.authorizedRollbackPredecessor(ctx, attempt, current, guard)
+func (d gatewayRebindTypedHandoverRuntime) typedBoundaryRepository() (
+	gatewayRebindTypedBoundaryRepository, bool,
+) {
+	if d.repository != nil {
+		return d.repository, true
+	}
+	if d.manager == nil {
+		return nil, false
+	}
+	repository, ok := d.manager.options.RebindCurrentStateRepository.(gatewayRebindTypedBoundaryRepository)
+	return repository, ok
+}
+
+type gatewayRebindRollbackPredecessorReader func(context.Context) (
+	gatewayRebindTypedPredecessorObservation, error)
+
+type gatewayRebindRollbackServingObservation struct {
+	PredecessorContainerID       string
+	PredecessorObservationDigest string
+	PredecessorRoutesDigest      string
+	StageAbsenceDigest           string
+}
+
+type gatewayRebindRollbackServingObservationResult struct {
+	Observation gatewayRebindRollbackServingObservation
+	Refuse      bool
+}
+
+// observeGatewayRebindRollbackServing contains only the stable physical reads
+// shared by active rollback confirmation and terminal proof. The supplied
+// predecessor reader owns its authority checks. An error from that reader is
+// returned directly because the active reader has already performed its exact
+// refusal path; Refuse identifies only a later physical mismatch.
+func (d gatewayRebindTypedHandoverRuntime) observeGatewayRebindRollbackServing(ctx context.Context,
+	attempt gatewayRebindPreparedAttempt, readPredecessor gatewayRebindRollbackPredecessorReader,
+	guard gatewayRebindTypedEffectGuard,
+) (gatewayRebindRollbackServingObservationResult, error) {
+	refuse := gatewayRebindRollbackServingObservationResult{Refuse: true}
+	if d.manager == nil || ctx == nil || ctx.Err() != nil || readPredecessor == nil || guard == nil {
+		return gatewayRebindRollbackServingObservationResult{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	predecessor, err := readPredecessor(ctx)
 	if err != nil {
-		return err
+		return gatewayRebindRollbackServingObservationResult{}, err
 	}
 	if !predecessor.Running || !validSHA256(predecessor.Routes) {
-		return d.refuseRollbackServing(ctx, attempt, current, guard)
+		return refuse, nil
 	}
 	absent := func(stage gatewayRebindTypedStageObservation) bool {
 		return !stage.NetworkFound && !stage.ConfigVolumeFound && !stage.DataVolumeFound &&
@@ -138,19 +181,54 @@ func (d gatewayRebindTypedHandoverRuntime) confirmRollbackServing(ctx context.Co
 	stage, err := d.stage.read(ctx, attempt.Intent)
 	if err != nil || !absent(stage) ||
 		!d.withdrawn(ctx, attempt, gatewayRebindTypedEffectProgress{}, predecessor, false, false) {
-		return d.refuseRollbackServing(ctx, attempt, current, guard)
+		return refuse, nil
 	}
-	// Inventory and probes may take time; recheck permissions after those reads.
-	confirmed, err := d.authorizedRollbackPredecessor(ctx, attempt, current, guard)
+	// Inventory and probes may take time. The predecessor reader rechecks its
+	// own authority before its second physical observation.
+	confirmed, err := readPredecessor(ctx)
 	if err != nil {
-		return err
+		return gatewayRebindRollbackServingObservationResult{}, err
 	}
-	if !confirmed.Running || !validSHA256(confirmed.Routes) || confirmed.ContainerID != predecessor.ContainerID ||
-		confirmed.Routes != predecessor.Routes {
-		return d.refuseRollbackServing(ctx, attempt, current, guard)
+	if !confirmed.Running || !validSHA256(confirmed.Routes) ||
+		confirmed.ContainerID != predecessor.ContainerID || confirmed.Routes != predecessor.Routes {
+		return refuse, nil
 	}
 	after, err := d.stage.read(ctx, attempt.Intent)
 	if err != nil || !absent(after) || !reflect.DeepEqual(stage, after) || guard(ctx) != nil {
+		return refuse, nil
+	}
+	canonicalStage, ok := canonicalGatewayRebindTypedStageObservation(attempt.Intent, after)
+	if !ok {
+		return refuse, nil
+	}
+	stageAbsenceDigest, err := canonicalDigest(struct {
+		Version               int                                `json:"version"`
+		Purpose               string                             `json:"purpose"`
+		OperationID           string                             `json:"operationId"`
+		ProtectedIntentDigest string                             `json:"protectedIntentDigest"`
+		Stage                 gatewayRebindTypedStageObservation `json:"stage"`
+	}{1, "hostd/generated-ingress/rebind/rollback-stage-absence/v1", attempt.Intent.OperationID,
+		attempt.Intent.Digest, canonicalStage})
+	if err != nil || !validSHA256(stageAbsenceDigest) {
+		return refuse, nil
+	}
+	return gatewayRebindRollbackServingObservationResult{Observation: gatewayRebindRollbackServingObservation{
+		PredecessorContainerID: predecessor.ContainerID, PredecessorObservationDigest: predecessor.Observation,
+		PredecessorRoutesDigest: predecessor.Routes, StageAbsenceDigest: stageAbsenceDigest,
+	}}, nil
+}
+
+func (d gatewayRebindTypedHandoverRuntime) confirmRollbackServing(ctx context.Context,
+	attempt gatewayRebindPreparedAttempt, current gatewayCurrentSelection, guard gatewayRebindTypedEffectGuard,
+) error {
+	result, err := d.observeGatewayRebindRollbackServing(ctx, attempt,
+		func(readCtx context.Context) (gatewayRebindTypedPredecessorObservation, error) {
+			return d.authorizedRollbackPredecessor(readCtx, attempt, current, guard)
+		}, guard)
+	if err != nil {
+		return err
+	}
+	if result.Refuse {
 		return d.refuseRollbackServing(ctx, attempt, current, guard)
 	}
 	return nil

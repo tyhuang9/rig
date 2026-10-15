@@ -22,7 +22,7 @@ func (d managerGatewayRebindCrossStoreDriver) restoreCompletedServingLocked(ctx 
 	if d.manager == nil || ctx == nil || ctx.Err() != nil || d.manager.gatewayRebindAdmissionBlocked() {
 		return invalid()
 	}
-	boundary, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
+	boundary, err := d.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
 	if err != nil {
 		return invalid()
 	}
@@ -32,7 +32,7 @@ func (d managerGatewayRebindCrossStoreDriver) restoreCompletedServingLocked(ctx 
 		(request.Terminal != nil && !gatewayRebindPhysicalMatchesTerminal(result, *request.Terminal)) {
 		return invalid()
 	}
-	repository, ok := d.manager.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
+	repository, ok := d.typedBoundaryRepository()
 	if !ok {
 		return invalid()
 	}
@@ -45,7 +45,7 @@ func (d managerGatewayRebindCrossStoreDriver) restoreCompletedServingLocked(ctx 
 		if effectCtx == nil || effectCtx.Err() != nil || d.manager.gatewayRebindAdmissionBlocked() {
 			return gatewayRebindEffectBoundaryError(effectCtx)
 		}
-		fresh, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(effectCtx, request)
+		fresh, err := d.readGatewayRebindTypedForwardBoundaryLocked(effectCtx, request)
 		if err != nil || !reflect.DeepEqual(boundary.Progress, fresh.Progress) ||
 			!sameGatewayCurrentSelection(boundary.Selection, fresh.Selection) ||
 			!sameGatewayRebindCurrentHistory(boundary.History, fresh.History) {

@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,21 +61,57 @@ type readinessRow struct {
 	plan *readinessPlan
 }
 
-type readinessObserverStub struct {
-	mu     sync.Mutex
-	states []string
+type readinessObservation struct {
+	result string
+	state  string
 }
 
-func (o *readinessObserverStub) ObserveReadiness(_, state string) {
+type readinessObserverStub struct {
+	mu           sync.Mutex
+	observations []readinessObservation
+	observed     chan struct{}
+}
+
+func newReadinessObserverStub() *readinessObserverStub {
+	return &readinessObserverStub{observed: make(chan struct{}, 8)}
+}
+
+func (o *readinessObserverStub) ObserveReadiness(result, state string) {
 	o.mu.Lock()
-	o.states = append(o.states, state)
+	o.observations = append(o.observations, readinessObservation{result: result, state: state})
 	o.mu.Unlock()
+	select {
+	case o.observed <- struct{}{}:
+	default:
+	}
+}
+
+func (o *readinessObserverStub) waitFor(t *testing.T, count int) []readinessObservation {
+	t.Helper()
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	for {
+		o.mu.Lock()
+		observations := append([]readinessObservation(nil), o.observations...)
+		o.mu.Unlock()
+		switch {
+		case len(observations) == count:
+			return observations
+		case len(observations) > count:
+			t.Fatalf("readiness observations=%v; want exactly %d", observations, count)
+		}
+		select {
+		case <-o.observed:
+		case <-timeout.C:
+			t.Fatalf("readiness observations=%v; want %d before timeout", observations, count)
+		}
+	}
 }
 
 func TestReadyObserverUsesClosedProbeAndCacheStates(t *testing.T) {
 	base := time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
 	var elapsed atomic.Int64
-	observer := new(readinessObserverStub)
+	observer := newReadinessObserverStub()
 	db := &readinessDB{plans: []*readinessPlan{{}, {err: errors.New("postgres://user:ghp_secret@db/relay")}}}
 	s, err := newWithDatabase(db, Options{Now: func() time.Time { return base.Add(time.Duration(elapsed.Load())) }, ReadinessObserver: observer})
 	if err != nil {
@@ -93,16 +130,26 @@ func TestReadyObserverUsesClosedProbeAndCacheStates(t *testing.T) {
 	if err = s.Ready(context.Background()); err != ErrUnavailable {
 		t.Fatalf("cached failure=%v", err)
 	}
-	observer.mu.Lock()
-	defer observer.mu.Unlock()
-	want := []string{"probe_success", "cached_success", "probe_failure", "cached_failure"}
-	if len(observer.states) != len(want) {
-		t.Fatalf("states=%v", observer.states)
+	if calls := db.calls.Load(); calls != 2 {
+		t.Fatalf("probe calls=%d; want 2", calls)
 	}
-	for i := range want {
-		if observer.states[i] != want[i] || strings.Contains(observer.states[i], "secret") || strings.Contains(observer.states[i], "postgres") {
-			t.Fatalf("states=%v", observer.states)
+	observations := observer.waitFor(t, 4)
+	want := map[readinessObservation]int{
+		{result: "success", state: "probe_success"}:  1,
+		{result: "success", state: "cached_success"}: 1,
+		{result: "failure", state: "probe_failure"}:  1,
+		{result: "failure", state: "cached_failure"}: 1,
+	}
+	got := make(map[readinessObservation]int, len(observations))
+	for _, observation := range observations {
+		if strings.Contains(observation.result, "secret") || strings.Contains(observation.result, "postgres") ||
+			strings.Contains(observation.state, "secret") || strings.Contains(observation.state, "postgres") {
+			t.Fatalf("readiness observation leaked database detail: %+v", observation)
 		}
+		got[observation]++
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("readiness observations=%v; want %v", got, want)
 	}
 }
 

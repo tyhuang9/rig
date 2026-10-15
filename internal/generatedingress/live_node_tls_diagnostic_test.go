@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -17,17 +18,23 @@ const (
 	liveNodeTLSDiagnosticProtocol  = "1"
 	liveNodeTLSDiagnosticLimit     = 512
 	liveNodeTLSDiagnosticMaxPhases = 7
+	liveNodeTLSStartupAllowance    = 15 * time.Second
+	liveNodeTLSCompletionAllowance = 5 * time.Second
+	liveNodeTLSKillReapAllowance   = 2 * time.Second
+	liveNodeTLSProbeHelperMode     = "RIG_TEST_LIVE_NODE_TLS_PROBE_HELPER_MODE"
 )
 
 type liveNodeTLSDiagnosticStderrBuffer struct {
-	mu        sync.Mutex
-	limit     int
-	value     []byte
-	truncated bool
+	mu              sync.Mutex
+	limit           int
+	value           []byte
+	truncated       bool
+	startupObserved chan struct{}
+	startupOnce     sync.Once
 }
 
 func newLiveNodeTLSDiagnosticStderrBuffer(limit int) *liveNodeTLSDiagnosticStderrBuffer {
-	return &liveNodeTLSDiagnosticStderrBuffer{limit: limit}
+	return &liveNodeTLSDiagnosticStderrBuffer{limit: limit, startupObserved: make(chan struct{})}
 }
 
 func (buffer *liveNodeTLSDiagnosticStderrBuffer) Write(value []byte) (int, error) {
@@ -46,7 +53,26 @@ func (buffer *liveNodeTLSDiagnosticStderrBuffer) Write(value []byte) (int, error
 		return len(value), nil
 	}
 	buffer.value = append(buffer.value, value...)
+	buffer.observeStartupLocked()
 	return len(value), nil
+}
+
+func (buffer *liveNodeTLSDiagnosticStderrBuffer) observeStartupLocked() {
+	if buffer.truncated {
+		return
+	}
+	newline := bytes.IndexByte(buffer.value, '\n')
+	if newline < 0 {
+		return
+	}
+	diagnostic := liveNodeTLSDiagnosticEvidence(buffer.value[:newline+1], false)
+	if diagnostic.context == liveNodeTLSDiagnosticContextStartup {
+		buffer.startupOnce.Do(func() { close(buffer.startupObserved) })
+	}
+}
+
+func (buffer *liveNodeTLSDiagnosticStderrBuffer) StartupObserved() <-chan struct{} {
+	return buffer.startupObserved
 }
 
 func (buffer *liveNodeTLSDiagnosticStderrBuffer) Bytes() []byte {
@@ -269,6 +295,74 @@ func TestLiveNodeTLSDiagnosticStderrBufferBoundsOutput(t *testing.T) {
 	}
 	if got := string(buffer.Bytes()); got != "abcd" || !buffer.Truncated() {
 		t.Fatal("bounded diagnostic writer retained unsafe output")
+	}
+}
+
+func TestLiveNodeTLSDiagnosticStderrBufferSignalsCompleteStartup(t *testing.T) {
+	buffer := newLiveNodeTLSDiagnosticStderrBuffer(liveNodeTLSDiagnosticLimit)
+	partial := []byte("rig-live-node-tls-diagnostic 1 startup 22")
+	if count, err := buffer.Write(partial); err != nil || count != len(partial) {
+		t.Fatal("diagnostic writer did not retain the partial startup record")
+	}
+	select {
+	case <-buffer.StartupObserved():
+		t.Fatal("partial startup record released the startup allowance")
+	default:
+	}
+	if count, err := buffer.Write([]byte("\n")); err != nil || count != 1 {
+		t.Fatal("diagnostic writer did not retain the startup record terminator")
+	}
+	select {
+	case <-buffer.StartupObserved():
+	default:
+		t.Fatal("complete validated startup record did not release the startup allowance")
+	}
+}
+
+func TestRunLiveNodeTLSProbeBoundsStartupAndCompletion(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		mode                string
+		startupAllowance    time.Duration
+		completionAllowance time.Duration
+		wantParentContext   string
+		wantNodeContext     liveNodeTLSDiagnosticContextCategory
+	}{
+		{name: "no startup", mode: "no-startup", startupAllowance: 100 * time.Millisecond,
+			completionAllowance: 100 * time.Millisecond, wantParentContext: "node-startup-deadline",
+			wantNodeContext: liveNodeTLSDiagnosticContextNoObservedJSEntry},
+		{name: "stalled after startup", mode: "stalled-after-startup", startupAllowance: 5 * time.Second,
+			completionAllowance: 100 * time.Millisecond, wantParentContext: "probe-completion-deadline",
+			wantNodeContext: liveNodeTLSDiagnosticContextStartup},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stderr := newLiveNodeTLSDiagnosticStderrBuffer(liveNodeTLSDiagnosticLimit)
+			command := exec.Command(os.Args[0], "-test.run=^TestLiveNodeTLSProbeProcessHelper$")
+			command.Env = append(os.Environ(), liveNodeTLSProbeHelperMode+"="+test.mode)
+			command.Stderr = stderr
+			_, err, parentContext := runLiveNodeTLSProbeWithAllowances(command, stderr,
+				test.startupAllowance, test.completionAllowance)
+			diagnostic := liveNodeTLSDiagnosticEvidence(stderr.Bytes(), stderr.Truncated())
+			if err == nil || parentContext != test.wantParentContext ||
+				diagnostic.context != test.wantNodeContext || command.ProcessState == nil {
+				t.Fatalf("bounded probe supervision: err=%v parent=%s node=%s reaped=%t",
+					err, parentContext, diagnostic.context, command.ProcessState != nil)
+			}
+		})
+	}
+}
+
+func TestLiveNodeTLSProbeProcessHelper(t *testing.T) {
+	switch os.Getenv(liveNodeTLSProbeHelperMode) {
+	case "":
+		return
+	case "no-startup":
+		time.Sleep(time.Minute)
+	case "stalled-after-startup":
+		_, _ = os.Stderr.WriteString("rig-live-node-tls-diagnostic 1 startup 22\n")
+		time.Sleep(time.Minute)
+	default:
+		t.Fatal("invalid live Node TLS probe helper mode")
 	}
 }
 

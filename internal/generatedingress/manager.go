@@ -103,6 +103,10 @@ type Manager struct {
 	// gatewayRebindAfterClaim is a package-test crash boundary after the SQL
 	// prepared commit and before any protected checkpoint write.
 	gatewayRebindAfterClaim func(context.Context, appaccess.GatewayRebindClaimV2) error
+	// gatewayRebindAfterPreparedCheckpoint is a package-test crash boundary
+	// after the exact predecessor checkpoint is durable and before the typed
+	// protected intent is installed.
+	gatewayRebindAfterPreparedCheckpoint func(context.Context) error
 	// gatewayRebindAfterPreparedIntent is a package-test crash boundary after
 	// the typed protected intent is durable and before progress is installed.
 	gatewayRebindAfterPreparedIntent func(context.Context) error
@@ -179,7 +183,19 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 	if options.RebindFenceCheck == nil {
 		return nil, errors.New("generated ingress rebind fence check is required")
 	}
-	return newManager(runner, options)
+	manager, err := newManager(runner, options)
+	if err != nil {
+		return nil, err
+	}
+	// A supported Manager always owns one coherent pair of physical adapters.
+	// Both adapters retain this exact manager, runner, protected store, lock and
+	// fail-stop identity. Interactive commit/reconcile still wrap the rebind
+	// adapter per invocation to add request-local authorization; they do not
+	// replace the startup/current capability installed here.
+	rebind, current := newGatewayRebindRuntimeDrivers(manager)
+	manager.gatewayRebindCrossStoreDriver = rebind
+	manager.gatewayCurrentPhysicalDriver = current
+	return manager, nil
 }
 
 func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager, error) {

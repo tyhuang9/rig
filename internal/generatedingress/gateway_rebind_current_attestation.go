@@ -11,19 +11,37 @@ import (
 // attest the exact commit baseline; terminal startup may attest newer current
 // revisions. A held commit barrier permits only this terminal observation.
 func (m *Manager) attestGatewayRebindCurrentLocked(ctx context.Context, selection gatewayCurrentSelection) (string, error) {
+	return m.attestGatewayRebindCurrentWithSessionLocked(ctx, selection, nil)
+}
+
+func (m *Manager) attestGatewayRebindCurrentWithSessionLocked(ctx context.Context, selection gatewayCurrentSelection,
+	forwardSessionGuard gatewayRebindForwardSessionGuard,
+) (string, error) {
+	if m == nil {
+		return "", newGatewayCurrentAttestationError(ctx, gatewayCurrentAttestationCheckpointManagerPrecondition)
+	}
+	repository, ok := m.options.RebindCurrentStateRepository.(gatewayRebindTypedBoundaryRepository)
+	if !ok {
+		return "", newGatewayCurrentAttestationError(ctx, gatewayCurrentAttestationCheckpointManagerAuthority)
+	}
+	return m.attestGatewayRebindCurrentWithRepositoryAndSessionLocked(ctx, selection, repository,
+		forwardSessionGuard)
+}
+
+func (m *Manager) attestGatewayRebindCurrentWithRepositoryAndSessionLocked(ctx context.Context,
+	selection gatewayCurrentSelection, repository gatewayRebindTypedBoundaryRepository,
+	forwardSessionGuard gatewayRebindForwardSessionGuard,
+) (string, error) {
 	invalid := func(checkpoint gatewayCurrentAttestationCheckpoint) (string, error) {
 		return "", newGatewayCurrentAttestationError(ctx, checkpoint)
 	}
 	invalidFrom := func(err error, checkpoint gatewayCurrentAttestationCheckpoint) (string, error) {
 		return "", gatewayCurrentAttestationErrorFrom(ctx, err, checkpoint)
 	}
-	if m == nil || ctx == nil || ctx.Err() != nil || selection.Kind != gatewayCurrentSelectionRebind ||
+	if m == nil || ctx == nil || ctx.Err() != nil || repository == nil ||
+		selection.Kind != gatewayCurrentSelectionRebind ||
 		selection.State == nil || selection.Store == nil || m.gatewayRebindFailStopLatch().Load() {
 		return invalid(gatewayCurrentAttestationCheckpointManagerPrecondition)
-	}
-	repository, ok := m.options.RebindCurrentStateRepository.(GatewayCurrentServingStartupRepository)
-	if !ok {
-		return invalid(gatewayCurrentAttestationCheckpointManagerAuthority)
 	}
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
 	if err != nil {
@@ -70,6 +88,11 @@ func (m *Manager) attestGatewayRebindCurrentLocked(ctx context.Context, selectio
 			m.gatewayRebindCommitBarrierLatch().Load() != barrier {
 			return fail(nil)
 		}
+		if forwardSessionGuard != nil {
+			if forwardSessionGuard(readCtx) != nil || readCtx.Err() != nil {
+				return fail(nil)
+			}
+		}
 		fresh, err := repository.HostingGatewayStartupSnapshot(readCtx)
 		if err != nil || !reflect.DeepEqual(snapshot, fresh) || !fresh.ActiveRebindApprovalsAuthorizeServing() {
 			return fail(err)
@@ -81,8 +104,14 @@ func (m *Manager) attestGatewayRebindCurrentLocked(ctx context.Context, selectio
 		if !active && (!gatewayCurrentRouteMutationSnapshotReady(fresh.Rebind) || repository.CheckGatewayRebindFence(readCtx) != nil) {
 			return fail(nil)
 		}
-		if readCtx.Err() != nil || m.gatewayRebindFailStopLatch().Load() || m.gatewayRebindCommitBarrierLatch().Load() != barrier {
+		if readCtx.Err() != nil || m.gatewayRebindFailStopLatch().Load() ||
+			m.gatewayRebindCommitBarrierLatch().Load() != barrier {
 			return fail(nil)
+		}
+		if forwardSessionGuard != nil {
+			if forwardSessionGuard(readCtx) != nil || readCtx.Err() != nil {
+				return fail(nil)
+			}
 		}
 		return fresh, nil
 	}
@@ -92,7 +121,9 @@ func (m *Manager) attestGatewayRebindCurrentLocked(ctx context.Context, selectio
 			return err
 		}
 		if active {
-			boundary, boundaryErr := m.readGatewayRebindTypedForwardBoundaryLocked(proofCtx, request)
+			boundary, boundaryErr := (managerGatewayRebindCrossStoreDriver{
+				manager: m, repository: repository, forwardSessionGuard: forwardSessionGuard,
+			}).readGatewayRebindTypedForwardBoundaryLocked(proofCtx, request)
 			if boundaryErr != nil || !sameGatewayCurrentSelection(selection, boundary.Selection) ||
 				!sameGatewayRebindCurrentHistory(history, boundary.History) {
 				return gatewayCurrentAttestationErrorFrom(proofCtx, boundaryErr,

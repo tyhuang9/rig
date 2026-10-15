@@ -3,7 +3,6 @@ package generatedingress
 import (
 	"context"
 	"errors"
-	"net/netip"
 	"reflect"
 	"time"
 
@@ -28,6 +27,27 @@ type gatewayRebindPreparedAttempt struct {
 	Progress   gatewayRebindProgressRecord
 }
 
+type gatewayRebindAdmissionCandidate struct {
+	Snapshot   appaccess.GatewayRebindRecoverySnapshot
+	Selection  gatewayCurrentSelection
+	Checkpoint gatewayRebindPredecessorCheckpoint
+	Proposal   appaccess.GatewayRebindPreclaimProposalV2
+}
+
+// gatewayRebindAcceptedClaim is invocation-local provenance from the exact
+// ClaimGatewayRebindV2 call below. Its private created bit is trusted only
+// after the returned claim has been checked against the locked candidate.
+type gatewayRebindAcceptedClaim struct {
+	claim   appaccess.GatewayRebindClaimV2
+	created bool
+}
+
+type gatewayRebindStrictClaim struct {
+	candidate gatewayRebindAdmissionCandidate
+	preclaim  gatewayRebindAdmissionPhysicalProof
+	accepted  gatewayRebindAcceptedClaim
+}
+
 // prepareGatewayRebindLocked is the claim-to-protected admission core. Its
 // caller holds the deployment-effects lease, Manager mutex, and gateway OS
 // lock. ClaimGatewayRebindV2 commits the short SQL prepared transaction before
@@ -40,6 +60,120 @@ func (m *Manager) prepareGatewayRebindLocked(ctx context.Context, repository gat
 	if m == nil || ctx == nil || repository == nil {
 		return gatewayRebindPreparedAttempt{}, &Error{Code: DiagnosticValidationFailed}
 	}
+	candidate, err := m.gatewayRebindAdmissionCandidateLocked(ctx, repository, input)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, err
+	}
+	claim, err := m.claimGatewayRebindAdmissionLocked(ctx, repository, candidate)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, err
+	}
+	return m.installGatewayRebindPreparedProtectedLocked(ctx, claim, input.Inspection.Roster,
+		input.Inspection.RuntimeHeads, candidate.Checkpoint, m.gatewayRebindProgressTime())
+}
+
+// prepareGatewayRebindStrictLocked is the request-bound admission path. Its
+// caller owns the deployment-effects lease, Manager mutex, and gateway OS
+// lock. Both the physical proof reader and live request/session callback are
+// mandatory; neither has a permissive default.
+func (m *Manager) prepareGatewayRebindStrictLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
+	proofReader gatewayRebindAdmissionProofReader, liveSession func(context.Context) error,
+) (gatewayRebindPreparedAttempt, error) {
+	strict, err := m.claimGatewayRebindStrictLocked(ctx, repository, input, proofReader, liveSession)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, err
+	}
+	return m.continueGatewayRebindStrictLocked(ctx, repository, input, strict, proofReader, liveSession)
+}
+
+func (m *Manager) claimGatewayRebindStrictLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
+	proofReader gatewayRebindAdmissionProofReader, liveSession func(context.Context) error,
+) (gatewayRebindStrictClaim, error) {
+	zero := gatewayRebindStrictClaim{}
+	if m == nil || ctx == nil || repository == nil || proofReader == nil || liveSession == nil {
+		return zero, &Error{Code: DiagnosticValidationFailed}
+	}
+	if err := checkGatewayRebindAdmissionSession(ctx, liveSession); err != nil {
+		return zero, err
+	}
+	candidate, err := m.gatewayRebindAdmissionCandidateLocked(ctx, repository, input)
+	if err != nil {
+		return zero, err
+	}
+	target := gatewayRebindAdmissionTarget(input.Inspection, candidate.Checkpoint)
+	preclaim, err := proofReader(ctx, target, candidate.Selection)
+	if err != nil || !gatewayRebindAdmissionProofMatchesTarget(ctx, preclaim, target, candidate.Selection) {
+		return zero, gatewayRebindProposalError(ctx)
+	}
+	if err := checkGatewayRebindAdmissionSession(ctx, liveSession); err != nil {
+		return zero, err
+	}
+	strict := gatewayRebindStrictClaim{candidate: candidate, preclaim: preclaim}
+	strict.accepted, err = m.claimGatewayRebindStrictAcceptedLocked(ctx, repository, candidate)
+	if err != nil {
+		return strict, err
+	}
+	return strict, nil
+}
+
+func (m *Manager) continueGatewayRebindStrictLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
+	strict gatewayRebindStrictClaim, proofReader gatewayRebindAdmissionProofReader,
+	liveSession func(context.Context) error,
+) (gatewayRebindPreparedAttempt, error) {
+	prepared, _, err := m.continueGatewayRebindStrictAdmissionLocked(ctx, repository, input,
+		strict, proofReader, liveSession)
+	return prepared, err
+}
+
+// continueGatewayRebindStrictAdmissionLocked reports whether the request's
+// live session passed immediately before the protected install. The facade
+// uses that provenance to distinguish an install failure eligible for the
+// narrowly proved no-effect abort from a session or cancellation failure,
+// which never authorizes cleanup.
+func (m *Manager) continueGatewayRebindStrictAdmissionLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
+	strict gatewayRebindStrictClaim, proofReader gatewayRebindAdmissionProofReader,
+	liveSession func(context.Context) error,
+) (gatewayRebindPreparedAttempt, bool, error) {
+	if m == nil || ctx == nil || repository == nil || proofReader == nil || liveSession == nil ||
+		!strict.accepted.created || !validGatewayRebindAcceptedClaim(strict.accepted, strict.candidate) ||
+		!reflect.DeepEqual(strict.candidate.Proposal.Spec, input.Inspection.Spec) ||
+		strict.candidate.Proposal.RebindApproval != input.RebindApproval ||
+		strict.candidate.Proposal.ConfigureApproval != input.ConfigureApproval ||
+		!sameGatewayRebindRosterV2(strict.candidate.Proposal.Roster, input.Inspection.Roster) ||
+		!sameGatewayRebindRuntimeHeads(strict.candidate.Proposal.RuntimeHeads, input.Inspection.RuntimeHeads) {
+		return gatewayRebindPreparedAttempt{}, false, gatewayRebindProposalError(ctx)
+	}
+	network, err := m.attestGatewayRebindClaimAdmissionLocked(ctx, repository, strict.candidate,
+		strict.accepted.claim, proofReader, strict.preclaim)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, false, err
+	}
+	if err := checkGatewayRebindAdmissionSession(ctx, liveSession); err != nil {
+		return gatewayRebindPreparedAttempt{}, false, err
+	}
+	prepared, err := m.installGatewayRebindPreparedProtectedWithNetworkLocked(ctx, strict.accepted.claim,
+		input.Inspection.Roster, input.Inspection.RuntimeHeads, strict.candidate.Checkpoint,
+		network, m.gatewayRebindProgressTime())
+	return prepared, true, err
+}
+
+func checkGatewayRebindAdmissionSession(ctx context.Context, liveSession func(context.Context) error) error {
+	if ctx == nil || ctx.Err() != nil || liveSession == nil {
+		return gatewayRebindProposalError(ctx)
+	}
+	if err := liveSession(ctx); err != nil || ctx.Err() != nil {
+		return gatewayRebindProposalError(ctx)
+	}
+	return nil
+}
+
+func (m *Manager) gatewayRebindAdmissionCandidateLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, input gatewayRebindCommitInput,
+) (gatewayRebindAdmissionCandidate, error) {
 	observed, err := m.inspectGatewayRebindProposalLocked(ctx, repository, GatewayRebindProposalInput{
 		OperationID:                    input.Inspection.Spec.OperationID,
 		SuccessorProfileRevisionID:     input.Inspection.Spec.SuccessorProfileRevisionID,
@@ -48,45 +182,92 @@ func (m *Manager) prepareGatewayRebindLocked(ctx context.Context, repository gat
 		SuccessorProfile:               input.Inspection.Spec.SuccessorProfile,
 	})
 	if err != nil || !reflect.DeepEqual(observed, input.Inspection) {
-		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		return gatewayRebindAdmissionCandidate{}, gatewayRebindProposalError(ctx)
 	}
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || snapshot.Active != nil {
-		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		return gatewayRebindAdmissionCandidate{}, gatewayRebindProposalError(ctx)
 	}
 	selection, err := m.selectGatewayCurrentLocked(ctx, snapshot)
 	if err != nil {
-		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		return gatewayRebindAdmissionCandidate{}, gatewayRebindProposalError(ctx)
 	}
 	checkpoint, err := gatewayRebindCheckpointForSelection(input.Inspection.ProtectedGeneration,
 		input.Inspection.Spec.OperationID, selection)
 	if err != nil || checkpoint.Digest != input.Inspection.PredecessorCheckpointDigest ||
 		checkpoint.sourceRef() != input.Inspection.Spec.Predecessor ||
 		input.Inspection.Spec.SuccessorProtectedGeneration != checkpoint.Generation {
-		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		return gatewayRebindAdmissionCandidate{}, gatewayRebindProposalError(ctx)
 	}
-	claim, _, err := repository.ClaimGatewayRebindV2(ctx, appaccess.GatewayRebindPreclaimProposalV2{
-		Spec: input.Inspection.Spec, RebindApproval: input.RebindApproval,
-		ConfigureApproval: input.ConfigureApproval, Roster: input.Inspection.Roster,
-		RuntimeHeads: input.Inspection.RuntimeHeads,
-	})
+	return gatewayRebindAdmissionCandidate{Snapshot: snapshot, Selection: selection, Checkpoint: checkpoint,
+		Proposal: appaccess.GatewayRebindPreclaimProposalV2{
+			Spec: input.Inspection.Spec, RebindApproval: input.RebindApproval,
+			ConfigureApproval: input.ConfigureApproval, Roster: input.Inspection.Roster,
+			RuntimeHeads: input.Inspection.RuntimeHeads,
+		}}, nil
+}
+
+func (m *Manager) claimGatewayRebindAdmissionLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, candidate gatewayRebindAdmissionCandidate,
+) (appaccess.GatewayRebindClaimV2, error) {
+	claim, _, err := repository.ClaimGatewayRebindV2(ctx, candidate.Proposal)
 	if err != nil {
-		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		return appaccess.GatewayRebindClaimV2{}, gatewayRebindProposalError(ctx)
 	}
 	if m.gatewayRebindAfterClaim != nil {
 		if err := m.gatewayRebindAfterClaim(ctx, claim); err != nil {
-			return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+			return appaccess.GatewayRebindClaimV2{}, gatewayRebindProposalError(ctx)
 		}
 	}
-	return m.installGatewayRebindPreparedProtectedLocked(ctx, claim, input.Inspection.Roster,
-		input.Inspection.RuntimeHeads,
-		checkpoint, m.gatewayRebindProgressTime())
+	return claim, nil
+}
+
+func (m *Manager) claimGatewayRebindStrictAcceptedLocked(ctx context.Context,
+	repository gatewayRebindAdmissionRepository, candidate gatewayRebindAdmissionCandidate,
+) (gatewayRebindAcceptedClaim, error) {
+	claim, created, err := repository.ClaimGatewayRebindV2(ctx, candidate.Proposal)
+	if err != nil {
+		return gatewayRebindAcceptedClaim{}, gatewayRebindProposalError(ctx)
+	}
+	accepted := gatewayRebindAcceptedClaim{claim: claim, created: created}
+	if !validGatewayRebindAcceptedClaim(accepted, candidate) {
+		return gatewayRebindAcceptedClaim{}, gatewayRebindProposalError(ctx)
+	}
+	if m.gatewayRebindAfterClaim != nil {
+		if err := m.gatewayRebindAfterClaim(ctx, claim); err != nil {
+			return accepted, gatewayRebindProposalError(ctx)
+		}
+	}
+	return accepted, nil
+}
+
+func validGatewayRebindAcceptedClaim(accepted gatewayRebindAcceptedClaim,
+	candidate gatewayRebindAdmissionCandidate,
+) bool {
+	claim := accepted.claim
+	if appaccess.ValidateGatewayRebindClaimV2ForProposal(claim, candidate.Proposal) != nil {
+		return false
+	}
+	if !accepted.created {
+		return true
+	}
+	return claim.State == appaccess.GatewayRebindPrepared && claim.StateSequence == 1 &&
+		!claim.CreatedAt.IsZero() && claim.UpdatedAt.Equal(claim.CreatedAt)
 }
 
 func (m *Manager) recoverGatewayRebindPreparedAdmissionLocked(ctx context.Context,
 	repository gatewayRebindProposalRepository, snapshot appaccess.GatewayRebindRecoverySnapshot,
 ) (gatewayRebindPreparedAttempt, error) {
+	return m.recoverGatewayRebindPreparedAdmissionWithProofLocked(ctx, repository, snapshot,
+		m.readGatewayRebindAdmissionPhysicalLocked)
+}
+
+func (m *Manager) recoverGatewayRebindPreparedAdmissionWithProofLocked(ctx context.Context,
+	repository gatewayRebindProposalRepository, snapshot appaccess.GatewayRebindRecoverySnapshot,
+	proofReader gatewayRebindAdmissionProofReader,
+) (gatewayRebindPreparedAttempt, error) {
 	if m == nil || ctx == nil || repository == nil || snapshot.Active == nil ||
+		proofReader == nil ||
 		snapshot.Active.Claim.SpecVersion != appaccess.GatewayRebindSpecVersionV2 ||
 		snapshot.Active.Claim.V2 == nil || snapshot.Phase != appaccess.GatewayRebindPrepared ||
 		!snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved || snapshot.DatabaseCommittedEvent != nil {
@@ -106,9 +287,20 @@ func (m *Manager) recoverGatewayRebindPreparedAdmissionLocked(ctx context.Contex
 	if err != nil || checkpoint.sourceRef() != claim.Spec.Predecessor {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
-	return m.installGatewayRebindPreparedProtectedLocked(ctx, claim, snapshot.Active.RosterV2,
-		snapshot.Active.RuntimeHeads,
-		checkpoint, m.gatewayRebindProgressTime())
+	if replay, complete, replayErr := m.loadGatewayRebindPreparedReplayLocked(ctx, claim,
+		snapshot.Active.RosterV2, snapshot.Active.RuntimeHeads, checkpoint); replayErr != nil {
+		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+	} else if complete {
+		return replay, nil
+	}
+	network, err := m.attestGatewayRebindPreparedA0Locked(ctx, repository, snapshot,
+		claim, selection, checkpoint, proofReader)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, err
+	}
+	return m.installGatewayRebindPreparedProtectedWithNetworkLocked(ctx, claim,
+		snapshot.Active.RosterV2, snapshot.Active.RuntimeHeads, checkpoint,
+		network, m.gatewayRebindProgressTime())
 }
 
 func (m *Manager) gatewayRebindProgressTime() time.Time {
@@ -123,22 +315,58 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 	runtimeHeads []appaccess.GatewayRebindRuntimeHead,
 	checkpoint gatewayRebindPredecessorCheckpoint, occurredAt time.Time,
 ) (gatewayRebindPreparedAttempt, error) {
+	if replay, complete, err := m.loadGatewayRebindPreparedReplayLocked(ctx, claim, roster,
+		runtimeHeads, checkpoint); err != nil {
+		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+	} else if complete {
+		return replay, nil
+	}
+	network, err := m.observeGatewayRebindV2SuccessorNetworkLocked(ctx, claim)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, err
+	}
+	return m.installGatewayRebindPreparedProtectedWithNetworkLocked(ctx, claim, roster,
+		runtimeHeads, checkpoint, network, occurredAt)
+}
+
+func (m *Manager) installGatewayRebindPreparedProtectedWithNetworkLocked(ctx context.Context,
+	claim appaccess.GatewayRebindClaimV2, roster []appaccess.GatewayRebindRosterEntryV2,
+	runtimeHeads []appaccess.GatewayRebindRuntimeHead, checkpoint gatewayRebindPredecessorCheckpoint,
+	network gatewayRebindSuccessorNetworkObservation, occurredAt time.Time,
+) (gatewayRebindPreparedAttempt, error) {
 	if !occurredAt.After(claim.CreatedAt) {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+	}
+	// Constructing the complete intent validates that the supplied network is
+	// claim-bound before the first protected file can be created.
+	intent, err := newGatewayRebindProtectedIntentV2(claim, roster, runtimeHeads, checkpoint, network)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+	}
+	if replay, complete, replayErr := m.loadGatewayRebindPreparedReplayLocked(ctx, claim,
+		roster, runtimeHeads, checkpoint); replayErr != nil {
+		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+	} else if complete {
+		if !reflect.DeepEqual(replay.Intent, intent) {
+			return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		}
+		return replay, nil
 	}
 	checkpointStore, err := newGatewayRebindPredecessorCheckpointStore(m.options.DataRoot,
 		checkpoint.Generation, checkpoint.OperationID)
 	if err != nil || ensureGatewayRebindCheckpoint(checkpointStore, checkpoint) != nil {
 		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
+	if m.gatewayRebindAfterPreparedCheckpoint != nil {
+		if err := m.gatewayRebindAfterPreparedCheckpoint(ctx); err != nil {
+			return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
+		}
+	}
 	intentStore, err := newGatewayRebindProtectedIntentV2Store(m.options.DataRoot,
 		checkpoint.Generation, checkpoint.OperationID)
 	if err == nil {
 		if installedIntent, loadErr := intentStore.load(); loadErr == nil {
-			if installedIntent.Claim.RequestDigest != claim.RequestDigest ||
-				installedIntent.Predecessor != checkpoint.sourceRef() ||
-				!sameGatewayRebindRosterV2(installedIntent.Roster, roster) ||
-				!sameGatewayRebindRuntimeHeads(installedIntent.RuntimeHeads, runtimeHeads) {
+			if !reflect.DeepEqual(installedIntent, intent) {
 				return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 			}
 			progressStore, progressStoreErr := newGatewayRebindProgressStore(m.options.DataRoot,
@@ -151,14 +379,6 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 				}
 			}
 		}
-	}
-	network, err := m.observeGatewayRebindV2SuccessorNetworkLocked(ctx, claim)
-	if err != nil {
-		return gatewayRebindPreparedAttempt{}, err
-	}
-	intent, err := newGatewayRebindProtectedIntentV2(claim, roster, runtimeHeads, checkpoint, network)
-	if err != nil {
-		return gatewayRebindPreparedAttempt{}, gatewayRebindProposalError(ctx)
 	}
 	intentStore, err = newGatewayRebindProtectedIntentV2Store(m.options.DataRoot, intent.Generation, intent.OperationID)
 	if err != nil || ensureGatewayRebindIntentV2(intentStore, intent) != nil {
@@ -185,6 +405,55 @@ func (m *Manager) installGatewayRebindPreparedProtectedLocked(ctx context.Contex
 		}
 	}
 	return gatewayRebindPreparedAttempt{Claim: claim, Checkpoint: checkpoint, Intent: intent, Progress: progress}, nil
+}
+
+func (m *Manager) loadGatewayRebindPreparedReplayLocked(ctx context.Context,
+	claim appaccess.GatewayRebindClaimV2, roster []appaccess.GatewayRebindRosterEntryV2,
+	runtimeHeads []appaccess.GatewayRebindRuntimeHead, checkpoint gatewayRebindPredecessorCheckpoint,
+) (gatewayRebindPreparedAttempt, bool, error) {
+	checkpointStore, err := newGatewayRebindPredecessorCheckpointStore(m.options.DataRoot,
+		checkpoint.Generation, checkpoint.OperationID)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, false, err
+	}
+	installedCheckpoint, err := checkpointStore.load()
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, false, nil
+	}
+	if !reflect.DeepEqual(installedCheckpoint, checkpoint) {
+		return gatewayRebindPreparedAttempt{}, false, errors.New("generated ingress rebind predecessor checkpoint does not match prepared claim")
+	}
+	intentStore, err := newGatewayRebindProtectedIntentV2Store(m.options.DataRoot,
+		checkpoint.Generation, checkpoint.OperationID)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, false, err
+	}
+	intent, err := intentStore.load()
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, false, nil
+	}
+	if intent.Claim.RequestDigest != claim.RequestDigest || intent.Predecessor != checkpoint.sourceRef() ||
+		!sameGatewayRebindRosterV2(intent.Roster, roster) ||
+		!sameGatewayRebindRuntimeHeads(intent.RuntimeHeads, runtimeHeads) {
+		return gatewayRebindPreparedAttempt{}, false, errors.New("generated ingress typed rebind intent does not match prepared claim")
+	}
+	progressStore, err := newGatewayRebindProgressStore(m.options.DataRoot,
+		intent.Generation, intent.OperationID, 1)
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, false, err
+	}
+	progress, err := progressStore.load()
+	if err != nil {
+		return gatewayRebindPreparedAttempt{}, false, nil
+	}
+	if !gatewayRebindProgressMatchesIntentV2(progress, intent, nil) {
+		return gatewayRebindPreparedAttempt{}, false, errors.New("generated ingress rebind progress does not match prepared intent")
+	}
+	if ctx == nil || ctx.Err() != nil {
+		return gatewayRebindPreparedAttempt{}, false, gatewayRebindProposalError(ctx)
+	}
+	return gatewayRebindPreparedAttempt{Claim: claim, Checkpoint: checkpoint,
+		Intent: intent, Progress: progress}, true, nil
 }
 
 func sameGatewayRebindRosterV2(left, right []appaccess.GatewayRebindRosterEntryV2) bool {
@@ -253,54 +522,18 @@ func readGatewayRebindV2SuccessorNetwork(ctx context.Context, claim appaccess.Ga
 		InterfaceID: claim.Spec.SuccessorProfile.InterfaceID, PortStart: claim.Spec.SuccessorProfile.PortStart,
 		PortEnd: claim.Spec.SuccessorProfile.PortEnd,
 	}
-	if ctx.Err() != nil || claim.State != appaccess.GatewayRebindPrepared || claim.StateSequence != 1 ||
-		!validGatewayProfileBinding(profile) || reads.network.candidates == nil || reads.network.host == nil ||
-		reads.network.docker == nil || reads.dockerIDs == nil {
+	if ctx == nil || ctx.Err() != nil || claim.State != appaccess.GatewayRebindPrepared || claim.StateSequence != 1 {
 		return gatewayRebindSuccessorPreflightObservation{}, gatewayRebindSuccessorNetworkError(ctx)
 	}
-	candidates, err := reads.network.candidates()
+	value, err := readGatewayRebindSuccessorPhysical(ctx, gatewayRebindAdmissionSuccessorTarget{
+		OperationID: claim.Spec.OperationID, ProfileOperationID: claim.Spec.SuccessorProfileOperationID,
+		Profile: profile,
+	}, reads)
 	if err != nil {
 		return gatewayRebindSuccessorPreflightObservation{}, gatewayRebindSuccessorNetworkError(ctx)
 	}
-	host, err := reads.network.host()
-	if err != nil {
-		return gatewayRebindSuccessorPreflightObservation{}, gatewayRebindSuccessorNetworkError(ctx)
-	}
-	dockerIDsBefore, err := reads.dockerIDs(ctx)
-	if err != nil || !validGatewayRebindSuccessorDockerIDs(dockerIDsBefore) {
-		return gatewayRebindSuccessorPreflightObservation{}, gatewayRebindSuccessorNetworkError(ctx)
-	}
-	docker, err := reads.network.docker(ctx)
-	if err != nil || ctx.Err() != nil {
-		return gatewayRebindSuccessorPreflightObservation{}, gatewayRebindSuccessorNetworkError(ctx)
-	}
-	dockerIDsAfter, err := reads.dockerIDs(ctx)
-	if err != nil || !validGatewayRebindSuccessorDockerIDs(dockerIDsAfter) || !equalStrings(dockerIDsBefore, dockerIDsAfter) {
-		return gatewayRebindSuccessorPreflightObservation{}, gatewayRebindSuccessorNetworkError(ctx)
-	}
-	plan, err := selectGatewayV2NetworkPlan(ctx, profile, gatewayV2NetworkPlanReads{
-		candidates: func() ([]hostNetworkCandidate, error) { return append([]hostNetworkCandidate(nil), candidates...), nil },
-		host: func() (gatewayV2HostNetworkSnapshot, error) {
-			return gatewayV2HostNetworkSnapshot{Routes: append([]netip.Prefix(nil), host.Routes...),
-				Interfaces: append([]netip.Prefix(nil), host.Interfaces...)}, nil
-		},
-		docker: func(context.Context) ([]netip.Prefix, error) { return append([]netip.Prefix(nil), docker...), nil },
-	})
-	if err != nil {
-		return gatewayRebindSuccessorPreflightObservation{}, gatewayRebindSuccessorNetworkError(ctx)
-	}
-	return gatewayRebindSuccessorPreflightObservation{
-		candidates: append([]hostNetworkCandidate(nil), candidates...),
-		host: gatewayV2HostNetworkSnapshot{Routes: append([]netip.Prefix(nil), host.Routes...),
-			Interfaces: append([]netip.Prefix(nil), host.Interfaces...)},
-		dockerIDs: append([]string(nil), dockerIDsBefore...), docker: append([]netip.Prefix(nil), docker...),
-		result: GatewayRebindSuccessorPreflight{RebindOperationID: claim.Spec.OperationID,
-			ClaimRequestDigest: claim.RequestDigest,
-			Profile: GatewayRebindSuccessorProfile{RevisionID: profile.RevisionID, RevisionNumber: profile.RevisionNumber,
-				OperationID: claim.Spec.SuccessorProfileOperationID, RequestDigest: claim.SuccessorProfileRequestDigest,
-				SpecDigest: profile.SpecDigest, SelectedIPv4: profile.SelectedIPv4, InterfaceID: profile.InterfaceID,
-				PortStart: profile.PortStart, PortEnd: profile.PortEnd, ApprovedBy: claim.ConfigureApproval.ActorID},
-			Network: GatewayRebindSuccessorNetworkPlan{Subnet: plan.Subnet, GatewayIPv4: plan.GatewayIPv4,
-				ContainerIPv4: plan.ContainerIPv4}},
-	}, nil
+	value.result.ClaimRequestDigest = claim.RequestDigest
+	value.result.Profile.RequestDigest = claim.SuccessorProfileRequestDigest
+	value.result.Profile.ApprovedBy = claim.ConfigureApproval.ActorID
+	return value, nil
 }

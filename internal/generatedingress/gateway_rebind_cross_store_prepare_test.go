@@ -219,6 +219,9 @@ func TestPrepareGatewayRebindLockedIntentBoundaryRetainsFence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	admissionProof := gatewayRebindAdmissionFixtureProof(t, f.manager, beforeSQL, inspection,
+		gatewayRebindNativeFixtureInspector(t, f),
+		gatewayRebindCrossStoreAdmissionTestReads(inspection.Spec, f.state.Network.Subnet))
 	beforeHistory, err := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -273,8 +276,9 @@ func TestPrepareGatewayRebindLockedIntentBoundaryRetainsFence(t *testing.T) {
 		t.Fatal(err)
 	}
 	installCrossStoreFixtureNetworkObserver(fresh, f.state.Network.Subnet)
+	proofReader := gatewayRebindImmutableFixtureProofReader(admissionProof)
 	recovered, recoverErr := withCrossStoreFixtureEffectLocks(t, fresh, func() (gatewayRebindPreparedAttempt, error) {
-		return fresh.recoverGatewayRebindPreparedAdmissionLocked(ctx, f.repository, preparedSQL)
+		return fresh.recoverGatewayRebindPreparedAdmissionWithProofLocked(ctx, f.repository, preparedSQL, proofReader)
 	})
 	if recoverErr != nil || recovered.Progress.Sequence != 1 || recovered.Progress.Phase != gatewayRebindProgressSuccessorIntent {
 		t.Fatalf("default recovery did not install progress one: attempt=%#v error=%v", recovered, recoverErr)
@@ -311,9 +315,15 @@ func TestRecoverGatewayRebindPreparedAdmissionUsesRetainedClaimGenerationAfterPr
 	if err := fixture.store.installBaseline(fixture.baseline); err != nil {
 		t.Fatal(err)
 	}
-	repository := &gatewayRebindAdmissionRepositoryFake{
+	fixture.manager.options.HostPort = fixture.history.Predecessor.Journal.Source.LocalHostPort
+	target := gatewayCurrentPhysicalRuntimeTestTarget(t, fixture)
+	runner := newGatewayCurrentPhysicalExecutor(t, target, target.State, target.State,
+		fixture.history.Predecessor.Journal.Source.LocalHostPort)
+	runner.stopAt(mustGatewayCurrentPhysicalConfig(t, target.State))
+	fixture.manager.runner = runner
+	repository := &gatewayRebindCanonicalEventRepository{gatewayRebindAdmissionRepositoryFake: &gatewayRebindAdmissionRepositoryFake{
 		gatewayRebindProposalRepositoryFake: gatewayRebindProposalRepositoryForCurrentFixture(t, fixture),
-	}
+	}}
 	proposalInput := GatewayRebindProposalInput{OperationID: uuid.NewString(),
 		SuccessorProfileRevisionID:     uuid.NewString(),
 		SuccessorProfileRevisionNumber: fixture.baseline.Profile.RevisionNumber + 1,
@@ -370,8 +380,10 @@ func TestRecoverGatewayRebindPreparedAdmissionUsesRetainedClaimGenerationAfterPr
 	if err != nil {
 		t.Fatal(err)
 	}
-	recovered, recoverErr := fixture.manager.recoverGatewayRebindPreparedAdmissionLocked(context.Background(),
-		repository, repository.snapshot)
+	proofReader := gatewayRebindPreparedFixtureProofReader(t, fixture.manager, repository.snapshot,
+		fixture.manager.inspectGatewayRebindDocker)
+	recovered, recoverErr := fixture.manager.recoverGatewayRebindPreparedAdmissionWithProofLocked(context.Background(),
+		repository, repository.snapshot, proofReader)
 	if releaseErr := release(); releaseErr != nil {
 		t.Fatal(releaseErr)
 	}

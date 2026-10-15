@@ -36,6 +36,28 @@ type GatewayRebindStartupRecoveryResult struct {
 	FenceReleased            bool
 }
 
+type gatewayRebindRequestedRecovery struct {
+	OperationID string
+	Policy      appaccess.GatewayRebindRecoveryPolicy
+}
+
+func (value gatewayRebindRequestedRecovery) valid() bool {
+	if value == (gatewayRebindRequestedRecovery{}) {
+		return true
+	}
+	if !validCanonicalUUID(value.OperationID) {
+		return false
+	}
+	switch value.Policy {
+	case appaccess.GatewayRebindRecoveryEvidenceDecides,
+		appaccess.GatewayRebindRecoveryForwardOnly,
+		appaccess.GatewayRebindRecoveryRollbackOnly:
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *Manager) RecoverGatewayRebindStartup(ctx context.Context,
 	repository GatewayRebindStartupRecoveryRepository,
 ) (GatewayRebindStartupRecoveryResult, error) {
@@ -68,12 +90,34 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 			result = GatewayRebindStartupRecoveryResult{}
 		}
 	}()
+	return m.recoverGatewayRebindStartupLocked(ctx, repository, driver)
+}
 
+// recoverGatewayRebindStartupLocked contains the existing deterministic
+// coordinator. The caller owns the deployment-effects lease, Manager mutex,
+// and gateway OS lock. It must not be called as a read-only classifier.
+func (m *Manager) recoverGatewayRebindStartupLocked(ctx context.Context,
+	repository GatewayRebindStartupRecoveryRepository, driver gatewayRebindCrossStoreDriver,
+) (result GatewayRebindStartupRecoveryResult, resultErr error) {
+	return m.recoverGatewayRebindStartupExpectedLocked(ctx, repository, driver,
+		gatewayRebindRequestedRecovery{})
+}
+
+func (m *Manager) recoverGatewayRebindStartupExpectedLocked(ctx context.Context,
+	repository GatewayRebindStartupRecoveryRepository, driver gatewayRebindCrossStoreDriver,
+	expected gatewayRebindRequestedRecovery,
+) (result GatewayRebindStartupRecoveryResult, resultErr error) {
+	if !expected.valid() {
+		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+	}
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil {
 		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
 	}
 	if len(snapshot.History) == 0 {
+		if expected != (gatewayRebindRequestedRecovery{}) {
+			return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+		}
 		presence, presenceErr := InspectGatewayRebindStartupPresence(ctx, m.options.DataRoot, repository)
 		if presenceErr != nil || presence.Present || presence.ProtectedArtifacts ||
 			repository.CheckGatewayRebindFence(ctx) != nil {
@@ -83,6 +127,9 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 	}
 	result.RebindHistoryPresent = true
 	if snapshot.Active == nil {
+		if expected != (gatewayRebindRequestedRecovery{}) {
+			return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+		}
 		return m.recoverGatewayRebindCommittedCurrentLocked(ctx, repository, driver, snapshot, result)
 	}
 	if snapshot.Active.Claim.SpecVersion != appaccess.GatewayRebindSpecVersionV2 ||
@@ -90,6 +137,9 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
 	}
 	claim := *snapshot.Active.Claim.V2
+	if expected != (gatewayRebindRequestedRecovery{}) && expected.OperationID != claim.Spec.OperationID {
+		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+	}
 	result.ActiveOperationID = claim.Spec.OperationID
 	result.InitialActivePhase = snapshot.Phase
 
@@ -103,6 +153,20 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 	}
 	if receipt != nil && !gatewayRebindTerminalMatchesActiveSnapshot(*receipt, snapshot) {
 		return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+	}
+	if expected != (gatewayRebindRequestedRecovery{}) {
+		protected, _, complete, protectedErr := gatewayRebindProtectedRecoveryProjection(history,
+			*snapshot.Active)
+		selection, selectionErr := m.selectGatewayCurrentLocked(ctx, snapshot)
+		selected, selectedErr := gatewayRebindSelectedCurrentEvidence(selection)
+		if protectedErr != nil || !complete || selectionErr != nil || selectedErr != nil {
+			return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+		}
+		policy, policyErr := appaccess.GatewayRebindRecoveryPolicyForSnapshot(snapshot,
+			appaccess.GatewayRebindTrustedRecoverySnapshot{Protected: protected, SelectedCurrent: selected})
+		if policyErr != nil || policy != expected.Policy {
+			return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
+		}
 	}
 	if snapshot.Phase == appaccess.GatewayRebindPrepared && receipt != nil &&
 		receipt.ProtectedIntentDigest == "" {
@@ -375,12 +439,22 @@ func gatewayRebindTerminalMatchesActiveSnapshot(receipt gatewayRebindTerminalRec
 	if snapshot.Active == nil || snapshot.Active.Claim.V2 == nil {
 		return false
 	}
-	claim := *snapshot.Active.Claim.V2
+	return gatewayRebindTerminalMatchesHistoryEntry(receipt, *snapshot.Active)
+}
+
+func gatewayRebindTerminalMatchesHistoryEntry(receipt gatewayRebindTerminalReceiptV2,
+	entry appaccess.GatewayRebindHistoryEntry,
+) bool {
+	if entry.Claim.SpecVersion != appaccess.GatewayRebindSpecVersionV2 ||
+		entry.Claim.Legacy != nil || entry.Claim.V2 == nil {
+		return false
+	}
+	claim := *entry.Claim.V2
 	preparedClaim := claim
 	preparedClaim.State, preparedClaim.StateSequence, preparedClaim.UpdatedAt =
 		appaccess.GatewayRebindPrepared, 1, preparedClaim.CreatedAt
-	databaseDigest, err := gatewayRebindPreparedDatabaseDigest(preparedClaim, snapshot.Active.RosterV2,
-		snapshot.Active.RuntimeHeads)
+	databaseDigest, err := gatewayRebindPreparedDatabaseDigest(preparedClaim, entry.RosterV2,
+		entry.RuntimeHeads)
 	return err == nil && receipt.Generation == claim.Spec.SuccessorProtectedGeneration &&
 		receipt.OperationID == claim.Spec.OperationID && receipt.ClaimRequestDigest == claim.RequestDigest &&
 		receipt.ClaimSpecDigest == claim.RebindApproval.SpecDigest && receipt.Predecessor == claim.Spec.Predecessor &&
@@ -444,7 +518,9 @@ func (m *Manager) applyGatewayRebindRetainedRollbackLocked(ctx context.Context,
 		receipt.Disposition != appaccess.GatewayRebindDispositionAbort || snapshot.Active == nil ||
 		snapshot.Active.Claim.V2 == nil || !snapshot.RollbackAllowed || snapshot.DatabaseCommitObserved ||
 		snapshot.DatabaseCommittedEvent != nil ||
-		(snapshot.Phase != appaccess.GatewayRebindPrepared && snapshot.Phase != appaccess.GatewayRebindSuccessorReady) {
+		(snapshot.Phase != appaccess.GatewayRebindPrepared &&
+			snapshot.Phase != appaccess.GatewayRebindSuccessorReady &&
+			snapshot.Phase != appaccess.GatewayRebindUnresolved) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
 	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
@@ -537,6 +613,22 @@ func (m *Manager) recoverGatewayRebindCommitTerminalLocked(ctx context.Context,
 		case appaccess.GatewayRebindDatabaseCommitted:
 			return m.recoverGatewayRebindDatabaseCommittedLocked(ctx, repository, driver, prepared,
 				receipt, baseline, initial)
+		case appaccess.GatewayRebindUnresolved:
+			if snapshot.DatabaseCommitObserved {
+				return m.recoverGatewayRebindDatabaseCommittedLocked(ctx, repository, driver, prepared,
+					receipt, baseline, initial)
+			}
+			proof, proofErr := gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt,
+				appaccess.GatewayRebindSuccessorReady, gatewayCurrentRouteState{}, nil, "")
+			if proofErr != nil {
+				return GatewayRebindCommitResult{}, proofErr
+			}
+			if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
+				return GatewayRebindCommitResult{}, err
+			}
+			if _, applyErr := applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
+				return GatewayRebindCommitResult{}, applyErr
+			}
 		default:
 			return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 		}
@@ -549,7 +641,9 @@ func (m *Manager) recoverGatewayRebindDatabaseCommittedLocked(ctx context.Contex
 	baseline gatewayCurrentRouteState, initial appaccess.GatewayRebindState,
 ) (GatewayRebindCommitResult, error) {
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
-	if err != nil || snapshot.Phase != appaccess.GatewayRebindDatabaseCommitted {
+	if err != nil || !snapshot.DatabaseCommitObserved || snapshot.DatabaseCommittedEvent == nil ||
+		(snapshot.Phase != appaccess.GatewayRebindDatabaseCommitted &&
+			snapshot.Phase != appaccess.GatewayRebindUnresolved) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
 	selection, err := m.selectGatewayCurrentLocked(ctx, snapshot)

@@ -30,7 +30,7 @@ func (d managerGatewayRebindCrossStoreDriver) confirmForwardServingLocked(ctx co
 	if !ok || d.manager == nil {
 		return fail()
 	}
-	boundary, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
+	boundary, err := d.readGatewayRebindTypedForwardBoundaryLocked(ctx, request)
 	if err != nil {
 		return fail()
 	}
@@ -41,7 +41,7 @@ func (d managerGatewayRebindCrossStoreDriver) confirmForwardServingLocked(ctx co
 		return fail()
 	}
 	guard := func(effectCtx context.Context) error {
-		fresh, err := d.manager.readGatewayRebindTypedForwardBoundaryLocked(effectCtx, request)
+		fresh, err := d.readGatewayRebindTypedForwardBoundaryLocked(effectCtx, request)
 		if err != nil || !reflect.DeepEqual(boundary.Progress, fresh.Progress) {
 			return gatewayRebindEffectBoundaryError(effectCtx)
 		}
@@ -86,10 +86,15 @@ func (d managerGatewayRebindCrossStoreDriver) withdrawCompletedSuccessorLocked(c
 	}
 	stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), v2ObservationTimeout)
 	defer cancel()
-	if d.manager.options.RebindCurrentStateRepository == nil {
+	repository, ok := d.typedBoundaryRepository()
+	if !ok {
 		return fail()
 	}
-	snapshot, err := d.manager.options.RebindCurrentStateRepository.GatewayRebindRecoverySnapshot(stopCtx)
+	snapshotRepository, ok := repository.(GatewayRebindCurrentStateRepository)
+	if !ok {
+		return fail()
+	}
+	snapshot, err := snapshotRepository.GatewayRebindRecoverySnapshot(stopCtx)
 	if err != nil || snapshot.Active == nil || snapshot.Active.Claim.V2 == nil ||
 		!sameGatewayRebindClaimV2Admission(*snapshot.Active.Claim.V2, request.Attempt.Claim) {
 		return fail()
@@ -115,7 +120,7 @@ func (d managerGatewayRebindCrossStoreDriver) withdrawCompletedSuccessorLocked(c
 	}
 	request.SQLPhase = snapshot.Phase
 	request.RollbackAllowed, request.DatabaseCommitObserved = snapshot.RollbackAllowed, snapshot.DatabaseCommitObserved
-	boundary, err := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(stopCtx, request)
+	boundary, err := d.manager.readGatewayRebindTypedAttemptBoundaryWithRepositoryLocked(stopCtx, repository, request)
 	if err != nil {
 		return fail()
 	}
@@ -135,7 +140,7 @@ func (d managerGatewayRebindCrossStoreDriver) withdrawCompletedSuccessorLocked(c
 		return fail()
 	}
 	guard := func(effectCtx context.Context) error {
-		fresh, err := d.manager.readGatewayRebindTypedAttemptBoundaryLocked(effectCtx, request)
+		fresh, err := d.manager.readGatewayRebindTypedAttemptBoundaryWithRepositoryLocked(effectCtx, repository, request)
 		if err != nil || !reflect.DeepEqual(boundary.Progress, fresh.Progress) {
 			return gatewayRebindEffectBoundaryError(effectCtx)
 		}

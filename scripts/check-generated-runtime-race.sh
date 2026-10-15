@@ -23,6 +23,11 @@ rebind_pattern='^Test(GatewayRebind|InspectGatewayRebind)'
 rebind_effects_pattern='^Test(GatewayRebind(Stage|Final|Successor)|InspectGatewayRebindSuccessor)'
 rebind_config_pattern='^TestGatewayRebind(StageConfig|FinalConfig)'
 rebind_current_pattern='^Test(GatewayRebind(Committed|Current)|InspectGatewayRebindCurrent)'
+# The reviewed recovery cases are database-heavy; retain complete parent trees
+# in a separate complementary group without extending the package deadline.
+rebind_recovery_pattern='^TestGatewayRebind(ForwardConfirmation|Interactive|Reconcile|Recovery|Requested|RollbackConfirmation)'
+rebind_recovery_guards_pattern='^TestGatewayRebind(ForwardConfirmation|Interactive|RollbackConfirmation)'
+rebind_startup_runtime_pattern='^TestGatewayRebind(Runtime|Startup)'
 rebind_handover_pattern='^TestGatewayRebindFinalHandover'
 rebind_handover_rollback_pattern='^TestGatewayRebindFinalHandoverRollback'
 # Keep the concrete lifecycle and retained-current cases out of the older
@@ -59,7 +64,19 @@ case "$suite" in
     ;;
   rebind-history)
     packages=(./internal/generatedingress)
-    filter=(-run "$rebind_pattern" -skip "$rebind_effects_pattern|$rebind_typed_pattern|$rebind_composition_pattern|$rebind_current_pattern")
+    filter=(-run "$rebind_pattern" -skip "$rebind_effects_pattern|$rebind_typed_pattern|$rebind_composition_pattern|$rebind_current_pattern|$rebind_recovery_pattern|$rebind_startup_runtime_pattern")
+    ;;
+  rebind-startup-runtime)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_startup_runtime_pattern")
+    ;;
+  rebind-recovery)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_recovery_pattern" -skip "$rebind_recovery_guards_pattern")
+    ;;
+  rebind-recovery-guards)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_recovery_guards_pattern")
     ;;
   rebind-current)
     packages=(./internal/generatedingress)
