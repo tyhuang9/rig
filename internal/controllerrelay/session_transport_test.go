@@ -654,14 +654,82 @@ func TestActiveSessionReplaysPendingControlsThroughSoleWriterAndClearsScratch(t 
 		t.Fatal("pending control was not written")
 	}
 	cancel()
-	if err := <-result; !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled session = %v, want observed cancellation", err)
+	if err := <-result; !errors.Is(err, errSessionCancellationObserved) {
+		t.Fatalf("cancelled session = %v, want observed cancellation marker", err)
 	}
 	if handler.pendingCalls != 1 || handler.handleCalls != 0 {
 		t.Fatalf("handler calls pending=%d handle=%d", handler.pendingCalls, handler.handleCalls)
 	}
 	if confirm.Signature != "" {
 		t.Fatal("confirmation signature scratch survived writer")
+	}
+}
+
+func TestSessionTerminalFailurePrecedence(t *testing.T) {
+	fallback := sessionFailure(sessionErrorConnectionClosed, false)
+	for _, test := range []struct {
+		name       string
+		contexts   func() (context.Context, context.Context)
+		fallback   error
+		wantCode   string
+		wantMarker bool
+		wantRaw    bool
+	}{
+		{
+			name:     "uncanceled transport failure",
+			contexts: func() (context.Context, context.Context) { return context.Background(), context.Background() },
+			fallback: fallback,
+			wantCode: sessionErrorConnectionClosed,
+		},
+		{
+			name: "raw cancellation without parent cancellation",
+			contexts: func() (context.Context, context.Context) {
+				parentCtx := context.Background()
+				runCtx, cancelRun := context.WithCancelCause(parentCtx)
+				cancelRun(context.Canceled)
+				return parentCtx, runCtx
+			},
+			fallback: context.Canceled,
+			wantRaw:  true,
+		},
+		{
+			name: "observed parent cancellation",
+			contexts: func() (context.Context, context.Context) {
+				parentCtx, cancelParent := context.WithCancelCause(context.Background())
+				runCtx, cancelRun := context.WithCancelCause(parentCtx)
+				cancelParent(errSupervisorReconcile)
+				cancelRun(context.Canceled)
+				return parentCtx, runCtx
+			},
+			fallback:   fallback,
+			wantMarker: true,
+		},
+		{
+			name: "expiry wins observed parent cancellation",
+			contexts: func() (context.Context, context.Context) {
+				parentCtx, cancelParent := context.WithCancelCause(context.Background())
+				runCtx, cancelRun := context.WithCancelCause(parentCtx)
+				cancelRun(errSessionExpired)
+				cancelParent(errSupervisorReconcile)
+				return parentCtx, runCtx
+			},
+			fallback: fallback,
+			wantCode: sessionErrorExpired,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			parentCtx, runCtx := test.contexts()
+			err := sessionTerminalFailure(parentCtx, runCtx, test.fallback)
+			if test.wantCode != "" && !sessionErrorCode(err, test.wantCode) {
+				t.Fatalf("terminal failure = %v, want %s", err, test.wantCode)
+			}
+			if errors.Is(err, errSessionCancellationObserved) != test.wantMarker {
+				t.Fatalf("terminal failure marker = %t, want %t (%v)", errors.Is(err, errSessionCancellationObserved), test.wantMarker, err)
+			}
+			if test.wantRaw && err != context.Canceled {
+				t.Fatalf("raw cancellation = %v, want context.Canceled", err)
+			}
+		})
 	}
 }
 
