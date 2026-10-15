@@ -922,7 +922,8 @@ func TestLiveExternalTLSNodeTrust(t *testing.T) {
 	stderr := newLiveNodeTLSDiagnosticStderrBuffer(liveNodeTLSDiagnosticLimit)
 	command := exec.Command(node, "-e", liveApplicationHTTPSProbeCommand, liveNodeTLSDiagnosticFlag, "127.0.0.1", fmt.Sprintf("%d", fixture.port), "", fixture.ca)
 	command.Stderr = stderr
-	output, err, parentContext := runLiveNodeTLSProbe(command, stderr)
+	output, err, parentContext, observation := runLiveNodeTLSProbe(command, stderr)
+	t.Log(liveNodeTLSProbeObservationText(command.Path, output, stderr, observation))
 	process := liveNodeTLSDiagnosticProcessOutcome(err)
 	nodeDiagnostic := liveNodeTLSDiagnosticEvidence(stderr.Bytes(), stderr.Truncated())
 	if err != nil || parentContext != "active" {
@@ -934,46 +935,48 @@ func TestLiveExternalTLSNodeTrust(t *testing.T) {
 	}
 }
 
-func runLiveNodeTLSProbe(command *exec.Cmd, stderr *liveNodeTLSDiagnosticStderrBuffer) ([]byte, error, string) {
+func runLiveNodeTLSProbe(command *exec.Cmd, stderr *liveNodeTLSDiagnosticStderrBuffer) ([]byte, error, string, liveNodeTLSDeadlineObservation) {
 	return runLiveNodeTLSProbeWithAllowances(command, stderr,
 		liveNodeTLSStartupAllowance, liveNodeTLSCompletionAllowance)
 }
 
 func runLiveNodeTLSProbeWithAllowances(command *exec.Cmd, stderr *liveNodeTLSDiagnosticStderrBuffer,
 	startupAllowance, completionAllowance time.Duration,
-) ([]byte, error, string) {
+) ([]byte, error, string, liveNodeTLSDeadlineObservation) {
+	observation := liveNodeTLSDeadlineObservation{kill: "not-attempted"}
 	var stdout bytes.Buffer
 	command.Stdout = &stdout
 	command.WaitDelay = liveNodeTLSKillReapAllowance
 	if err := command.Start(); err != nil {
-		return nil, err, "active"
+		return nil, err, "active", observation
 	}
 	waited := make(chan error, 1)
+	waitCompleted := make(chan struct{})
 	go func() {
-		waited <- command.Wait()
+		err := command.Wait()
+		close(waitCompleted)
+		waited <- err
 	}()
 	startup := time.NewTimer(startupAllowance)
 	select {
 	case err := <-waited:
 		startup.Stop()
-		return stdout.Bytes(), err, "active"
+		return stdout.Bytes(), err, "active", observation
 	case <-stderr.StartupObserved():
 		startup.Stop()
 	case <-startup.C:
-		_ = command.Process.Kill()
-		err := <-waited
-		return stdout.Bytes(), err, "node-startup-deadline"
+		err, observation := observeLiveNodeTLSDeadline(stderr.StartupObserved(), waitCompleted, command.Process.Kill, waited)
+		return stdout.Bytes(), err, "node-startup-deadline", observation
 	}
 
 	completion := time.NewTimer(completionAllowance)
 	defer completion.Stop()
 	select {
 	case err := <-waited:
-		return stdout.Bytes(), err, "active"
+		return stdout.Bytes(), err, "active", observation
 	case <-completion.C:
-		_ = command.Process.Kill()
-		err := <-waited
-		return stdout.Bytes(), err, "probe-completion-deadline"
+		err, observation := observeLiveNodeTLSDeadline(stderr.StartupObserved(), waitCompleted, command.Process.Kill, waited)
+		return stdout.Bytes(), err, "probe-completion-deadline", observation
 	}
 }
 

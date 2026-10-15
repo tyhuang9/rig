@@ -340,13 +340,15 @@ func TestRunLiveNodeTLSProbeBoundsStartupAndCompletion(t *testing.T) {
 			command := exec.Command(os.Args[0], "-test.run=^TestLiveNodeTLSProbeProcessHelper$")
 			command.Env = append(os.Environ(), liveNodeTLSProbeHelperMode+"="+test.mode)
 			command.Stderr = stderr
-			_, err, parentContext := runLiveNodeTLSProbeWithAllowances(command, stderr,
+			_, err, parentContext, observation := runLiveNodeTLSProbeWithAllowances(command, stderr,
 				test.startupAllowance, test.completionAllowance)
 			diagnostic := liveNodeTLSDiagnosticEvidence(stderr.Bytes(), stderr.Truncated())
 			if err == nil || parentContext != test.wantParentContext ||
-				diagnostic.context != test.wantNodeContext || command.ProcessState == nil {
-				t.Fatalf("bounded probe supervision: err=%v parent=%s node=%s reaped=%t",
-					err, parentContext, diagnostic.context, command.ProcessState != nil)
+				diagnostic.context != test.wantNodeContext || command.ProcessState == nil ||
+				observation.kill != "returned-nil" || observation.waitObserved ||
+				observation.startupObserved != (test.mode == "stalled-after-startup") {
+				t.Fatalf("bounded probe supervision: process=%s parent=%s node=%s reaped=%t",
+					liveNodeTLSDiagnosticProcessOutcome(err), parentContext, diagnostic.context, command.ProcessState != nil)
 			}
 		})
 	}
@@ -361,6 +363,13 @@ func TestLiveNodeTLSProbeProcessHelper(t *testing.T) {
 	case "stalled-after-startup":
 		_, _ = os.Stderr.WriteString("rig-live-node-tls-diagnostic 1 startup 22\n")
 		time.Sleep(time.Minute)
+	case "completed-response", "response-before-stall":
+		_, _ = os.Stdout.WriteString(`{"outcome":"response","status":204}`)
+		_, _ = os.Stderr.WriteString("rig-live-node-tls-diagnostic 1 startup 22\n")
+		if os.Getenv(liveNodeTLSProbeHelperMode) == "response-before-stall" {
+			time.Sleep(time.Minute)
+		}
+		os.Exit(0)
 	default:
 		t.Fatal("invalid live Node TLS probe helper mode")
 	}
