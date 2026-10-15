@@ -293,6 +293,13 @@ func newGatewayRebindFixtureOnDB(t *testing.T, db *sql.DB, insertRoster bool) ga
 
 func newGatewayRebindFixtureOnDBWithClaim(t *testing.T, db *sql.DB, insertRoster, insertClaim bool) gatewayRebindFixture {
 	t.Helper()
+	return newGatewayRebindFixtureOnDBWithClaimAndReleaseID(t, db, insertRoster, insertClaim, uuid.NewString())
+}
+
+func newGatewayRebindFixtureOnDBWithClaimAndReleaseID(t *testing.T, db *sql.DB,
+	insertRoster, insertClaim bool, releaseID string,
+) gatewayRebindFixture {
+	t.Helper()
 	ctx := context.Background()
 	repository := testRepository(db)
 	profile, _, err := repository.ConfigureGatewayProfile(ctx, approvedGatewayInput(t,
@@ -336,7 +343,7 @@ func newGatewayRebindFixtureOnDBWithClaim(t *testing.T, db *sql.DB, insertRoster
 	if err != nil {
 		t.Fatal(err)
 	}
-	active := seedGatewayRebindActiveRuntime(t, db, appID)
+	active := seedGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, releaseID)
 
 	upgrade, _, err := repository.ClaimGatewayProfileUpgrade(ctx, upgradeInput)
 	if err != nil {
@@ -427,7 +434,14 @@ func newGatewayRebindFixtureOnDBWithClaim(t *testing.T, db *sql.DB, insertRoster
 
 func seedGatewayRebindActiveRuntime(t *testing.T, db *sql.DB, appID string) generatedruntimestate.ActiveHead {
 	t.Helper()
-	planID, releaseID, deploymentID, jobID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	return seedGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, uuid.NewString())
+}
+
+func seedGatewayRebindActiveRuntimeWithReleaseID(t *testing.T, db *sql.DB,
+	appID, releaseID string,
+) generatedruntimestate.ActiveHead {
+	t.Helper()
+	planID, deploymentID, jobID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	stamp := formatTime(testNow)
 	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(
 		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,

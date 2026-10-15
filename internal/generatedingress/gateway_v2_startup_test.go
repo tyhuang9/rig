@@ -110,24 +110,42 @@ func TestGatewayV2StartupProofFailuresFailClosed(t *testing.T) {
 		name    string
 		history string
 		state   appaccess.GatewayProfileUpgradeState
+		want    string
 		fail    func(*fakeGatewayV2CoordinatorDriver, *fakeGatewayV2TransferDriver)
 	}{
 		{
 			name: "v1 and absence proof", history: "none", state: appaccess.GatewayProfileUpgradePrepared,
+			want: "upgrade_no_artifact_proof",
 			fail: func(source *fakeGatewayV2CoordinatorDriver, _ *fakeGatewayV2TransferDriver) {
 				source.abortErr = errors.New("v1 drift")
 			},
 		},
 		{
 			name: "retirement replay proof", history: "retired", state: appaccess.GatewayProfileUpgradeRolledBack,
+			want: "upgrade_terminal_receipt_proof",
 			fail: func(source *fakeGatewayV2CoordinatorDriver, _ *fakeGatewayV2TransferDriver) {
 				source.retirementObservation.IngressNetworkPresent = true
 			},
 		},
 		{
 			name: "final topology proof", history: "committed", state: appaccess.GatewayProfileUpgradeCommitted,
+			want: "upgrade_committed_topology",
 			fail: func(_ *fakeGatewayV2CoordinatorDriver, transfer *fakeGatewayV2TransferDriver) {
 				transfer.finalRunning = false
+			},
+		},
+		{
+			name: "final host routes proof", history: "committed", state: appaccess.GatewayProfileUpgradeCommitted,
+			want: "upgrade_committed_host_routes",
+			fail: func(_ *fakeGatewayV2CoordinatorDriver, transfer *fakeGatewayV2TransferDriver) {
+				transfer.failFinalHostRoutes = true
+			},
+		},
+		{
+			name: "selected interface proof", history: "committed", state: appaccess.GatewayProfileUpgradeCommitted,
+			want: "upgrade_committed_selected_interface",
+			fail: func(_ *fakeGatewayV2CoordinatorDriver, transfer *fakeGatewayV2TransferDriver) {
+				transfer.failSelectedPreflightAt = 1
 			},
 		},
 	}
@@ -158,7 +176,8 @@ func TestGatewayV2StartupProofFailuresFailClosed(t *testing.T) {
 			got, err := manager.InspectGatewayV2Startup(context.Background(), []GatewayV2StartupClaim{{
 				Request: request, State: test.state, StateSequence: sequence,
 			}})
-			if !IsCode(err, DiagnosticRouteUnresolved) || got != (GatewayV2StartupInspection{}) {
+			if !IsCode(err, DiagnosticRouteUnresolved) || got != (GatewayV2StartupInspection{}) ||
+				GatewayStartupDiagnosticCheckpoint(err) != test.want {
 				t.Fatalf("inspection=%+v err=%v", got, err)
 			}
 		})
@@ -189,7 +208,8 @@ func TestGatewayV2StartupRejectsInvalidClaimSets(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := manager.InspectGatewayV2Startup(context.Background(), test.claims)
-			if !IsCode(err, DiagnosticValidationFailed) || got != (GatewayV2StartupInspection{}) {
+			if !IsCode(err, DiagnosticValidationFailed) || got != (GatewayV2StartupInspection{}) ||
+				GatewayStartupDiagnosticCheckpoint(err) != "upgrade_claims_validation" {
 				t.Fatalf("inspection=%+v err=%v", got, err)
 			}
 		})

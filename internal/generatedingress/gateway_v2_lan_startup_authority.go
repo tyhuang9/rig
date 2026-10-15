@@ -20,9 +20,14 @@ func (m *Manager) readGatewayV2LANStartupAuthorityLocked(ctx context.Context,
 	store *gatewayUpgradeStateStore, state gatewayV2RouteState, journal gatewayMigrationJournal,
 	grants gatewayV2LANStartupClaimSet, disables map[string]GatewayV2LANDisableStartupClaim,
 ) (gatewayV2LANStartupAuthority, error) {
-	invalid := gatewayV2StartupInspectionError(ctx)
-	selection, snapshot, present, err := m.readOptionalGatewayCurrentSelectionLocked(ctx)
-	if err != nil || snapshot.Active != nil || snapshot.Phase != "" || snapshot.DatabaseCommittedEvent != nil ||
+	invalid := newGatewayStartupDiagnosticError(ctx, gatewayStartupDiagnosticCheckpointLANStartupAuthority)
+	selection, snapshot, present, currentCheckpoint, err :=
+		m.readOptionalGatewayCurrentSelectionDiagnosticLocked(ctx)
+	if err != nil {
+		return gatewayV2LANStartupAuthority{}, newGatewayStartupDiagnosticErrorWithCode(
+			invalid.Code, currentCheckpoint)
+	}
+	if snapshot.Active != nil || snapshot.Phase != "" || snapshot.DatabaseCommittedEvent != nil ||
 		snapshot.DatabaseCommitObserved || snapshot.RollbackAllowed {
 		return gatewayV2LANStartupAuthority{}, invalid
 	}
@@ -82,7 +87,7 @@ func (m *Manager) confirmGatewayV2LANStartupAuthorityLocked(ctx context.Context,
 	if err != nil || before.present != after.present || !reflect.DeepEqual(before.snapshot, after.snapshot) ||
 		!sameGatewayCurrentSelection(before.selection, after.selection) ||
 		!reflect.DeepEqual(before.selection.UpgradeSource, after.selection.UpgradeSource) || ctx.Err() != nil {
-		return gatewayV2StartupInspectionError(ctx)
+		return newGatewayStartupDiagnosticError(ctx, gatewayStartupDiagnosticCheckpointLANAuthorityStability)
 	}
 	return nil
 }

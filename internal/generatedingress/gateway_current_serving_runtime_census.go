@@ -46,7 +46,7 @@ func gatewayServingRuntimeComponentsMatch(apps map[string]gatewayCurrentAppRoute
 	for i, head := range snapshot.RuntimeHeads {
 		app, exists := apps[head.AppID]
 		if !exists || !validCanonicalUUID(head.AppID) || !validCanonicalUUID(head.DeploymentID) ||
-			!validCanonicalUUID(head.ReleaseID) || head.Generation <= 0 || head.UpdatedAt.IsZero() ||
+			!validGatewayRebindRuntimeReleaseID(head.ReleaseID) || head.Generation <= 0 || head.UpdatedAt.IsZero() ||
 			string(app.Route.Slot) != head.Slot || (i > 0 && snapshot.RuntimeHeads[i-1].AppID >= head.AppID) {
 			return false
 		}

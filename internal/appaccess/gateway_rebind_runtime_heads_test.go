@@ -13,6 +13,8 @@ import (
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
+const rebindTestSnapshotReleaseID = "0123456789abcdef0123456789abcdef"
+
 func TestGatewayRebindRuntimeHeadsIncludesCompleteSortedLANAndLoopbackHeads(t *testing.T) {
 	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
 	ctx := context.Background()
@@ -38,6 +40,27 @@ func TestGatewayRebindRuntimeHeadsIncludesCompleteSortedLANAndLoopbackHeads(t *t
 	got, err := fixture.repository.GatewayRebindRuntimeHeads(ctx)
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("complete sorted heads = %#v, want %#v, error=%v", got, want, err)
+	}
+}
+
+func TestGatewayRebindRuntimeHeadsAcceptsCanonicalReleaseIDForms(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		releaseID string
+	}{
+		{name: "UUID", releaseID: uuid.NewString()},
+		{name: "snapshot hex", releaseID: rebindTestSnapshotReleaseID},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := appAccessDB(t)
+			appID := addApps(t, db, 1)[0]
+			active := seedGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, test.releaseID)
+			got, err := testRepository(db).GatewayRebindRuntimeHeads(context.Background())
+			want := []GatewayRebindRuntimeHead{runtimeHeadForRebindTest(active)}
+			if err != nil || !reflect.DeepEqual(got, want) || got[0].ReleaseID != test.releaseID {
+				t.Fatalf("fresh runtime-head snapshot=%#v want=%#v error=%v", got, want, err)
+			}
+		})
 	}
 }
 
@@ -218,8 +241,8 @@ func TestGatewayRebindRuntimeHeadsRejectsCrossedDeploymentReleaseAndSlot(t *test
 		name   string
 		mutate func(*testing.T, *sql.DB, generatedruntimestate.ActiveHead, generatedruntimestate.ActiveHead)
 	}{
-		{name: "same-app release differs from deployment", mutate: func(t *testing.T, db *sql.DB, _, second generatedruntimestate.ActiveHead) {
-			otherReleaseID := uuid.NewString()
+		{name: "same-app snapshot release differs from deployment", mutate: func(t *testing.T, db *sql.DB, _, second generatedruntimestate.ActiveHead) {
+			otherReleaseID := rebindTestSnapshotReleaseID
 			if _, err := db.Exec(`INSERT INTO releases(
 				id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,
 				workspace_state,workspace_tree_sha256,deployment_plan_revision_id,deployment_plan_revision_number

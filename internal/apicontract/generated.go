@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "f066e1616bbfbbc7500d58c68360e518e2cb52a29eb7632434821e7586e90a4e"
+const SourceSHA256 = "fc4ad28a5685cc16336df797e086803bf89f11a913e765608ecb241402880661"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},

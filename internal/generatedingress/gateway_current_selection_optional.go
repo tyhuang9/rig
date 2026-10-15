@@ -17,38 +17,53 @@ import (
 func (m *Manager) readOptionalGatewayCurrentSelectionLocked(ctx context.Context) (
 	gatewayCurrentSelection, appaccess.GatewayRebindRecoverySnapshot, bool, error,
 ) {
+	selection, snapshot, present, _, err := m.readOptionalGatewayCurrentSelectionDiagnosticLocked(ctx)
+	return selection, snapshot, present, err
+}
+
+func (m *Manager) readOptionalGatewayCurrentSelectionDiagnosticLocked(ctx context.Context) (
+	gatewayCurrentSelection, appaccess.GatewayRebindRecoverySnapshot, bool,
+	gatewayStartupDiagnosticCheckpoint, error,
+) {
 	invalid := errors.New("generated ingress optional current gateway selection is unresolved")
 	if m == nil || ctx == nil || ctx.Err() != nil || m.options.RebindCurrentStateRepository == nil {
-		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false, invalid
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false,
+			gatewayStartupDiagnosticCheckpointCurrentSelectionPrecondition, invalid
 	}
 	repository := m.options.RebindCurrentStateRepository
 	first, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || ctx.Err() != nil {
-		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false, invalid
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false,
+			gatewayStartupDiagnosticCheckpointCurrentSQLFirstRead, invalid
 	}
 	if first.CurrentSource != nil {
 		selection, confirmed, err := m.readGatewayCurrentSelectionLocked(ctx)
 		if err != nil || !reflect.DeepEqual(first, confirmed) {
-			return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false, invalid
+			return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false,
+				gatewayStartupDiagnosticCheckpointCurrentProtectedSelection, invalid
 		}
-		return selection, confirmed, true, nil
+		return selection, confirmed, true, gatewayStartupDiagnosticCheckpointUnknown, nil
 	}
 	if !gatewayCurrentSelectionSQLAbsent(first) {
-		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false, invalid
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false,
+			gatewayStartupDiagnosticCheckpointCurrentSelectionPrecondition, invalid
 	}
 	before, err := readGatewayRebindProtectedPresenceReadOnly(m.options.DataRoot)
 	if err != nil || before.present || ctx.Err() != nil {
-		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false, invalid
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false,
+			gatewayStartupDiagnosticCheckpointCurrentAbsenceProtectedPresence, invalid
 	}
 	confirmed, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(first, confirmed) {
-		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false, invalid
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false,
+			gatewayStartupDiagnosticCheckpointCurrentSQLStability, invalid
 	}
 	after, err := readGatewayRebindProtectedPresenceReadOnly(m.options.DataRoot)
 	if err != nil || after.present || ctx.Err() != nil || !sameGatewayRebindProtectedPresence(before, after) {
-		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false, invalid
+		return gatewayCurrentSelection{}, appaccess.GatewayRebindRecoverySnapshot{}, false,
+			gatewayStartupDiagnosticCheckpointCurrentProtectedStability, invalid
 	}
-	return gatewayCurrentSelection{}, first, false, nil
+	return gatewayCurrentSelection{}, first, false, gatewayStartupDiagnosticCheckpointUnknown, nil
 }
 
 func gatewayCurrentSelectionSQLAbsent(value appaccess.GatewayRebindRecoverySnapshot) bool {

@@ -52,7 +52,7 @@ func TestLiveControllerGatewayRebindCrashMatrix(t *testing.T) {
 
 func liveHostdRebindRunCrashCase(t *testing.T, boundaryID, scenarioID string) {
 	t.Helper()
-	expectedDisposition := liveHostdRebindExpectedDisposition(t, boundaryID, scenarioID)
+	expectedDisposition := liveHostdRebindExpectedTerminalDisposition(t, boundaryID, scenarioID)
 	fixture := newLiveHostdGatewayRebindFixture(t)
 	operationID := uuid.NewString()
 	fixture.registerOperation(operationID)
@@ -65,8 +65,8 @@ func liveHostdRebindRunCrashCase(t *testing.T, boundaryID, scenarioID string) {
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, target)
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	successor := liveHostdRebindPlanSuccessor(t, fixture, target)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	commitDone := make(chan error, 1)
 	go func() {
 		status, _, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
@@ -101,9 +101,9 @@ func liveHostdRebindRunCrashCase(t *testing.T, boundaryID, scenarioID string) {
 
 	recovery := liveHostdRebindStartChild(t, fixture, "", "", "")
 	recoveryReady := liveHostdRebindWaitReady(t, fixture, recovery)
+	t.Log("rebind crash verification phase=first-recovery")
 	status := liveHostdRebindRecover(t, fixture, operationID, recoveryReady)
-	liveHostdRebindAssertTerminal(t, status, operationID)
-	liveHostdRebindAssertDisposition(t, status, expectedDisposition)
+	liveHostdRebindAssertCrashTerminalDisposition(t, "first-recovery", status, operationID, expectedDisposition)
 	liveHostdRebindKillAndReap(t, recovery)
 
 	// A terminal result in a recovery-only process never relaxes that process.
@@ -113,33 +113,51 @@ func liveHostdRebindRunCrashCase(t *testing.T, boundaryID, scenarioID string) {
 	if normalReady.RecoveryOnly || normalReady.RecoveryKind != "" || normalReady.OperationID != "" {
 		t.Fatal("fresh post-terminal hostd did not return to normal startup")
 	}
+	t.Log("rebind crash verification phase=third-normal")
 	status = liveHostdRebindRecover(t, fixture, operationID, normalReady)
-	liveHostdRebindAssertTerminal(t, status, operationID)
-	liveHostdRebindAssertDisposition(t, status, expectedDisposition)
+	liveHostdRebindAssertCrashTerminalDisposition(t, "third-normal", status, operationID, expectedDisposition)
 	liveHostdRebindAssertServing(t, fixture, status)
 	liveHostdRebindKillAndReap(t, normal)
 }
 
-func liveHostdRebindExpectedDisposition(t *testing.T, boundaryID, scenarioID string) string {
+func liveHostdRebindExpectedTerminalDisposition(t *testing.T, boundaryID, scenarioID string) string {
 	t.Helper()
-	if liveHostdRebindLostEffectScenario(scenarioID) {
-		return "abort"
+	if (boundaryID == "") == (scenarioID == "") {
+		t.Fatalf("crash case must name exactly one boundary or lost acknowledgement scenario")
+	}
+	if scenarioID != "" {
+		disposition, found := gatewayRebindLiveLostAcknowledgementExpectedTerminalDispositions[scenarioID]
+		if !found {
+			t.Fatalf("no expected terminal disposition for lost acknowledgement scenario %q", scenarioID)
+		}
+		if disposition != "commit" && disposition != "abort" {
+			t.Fatalf("invalid expected terminal disposition %q for lost acknowledgement scenario %q",
+				disposition, scenarioID)
+		}
+		return disposition
 	}
 	for _, entry := range gatewayRebindLiveBoundaries {
 		if entry.ID != boundaryID {
 			continue
 		}
-		switch entry.Direction {
-		case "rollback":
-			return "abort"
-		case "forward":
-			return "commit"
-		default:
-			t.Fatalf("unknown recovery direction %q for %s", entry.Direction, boundaryID)
+		if entry.ExpectedTerminalDisposition != "commit" && entry.ExpectedTerminalDisposition != "abort" {
+			t.Fatalf("invalid expected terminal disposition %q for boundary %s",
+				entry.ExpectedTerminalDisposition, boundaryID)
 		}
+		return entry.ExpectedTerminalDisposition
 	}
-	t.Fatalf("no expected recovery direction for boundary=%q scenario=%q", boundaryID, scenarioID)
+	t.Fatalf("no expected terminal disposition for boundary=%q scenario=%q", boundaryID, scenarioID)
 	return ""
+}
+
+func liveHostdRebindAssertCrashTerminalDisposition(t *testing.T, phase string,
+	status liveHostdRebindStatus, operationID, expectedDisposition string,
+) {
+	t.Helper()
+	liveHostdRebindAssertTerminal(t, status, operationID)
+	if status.Operation == nil || status.Operation.TerminalDisposition != expectedDisposition {
+		t.Fatalf("%s terminal disposition=%v want=%q", phase, status.Operation, expectedDisposition)
+	}
 }
 
 func liveHostdRebindAssertDisposition(t *testing.T, status liveHostdRebindStatus, want string) {
@@ -227,11 +245,11 @@ func liveHostdRebindRunReleaseFault(t *testing.T, scenarioID string) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before release-fault admission")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	statusCode, _, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
 		"/api/v1/system/lan-gateway-rebind", commit)
 	if err != nil || statusCode < 500 {
@@ -254,11 +272,11 @@ func liveHostdRebindRunCompetingController(t *testing.T) {
 	if liveHostdRebindWaitReady(t, fixture, owner).RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before contender case")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	requestContext, cancel := context.WithCancel(fixture.ctx)
 	defer cancel()
 	commitDone := make(chan struct{})
@@ -311,11 +329,11 @@ func liveHostdRebindRunCancellationBeforeWrite(t *testing.T) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before cancellation case")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	if err := liveHostdRebindWriteExclusiveJSON(child.manifest.RequestArm, map[string]string{
 		"operationId": operationID,
 	}); err != nil {
@@ -364,11 +382,11 @@ func liveHostdRebindRunCancellationAfterWrite(t *testing.T) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before post-write cancellation")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	requestContext, cancelRequest := context.WithCancel(fixture.ctx)
 	requestDone := make(chan error, 1)
 	go func() {
@@ -409,7 +427,7 @@ func liveHostdRebindRunCancellationAfterWrite(t *testing.T) {
 	ready := liveHostdRebindWaitReady(t, fixture, recovery)
 	status = liveHostdRebindRecover(t, fixture, operationID, ready)
 	liveHostdRebindAssertTerminal(t, status, operationID)
-	liveHostdRebindAssertDisposition(t, status, "abort")
+	liveHostdRebindAssertDisposition(t, status, "commit")
 	liveHostdRebindAssertServing(t, fixture, status)
 	liveHostdRebindKillAndReap(t, recovery)
 }

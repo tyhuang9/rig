@@ -204,7 +204,8 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 	gate, err := inspectGatewayStartupAfterPreparationWithRunner(context.Background(), cfg, db,
 		dockerExecutable, ownerDirectories, preparedGateway, assembly.runner)
 	if err != nil {
-		logger.Error("gateway startup inspection failed", "error", err)
+		logger.Error("gateway startup inspection failed", "startup_checkpoint", gatewayStartupDiagnosticCheckpointForError(err),
+			"startup_cause", gatewayStartupDiagnosticCauseForError(err))
 		emergencyStop()
 		return 1
 	}

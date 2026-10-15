@@ -315,7 +315,7 @@ func GatewayRebindRosterEntryV2Digest(entry GatewayRebindRosterEntryV2) (string,
 		!validUUID(entry.GrantAttemptID) || entry.GrantStateSequence <= 0 || !validDigest(entry.GrantProtectedStateDigest) ||
 		!validUUID(entry.SourceProfileRevisionID) || entry.SourceProfileRevisionNumber <= 0 || !validDigest(entry.SourceProfileSpecDigest) ||
 		!validOptionalDigest(entry.PredecessorTransferDigest) ||
-		!validUUID(entry.ServingDeploymentID) || !validUUID(entry.ServingReleaseID) ||
+		!validUUID(entry.ServingDeploymentID) || !validReleaseID(entry.ServingReleaseID) ||
 		(entry.ServingSlot != "blue" && entry.ServingSlot != "green") || entry.RouteGeneration <= 0 {
 		return "", ErrInvalidInput
 	}
@@ -411,7 +411,7 @@ func canonicalGatewayRebindRuntimeHead(ordinal int64,
 	head GatewayRebindRuntimeHead,
 ) (gatewayRebindCanonicalRuntimeHead, error) {
 	if ordinal <= 0 || !validUUID(head.AppID) || !validUUID(head.DeploymentID) ||
-		!validUUID(head.ReleaseID) || (head.Slot != "blue" && head.Slot != "green") ||
+		!validReleaseID(head.ReleaseID) || (head.Slot != "blue" && head.Slot != "green") ||
 		head.Generation <= 0 || head.UpdatedAt.IsZero() {
 		return gatewayRebindCanonicalRuntimeHead{}, ErrInvalidInput
 	}

@@ -47,6 +47,22 @@ import (
 
 const liveHostdGatewayRebindEnvironment = "RIG_RUN_LIVE_HOSTD_GATEWAY_REBIND"
 
+const (
+	liveHostdRebindLegacyV1ContainerName = "rig-generated-caddy-v1"
+	liveHostdRebindLegacyV1NetworkName   = "rig-generated-caddy-ingress-v1"
+	liveHostdRebindLegacyV1ConfigVolume  = "rig-generated-caddy-config-v1"
+)
+
+// liveHostdRebindLegacyV1Resources records the immutable identities observed
+// before the upgrade transfers the still-restartable v1 predecessor into the
+// fixture's retained baseline. The registered two-app cleanup remains the
+// sole remover for these legacy resources.
+type liveHostdRebindLegacyV1Resources struct {
+	containerID      string
+	networkID        string
+	configVolumeName string
+}
+
 type liveHostdGatewayRebindFixture struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
@@ -63,9 +79,11 @@ type liveHostdGatewayRebindFixture struct {
 	secondApp   lanTwoAppDeployment
 	appIDs      []string
 	upgradeID   string
+	legacyV1    liveHostdRebindLegacyV1Resources
 
-	mu           sync.Mutex
-	operationIDs map[string]struct{}
+	mu             sync.Mutex
+	operationIDs   map[string]struct{}
+	commitRequests map[string]json.RawMessage
 }
 
 // newLiveHostdGatewayRebindFixture creates the predecessor through the same
@@ -99,9 +117,13 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 		ctx: ctx, cancel: cancel, root: root, dataRoot: dataRoot, docker: docker,
 		predecessor: predecessor, successor: successor, ports: ports,
 		upgradeID: uuid.NewString(), operationIDs: make(map[string]struct{}),
+		commitRequests: make(map[string]json.RawMessage),
 	}
 	fixture.operationIDs[fixture.upgradeID] = struct{}{}
-	lanTwoAppRegisterCleanup(t, docker, dataRoot, fixture.upgradeID, &fixture.appIDs)
+	lanTwoAppRegisterCleanupWithLegacyGuard(t, docker, dataRoot, fixture.upgradeID, &fixture.appIDs,
+		func(ctx context.Context, docker, kind, candidate string, labels map[string]string) (string, bool) {
+			return fixture.legacyV1.removalIdentity(ctx, docker, kind, candidate, labels)
+		})
 	t.Cleanup(func() { fixture.cleanup(t) })
 
 	installed, err := filepath.Abs(filepath.Join("..", "..", "examples", "hosting-notes"))
@@ -215,6 +237,10 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 		source, setup, "Supported rebind A", "supported-rebind-a-v1", &fixture.appIDs)
 	fixture.secondApp = liveHostdRebindDeployLocal(t, &setupAPI, jobStore, deploymentStore, composition.state,
 		source, setup, "Supported rebind B", "supported-rebind-b-v1", &fixture.appIDs)
+	// Capture the exact legacy predecessor while it is still the baseline
+	// gateway. The subsequent v1-to-v2 upgrade intentionally retains it, and
+	// cleanup may delegate only this observed identity to the older callback.
+	fixture.legacyV1 = liveHostdRebindCaptureLegacyV1Resources(t, fixture)
 
 	predecessorQuery := fmt.Sprintf("?interfaceId=%s&selectedIpv4=%s&portStart=%d&portEnd=%d",
 		urlQuery(predecessor.InterfaceID), urlQuery(predecessor.IPv4), ports[0], ports[2])
@@ -325,6 +351,45 @@ func (f *liveHostdGatewayRebindFixture) operationOwned(operationID string) bool 
 	return ok
 }
 
+// retainCommitRequest keeps the exact reviewed commit bytes for the only
+// normal-mode replay permitted after a hostd restart. The fixture never
+// rebuilds approvals from a later profile read.
+func (f *liveHostdGatewayRebindFixture) retainCommitRequest(operationID string, request []byte) error {
+	if operationID == "" || len(request) == 0 {
+		return fmt.Errorf("rebind commit request is unavailable")
+	}
+	var identity struct {
+		OperationID string `json:"operationId"`
+	}
+	if json.Unmarshal(request, &identity) != nil || identity.OperationID != operationID {
+		return fmt.Errorf("rebind commit request operation identity is invalid")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.commitRequests == nil {
+		f.commitRequests = make(map[string]json.RawMessage)
+	}
+	copyRequest := append(json.RawMessage(nil), request...)
+	if existing, ok := f.commitRequests[operationID]; ok {
+		if !bytes.Equal(existing, copyRequest) {
+			return fmt.Errorf("rebind commit request identity changed")
+		}
+		return nil
+	}
+	f.commitRequests[operationID] = copyRequest
+	return nil
+}
+
+func (f *liveHostdGatewayRebindFixture) retainedCommitRequest(operationID string) ([]byte, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	request, ok := f.commitRequests[operationID]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), request...), true
+}
+
 // cleanup runs before the older two-app cleanup. The preflight established an
 // empty daemon, so every accepted managed resource must bind either an exact
 // operation or application created by this fixture. Anything else is retained
@@ -353,6 +418,17 @@ func (f *liveHostdGatewayRebindFixture) cleanup(t *testing.T) {
 		}
 		for _, id := range strings.Fields(string(ids)) {
 			labels, labelErr := lanTwoAppDockerLabels(ctx, f.docker, kind, id)
+			if labelErr == nil {
+				switch f.legacyV1.cleanupDecision(ctx, f.docker, kind, id, labels) {
+				case liveHostdRebindLegacyV1Delegate:
+					// The registered two-app cleanup owns the one verified retained
+					// v1 predecessor and its config volume. Do not remove it twice.
+					continue
+				case liveHostdRebindLegacyV1Retain:
+					t.Errorf("retain uncertain managed %s %s", kind, id)
+					continue
+				}
+			}
 			operationID, appID := labels["io.rig.operation-id"], labels["io.rig.application"]
 			if labelErr != nil || (!f.operationOwned(operationID) && !appOwned(appID)) {
 				t.Errorf("retain uncertain managed %s %s", kind, id)
@@ -367,7 +443,194 @@ func (f *liveHostdGatewayRebindFixture) cleanup(t *testing.T) {
 			}
 		}
 	}
-	controllerJourneyRemoveBuilder(t, ctx, f.docker, f.dataRoot)
+}
+
+func liveHostdRebindCaptureLegacyV1Resources(t *testing.T, fixture *liveHostdGatewayRebindFixture) liveHostdRebindLegacyV1Resources {
+	t.Helper()
+	containerID := liveHostdRebindCaptureLegacyV1DockerID(t, fixture, "container", liveHostdRebindLegacyV1ContainerName)
+	networkID := liveHostdRebindCaptureLegacyV1DockerID(t, fixture, "network", liveHostdRebindLegacyV1NetworkName)
+	volumeName := liveHostdRebindCaptureLegacyV1Volume(t, fixture)
+	return liveHostdRebindLegacyV1Resources{
+		containerID: containerID, networkID: networkID, configVolumeName: volumeName,
+	}
+}
+
+func liveHostdRebindCaptureLegacyV1DockerID(t *testing.T, fixture *liveHostdGatewayRebindFixture, kind, expectedName string) string {
+	t.Helper()
+	id, name, labels, err := liveHostdRebindDockerIdentity(fixture.ctx, fixture.docker, kind, expectedName)
+	if err != nil || !liveHostdRebindCanonicalLegacyV1Labels(kind, labels) || name != expectedName ||
+		!liveHostdRebindImmutableDockerID(id) {
+		t.Fatalf("cannot verify canonical retained v1 %s baseline", kind)
+	}
+	return id
+}
+
+func liveHostdRebindCaptureLegacyV1Volume(t *testing.T, fixture *liveHostdGatewayRebindFixture) string {
+	t.Helper()
+	id, name, labels, err := liveHostdRebindDockerIdentity(fixture.ctx, fixture.docker, "volume", liveHostdRebindLegacyV1ConfigVolume)
+	if err != nil || !liveHostdRebindCanonicalLegacyV1Labels("volume", labels) ||
+		id != liveHostdRebindLegacyV1ConfigVolume || name != liveHostdRebindLegacyV1ConfigVolume {
+		t.Fatal("cannot verify canonical retained v1 config-volume baseline")
+	}
+	return name
+}
+
+func (resources liveHostdRebindLegacyV1Resources) removalIdentity(
+	ctx context.Context, docker, kind, candidate string, labels map[string]string,
+) (string, bool) {
+	if !liveHostdRebindCanonicalLegacyV1Labels(kind, labels) {
+		return "", false
+	}
+	id, name, inspectedLabels, err := liveHostdRebindDockerIdentity(ctx, docker, kind, candidate)
+	return resources.removalIdentityFromInspection(kind, id, name, labels, inspectedLabels, err)
+}
+
+func (resources liveHostdRebindLegacyV1Resources) removalIdentityFromInspection(
+	kind, id, name string, labels, inspectedLabels map[string]string, inspectErr error,
+) (string, bool) {
+	if inspectErr != nil || !liveHostdRebindCanonicalLegacyV1Labels(kind, labels) ||
+		!liveHostdRebindSameLabels(labels, inspectedLabels) {
+		return "", false
+	}
+	if !resources.matches(kind, id, name, labels) {
+		return "", false
+	}
+	if kind == "volume" {
+		return resources.configVolumeName, true
+	}
+	return id, true
+}
+
+type liveHostdRebindLegacyV1CleanupDecision uint8
+
+const (
+	liveHostdRebindLegacyV1NotApplicable liveHostdRebindLegacyV1CleanupDecision = iota
+	liveHostdRebindLegacyV1Delegate
+	liveHostdRebindLegacyV1Retain
+)
+
+func (resources liveHostdRebindLegacyV1Resources) cleanupDecision(
+	ctx context.Context, docker, kind, candidate string, labels map[string]string,
+) liveHostdRebindLegacyV1CleanupDecision {
+	if labels["io.rig.identity-version"] != "v1" {
+		return liveHostdRebindLegacyV1NotApplicable
+	}
+	id, name, inspectedLabels, err := liveHostdRebindDockerIdentity(ctx, docker, kind, candidate)
+	return resources.cleanupDecisionFromInspection(kind, id, name, labels, inspectedLabels, err)
+}
+
+func (resources liveHostdRebindLegacyV1Resources) cleanupDecisionFromInspection(
+	kind, id, name string, labels, inspectedLabels map[string]string, inspectErr error,
+) liveHostdRebindLegacyV1CleanupDecision {
+	if inspectErr != nil {
+		if liveHostdRebindLooksLikeLegacyV1(kind, "", labels) {
+			return liveHostdRebindLegacyV1Retain
+		}
+		return liveHostdRebindLegacyV1NotApplicable
+	}
+	if liveHostdRebindSameLabels(labels, inspectedLabels) && resources.matches(kind, id, name, labels) {
+		return liveHostdRebindLegacyV1Delegate
+	}
+	if liveHostdRebindLooksLikeLegacyV1(kind, name, labels) || liveHostdRebindLooksLikeLegacyV1(kind, name, inspectedLabels) {
+		return liveHostdRebindLegacyV1Retain
+	}
+	return liveHostdRebindLegacyV1NotApplicable
+}
+
+func liveHostdRebindLooksLikeLegacyV1(kind, name string, labels map[string]string) bool {
+	if labels["io.rig.identity-version"] == "v1" {
+		return true
+	}
+	switch kind {
+	case "container":
+		return name == liveHostdRebindLegacyV1ContainerName
+	case "network":
+		return name == liveHostdRebindLegacyV1NetworkName
+	case "volume":
+		return name == liveHostdRebindLegacyV1ConfigVolume
+	default:
+		return false
+	}
+}
+
+func (resources liveHostdRebindLegacyV1Resources) matches(kind, id, name string, labels map[string]string) bool {
+	if !liveHostdRebindCanonicalLegacyV1Labels(kind, labels) {
+		return false
+	}
+	switch kind {
+	case "container":
+		return name == liveHostdRebindLegacyV1ContainerName && id == resources.containerID &&
+			liveHostdRebindImmutableDockerID(resources.containerID)
+	case "network":
+		return name == liveHostdRebindLegacyV1NetworkName && id == resources.networkID &&
+			liveHostdRebindImmutableDockerID(resources.networkID)
+	case "volume":
+		return name == liveHostdRebindLegacyV1ConfigVolume && id == resources.configVolumeName &&
+			resources.configVolumeName == liveHostdRebindLegacyV1ConfigVolume
+	default:
+		return false
+	}
+}
+
+func liveHostdRebindCanonicalLegacyV1Labels(kind string, labels map[string]string) bool {
+	if labels["io.rig.identity-version"] != "v1" {
+		return false
+	}
+	switch kind {
+	case "container":
+		return labels["io.rig.managed"] == "generated-ingress" && labels["io.rig.listener-isolation"] == "v1"
+	case "network":
+		return labels["io.rig.managed"] == "generated-ingress-network"
+	case "volume":
+		return labels["io.rig.managed"] == "generated-ingress"
+	default:
+		return false
+	}
+}
+
+func liveHostdRebindDockerIdentity(ctx context.Context, docker, kind, candidate string) (string, string, map[string]string, error) {
+	identifierField := "{{.Id}}"
+	nameField := "{{.Name}}"
+	if kind == "volume" {
+		identifierField = "{{.Name}}"
+	}
+	idBody, err := controllerJourneyDocker(ctx, docker, nil, kind, "inspect", "--format", identifierField, candidate)
+	if err != nil {
+		return "", "", nil, err
+	}
+	nameBody, err := controllerJourneyDocker(ctx, docker, nil, kind, "inspect", "--format", nameField, candidate)
+	if err != nil {
+		return "", "", nil, err
+	}
+	labels, err := lanTwoAppDockerLabels(ctx, docker, kind, candidate)
+	if err != nil {
+		return "", "", nil, err
+	}
+	id, name := strings.TrimSpace(string(idBody)), strings.TrimPrefix(strings.TrimSpace(string(nameBody)), "/")
+	if id == "" || name == "" || strings.ContainsAny(id, "\r\n\t ") || strings.ContainsAny(name, "\r\n\t ") {
+		return "", "", nil, fmt.Errorf("invalid Docker %s identity", kind)
+	}
+	return id, name, labels, nil
+}
+
+func liveHostdRebindImmutableDockerID(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func liveHostdRebindSameLabels(first, second map[string]string) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for key, value := range first {
+		if second[key] != value {
+			return false
+		}
+	}
+	return true
 }
 
 func liveHostdGatewayRebindListenAddress(t *testing.T) string {
