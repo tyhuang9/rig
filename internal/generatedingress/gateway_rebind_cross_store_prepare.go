@@ -69,7 +69,7 @@ func (m *Manager) prepareGatewayRebindLocked(ctx context.Context, repository gat
 		return gatewayRebindPreparedAttempt{}, err
 	}
 	return m.installGatewayRebindPreparedProtectedLocked(ctx, claim, input.Inspection.Roster,
-		input.Inspection.RuntimeHeads, candidate.Checkpoint, m.gatewayRebindProgressTime())
+		input.Inspection.RuntimeHeads, candidate.Checkpoint, m.gatewayRebindPreparedTime(claim))
 }
 
 // prepareGatewayRebindStrictLocked is the request-bound admission path. Its
@@ -157,7 +157,7 @@ func (m *Manager) continueGatewayRebindStrictAdmissionLocked(ctx context.Context
 	}
 	prepared, err := m.installGatewayRebindPreparedProtectedWithNetworkLocked(ctx, strict.accepted.claim,
 		input.Inspection.Roster, input.Inspection.RuntimeHeads, strict.candidate.Checkpoint,
-		network, m.gatewayRebindProgressTime())
+		network, m.gatewayRebindPreparedTime(strict.accepted.claim))
 	return prepared, true, err
 }
 
@@ -308,7 +308,14 @@ func (m *Manager) recoverGatewayRebindPreparedAdmissionWithProofLocked(ctx conte
 	}
 	return m.installGatewayRebindPreparedProtectedWithNetworkLocked(ctx, claim,
 		snapshot.Active.RosterV2, snapshot.Active.RuntimeHeads, checkpoint,
-		network, m.gatewayRebindProgressTime())
+		network, m.gatewayRebindPreparedTime(claim))
+}
+
+// Construct a new progress time after its retained SQL claim even when adjacent
+// wall-clock reads are equal or the clock moved backwards. Stored history and
+// the installer's strict ordering validation remain unchanged.
+func (m *Manager) gatewayRebindPreparedTime(claim appaccess.GatewayRebindClaimV2) time.Time {
+	return gatewayRebindTimeStrictlyAfter(m.gatewayRebindProgressTime(), claim.CreatedAt.UTC().Format(time.RFC3339Nano))
 }
 
 func (m *Manager) gatewayRebindProgressTime() time.Time {
