@@ -208,7 +208,7 @@ func liveHostdRebindRunScenario(t *testing.T, scenarioID string) {
 		"pending-route-restart", "pending-lan-restart", "pending-lan-batch-restart",
 		"original-role-revocation", "current-role-revocation", "ownership-drift",
 		"configuration-drift", "census-drift", "emergency-withdrawal-failure",
-		"recovery-worker-isolation":
+		"recovery-worker-isolation", "recovery-background-isolation":
 		liveHostdRebindRunAdversarialScenario(t, scenarioID)
 	default:
 		t.Fatalf("unknown required rebind scenario %q", scenarioID)

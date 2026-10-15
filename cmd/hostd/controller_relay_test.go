@@ -205,7 +205,7 @@ func (relayRunnerFake) Reconcile() {}
 func TestControllerRelayDisabledDoesNotConstructOrRun(t *testing.T) {
 	var calls int
 	target := newControllerRelayManagementTarget()
-	done := startControllerRelay(context.Background(), config.Defaults(), newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { calls++; return nil, nil })
+	done := startControllerRelay(context.Background(), config.Defaults(), newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { calls++; return nil, nil }, nil)
 	if calls != 0 {
 		t.Fatalf("disabled relay factory calls=%d", calls)
 	}
@@ -231,7 +231,7 @@ func TestControllerRelayEnabledStartsWithoutBlockingAndDoesNotCancelHost(t *test
 	done := startControllerRelay(ctx, cfg, newStructuredLogger(&logs, "info"), newControllerRelayManagementTarget(), func() (controllerRelayRunner, error) {
 		calls++
 		return relayRunnerFake{started: started, release: release, err: errors.New(runSecret)}, nil
-	})
+	}, nil)
 	if time.Since(start) > 100*time.Millisecond {
 		t.Fatal("relay startup blocked host")
 	}
@@ -255,6 +255,31 @@ func TestControllerRelayEnabledStartsWithoutBlockingAndDoesNotCancelHost(t *test
 	}
 }
 
+func TestControllerRelayStartObserverReportsOnlyEnabledLaunch(t *testing.T) {
+	var disabledStarts, disabledFactories int
+	disabledDone := startControllerRelay(context.Background(), config.Defaults(), newStructuredLogger(&bytes.Buffer{}, "info"),
+		newControllerRelayManagementTarget(), func() (controllerRelayRunner, error) {
+			disabledFactories++
+			return nil, nil
+		}, func(hostdBackgroundComponent) { disabledStarts++ })
+	if disabledStarts != 0 || disabledFactories != 0 || !waitForWorker(disabledDone, time.Second) {
+		t.Fatalf("disabled relay starts=%d factories=%d", disabledStarts, disabledFactories)
+	}
+
+	cfg := config.Defaults()
+	cfg.ControllerRelay, cfg.RelayOrigin = true, "https://relay.example"
+	var observed hostdBackgroundComponent
+	factorySawObserver := false
+	done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), newControllerRelayManagementTarget(),
+		func() (controllerRelayRunner, error) {
+			factorySawObserver = observed == hostdBackgroundControllerRelay
+			return relayRunnerFake{started: make(chan struct{})}, nil
+		}, func(component hostdBackgroundComponent) { observed = component })
+	if !waitForWorker(done, time.Second) || observed != hostdBackgroundControllerRelay || !factorySawObserver {
+		t.Fatalf("enabled relay observed=%d factory_saw_observer=%t", observed, factorySawObserver)
+	}
+}
+
 func TestControllerRelaySlowFactoryDoesNotBlockHost(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.ControllerRelay = true
@@ -266,7 +291,7 @@ func TestControllerRelaySlowFactoryDoesNotBlockHost(t *testing.T) {
 		close(factoryStarted)
 		<-releaseFactory
 		return relayRunnerFake{started: runnerStarted}, nil
-	})
+	}, nil)
 	if time.Since(start) > 100*time.Millisecond {
 		t.Fatal("slow relay factory blocked host startup")
 	}
@@ -294,7 +319,7 @@ func TestControllerRelayConstructionFailureIsSafeAndNonfatal(t *testing.T) {
 	target := newControllerRelayManagementTarget()
 	done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&logs, "info"), target, func() (controllerRelayRunner, error) {
 		return nil, errors.New("https://relay.example secret-session-id")
-	})
+	}, nil)
 	if !waitForWorker(done, time.Second) {
 		t.Fatal("failed construction did not finish")
 	}
@@ -346,7 +371,7 @@ func TestControllerRelayManagementTargetReplaysOnlyAfterAsyncConstruction(t *tes
 		close(factoryEntered)
 		<-releaseFactory
 		return runner, nil
-	})
+	}, nil)
 	<-factoryEntered
 	for index := 0; index < 1000; index++ {
 		target.Reconcile()
@@ -430,7 +455,7 @@ func TestControllerRelayManagementTargetUnexpectedExitIsTerminalButCancellationI
 			management := &controllerRelayManagementFake{status: controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementAvailable, State: controllerrelay.SessionReady}}
 			started, release := make(chan struct{}), make(chan struct{})
 			runner := &terminatingManagedRelayRunnerFake{management: management, started: started, release: release, exitErr: exitErr}
-			done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil })
+			done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil }, nil)
 			<-started
 			if status := target.Status(); status.Availability != controllerrelay.ManagementAvailable || status.DiagnosticsUnavailable {
 				t.Fatalf("installed status=%#v", status)
@@ -472,7 +497,7 @@ func TestControllerRelayManagementTargetUnexpectedExitIsTerminalButCancellationI
 			management := &controllerRelayManagementFake{status: controllerrelay.ManagementStatus{Availability: controllerrelay.ManagementAvailable, State: controllerrelay.SessionStopped}}
 			started, release := make(chan struct{}), make(chan struct{})
 			runner := &terminatingManagedRelayRunnerFake{management: management, started: started, release: release, cancelErr: cancelErr}
-			done := startControllerRelay(ctx, cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil })
+			done := startControllerRelay(ctx, cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil }, nil)
 			<-started
 			cancel()
 			if !waitForWorker(done, time.Second) {
@@ -531,7 +556,7 @@ func TestControllerRelayManagementTargetDrainsAdmittedMutationsBeforeTerminalBou
 			management.blocked[test.index] = unblock
 			runnerStarted, runnerExit := make(chan struct{}), make(chan struct{})
 			runner := &terminatingManagedRelayRunnerFake{management: management, started: runnerStarted, release: runnerExit}
-			done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil })
+			done := startControllerRelay(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), target, func() (controllerRelayRunner, error) { return runner, nil }, nil)
 			<-runnerStarted
 
 			callDone := make(chan error, 1)
@@ -672,7 +697,7 @@ func TestControllerRelayShutdownDrainAndTimeout(t *testing.T) {
 	cfg.RelayOrigin = "https://relay.example"
 	ctx, cancel := context.WithCancel(context.Background())
 	started, release := make(chan struct{}), make(chan struct{})
-	done := startControllerRelay(ctx, cfg, newStructuredLogger(&bytes.Buffer{}, "info"), newControllerRelayManagementTarget(), func() (controllerRelayRunner, error) { return relayRunnerFake{started: started, release: release}, nil })
+	done := startControllerRelay(ctx, cfg, newStructuredLogger(&bytes.Buffer{}, "info"), newControllerRelayManagementTarget(), func() (controllerRelayRunner, error) { return relayRunnerFake{started: started, release: release}, nil }, nil)
 	<-started
 	cancel()
 	if !waitForWorker(done, time.Second) {
@@ -683,7 +708,7 @@ func TestControllerRelayShutdownDrainAndTimeout(t *testing.T) {
 	var timeoutLogs bytes.Buffer
 	stuck := startControllerRelay(stuckContext, cfg, newStructuredLogger(&timeoutLogs, "info"), newControllerRelayManagementTarget(), func() (controllerRelayRunner, error) {
 		return noncooperativeRelayRunner{started: stuckStarted, release: releaseStuck}, nil
-	})
+	}, nil)
 	<-stuckStarted
 	stopStuck()
 	if waitForControllerRelay(stuck, time.Millisecond, newStructuredLogger(&timeoutLogs, "info")) {

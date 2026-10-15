@@ -133,6 +133,7 @@ effects-release-fault
 gateway-release-fault
 emergency-withdrawal-failure
 recovery-worker-isolation
+recovery-background-isolation
 `
 
 var gatewayRebindLiveScenarios = []gatewayRebindLiveScenario{
@@ -165,6 +166,7 @@ var gatewayRebindLiveScenarios = []gatewayRebindLiveScenario{
 	{"gateway-release-fault", "failed gateway lock release returns no success and latches the process", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "releaseGatewayRebindTerminalLocks"},
 	{"emergency-withdrawal-failure", "failed exact-owned emergency withdrawal keeps ordinary authority closed", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "withdrawForwardSuccessorLocked"},
 	{"recovery-worker-isolation", "queued ordinary work remains untouched while recovery-only assembly omits worker, auto-deploy and relay graphs", "cmd/hostd/main.go", "runRecoveryOnlyController"},
+	{"recovery-background-isolation", "enabled auto-deploy and relay startup graphs remain absent through recovery readiness, probes and reconcile, then start and recover durable sentinels in a fresh normal process", "cmd/hostd/gateway_rebind_background_isolation_test.go", "liveHostdRebindRunRecoveryBackgroundIsolation"},
 }
 
 func TestGatewayRebindLiveRequiredManifestIsClosed(t *testing.T) {

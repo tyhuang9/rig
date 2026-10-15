@@ -289,12 +289,17 @@ func controllerRelayManagementUnavailable() error {
 
 // startControllerRelay is deliberately a no-op before invoking its factory
 // unless the paired controller relay configuration enabled it.
-func startControllerRelay(ctx context.Context, cfg config.Config, logger *slog.Logger, target *controllerRelayManagementTarget, factory controllerRelayFactory) <-chan struct{} {
+func startControllerRelay(ctx context.Context, cfg config.Config, logger *slog.Logger, target *controllerRelayManagementTarget,
+	factory controllerRelayFactory, observeStart hostdBackgroundStartObserver,
+) <-chan struct{} {
 	done := make(chan struct{})
 	if !cfg.ControllerRelay {
 		target.markUnavailable()
 		close(done)
 		return done
+	}
+	if observeStart != nil {
+		observeStart(hostdBackgroundControllerRelay)
 	}
 	go func() {
 		defer close(done)

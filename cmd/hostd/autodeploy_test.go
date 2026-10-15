@@ -89,7 +89,7 @@ func TestAutoDeployDefaultOffDoesNotConstruct(t *testing.T) {
 		done, wake, reconcile := startAutoDeploy(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), func() (autoDeployRunner, error) {
 			calls++
 			return nil, nil
-		})
+		}, nil)
 		wake()
 		reconcile()
 		if calls != 0 || !waitForWorker(done, time.Second) {
@@ -110,7 +110,7 @@ func TestAutoDeployEnabledIsAsyncIndependentAndForwardsPendingWake(t *testing.T)
 		close(factoryStarted)
 		<-releaseFactory
 		return runner, nil
-	})
+	}, nil)
 	if time.Since(start) > 100*time.Millisecond {
 		t.Fatal("auto-deploy factory blocked host startup")
 	}
@@ -142,9 +142,32 @@ func TestAutoDeployGeneratedRuntimeStartsFactory(t *testing.T) {
 	done, _, _ := startAutoDeploy(context.Background(), cfg, newStructuredLogger(&bytes.Buffer{}, "info"), func() (autoDeployRunner, error) {
 		calls++
 		return &autoDeployRunnerFake{}, nil
-	})
+	}, nil)
 	if !waitForWorker(done, time.Second) || calls != 1 {
 		t.Fatalf("generated factory calls=%d", calls)
+	}
+}
+
+func TestAutoDeployStartObserverReportsOnlyEnabledLaunch(t *testing.T) {
+	var disabledStarts, disabledFactories int
+	disabledDone, _, _ := startAutoDeploy(context.Background(), config.Defaults(), newStructuredLogger(&bytes.Buffer{}, "info"),
+		func() (autoDeployRunner, error) {
+			disabledFactories++
+			return nil, nil
+		}, func(hostdBackgroundComponent) { disabledStarts++ })
+	if disabledStarts != 0 || disabledFactories != 0 || !waitForWorker(disabledDone, time.Second) {
+		t.Fatalf("disabled auto-deploy starts=%d factories=%d", disabledStarts, disabledFactories)
+	}
+
+	var observed hostdBackgroundComponent
+	factorySawObserver := false
+	done, _, _ := startAutoDeploy(context.Background(), enabledAutoDeployConfig(), newStructuredLogger(&bytes.Buffer{}, "info"),
+		func() (autoDeployRunner, error) {
+			factorySawObserver = observed == hostdBackgroundAutoDeploy
+			return &autoDeployRunnerFake{}, nil
+		}, func(component hostdBackgroundComponent) { observed = component })
+	if !waitForWorker(done, time.Second) || observed != hostdBackgroundAutoDeploy || !factorySawObserver {
+		t.Fatalf("enabled auto-deploy observed=%d factory_saw_observer=%t", observed, factorySawObserver)
 	}
 }
 
@@ -155,7 +178,7 @@ func TestAutoDeployConstructionAndRunFailuresAreSanitized(t *testing.T) {
 		func() (autoDeployRunner, error) { return &autoDeployRunnerFake{err: errors.New(secret)}, nil },
 	} {
 		var logs bytes.Buffer
-		done, _, _ := startAutoDeploy(context.Background(), enabledAutoDeployConfig(), newStructuredLogger(&logs, "info"), factory)
+		done, _, _ := startAutoDeploy(context.Background(), enabledAutoDeployConfig(), newStructuredLogger(&logs, "info"), factory, nil)
 		if !waitForWorker(done, time.Second) {
 			t.Fatal("failure path did not drain")
 		}
