@@ -240,6 +240,8 @@ jobs:
           - rebind-typed-completed
           - rebind-typed-runtime
           - rebind-composition-native
+          - rebind-composition-startup
+          - rebind-composition-transferred
           - rebind-composition-second-generation
           - rebind-composition-legacy-source
           - current-lan

@@ -643,12 +643,7 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 		if err != nil {
 			destroySessionControlFrames(pending)
 			if controlFailureWasCanceled(err) {
-				if errors.Is(context.Cause(runCtx), errSessionExpired) {
-					return finish(sessionFailure(sessionErrorExpired, false))
-				}
-				if ctx.Err() != nil {
-					return finish(errSessionCancellationObserved)
-				}
+				return finish(sessionTerminalFailure(ctx, runCtx, controlSessionFailure(err)))
 			}
 			return finish(controlSessionFailure(err))
 		}
@@ -667,24 +662,18 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 	for {
 		select {
 		case <-runCtx.Done():
-			if errors.Is(context.Cause(runCtx), errSessionExpired) {
-				return finish(sessionFailure(sessionErrorExpired, false))
-			}
-			return finish(errSessionCancellationObserved)
+			return finish(sessionTerminalFailure(ctx, runCtx, errSessionCancellationObserved))
 		case err := <-writeErrors:
 			if err == nil {
 				err = sessionFailure(sessionErrorConnectionClosed, false)
 			}
-			return finish(err)
+			return finish(sessionTerminalFailure(ctx, runCtx, err))
 		case event := <-reads:
-			// Closing the socket to join the reader races with its terminal read
-			// result. Preserve expiry as the authoritative safe outcome when the
-			// session deadline canceled the run before observing that read error.
-			if errors.Is(context.Cause(runCtx), errSessionExpired) {
-				return finish(sessionFailure(sessionErrorExpired, false))
+			if err := sessionTerminalFailure(ctx, runCtx, nil); err != nil {
+				return finish(err)
 			}
 			if event.err != nil {
-				return finish(sessionFailure(sessionErrorConnectionClosed, false))
+				return finish(sessionTerminalFailure(ctx, runCtx, sessionFailure(sessionErrorConnectionClosed, false)))
 			}
 			lastSeen = session.transport.now()
 			remaining := session.expiresAt.Sub(lastSeen)
@@ -698,11 +687,11 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 			inboundCtx, cancelInbound := context.WithTimeout(runCtx, persistenceTimeout)
 			response, nextHeartbeat, action, err := session.handleInboundWithAction(inboundCtx, event.frame, inboundHeartbeat)
 			cancelInbound()
-			if errors.Is(context.Cause(runCtx), errSessionExpired) || !session.expiresAt.After(session.transport.now()) {
+			if !session.expiresAt.After(session.transport.now()) {
 				return finish(sessionFailure(sessionErrorExpired, false))
 			}
-			if ctx.Err() != nil {
-				return finish(nil)
+			if terminalErr := sessionTerminalFailure(ctx, runCtx, nil); terminalErr != nil {
+				return finish(terminalErr)
 			}
 			if err != nil {
 				return finish(err)
@@ -726,8 +715,11 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 			if !session.expiresAt.After(now) {
 				return finish(sessionFailure(sessionErrorExpired, false))
 			}
+			if err := sessionTerminalFailure(ctx, runCtx, nil); err != nil {
+				return finish(err)
+			}
 			if now.Sub(lastSeen) > time.Duration(defaultSessionIdleMultiplier)*session.heartbeatInterval {
-				return finish(sessionFailure(sessionErrorConnectionClosed, false))
+				return finish(sessionTerminalFailure(ctx, runCtx, sessionFailure(sessionErrorConnectionClosed, false)))
 			}
 			outboundHeartbeat++
 			messageID, err := session.transport.messageID()
@@ -740,6 +732,20 @@ func (session *activeControllerSession) run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// sessionTerminalFailure gives cancellation causes precedence over a terminal
+// reader or writer result. The parent context identifies a cancellation that
+// the caller has observed; raw context.Canceled from an independent operation
+// remains the supplied fallback.
+func sessionTerminalFailure(parentCtx, runCtx context.Context, fallback error) error {
+	if errors.Is(context.Cause(runCtx), errSessionExpired) {
+		return sessionFailure(sessionErrorExpired, false)
+	}
+	if parentCtx != nil && parentCtx.Err() != nil {
+		return errSessionCancellationObserved
+	}
+	return fallback
 }
 
 func (session *activeControllerSession) handleInbound(ctx context.Context, frame protocol.Frame, heartbeat uint64) (protocol.Frame, uint64, error) {
