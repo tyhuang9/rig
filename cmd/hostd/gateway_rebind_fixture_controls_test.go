@@ -14,6 +14,8 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	knownGateway := `{"msg":"gateway startup inspection failed","error":"/private/path ` + secret + `"}`
 	knownGatewayCheckpoint := `{"msg":"gateway startup inspection failed","startup_checkpoint":"upgrade_gateway_lock","error":"/private/path ` + secret + `"}`
 	unknownGatewayCheckpoint := `{"msg":"gateway startup inspection failed","startup_checkpoint":"forged-checkpoint","error":"/private/path ` + secret + `"}`
+	knownSnapshotCause := `{"msg":"gateway startup inspection failed","startup_checkpoint":"startup_snapshot_grants","startup_cause":"sqlite_locked","error":"/private/path ` + secret + `"}`
+	unknownSnapshotCause := `{"msg":"gateway startup inspection failed","startup_checkpoint":"startup_snapshot_grants","startup_cause":"forged-cause","error":"/private/path ` + secret + `"}`
 	secondary := `{"msg":"owned gateway emergency stop could not be verified","error":"` + secret + `"}`
 	cases := []struct {
 		name      string
@@ -24,6 +26,14 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		{name: "known exact message", stderr: knownRuntime, wantCode: "runtime_composition"},
 		{name: "primary precedes emergency stop", stderr: knownGateway + "\n" + secondary, wantCode: "gateway_inspection"},
 		{name: "known gateway checkpoint", stderr: knownGatewayCheckpoint, wantCode: "upgrade_gateway_lock"},
+		{name: "known snapshot stage and cause", stderr: knownSnapshotCause, wantCode: "startup_snapshot_grants cause=sqlite_locked"},
+		{name: "unknown snapshot cause keeps stage", stderr: unknownSnapshotCause, wantCode: "startup_snapshot_grants"},
+		{name: "numeric snapshot cause keeps stage", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":"startup_snapshot_grants","startup_cause":42,"error":"/private/path ` + secret + `"}`, wantCode: "startup_snapshot_grants"},
+		{name: "object snapshot cause keeps stage", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":"startup_snapshot_grants","startup_cause":{"value":"sqlite_locked"},"error":"/private/path ` + secret + `"}`, wantCode: "startup_snapshot_grants"},
+		{name: "array snapshot cause keeps stage", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":"startup_snapshot_grants","startup_cause":["sqlite_locked"],"error":"/private/path ` + secret + `"}`, wantCode: "startup_snapshot_grants"},
+		{name: "null snapshot cause keeps stage", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":"startup_snapshot_grants","startup_cause":null,"error":"/private/path ` + secret + `"}`, wantCode: "startup_snapshot_grants"},
+		{name: "snapshot cause ignored on non snapshot stage", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":"upgrade_gateway_lock","startup_cause":"sqlite_locked","error":"/private/path ` + secret + `"}`, wantCode: "upgrade_gateway_lock"},
+		{name: "raw error cannot manufacture snapshot cause", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":"startup_snapshot_grants","error":"sqlite_locked ` + secret + `"}`, wantCode: "startup_snapshot_grants"},
 		{name: "unknown gateway checkpoint keeps broad code", stderr: unknownGatewayCheckpoint, wantCode: "gateway_inspection"},
 		{name: "numeric gateway checkpoint keeps broad code", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":42,"error":"/private/path ` + secret + `"}`, wantCode: "gateway_inspection"},
 		{name: "object gateway checkpoint keeps broad code", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":{"value":"upgrade_gateway_lock"},"error":"/private/path ` + secret + `"}`, wantCode: "gateway_inspection"},
@@ -91,6 +101,43 @@ func TestLiveHostdRebindClosedDiagnosticCheckpointRoster(t *testing.T) {
 			}
 			if want := " startup=" + string(checkpoint); !strings.HasSuffix(got, want) {
 				t.Fatalf("closed diagnostic=%q want code %q", got, checkpoint)
+			}
+		})
+	}
+}
+
+func TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster(t *testing.T) {
+	const secret = "token=do-not-disclose"
+	cases := []struct {
+		checkpoint gatewayStartupDiagnosticCheckpoint
+		cause      gatewayStartupDiagnosticCause
+	}{
+		{gatewayStartupDiagnosticStartupSnapshotBegin, gatewayStartupDiagnosticCauseInvalidStoredState},
+		{gatewayStartupDiagnosticStartupSnapshotUpgrade, gatewayStartupDiagnosticCauseCanceled},
+		{gatewayStartupDiagnosticStartupSnapshotGrants, gatewayStartupDiagnosticCauseDeadlineExceeded},
+		{gatewayStartupDiagnosticStartupSnapshotDisables, gatewayStartupDiagnosticCauseSQLiteBusy},
+		{gatewayStartupDiagnosticStartupSnapshotRebind, gatewayStartupDiagnosticCauseSQLiteLocked},
+		{gatewayStartupDiagnosticStartupSnapshotRuntimeHeads, gatewayStartupDiagnosticCauseSQLiteError},
+		{gatewayStartupDiagnosticStartupSnapshotRuntimeComponents, gatewayStartupDiagnosticCauseSQLiteCorrupt},
+		{gatewayStartupDiagnosticStartupSnapshotApprovalAuthority, gatewayStartupDiagnosticCauseSQLiteIO},
+		{gatewayStartupDiagnosticStartupSnapshotCommit, gatewayStartupDiagnosticCauseSQLiteOther},
+		{gatewayStartupDiagnosticStartupSnapshotBegin, gatewayStartupDiagnosticCauseUnknown},
+	}
+	for _, test := range cases {
+		name := string(test.checkpoint) + "/" + string(test.cause)
+		t.Run(name, func(t *testing.T) {
+			stderr := `{"msg":"gateway startup inspection failed","startup_checkpoint":"` + string(test.checkpoint) +
+				`","startup_cause":"` + string(test.cause) + `","error":"/private/path ` + secret + `"}`
+			got := liveHostdRebindClosedDiagnostic(stderr)
+			if !strings.HasPrefix(got, "sha256:") || strings.Contains(got, secret) || strings.Contains(got, "/private/path") {
+				t.Fatalf("closed diagnostic exposed untrusted stderr: %q", got)
+			}
+			want := " startup=" + string(test.checkpoint)
+			if test.cause != gatewayStartupDiagnosticCauseUnknown {
+				want += " cause=" + string(test.cause)
+			}
+			if !strings.HasSuffix(got, want) {
+				t.Fatalf("closed diagnostic=%q want %q", got, want)
 			}
 		})
 	}

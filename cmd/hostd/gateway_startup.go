@@ -101,8 +101,8 @@ func inspectGatewayStartupUsingIngressWithRunner(ctx context.Context, cfg config
 	repository := appaccess.New(db)
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
 	if err != nil {
-		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticStartupSnapshot,
-			fmt.Errorf("read hosting gateway startup snapshot: %w", err))
+		return gatewayStartup{}, gatewayStartupDiagnosticWrapSnapshot(
+			fmt.Errorf("read hosting gateway startup snapshot: %w", err), err)
 	}
 	if !cfg.GeneratedRuntime {
 		history, err := hasProtectedGatewayUpgradeHistory(cfg.DataRoot)

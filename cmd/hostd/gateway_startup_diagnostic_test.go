@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/runtime/docker"
@@ -25,6 +26,15 @@ var gatewayStartupDiagnosticExpectedCheckpoints = []gatewayStartupDiagnosticChec
 	gatewayStartupDiagnosticPreparedCurrentRecheck,
 	gatewayStartupDiagnosticOrdinaryFence,
 	gatewayStartupDiagnosticStartupSnapshot,
+	gatewayStartupDiagnosticStartupSnapshotBegin,
+	gatewayStartupDiagnosticStartupSnapshotUpgrade,
+	gatewayStartupDiagnosticStartupSnapshotGrants,
+	gatewayStartupDiagnosticStartupSnapshotDisables,
+	gatewayStartupDiagnosticStartupSnapshotRebind,
+	gatewayStartupDiagnosticStartupSnapshotRuntimeHeads,
+	gatewayStartupDiagnosticStartupSnapshotRuntimeComponents,
+	gatewayStartupDiagnosticStartupSnapshotApprovalAuthority,
+	gatewayStartupDiagnosticStartupSnapshotCommit,
 	gatewayStartupDiagnosticDisabledRuntimeHistory,
 	gatewayStartupDiagnosticStartupManager,
 	gatewayStartupDiagnosticUpgradeInspection,
@@ -101,6 +111,34 @@ var gatewayStartupDiagnosticExpectedOuterStages = []gatewayStartupDiagnosticChec
 	gatewayStartupDiagnosticLANRecoverySelection,
 }
 
+var gatewayStartupDiagnosticExpectedSnapshotStages = []struct {
+	stage      string
+	checkpoint gatewayStartupDiagnosticCheckpoint
+}{
+	{stage: "begin", checkpoint: gatewayStartupDiagnosticStartupSnapshotBegin},
+	{stage: "upgrade", checkpoint: gatewayStartupDiagnosticStartupSnapshotUpgrade},
+	{stage: "grants", checkpoint: gatewayStartupDiagnosticStartupSnapshotGrants},
+	{stage: "disables", checkpoint: gatewayStartupDiagnosticStartupSnapshotDisables},
+	{stage: "rebind", checkpoint: gatewayStartupDiagnosticStartupSnapshotRebind},
+	{stage: "runtime_heads", checkpoint: gatewayStartupDiagnosticStartupSnapshotRuntimeHeads},
+	{stage: "runtime_components", checkpoint: gatewayStartupDiagnosticStartupSnapshotRuntimeComponents},
+	{stage: "active_approval_authority", checkpoint: gatewayStartupDiagnosticStartupSnapshotApprovalAuthority},
+	{stage: "commit", checkpoint: gatewayStartupDiagnosticStartupSnapshotCommit},
+}
+
+var gatewayStartupDiagnosticExpectedSnapshotCauses = []gatewayStartupDiagnosticCause{
+	gatewayStartupDiagnosticCauseUnknown,
+	gatewayStartupDiagnosticCauseInvalidStoredState,
+	gatewayStartupDiagnosticCauseCanceled,
+	gatewayStartupDiagnosticCauseDeadlineExceeded,
+	gatewayStartupDiagnosticCauseSQLiteBusy,
+	gatewayStartupDiagnosticCauseSQLiteLocked,
+	gatewayStartupDiagnosticCauseSQLiteError,
+	gatewayStartupDiagnosticCauseSQLiteCorrupt,
+	gatewayStartupDiagnosticCauseSQLiteIO,
+	gatewayStartupDiagnosticCauseSQLiteOther,
+}
+
 func TestGatewayStartupDiagnosticClosedCheckpointContract(t *testing.T) {
 	seen := make(map[gatewayStartupDiagnosticCheckpoint]struct{}, len(gatewayStartupDiagnosticExpectedCheckpoints))
 	for _, expected := range gatewayStartupDiagnosticExpectedCheckpoints {
@@ -116,6 +154,32 @@ func TestGatewayStartupDiagnosticClosedCheckpointContract(t *testing.T) {
 	for _, forged := range []string{"", "unknown", "upgrade_gateway_lock_extra", "UPGRADE_GATEWAY_LOCK", "lan_gateway_unlock\nsecret"} {
 		if got, ok := gatewayStartupDiagnosticCheckpointFromString(forged); ok || got != "" {
 			t.Fatalf("forged checkpoint %q parsed as %q", forged, got)
+		}
+	}
+}
+
+func TestGatewayStartupDiagnosticSnapshotStageAndCauseContract(t *testing.T) {
+	for _, expected := range gatewayStartupDiagnosticExpectedSnapshotStages {
+		t.Run(expected.stage, func(t *testing.T) {
+			got, ok := gatewayStartupDiagnosticSnapshotCheckpointForStage(expected.stage)
+			if !ok || got != expected.checkpoint || !gatewayStartupDiagnosticSnapshotCheckpoint(got) {
+				t.Fatalf("stage=%q checkpoint=%q ok=%t", expected.stage, got, ok)
+			}
+		})
+	}
+	if got, ok := gatewayStartupDiagnosticSnapshotCheckpointForStage("forged"); ok ||
+		got != gatewayStartupDiagnosticStartupSnapshot || gatewayStartupDiagnosticSnapshotCheckpoint(got) {
+		t.Fatalf("forged stage mapped to checkpoint=%q ok=%t", got, ok)
+	}
+	for _, expected := range gatewayStartupDiagnosticExpectedSnapshotCauses {
+		got, ok := gatewayStartupDiagnosticCauseFromString(string(expected))
+		if !ok || got != expected {
+			t.Fatalf("cause=%q parsed as %q ok=%t", expected, got, ok)
+		}
+	}
+	for _, forged := range []string{"", "sqlite_busy_extra", "SQLITE_BUSY", "sqlite_other\nmarker"} {
+		if got, ok := gatewayStartupDiagnosticCauseFromString(forged); ok || got != gatewayStartupDiagnosticCauseUnknown {
+			t.Fatalf("forged cause %q parsed as %q", forged, got)
 		}
 	}
 }
@@ -234,7 +298,7 @@ func TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths(t *testing.T) {
 		if err == nil {
 			t.Fatal("closed database snapshot was accepted")
 		}
-		if got := gatewayStartupDiagnosticCheckpointForError(err); got != "startup_snapshot" {
+		if got := gatewayStartupDiagnosticCheckpointForError(err); got != "startup_snapshot_begin" {
 			t.Fatalf("checkpoint=%q error=%v", got, err)
 		}
 	})
@@ -263,5 +327,32 @@ func TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult(t *testing.T) {
 	var ingressCause *generatedingress.Error
 	if !errors.As(wrapped, &ingressCause) || ingressCause == nil || !errors.Is(wrapped, ingressErr) {
 		t.Fatalf("direct ingress cause was not retained: %v", wrapped)
+	}
+}
+
+func TestGatewayStartupDiagnosticUsesDirectSnapshotResult(t *testing.T) {
+	fixture := newRuntimeCompositionFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, snapshotErr := appaccess.New(fixture.db).HostingGatewayStartupSnapshot(ctx)
+	stage, cause := appaccess.HostingGatewayStartupDiagnostic(snapshotErr)
+	if snapshotErr == nil || stage != "begin" || cause != "canceled" || !errors.Is(snapshotErr, context.Canceled) {
+		t.Fatalf("canceled snapshot stage=%q cause=%q error=%v", stage, cause, snapshotErr)
+	}
+	contextual := fmt.Errorf("read hosting gateway startup snapshot: %w", snapshotErr)
+	wrapped := gatewayStartupDiagnosticWrapSnapshot(contextual, snapshotErr)
+	if got := gatewayStartupDiagnosticCheckpointForError(wrapped); got != "startup_snapshot_begin" {
+		t.Fatalf("checkpoint=%q error=%v", got, wrapped)
+	}
+	if got := gatewayStartupDiagnosticCauseForError(wrapped); got != "canceled" {
+		t.Fatalf("cause=%q error=%v", got, wrapped)
+	}
+	if !errors.Is(wrapped, context.Canceled) || !errors.Is(wrapped, snapshotErr) ||
+		wrapped.Error() != "gateway startup diagnostic failed" {
+		t.Fatalf("snapshot wrapper did not retain the original cause: %v", wrapped)
+	}
+	if got := gatewayStartupDiagnosticCauseForError(gatewayStartupDiagnosticWrap(
+		gatewayStartupDiagnosticOrdinaryFence, errors.New("ordinary failure"))); got != "unknown" {
+		t.Fatalf("non-snapshot cause was emitted: %q", got)
 	}
 }

@@ -84,39 +84,48 @@ func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (Hosting
 	}
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageBegin, err)
 	}
 	defer tx.Rollback()
 	gateway, err := r.readGatewayUpgradeStartupSnapshot(ctx, tx)
 	if err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageUpgrade, err)
 	}
 	grants, err := r.readAppAccessGrantStartupSnapshot(ctx, tx)
 	if err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageGrants, err)
 	}
 	disables, err := r.readAppAccessDisableStartupSnapshot(ctx, tx)
 	if err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageDisables, err)
 	}
 	rebind, err := readGatewayRebindRecoverySnapshot(ctx, tx)
 	if err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageRebind, err)
 	}
 	heads, err := readGatewayRebindRuntimeHeads(ctx, tx)
 	if err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageRuntimeHeads, err)
 	}
 	components, err := readGatewayStartupRuntimeComponents(ctx, tx, heads)
 	if err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageRuntimeComponents, err)
 	}
 	approvals, err := readGatewayRebindActiveApprovalAuthority(ctx, tx, rebind)
 	if err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageActiveApprovalAuthority, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return HostingGatewayStartupSnapshot{}, err
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageCommit, err)
 	}
 	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants, Disables: disables, Rebind: rebind,
 		RuntimeHeads: heads, RuntimeComponents: components, ActiveRebindApprovalAuthority: approvals}, nil

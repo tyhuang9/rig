@@ -848,6 +848,7 @@ func liveHostdRebindStartupDiagnosticCode(stderr string) string {
 		var record struct {
 			Message           string          `json:"msg"`
 			StartupCheckpoint json.RawMessage `json:"startup_checkpoint"`
+			StartupCause      json.RawMessage `json:"startup_cause"`
 		}
 		if json.Unmarshal(line, &record) != nil {
 			continue
@@ -855,6 +856,9 @@ func liveHostdRebindStartupDiagnosticCode(stderr string) string {
 		code, isPrimary, ok := liveHostdRebindKnownStartupMessage(record.Message)
 		if ok && record.Message == "gateway startup inspection failed" {
 			code = liveHostdRebindGatewayStartupDiagnosticCode(record.StartupCheckpoint)
+			if cause := liveHostdRebindGatewayStartupSnapshotCause(code, record.StartupCause); cause != "" {
+				code += " cause=" + cause
+			}
 		}
 		if !ok {
 			continue
@@ -883,6 +887,25 @@ func liveHostdRebindGatewayStartupDiagnosticCode(raw json.RawMessage) string {
 		return "gateway_inspection"
 	}
 	return string(checkpoint)
+}
+
+// liveHostdRebindGatewayStartupSnapshotCause accepts a cause only for the
+// exact snapshot checkpoints. A malformed, unknown, or broad/non-snapshot
+// pairing deliberately leaves the pre-existing stage diagnostic unchanged.
+func liveHostdRebindGatewayStartupSnapshotCause(code string, raw json.RawMessage) string {
+	checkpoint, ok := gatewayStartupDiagnosticCheckpointFromString(code)
+	if !ok || !gatewayStartupDiagnosticSnapshotCheckpoint(checkpoint) {
+		return ""
+	}
+	var value string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return ""
+	}
+	cause, ok := gatewayStartupDiagnosticCauseFromString(value)
+	if !ok || cause == gatewayStartupDiagnosticCauseUnknown {
+		return ""
+	}
+	return string(cause)
 }
 
 // liveHostdRebindKnownStartupMessage is intentionally a closed mapping of

@@ -225,6 +225,66 @@ workspace wrapper. Final raw test log hashes:
 - Windows: `2c42d5471e76d937e218729b21990a8f332113fb8c99b101f75d9a2230c2c9a3`.
 - Linux: `dc84d1bff31be000817ace3d93ec032b57a6680375ba579221bdd4df7f88194b`.
 
+## SQL stage and cause diagnostics
+
+The next refinement observes the actual child's failing snapshot without changing
+fixture setup. The repository returns a private wrapper at its nine existing
+error boundaries: transaction begin, upgrades, grants, disables, rebind state,
+runtime heads, runtime components, active approval authority, and commit.
+Original error text, JSON serialization, unwrap identity, result-zeroing, read
+ordering and transaction behavior are preserved. The dependency guard and all
+validators are unchanged.
+
+`HostingGatewayStartupDiagnostic` accepts only that direct private wrapper. It
+returns a closed stage and cause class; it does not inspect error text or invoke
+custom `Is`, `As` or `Unwrap` methods. Cause classification uses direct sentinels
+and the concrete SQLite error type. The categories distinguish invalid stored
+state, cancellation/deadline, SQLite busy/locked/query/corruption/I/O/other errors,
+and unknown. Wrapped or unrecognized causes deliberately remain unknown.
+
+The existing `gateway startup inspection failed` log emits only finite
+`startup_checkpoint` and `startup_cause` fields. The live parser includes a cause
+only for that exact message and a known snapshot checkpoint. Invalid field types
+or values retain the stage diagnostic. Existing hashing, byte/record limits and
+first-primary precedence remain intact. No raw error attributes are added.
+
+The changed source passed **65 parent tests and 342 subcases per platform**:
+
+| Package | Parents | Subcases | Windows seconds | Linux seconds |
+| --- | ---: | ---: | ---: | ---: |
+| `internal/appaccess` | 11 | 58 | 2.661 | 2.667 |
+| `cmd/hostd` | 54 | 284 | 5.689 | 7.202 |
+
+Both platforms used explicit discovery and uncached test binaries compiled with
+`go test -tags live_docker -c`, then `go tool test2json` and
+`-test.v=test2json -test.count=1 -test.timeout=10m`. There were no failures or
+skips. All 957 source hashes matched before and after execution. Windows and
+Linux `go build ./cmd/hostd` and
+`go vet -tags live_docker ./cmd/hostd ./internal/appaccess` passed.
+
+The workflow now requires 20 controller controls before each supported-hostd
+live job. Its 13 synthetic filter cases and shell checks passed; comparison with
+the earlier workflow confirms the full recovery matrix, dependencies, timeouts
+and cleanup remain intact. Workflow SHA-256:
+`9bda4866e72465382f186243fd087c53ac462899fa9694ee0f352d796eb4b93b`.
+Independent static code and security reviews found no blocking issue.
+
+Receipts, exact rosters and commands are under
+`temp/m3-lan-external-db-20261015/snapshot-diagnostic-verification/` in the
+workspace wrapper. Raw log hashes:
+
+- Windows appaccess: `ba2674924e7f1d788c9e3c37cdaefb3f552e2874a8ba1867a3bc266bfcef1533`.
+- Linux appaccess: `4e6d64c383ac58655de74bacc66e984a29576cfbd83c414de9822cdcb7011899`.
+- Windows controller: `549bb72402d8b6db6583c46bea33f30b0b6328253f85e08c9da59b3b7b325e48`.
+- Linux controller: `7aa9b486a8de9a736d3e1b5b8a14ba5b37aadd9c3be7118842a7ca6e6c683340`.
+
+This is diagnostic coverage, not a repair or Docker acceptance. Local Docker,
+local race execution and physical second-device LAN checks remain unavailable.
+The repository-wide `make test` and browser suite were not repeated locally;
+hosted CI supplies those broader checks for the published candidate. The new
+hosted result must identify the failed stage/cause before selecting a behavioral
+repair. M3 remains incomplete.
+
 ## Rollback
 
 Revert the relevant diagnostic commit through the PR process if needed. No

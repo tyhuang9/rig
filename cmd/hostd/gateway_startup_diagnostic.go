@@ -1,6 +1,9 @@
 package main
 
-import "github.com/hostd/hostd/internal/generatedingress"
+import (
+	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/generatedingress"
+)
 
 // gatewayStartupDiagnosticCheckpoint is closed, audit-safe observation data
 // for the startup inspection gate. It is never admission authority: the
@@ -16,6 +19,15 @@ const (
 	gatewayStartupDiagnosticPreparedCurrentRecheck            gatewayStartupDiagnosticCheckpoint = "prepared_current_recheck"
 	gatewayStartupDiagnosticOrdinaryFence                     gatewayStartupDiagnosticCheckpoint = "ordinary_fence"
 	gatewayStartupDiagnosticStartupSnapshot                   gatewayStartupDiagnosticCheckpoint = "startup_snapshot"
+	gatewayStartupDiagnosticStartupSnapshotBegin              gatewayStartupDiagnosticCheckpoint = "startup_snapshot_begin"
+	gatewayStartupDiagnosticStartupSnapshotUpgrade            gatewayStartupDiagnosticCheckpoint = "startup_snapshot_upgrade"
+	gatewayStartupDiagnosticStartupSnapshotGrants             gatewayStartupDiagnosticCheckpoint = "startup_snapshot_grants"
+	gatewayStartupDiagnosticStartupSnapshotDisables           gatewayStartupDiagnosticCheckpoint = "startup_snapshot_disables"
+	gatewayStartupDiagnosticStartupSnapshotRebind             gatewayStartupDiagnosticCheckpoint = "startup_snapshot_rebind"
+	gatewayStartupDiagnosticStartupSnapshotRuntimeHeads       gatewayStartupDiagnosticCheckpoint = "startup_snapshot_runtime_heads"
+	gatewayStartupDiagnosticStartupSnapshotRuntimeComponents  gatewayStartupDiagnosticCheckpoint = "startup_snapshot_runtime_components"
+	gatewayStartupDiagnosticStartupSnapshotApprovalAuthority  gatewayStartupDiagnosticCheckpoint = "startup_snapshot_active_approval_authority"
+	gatewayStartupDiagnosticStartupSnapshotCommit             gatewayStartupDiagnosticCheckpoint = "startup_snapshot_commit"
 	gatewayStartupDiagnosticDisabledRuntimeHistory            gatewayStartupDiagnosticCheckpoint = "disabled_runtime_history"
 	gatewayStartupDiagnosticStartupManager                    gatewayStartupDiagnosticCheckpoint = "startup_manager"
 	gatewayStartupDiagnosticUpgradeInspection                 gatewayStartupDiagnosticCheckpoint = "upgrade_inspection"
@@ -70,6 +82,21 @@ const (
 	gatewayStartupDiagnosticLANGatewayUnlock                  gatewayStartupDiagnosticCheckpoint = "lan_gateway_unlock"
 )
 
+type gatewayStartupDiagnosticCause string
+
+const (
+	gatewayStartupDiagnosticCauseUnknown            gatewayStartupDiagnosticCause = "unknown"
+	gatewayStartupDiagnosticCauseInvalidStoredState gatewayStartupDiagnosticCause = "invalid_stored_state"
+	gatewayStartupDiagnosticCauseCanceled           gatewayStartupDiagnosticCause = "canceled"
+	gatewayStartupDiagnosticCauseDeadlineExceeded   gatewayStartupDiagnosticCause = "deadline_exceeded"
+	gatewayStartupDiagnosticCauseSQLiteBusy         gatewayStartupDiagnosticCause = "sqlite_busy"
+	gatewayStartupDiagnosticCauseSQLiteLocked       gatewayStartupDiagnosticCause = "sqlite_locked"
+	gatewayStartupDiagnosticCauseSQLiteError        gatewayStartupDiagnosticCause = "sqlite_error"
+	gatewayStartupDiagnosticCauseSQLiteCorrupt      gatewayStartupDiagnosticCause = "sqlite_corrupt"
+	gatewayStartupDiagnosticCauseSQLiteIO           gatewayStartupDiagnosticCause = "sqlite_io"
+	gatewayStartupDiagnosticCauseSQLiteOther        gatewayStartupDiagnosticCause = "sqlite_other"
+)
+
 // gatewayStartupDiagnosticCheckpointFromString is the only parser for a
 // checkpoint. Its closed switch is shared by the main logger and live stderr
 // harness; values are not accepted by prefix, syntax, or caller assertion.
@@ -84,6 +111,15 @@ func gatewayStartupDiagnosticCheckpointFromString(value string) (gatewayStartupD
 		gatewayStartupDiagnosticPreparedCurrentRecheck,
 		gatewayStartupDiagnosticOrdinaryFence,
 		gatewayStartupDiagnosticStartupSnapshot,
+		gatewayStartupDiagnosticStartupSnapshotBegin,
+		gatewayStartupDiagnosticStartupSnapshotUpgrade,
+		gatewayStartupDiagnosticStartupSnapshotGrants,
+		gatewayStartupDiagnosticStartupSnapshotDisables,
+		gatewayStartupDiagnosticStartupSnapshotRebind,
+		gatewayStartupDiagnosticStartupSnapshotRuntimeHeads,
+		gatewayStartupDiagnosticStartupSnapshotRuntimeComponents,
+		gatewayStartupDiagnosticStartupSnapshotApprovalAuthority,
+		gatewayStartupDiagnosticStartupSnapshotCommit,
 		gatewayStartupDiagnosticDisabledRuntimeHistory,
 		gatewayStartupDiagnosticStartupManager,
 		gatewayStartupDiagnosticUpgradeInspection,
@@ -142,11 +178,73 @@ func gatewayStartupDiagnosticCheckpointFromString(value string) (gatewayStartupD
 	}
 }
 
+func gatewayStartupDiagnosticCauseFromString(value string) (gatewayStartupDiagnosticCause, bool) {
+	cause := gatewayStartupDiagnosticCause(value)
+	switch cause {
+	case gatewayStartupDiagnosticCauseUnknown,
+		gatewayStartupDiagnosticCauseInvalidStoredState,
+		gatewayStartupDiagnosticCauseCanceled,
+		gatewayStartupDiagnosticCauseDeadlineExceeded,
+		gatewayStartupDiagnosticCauseSQLiteBusy,
+		gatewayStartupDiagnosticCauseSQLiteLocked,
+		gatewayStartupDiagnosticCauseSQLiteError,
+		gatewayStartupDiagnosticCauseSQLiteCorrupt,
+		gatewayStartupDiagnosticCauseSQLiteIO,
+		gatewayStartupDiagnosticCauseSQLiteOther:
+		return cause, true
+	default:
+		return gatewayStartupDiagnosticCauseUnknown, false
+	}
+}
+
+func gatewayStartupDiagnosticSnapshotCheckpointForStage(stage string) (gatewayStartupDiagnosticCheckpoint, bool) {
+	switch stage {
+	case "begin":
+		return gatewayStartupDiagnosticStartupSnapshotBegin, true
+	case "upgrade":
+		return gatewayStartupDiagnosticStartupSnapshotUpgrade, true
+	case "grants":
+		return gatewayStartupDiagnosticStartupSnapshotGrants, true
+	case "disables":
+		return gatewayStartupDiagnosticStartupSnapshotDisables, true
+	case "rebind":
+		return gatewayStartupDiagnosticStartupSnapshotRebind, true
+	case "runtime_heads":
+		return gatewayStartupDiagnosticStartupSnapshotRuntimeHeads, true
+	case "runtime_components":
+		return gatewayStartupDiagnosticStartupSnapshotRuntimeComponents, true
+	case "active_approval_authority":
+		return gatewayStartupDiagnosticStartupSnapshotApprovalAuthority, true
+	case "commit":
+		return gatewayStartupDiagnosticStartupSnapshotCommit, true
+	default:
+		return gatewayStartupDiagnosticStartupSnapshot, false
+	}
+}
+
+func gatewayStartupDiagnosticSnapshotCheckpoint(checkpoint gatewayStartupDiagnosticCheckpoint) bool {
+	switch checkpoint {
+	case gatewayStartupDiagnosticStartupSnapshotBegin,
+		gatewayStartupDiagnosticStartupSnapshotUpgrade,
+		gatewayStartupDiagnosticStartupSnapshotGrants,
+		gatewayStartupDiagnosticStartupSnapshotDisables,
+		gatewayStartupDiagnosticStartupSnapshotRebind,
+		gatewayStartupDiagnosticStartupSnapshotRuntimeHeads,
+		gatewayStartupDiagnosticStartupSnapshotRuntimeComponents,
+		gatewayStartupDiagnosticStartupSnapshotApprovalAuthority,
+		gatewayStartupDiagnosticStartupSnapshotCommit:
+		return true
+	default:
+		return false
+	}
+}
+
 // gatewayStartupDiagnosticError keeps the original cause observable to normal
 // callers while keeping the diagnostic's Error string fixed and private.
 type gatewayStartupDiagnosticError struct {
-	checkpoint gatewayStartupDiagnosticCheckpoint
-	cause      error
+	checkpoint    gatewayStartupDiagnosticCheckpoint
+	snapshotCause gatewayStartupDiagnosticCause
+	cause         error
 }
 
 func (e *gatewayStartupDiagnosticError) Error() string {
@@ -184,6 +282,29 @@ func gatewayStartupDiagnosticWrapIngress(checkpoint gatewayStartupDiagnosticChec
 	return gatewayStartupDiagnosticWrap(checkpoint, cause)
 }
 
+// gatewayStartupDiagnosticWrapSnapshot reads appaccess metadata from the
+// direct repository result before its existing contextual error is assembled.
+// An unknown stage deliberately retains the pre-existing broad checkpoint and
+// emits no cause classification.
+func gatewayStartupDiagnosticWrapSnapshot(cause, snapshotErr error) error {
+	if cause == nil {
+		return nil
+	}
+	if existing, ok := cause.(*gatewayStartupDiagnosticError); ok && existing != nil {
+		return cause
+	}
+	stage, causeKind := appaccess.HostingGatewayStartupDiagnostic(snapshotErr)
+	checkpoint, knownStage := gatewayStartupDiagnosticSnapshotCheckpointForStage(stage)
+	if !knownStage {
+		return &gatewayStartupDiagnosticError{checkpoint: checkpoint, snapshotCause: gatewayStartupDiagnosticCauseUnknown, cause: cause}
+	}
+	classifiedCause, ok := gatewayStartupDiagnosticCauseFromString(causeKind)
+	if !ok {
+		classifiedCause = gatewayStartupDiagnosticCauseUnknown
+	}
+	return &gatewayStartupDiagnosticError{checkpoint: checkpoint, snapshotCause: classifiedCause, cause: cause}
+}
+
 // gatewayStartupDiagnosticCheckpointForError accepts only the private wrapper
 // assembled at this gate. It deliberately does not walk error chains, inspect
 // text, or trust implementable external types.
@@ -197,4 +318,16 @@ func gatewayStartupDiagnosticCheckpointForError(err error) string {
 		return "unknown"
 	}
 	return string(checkpoint)
+}
+
+func gatewayStartupDiagnosticCauseForError(err error) string {
+	wrapped, ok := err.(*gatewayStartupDiagnosticError)
+	if !ok || wrapped == nil || !gatewayStartupDiagnosticSnapshotCheckpoint(wrapped.checkpoint) {
+		return string(gatewayStartupDiagnosticCauseUnknown)
+	}
+	cause, ok := gatewayStartupDiagnosticCauseFromString(string(wrapped.snapshotCause))
+	if !ok {
+		return string(gatewayStartupDiagnosticCauseUnknown)
+	}
+	return string(cause)
 }
