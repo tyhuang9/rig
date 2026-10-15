@@ -536,8 +536,8 @@ func TestWriterFailurePropagatesAndForcedCloseUnblocksWriter(t *testing.T) {
 			t.Fatal("writer failure did not propagate promptly")
 		}
 		started = time.Now()
-		if err := session.sendFrame(ctx, frame); err == nil {
-			t.Fatal("second send to exited writer succeeded")
+		if err := session.sendFrame(ctx, frame); !errors.Is(err, writeFailure) {
+			t.Fatalf("second error=%v, want writer cause", err)
 		}
 		if time.Since(started) > 200*time.Millisecond {
 			t.Fatal("second send did not observe durable writer exit")
