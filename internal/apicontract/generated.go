@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "bb03a9ccef2f6ce597f9c466a6a97045c698ab1cafe8bc279662c82a0bc4adba"
+const SourceSHA256 = "f066e1616bbfbbc7500d58c68360e518e2cb52a29eb7632434821e7586e90a4e"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -32,6 +32,7 @@ var Operations = map[string]Operation{
 	"getApplicationLANDisable":                  {Method: "GET", Path: "/api/v1/apps/{appId}/lan-access/disables/{operationId}"},
 	"getApplicationLANGrant":                    {Method: "GET", Path: "/api/v1/apps/{appId}/lan-access/grants/{attemptId}"},
 	"getApplicationLocalRoute":                  {Method: "GET", Path: "/api/v1/apps/{appId}/local-route"},
+	"getControllerRecovery":                     {Method: "GET", Path: "/api/v1/system/recovery"},
 	"getDefaultSourceConnection":                {Method: "GET", Path: "/api/v1/source-connections/default"},
 	"getDeploymentJobByIdempotency":             {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-jobs/by-idempotency"},
 	"getJob":                                    {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
@@ -311,6 +312,17 @@ type ConnectedGitHubRepositoryPage struct {
 	PerPage    int                         `json:"perPage"`
 	TotalCount int                         `json:"totalCount"`
 	Truncated  bool                        `json:"truncated"`
+}
+
+type ControllerRecovery struct {
+	Mode     string                     `json:"mode"`
+	Recovery *ControllerRecoveryLocator `json:"recovery,omitempty"`
+	Version  int                        `json:"version"`
+}
+
+type ControllerRecoveryLocator struct {
+	Kind        string `json:"kind"`
+	OperationID string `json:"operationId"`
 }
 
 type CreateApplicationRequest struct {

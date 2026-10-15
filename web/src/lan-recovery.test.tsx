@@ -120,7 +120,12 @@ async function confirmAndSubmit(name: string) {
 }
 
 describe("authenticated operator mode gate", () => {
-  beforeEach(() => vi.restoreAllMocks());
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({
+      version: 1, mode: "recovery_only", recovery: { kind: "lan_grant", operationId },
+    } as never);
+  });
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
@@ -150,6 +155,68 @@ describe("authenticated operator mode gate", () => {
     expect(await screen.findByRole("heading", { name: "LAN reconciliation required" })).not.toBeNull();
     expect(screen.queryByText("Normal operator routes")).toBeNull();
     expect(screen.queryByRole("navigation")).toBeNull();
+  });
+
+  it("dispatches an exact gateway rebind locator without probing legacy LAN recovery", async () => {
+    vi.spyOn(api, "status").mockRejectedValue(recoveryRequired());
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({
+      version: 1, mode: "recovery_only", recovery: { kind: "gateway_rebind", operationId },
+    } as never);
+    const legacyHead = vi.spyOn(api, "lanRecoveryHead");
+    const rebind = vi.spyOn(api, "getLANGatewayRebind").mockResolvedValue({
+      version: 1, operationId, availability: "unavailable", active: true, historicalTerminal: false,
+      terminalProof: "unknown", currentProof: "unknown", operationFence: "held", allowedActions: [],
+      operation: { operationId, storedState: "prepared", stateSequence: 1, databaseCommitObserved: false },
+    } as never);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(<QueryClientProvider client={client}><AuthenticatedOperatorGate onSignOut={() => undefined}><div>Normal operator routes</div></AuthenticatedOperatorGate></QueryClientProvider>);
+
+    expect(await screen.findByRole("heading", { name: "LAN gateway recovery required" })).not.toBeNull();
+    expect(rebind).toHaveBeenCalledWith(operationId);
+    expect(legacyHead).not.toHaveBeenCalled();
+    expect(screen.queryByText("Normal operator routes")).toBeNull();
+  });
+
+  it("dispatches an exact gateway upgrade locator without probing normal or legacy recovery reads", async () => {
+    vi.spyOn(api, "status").mockRejectedValue(recoveryRequired());
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({
+      version: 1, mode: "recovery_only", recovery: { kind: "gateway_upgrade", operationId },
+    } as never);
+    const legacyHead = vi.spyOn(api, "lanRecoveryHead");
+    const upgradeRead = vi.spyOn(api, "lanGatewayUpgrade");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(<QueryClientProvider client={client}><AuthenticatedOperatorGate onSignOut={() => undefined}><div>Normal operator routes</div></AuthenticatedOperatorGate></QueryClientProvider>);
+
+    expect(await screen.findByRole("heading", { name: "LAN gateway upgrade recovery required" })).not.toBeNull();
+    expect(upgradeRead).not.toHaveBeenCalled();
+    expect(legacyHead).not.toHaveBeenCalled();
+    expect(screen.queryByText("Normal operator routes")).toBeNull();
+  });
+  it("keeps a viewer isolated without an administrator recovery read", async () => {
+    vi.spyOn(api, "status").mockRejectedValue(recoveryRequired());
+    const locator = vi.spyOn(api, "getControllerRecovery");
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(<QueryClientProvider client={client}><AuthenticatedOperatorGate role="viewer" onSignOut={() => undefined}><div>Normal operator routes</div></AuthenticatedOperatorGate></QueryClientProvider>);
+
+    expect(await screen.findByText("Administrator access is required")).not.toBeNull();
+    expect(locator).not.toHaveBeenCalled();
+    expect(screen.queryByText("Normal operator routes")).toBeNull();
+  });
+
+  it("keeps recovery latched until an explicit healthy status check after a normal no-locator discovery", async () => {
+    vi.spyOn(api, "status").mockRejectedValueOnce(recoveryRequired()).mockResolvedValueOnce(normalStatus);
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({ version: 1, mode: "normal" } as never);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(<QueryClientProvider client={client}><AuthenticatedOperatorGate onSignOut={() => undefined}><div>Normal operator routes</div></AuthenticatedOperatorGate></QueryClientProvider>);
+
+    expect(await screen.findByText("No active LAN recovery is recorded")).not.toBeNull();
+    expect(screen.queryByText("Normal operator routes")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Check system status after restart" }));
+    expect(await screen.findByText("Normal operator routes")).not.toBeNull();
   });
 
   it("keeps other status failures indeterminate until an explicit retry succeeds", async () => {
@@ -526,9 +593,12 @@ describe("recovery sign out", () => {
 
   it("clears session-scoped data and the query cache from the isolated screen", async () => {
     vi.spyOn(api, "bootstrapStatus").mockResolvedValue({ bootstrapRequired: false });
-    vi.spyOn(api, "me").mockResolvedValue({ user: { id: "admin-id", username: "admin", role: "admin" } });
+    vi.spyOn(api, "me").mockResolvedValue({ user: { id: "admin-id", username: "admin", role: "administrator" } });
     vi.spyOn(api, "csrf").mockResolvedValue("csrf-token");
     vi.spyOn(api, "status").mockRejectedValue(recoveryRequired());
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({
+      version: 1, mode: "recovery_only", recovery: { kind: "lan_grant", operationId },
+    } as never);
     vi.spyOn(api, "lanRecoveryHead").mockResolvedValue(grantHead);
     vi.spyOn(api, "lanGrant").mockResolvedValue(grantRead);
     const logout = vi.spyOn(api, "logout").mockResolvedValue(undefined);

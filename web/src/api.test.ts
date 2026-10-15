@@ -23,6 +23,53 @@ describe("API client", () => {
     }));
   });
 
+  it("does not resubmit a rebind commit or reconciliation after CSRF failure", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "csrf_failed", detail: "CSRF validation failed" }), { status: 403 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ code: "csrf_failed", detail: "CSRF validation failed" }), { status: 403 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const operationId = "11111111-1111-4111-8111-111111111111";
+    const successorProfileRevisionId = "22222222-2222-4222-8222-222222222222";
+    const successorProfileOperationId = "33333333-3333-4333-8333-333333333333";
+
+    await expect(api.commitLANGatewayRebind({
+      operationId, successorProfileRevisionId, successorProfileRevisionNumber: 5, successorProfileOperationId,
+      successorProfile: { interfaceId: "nic-1", selectedIpv4: "192.168.50.4", portStart: 8100, portEnd: 8119 },
+      version: 1, proposalDigest: "a".repeat(64), configureApprovalDigest: "b".repeat(64), rebindApprovalDigest: "c".repeat(64),
+    })).rejects.toEqual(expect.objectContaining<Partial<APIError>>({ status: 403, code: "csrf_failed" }));
+    await expect(api.reconcileLANGatewayRebind(operationId, {
+      version: 1, action: "reconcile", recoveryDigest: "d".repeat(64), recoveryApprovalDigest: "e".repeat(64),
+    })).rejects.toEqual(expect.objectContaining<Partial<APIError>>({ status: 403, code: "csrf_failed" }));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, "/api/v1/system/lan-gateway-rebind", expect.objectContaining({ method: "POST" }));
+    expect(fetchMock).toHaveBeenNthCalledWith(2, `/api/v1/system/lan-gateway-rebind/${operationId}/reconcile`, expect.objectContaining({ method: "POST" }));
+  });
+
+  it("does not resubmit a gateway upgrade recovery after CSRF failure", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ code: "csrf_failed", detail: "CSRF validation failed" }), { status: 403 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const request = {
+      operationId: "11111111-1111-4111-8111-111111111111",
+      profileRevisionId: "22222222-2222-4222-8222-222222222222",
+      profileRevisionNumber: 5,
+      actionDigest: "a".repeat(64),
+    };
+
+    await expect(api.recoverLANGatewayUpgrade(request)).rejects.toEqual(expect.objectContaining<Partial<APIError>>({
+      status: 403,
+      code: "csrf_failed",
+    }));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/system/lan-gateway-upgrade", expect.objectContaining({
+      method: "POST",
+      body: JSON.stringify(request),
+      headers: expect.objectContaining({ "X-CSRF-Token": "csrf-token" }),
+    }));
+  });
   it("sends browser CSRF protection for mutations", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ id: "a" }), { status: 201 }),

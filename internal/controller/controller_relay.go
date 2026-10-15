@@ -280,6 +280,7 @@ func safeHandlerOperation(operation string) string {
 		operationGetApplicationAutoDeploy, operationUpdateApplicationAutoDeploy,
 		operationResumeApplicationAutoDeploy, operationAcceptDeploymentPlan,
 		operationApproveDeploymentMigration, operationGetLANGatewayProfile,
+		operationGetControllerRecovery,
 		operationConfigureLANGatewayProfile, operationGetLANGatewayUpgrade,
 		operationUpgradeLANGateway, operationGetLANRecoveryHead, operationGetApplicationLANAccess,
 		operationInspectLANGatewayRebind, operationCommitLANGatewayRebind,

@@ -1,6 +1,16 @@
 # M3 supported controller candidate: acceptance evidence
 
 Status: implementation candidate for draft CI; M3 acceptance is incomplete.
+The current combined source is `82d489691b95b0c23c1ab45355478d183f9a04aa`,
+which retains the reviewed operator/upgrade recovery UI, expanded LAN transport
+fixture and enabled background-isolation scenario. Its current live requirement
+is 33 boundaries and 30 scenarios. See
+[the combined acceptance record](m3-integrated-acceptance.md) for source identities,
+local checks and outstanding gates. The dated source snapshots below remain
+historical evidence for their recorded revisions.
+
+## Original supported-controller snapshot
+
 Core source `ed9bc5a966032263e3c27a61745708d58ea26ada` and full-hostd harness
 `8206fd87dfd59196ee5bfe8e7097112bee655592` are integrated with published PR #153
 `386bad5f62686e1f5a7bd549ef367ec0fc26dad8`, preserving history. Local integration
@@ -217,7 +227,14 @@ It changes no Go, SQL, schema, frontend or CI source relative to the first draft
 `7c20485`; the final API/diagnostic source hashes still match exactly. The older
 CLI receipt differs only in the two documented diagnostic test files, with all
 production hashes unchanged. This is source equivalence, not a new test run.
-Actual hosted verification of the repaired private journey remains required.
+The repaired prerequisite's private HTTP journey subsequently passed on exact
+parent `386bad5`, including independent cleanup:
+[job 116133035604](https://github.com/tyhuang9/rig/actions/runs/38646046781/job/116133035604).
+Its one RUN/one PASS event stream took 181.1 seconds without a failure or skip;
+raw job log SHA-256 is
+`3630601ebfd63fb1f2455f2b640c961c28435e8f7508b6a135abd038f2c2e99e`.
+This parent result verifies the constructor repair's private journey, not this
+candidate's full supported-hostd crash matrix or physical LAN qualification.
 
 The dashboard also passed its lockfile-respecting offline install and
 `pnpm --dir web build` (TypeScript build plus Vite production build). Receipt
@@ -228,12 +245,15 @@ controller verification.
 
 ## Remaining acceptance and rollback
 
-The full hostd crash harness must pass its exact 33-boundary / 29-scenario Docker
-matrix, with independent fixture cleanup, on the candidate source. Compiling it
-and checking its manifest do not establish any live case. Full repository,
-Linux race and hosted Windows gates are still required. Auto-deploy and relay
-isolation must be distinguished from the ordinary queued-job sentinel and from
-structural evidence that recovery-only startup returns before creating loops.
+The full hostd crash harness must pass its exact 33-boundary / 30-scenario Docker
+matrix, with independent fixture cleanup, on the combined candidate source.
+Compiling it and checking its manifest do not establish any live case. Full
+repository, Linux race and hosted Windows gates are still required. The added
+`recovery-background-isolation` scenario enables both background services and
+requires unchanged sentinels through recovery plus exact fresh-normal startup
+transitions. Its local controls have passed; its full live result remains
+required, separately from the ordinary queued-job sentinel and structural
+startup evidence.
 
 Physical qualification still requires a second device, all roster applications,
 redeploy/restart, address drift, old-interface removal/return, stale-address

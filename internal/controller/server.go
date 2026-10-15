@@ -74,6 +74,9 @@ type Server struct {
 	AppDisables                  LANAppDisableService
 	LANDisableRuntime            LANAppDisableRuntime
 	LANRecoveryHeads             LANRecoveryHeadService
+	RecoveryDiscovery            ControllerRecoveryDiscovery
+	RecoverySnapshots            ControllerRecoverySnapshotService
+	RecoveryStartupRuntime       ControllerRecoveryStartupRuntime
 	RecoveryOnly                 bool
 	RecoveryLANBatch             bool
 	RecoveryBatchHead            int
@@ -150,6 +153,7 @@ func (s *Server) apiRoutes() []apiRoute {
 		contractRoute("me", s.require(s.me)),
 		contractRoute("rotateCSRF", s.require(s.rotateCSRF)),
 		contractRoute("systemStatus", s.require(s.status)),
+		contractRoute(operationGetControllerRecovery, noStore(s.requireOperation(operationGetControllerRecovery, s.getControllerRecovery))),
 		contractRoute("doctor", s.require(s.doctor)),
 		contractRoute(operationGetLANGatewayProfile, noStore(s.requireOperation(operationGetLANGatewayProfile, s.getLANGatewayProfile))),
 		contractRoute(operationConfigureLANGatewayProfile, noStore(s.requireOperation(operationConfigureLANGatewayProfile, s.configureLANGatewayProfile))),
@@ -265,6 +269,8 @@ func (s *Server) recoveryGate(next http.Handler) http.Handler {
 		permit := false
 		switch route.operationID {
 		case "bootstrapStatus", "bootstrap", "login", "logout", "me", "rotateCSRF":
+			permit = true
+		case operationGetControllerRecovery:
 			permit = true
 		case operationGetLANGatewayUpgrade, operationUpgradeLANGateway:
 			permit = s.RecoveryKind == "" || s.RecoveryKind == RecoveryGatewayUpgrade
