@@ -484,7 +484,7 @@ func (trace *lanTwoAppGrantTrace) WithGatewayV2LANRollbackResolution(ctx context
 	return err
 }
 
-func (a *lanTwoAppAPI) do(method, path string, input any, want int, output any) {
+func (a *lanTwoAppAPI) do(method, path string, input any, want int, output any) []byte {
 	a.t.Helper()
 	var body io.Reader
 	if input != nil {
@@ -523,6 +523,7 @@ func (a *lanTwoAppAPI) do(method, path string, input any, want int, output any) 
 	if output != nil && json.Unmarshal(contents, output) != nil {
 		a.t.Fatalf("invalid controller response for %s %s", method, path)
 	}
+	return contents
 }
 
 type lanTwoAppDeployment struct {
@@ -542,6 +543,22 @@ func lanTwoAppConfig(marker string) []apicontract.ScopedConfigurationValueInput 
 func lanTwoAppDeploy(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, deploymentStore *deployments.Repository,
 	state *generatedruntimestate.Repository, source apicontract.GitHubSource, setup apicontract.DeploymentSetupInput,
 	name, marker string, appIDs *[]string,
+) lanTwoAppDeployment {
+	t.Helper()
+	deployment := lanTwoAppCreateApplication(t, api, source, setup, name, appIDs)
+	var saved apicontract.ApplicationConfiguration
+	api.do(http.MethodPut, "/api/v1/apps/"+deployment.id+"/scoped-configuration", apicontract.ReplaceScopedApplicationConfigurationRequest{
+		ExpectedRevisionNumber: 0, PlanRevisionID: deployment.plan.RevisionID, PlanRevisionNumber: deployment.plan.RevisionNumber,
+		PublicBuildDisclosureAcknowledged: true, Entries: lanTwoAppConfig(marker),
+		Remove: []apicontract.ScopedConfigurationKey{},
+	}, http.StatusOK, &saved)
+	deployment.config = saved
+	deployment.deploymentID = lanTwoAppDeployJob(t, api, jobStore, deploymentStore, state, deployment.id, deployment.plan, saved)
+	return deployment
+}
+
+func lanTwoAppCreateApplication(t *testing.T, api *lanTwoAppAPI, source apicontract.GitHubSource,
+	setup apicontract.DeploymentSetupInput, name string, appIDs *[]string,
 ) lanTwoAppDeployment {
 	t.Helper()
 	var inspection apicontract.InspectResponse
@@ -566,14 +583,7 @@ func lanTwoAppDeploy(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, de
 	if plan.Strategy != string(deploymentplans.StrategyGeneratedNode) || len(plan.Components) != 2 {
 		t.Fatal("reviewed fixture did not produce two generated components")
 	}
-	var saved apicontract.ApplicationConfiguration
-	api.do(http.MethodPut, "/api/v1/apps/"+application.ID+"/scoped-configuration", apicontract.ReplaceScopedApplicationConfigurationRequest{
-		ExpectedRevisionNumber: 0, PlanRevisionID: plan.RevisionID, PlanRevisionNumber: plan.RevisionNumber,
-		PublicBuildDisclosureAcknowledged: true, Entries: lanTwoAppConfig(marker),
-		Remove: []apicontract.ScopedConfigurationKey{},
-	}, http.StatusOK, &saved)
-	deploymentID := lanTwoAppDeployJob(t, api, jobStore, deploymentStore, state, application.ID, plan, saved)
-	return lanTwoAppDeployment{id: application.ID, deploymentID: deploymentID, plan: plan, config: saved}
+	return lanTwoAppDeployment{id: application.ID, plan: plan}
 }
 
 func lanTwoAppDeployJob(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, deploymentStore *deployments.Repository,

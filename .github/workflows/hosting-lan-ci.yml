@@ -85,3 +85,106 @@ jobs:
             printf 'Two-app LAN gate left Docker resources behind.\n' >&2
             exit 1
           fi
+
+  lan-external-database:
+    name: LAN application-owned TLS database persistence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 85
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Set up pnpm
+        timeout-minutes: 3
+        uses: pnpm/action-setup@9fd676a19091d4595eefd76e4bd31c97133911f1 # v4.2.0
+        with:
+          version: 11.22.0
+          run_install: false
+
+      - name: Set up Node.js
+        timeout-minutes: 3
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24.19.0
+          package-manager-cache: false
+
+      - name: Record hosted Docker versions
+        timeout-minutes: 1
+        run: |
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}'
+          docker buildx version
+          docker compose version
+
+      - name: Install application-owned fixture dependencies
+        timeout-minutes: 5
+        run: pnpm --dir examples/hosting-notes install --frozen-lockfile
+
+      - name: Prove external database persistence through LAN redeploy and reopen
+        timeout-minutes: 72
+        shell: bash
+        env:
+          RIG_RUN_LIVE_LAN_DATABASE: "1"
+        run: |
+          set -euo pipefail
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          required_tests=(
+            TestLiveControllerLANDatabaseJourney
+            TestLANDatabasePositiveDecimal
+            TestLANDatabaseEnvContainsExactValue
+            TestLANDatabaseConfigurationScopes
+            TestLANDatabaseRoutedRequestRejectsRedirect
+          )
+          test_pattern="^($(IFS='|'; echo "${required_tests[*]}"))$"
+          required_json="$(jq -cn --args '$ARGS.positional' "${required_tests[@]}")"
+          package_name='github.com/hostd/hostd/cmd/hostd'
+          go test -tags=live_docker -json -v -count=1 -timeout=66m ./cmd/hostd -run "$test_pattern" | tee "$output"
+          jq -se --arg package_name "$package_name" --argjson required "$required_json" '
+            [.[] | select(.Package == $package_name)] as $events |
+            all($required[]; . as $test_name |
+              ([$events[] | select(.Test == $test_name and .Action == "run")] | length) == 1 and
+              ([$events[] | select(.Test == $test_name and .Action == "pass")] | length) == 1 and
+              ([$events[] | select((.Test == $test_name or ((.Test // "") | startswith($test_name + "/"))) and (.Action == "fail" or .Action == "skip"))] | length) == 0
+            )
+          ' "$output" > /dev/null
+
+      - name: Require complete application and external fixture cleanup
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          containers="$(docker ps --all --filter label=io.rig.managed --format '{{.ID}} {{.Names}} {{.Status}}')"
+          networks="$(docker network ls --filter label=io.rig.managed --format '{{.ID}} {{.Name}}')"
+          volumes="$(docker volume ls --filter label=io.rig.managed --format '{{.Name}}')"
+          images="$(docker image ls --filter label=io.rig.managed=generated-image --format '{{.ID}} {{.Repository}}:{{.Tag}}')"
+          fixture_containers="$(docker ps --all --filter label=com.docker.compose.project=rig-lan-database-test --format '{{.ID}} {{.Names}} {{.Status}}')"
+          fixture_networks="$(docker network ls --filter label=com.docker.compose.project=rig-lan-database-test --format '{{.ID}} {{.Name}}')"
+          fixture_volumes="$(docker volume ls --filter label=com.docker.compose.project=rig-lan-database-test --format '{{.Name}}')"
+          builders="$(docker ps --all --filter label=rig.controller=generated-builder --format '{{.ID}} {{.Names}}')"
+          builder_networks="$(docker network ls --filter label=rig.controller=generated-builder --format '{{.ID}} {{.Name}}')"
+          stage_containers="$(docker ps --all --filter name=rig-generated-caddy-v2-stage- --format '{{.ID}} {{.Names}} {{.Status}}')"
+          exact_resources=''
+          for container in rig-generated-caddy-v1 rig-generated-caddy-v2; do
+            if docker container inspect "$container" >/dev/null 2>&1; then exact_resources+=" container:$container"; fi
+          done
+          for network in rig-generated-caddy-ingress-v1 rig-generated-caddy-ingress-v2 rig-lan-two-app-test-client rig-lan-database-external; do
+            if docker network inspect "$network" >/dev/null 2>&1; then exact_resources+=" network:$network"; fi
+          done
+          for volume in rig-generated-caddy-config-v1 rig-generated-caddy-config-v2 rig-generated-caddy-data-v2; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then exact_resources+=" volume:$volume"; fi
+          done
+          if [[ -n "$containers" || -n "$networks" || -n "$volumes" || -n "$images" || -n "$fixture_containers" || -n "$fixture_networks" || -n "$fixture_volumes" || -n "$builders" || -n "$builder_networks" || -n "$stage_containers" || -n "$exact_resources" ]]; then
+            printf 'LAN external database gate left Docker resources behind.\n' >&2
+            exit 1
+          fi
