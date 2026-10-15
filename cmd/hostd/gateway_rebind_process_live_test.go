@@ -781,20 +781,38 @@ func liveHostdRebindCurrentConfigPublishCommand(args []string) bool {
 func liveHostdRebindHTTP(ctx context.Context, fixture *liveHostdGatewayRebindFixture,
 	method, path string, input any,
 ) (int, []byte, error) {
+	if input == nil {
+		return liveHostdRebindHTTPBody(ctx, fixture, method, path, nil, false)
+	}
+	encoded, err := json.Marshal(input)
+	if err != nil {
+		return 0, nil, err
+	}
+	return liveHostdRebindHTTPBody(ctx, fixture, method, path, encoded, true)
+}
+
+// liveHostdRebindHTTPRaw sends the exact previously reviewed commit request.
+// It exists only for restart replay; callers must not use it to synthesize a
+// new approval-bearing request.
+func liveHostdRebindHTTPRaw(ctx context.Context, fixture *liveHostdGatewayRebindFixture,
+	method, path string, request []byte,
+) (int, []byte, error) {
+	return liveHostdRebindHTTPBody(ctx, fixture, method, path, request, true)
+}
+
+func liveHostdRebindHTTPBody(ctx context.Context, fixture *liveHostdGatewayRebindFixture,
+	method, path string, requestBody []byte, hasBody bool,
+) (int, []byte, error) {
 	var body io.Reader
-	if input != nil {
-		encoded, err := json.Marshal(input)
-		if err != nil {
-			return 0, nil, err
-		}
-		body = bytes.NewReader(encoded)
+	if hasBody {
+		body = bytes.NewReader(requestBody)
 	}
 	request, err := http.NewRequestWithContext(ctx, method, "http://"+fixture.listen+path, body)
 	if err != nil {
 		return 0, nil, err
 	}
 	request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: fixture.session.Token})
-	if input != nil {
+	if hasBody {
 		request.Header.Set("Content-Type", "application/json")
 	}
 	if method != http.MethodGet {
@@ -998,26 +1016,20 @@ type liveHostdRebindReview struct {
 }
 
 type liveHostdRebindStatus struct {
-	Version         int      `json:"version"`
-	OperationID     string   `json:"operationId"`
-	Availability    string   `json:"availability"`
-	Active          bool     `json:"active"`
-	Historical      bool     `json:"historicalTerminal"`
-	TerminalProof   string   `json:"terminalProof"`
-	CurrentProof    string   `json:"currentProof"`
-	OperationFence  string   `json:"operationFence"`
-	RecoveryPolicy  string   `json:"recoveryPolicy,omitempty"`
-	AllowedActions  []string `json:"allowedActions"`
-	TerminalDigest  string   `json:"terminalProofDigest,omitempty"`
-	CurrentDigest   string   `json:"currentAttestationDigest,omitempty"`
-	SelectedCurrent *struct {
-		OperationID string `json:"operationId"`
-	} `json:"selectedCurrentAuthority,omitempty"`
-	Operation *struct {
-		StoredState            string `json:"storedState"`
-		DatabaseCommitObserved bool   `json:"databaseCommitObserved"`
-		TerminalDisposition    string `json:"terminalDisposition,omitempty"`
-	} `json:"operation,omitempty"`
+	Version         int                                           `json:"version"`
+	OperationID     string                                        `json:"operationId"`
+	Availability    string                                        `json:"availability"`
+	Active          bool                                          `json:"active"`
+	Historical      bool                                          `json:"historicalTerminal"`
+	TerminalProof   string                                        `json:"terminalProof"`
+	CurrentProof    string                                        `json:"currentProof"`
+	OperationFence  string                                        `json:"operationFence"`
+	RecoveryPolicy  string                                        `json:"recoveryPolicy,omitempty"`
+	AllowedActions  []string                                      `json:"allowedActions"`
+	TerminalDigest  string                                        `json:"terminalProofDigest,omitempty"`
+	CurrentDigest   string                                        `json:"currentAttestationDigest,omitempty"`
+	SelectedCurrent *apicontract.LANGatewayRebindCurrentAuthority `json:"selectedCurrentAuthority,omitempty"`
+	Operation       *apicontract.LANGatewayRebindOperation        `json:"operation,omitempty"`
 }
 
 type liveHostdRebindRecoveryReview struct {
@@ -1109,23 +1121,155 @@ func liveHostdRebindPrepareRequest(t *testing.T, fixture *liveHostdGatewayRebind
 	inspect["proposalDigest"] = review.ProposalDigest
 	inspect["configureApprovalDigest"] = review.ConfigureApprovalDigest
 	inspect["rebindApprovalDigest"] = review.RebindApprovalDigest
+	request, marshalErr := json.Marshal(inspect)
+	if marshalErr != nil {
+		t.Fatal("marshal reviewed rebind commit request")
+	}
+	if retainErr := fixture.retainCommitRequest(operationID, request); retainErr != nil {
+		t.Fatalf("retain reviewed rebind commit request: %v", retainErr)
+	}
 	return inspect
+}
+
+// liveHostdRebindNormalReplay reads the diagnostic startup view and replays
+// only the exact reviewed commit request retained before the child stopped.
+// The diagnostic response remains unavailable by design; it becomes usable
+// terminal evidence only after the commit facade independently re-proves it.
+func liveHostdRebindNormalReplay(fixture *liveHostdGatewayRebindFixture,
+	operationID string,
+) (liveHostdRebindStatus, error) {
+	if fixture == nil || fixture.ctx == nil || operationID == "" {
+		return liveHostdRebindStatus{}, errors.New("normal rebind replay is unavailable")
+	}
+	path := "/api/v1/system/lan-gateway-rebind/" + operationID
+	statusCode, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet, path, nil)
+	if err != nil || statusCode != http.StatusOK {
+		return liveHostdRebindStatus{}, errors.New("normal rebind diagnostic read failed")
+	}
+	var diagnostic liveHostdRebindStatus
+	if json.Unmarshal(body, &diagnostic) != nil {
+		return liveHostdRebindStatus{}, errors.New("normal rebind diagnostic response is invalid")
+	}
+	if err := liveHostdRebindValidateNormalReplayDiagnostic(diagnostic, operationID); err != nil {
+		return liveHostdRebindStatus{}, err
+	}
+	request, ok := fixture.retainedCommitRequest(operationID)
+	if !ok {
+		return liveHostdRebindStatus{}, errors.New("normal rebind replay request is unavailable")
+	}
+	statusCode, body, err = liveHostdRebindHTTPRaw(fixture.ctx, fixture, http.MethodPost,
+		"/api/v1/system/lan-gateway-rebind", request)
+	if err != nil || statusCode != http.StatusOK {
+		return liveHostdRebindStatus{}, errors.New("normal rebind replay failed")
+	}
+	var replay apicontract.LANGatewayRebindMutation
+	if json.Unmarshal(body, &replay) != nil {
+		return liveHostdRebindStatus{}, errors.New("normal rebind replay response is invalid")
+	}
+	if err := liveHostdRebindValidateNormalReplay(diagnostic, replay, operationID); err != nil {
+		return liveHostdRebindStatus{}, err
+	}
+	verified := diagnostic
+	verified.TerminalProof = replay.TerminalProof
+	verified.TerminalDigest = replay.TerminalProofDigest
+	verified.CurrentProof = replay.CurrentProof
+	verified.CurrentDigest = replay.CurrentAttestationDigest
+	operation := replay.Operation
+	verified.Operation = &operation
+	authority := *replay.SelectedCurrentAuthority
+	verified.SelectedCurrent = &authority
+	return verified, nil
+}
+
+func liveHostdRebindValidateNormalReplayDiagnostic(status liveHostdRebindStatus, operationID string) error {
+	if status.Version != generatedingress.GatewayRebindOperationInspectionVersion || status.OperationID != operationID ||
+		status.Availability != string(generatedingress.GatewayRebindOperationAvailable) || status.Active || !status.Historical ||
+		status.TerminalProof != "unavailable" || status.TerminalDigest != "" || status.CurrentProof != "unavailable" ||
+		status.CurrentDigest != "" || status.OperationFence != "released" || status.RecoveryPolicy != "" ||
+		len(status.AllowedActions) != 0 || !liveHostdRebindValidOperation(status.Operation, operationID) ||
+		!liveHostdRebindValidAuthority(status.SelectedCurrent) {
+		return errors.New("normal rebind diagnostic is not an unavailable terminal")
+	}
+	return nil
+}
+
+func liveHostdRebindValidateNormalReplay(diagnostic liveHostdRebindStatus,
+	replay apicontract.LANGatewayRebindMutation, operationID string,
+) error {
+	if replay.Created || replay.RecoveryRequired || !replay.FenceReleased || replay.TerminalProof != "verified" ||
+		replay.CurrentProof != "verified" || !liveHostdRebindValidDigest(replay.TerminalProofDigest) ||
+		!liveHostdRebindValidDigest(replay.CurrentAttestationDigest) ||
+		!liveHostdRebindValidOperation(&replay.Operation, operationID) ||
+		!liveHostdRebindValidAuthority(replay.SelectedCurrentAuthority) {
+		return errors.New("normal rebind replay proof is incomplete")
+	}
+	if diagnostic.Operation == nil || *diagnostic.Operation != replay.Operation || diagnostic.SelectedCurrent == nil ||
+		*diagnostic.SelectedCurrent != *replay.SelectedCurrentAuthority {
+		return errors.New("normal rebind replay identity changed")
+	}
+	return nil
+}
+
+func liveHostdRebindValidOperation(operation *apicontract.LANGatewayRebindOperation, operationID string) bool {
+	if operation == nil || operation.OperationID != operationID || operation.StateSequence <= 0 ||
+		!liveHostdRebindValidDigest(operation.TerminalReceiptDigest) {
+		return false
+	}
+	switch operation.TerminalDisposition {
+	case "commit":
+		return operation.StoredState == string(appaccess.GatewayRebindCommitted) && operation.DatabaseCommitObserved
+	case "abort":
+		return operation.StoredState == string(appaccess.GatewayRebindRolledBack) && !operation.DatabaseCommitObserved
+	default:
+		return false
+	}
+}
+
+func liveHostdRebindValidAuthority(authority *apicontract.LANGatewayRebindCurrentAuthority) bool {
+	if authority == nil || authority.OperationID == "" || authority.ProfileRevisionID == "" ||
+		authority.ProfileRevisionNumber <= 0 || !liveHostdRebindValidDigest(authority.ProfileSpecDigest) {
+		return false
+	}
+	switch authority.Kind {
+	case string(appaccess.GatewayRebindSourceGatewayUpgrade):
+		return authority.TerminalReceiptDigest == ""
+	case string(appaccess.GatewayRebindSourceGatewayRebind):
+		return liveHostdRebindValidDigest(authority.TerminalReceiptDigest)
+	default:
+		return false
+	}
+}
+
+func liveHostdRebindValidDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || (character > '9' && (character < 'a' || character > 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func liveHostdRebindRecover(t *testing.T, fixture *liveHostdGatewayRebindFixture,
 	operationID string, ready liveHostdRebindReadyMarker,
 ) liveHostdRebindStatus {
 	t.Helper()
+	if !ready.RecoveryOnly {
+		status, replayErr := liveHostdRebindNormalReplay(fixture, operationID)
+		if replayErr != nil {
+			t.Fatalf("normal retained rebind replay: %v", replayErr)
+		}
+		liveHostdRebindAssertDurableTerminal(t, fixture, status, operationID, false)
+		return status
+	}
 	path := "/api/v1/system/lan-gateway-rebind/" + operationID
 	statusCode, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet, path, nil)
 	var status liveHostdRebindStatus
 	if err != nil || statusCode != http.StatusOK || json.Unmarshal(body, &status) != nil ||
 		status.OperationID != operationID {
 		t.Fatalf("read retained rebind: status=%d error=%v", statusCode, err)
-	}
-	if !ready.RecoveryOnly {
-		liveHostdRebindAssertDurableTerminal(t, fixture, status, operationID, false)
-		return status
 	}
 	if ready.RecoveryKind != "gateway_rebind" || ready.OperationID != operationID {
 		t.Fatal("recovery-only full hostd did not retain the exact rebind pin")
@@ -1219,8 +1363,11 @@ func liveHostdRebindAssertDurableTerminal(t *testing.T, fixture *liveHostdGatewa
 		}
 	}
 	receipt := liveHostdRebindReadTerminal(t, fixture.dataRoot, operationID)
-	if receipt.OperationID != operationID || receipt.Digest != status.TerminalDigest ||
-		receipt.ProtectedRecordDigest == "" || receipt.ClaimRequestDigest != claim.RequestDigest ||
+	terminalCommand := history.Commands[len(history.Commands)-1]
+	if !liveHostdRebindTerminalReceiptBound(status, receipt, terminalCommand) ||
+		status.Operation.OperationID != operationID || status.Operation.StoredState != string(claim.State) ||
+		status.Operation.StateSequence != claim.StateSequence || receipt.ProtectedRecordDigest == "" ||
+		receipt.ClaimRequestDigest != claim.RequestDigest ||
 		receipt.ClaimSpecDigest != claim.RebindApproval.SpecDigest {
 		t.Fatal("protected terminal does not bind the retained SQL claim")
 	}
@@ -1260,6 +1407,19 @@ func liveHostdRebindAssertDurableTerminal(t *testing.T, fixture *liveHostdGatewa
 	}
 }
 
+// liveHostdRebindTerminalReceiptBound joins the separately generated terminal
+// proof, protected receipt, and immutable final SQL command. The terminal
+// proof digest is deliberately not a receipt digest and is validated elsewhere.
+func liveHostdRebindTerminalReceiptBound(status liveHostdRebindStatus,
+	receipt liveHostdRebindTerminalReceipt, command appaccess.GatewayRebindTransitionCommand,
+) bool {
+	return status.Operation != nil && receipt.OperationID == status.Operation.OperationID &&
+		command.OperationID == status.Operation.OperationID && receipt.Digest == status.Operation.TerminalReceiptDigest &&
+		command.TerminalReceiptDigest == receipt.Digest && string(receipt.Disposition) == status.Operation.TerminalDisposition &&
+		string(command.TerminalDisposition) == status.Operation.TerminalDisposition &&
+		string(command.NextState) == status.Operation.StoredState && command.Sequence == status.Operation.StateSequence
+}
+
 func liveHostdRebindAssertOwnedResourceCounts(t *testing.T, fixture *liveHostdGatewayRebindFixture,
 	operationID string, expected map[string]int,
 ) {
@@ -1286,14 +1446,22 @@ func liveHostdRebindAssertOwnedResourceCounts(t *testing.T, fixture *liveHostdGa
 func liveHostdRebindAssertTerminal(t *testing.T, status liveHostdRebindStatus, operationID string) {
 	t.Helper()
 	if status.OperationID != operationID || status.Active || !status.Historical || status.TerminalProof != "verified" ||
-		status.OperationFence != "released" || status.Operation == nil || status.Operation.TerminalDisposition == "" ||
-		status.TerminalDigest == "" {
+		status.OperationFence != "released" || !liveHostdRebindValidOperation(status.Operation, operationID) ||
+		!liveHostdRebindValidDigest(status.TerminalDigest) || status.CurrentProof != "verified" ||
+		!liveHostdRebindValidDigest(status.CurrentDigest) || !liveHostdRebindValidAuthority(status.SelectedCurrent) {
 		t.Fatalf("rebind terminal proof is incomplete: operation=%q active=%v historical=%v terminal=%q fence=%q",
 			status.OperationID, status.Active, status.Historical, status.TerminalProof, status.OperationFence)
 	}
-	if status.Operation.TerminalDisposition == "commit" &&
-		(status.CurrentProof != "verified" || status.CurrentDigest == "" || status.SelectedCurrent == nil ||
-			status.SelectedCurrent.OperationID != operationID || !status.Operation.DatabaseCommitObserved) {
-		t.Fatal("committed rebind lacks immutable database/current proof")
+	switch status.Operation.TerminalDisposition {
+	case "commit":
+		if status.SelectedCurrent.OperationID != operationID || !status.Operation.DatabaseCommitObserved {
+			t.Fatal("committed rebind lacks immutable database/current proof")
+		}
+	case "abort":
+		if status.SelectedCurrent.OperationID == operationID || status.Operation.DatabaseCommitObserved {
+			t.Fatal("rolled-back rebind lacks immutable current proof")
+		}
+	default:
+		t.Fatal("rebind terminal disposition is invalid")
 	}
 }

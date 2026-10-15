@@ -81,8 +81,9 @@ type liveHostdGatewayRebindFixture struct {
 	upgradeID   string
 	legacyV1    liveHostdRebindLegacyV1Resources
 
-	mu           sync.Mutex
-	operationIDs map[string]struct{}
+	mu             sync.Mutex
+	operationIDs   map[string]struct{}
+	commitRequests map[string]json.RawMessage
 }
 
 // newLiveHostdGatewayRebindFixture creates the predecessor through the same
@@ -116,6 +117,7 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 		ctx: ctx, cancel: cancel, root: root, dataRoot: dataRoot, docker: docker,
 		predecessor: predecessor, successor: successor, ports: ports,
 		upgradeID: uuid.NewString(), operationIDs: make(map[string]struct{}),
+		commitRequests: make(map[string]json.RawMessage),
 	}
 	fixture.operationIDs[fixture.upgradeID] = struct{}{}
 	lanTwoAppRegisterCleanupWithLegacyGuard(t, docker, dataRoot, fixture.upgradeID, &fixture.appIDs,
@@ -347,6 +349,45 @@ func (f *liveHostdGatewayRebindFixture) operationOwned(operationID string) bool 
 	defer f.mu.Unlock()
 	_, ok := f.operationIDs[operationID]
 	return ok
+}
+
+// retainCommitRequest keeps the exact reviewed commit bytes for the only
+// normal-mode replay permitted after a hostd restart. The fixture never
+// rebuilds approvals from a later profile read.
+func (f *liveHostdGatewayRebindFixture) retainCommitRequest(operationID string, request []byte) error {
+	if operationID == "" || len(request) == 0 {
+		return fmt.Errorf("rebind commit request is unavailable")
+	}
+	var identity struct {
+		OperationID string `json:"operationId"`
+	}
+	if json.Unmarshal(request, &identity) != nil || identity.OperationID != operationID {
+		return fmt.Errorf("rebind commit request operation identity is invalid")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.commitRequests == nil {
+		f.commitRequests = make(map[string]json.RawMessage)
+	}
+	copyRequest := append(json.RawMessage(nil), request...)
+	if existing, ok := f.commitRequests[operationID]; ok {
+		if !bytes.Equal(existing, copyRequest) {
+			return fmt.Errorf("rebind commit request identity changed")
+		}
+		return nil
+	}
+	f.commitRequests[operationID] = copyRequest
+	return nil
+}
+
+func (f *liveHostdGatewayRebindFixture) retainedCommitRequest(operationID string) ([]byte, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	request, ok := f.commitRequests[operationID]
+	if !ok {
+		return nil, false
+	}
+	return append([]byte(nil), request...), true
 }
 
 // cleanup runs before the older two-app cleanup. The preflight established an

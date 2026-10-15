@@ -1,6 +1,6 @@
 # M3 supported-controller fixture startup investigation
 
-Status: materialized release identity repair candidate; M3 remains incomplete.
+Status: terminal-proof fixture correction candidate; M3 remains incomplete.
 This branch starts from PR #160 at
 `950944edc9e028ce407060e4e726521876ae1c14`. Its initial revision changes test
 infrastructure. The follow-up adds closed diagnostic metadata to production
@@ -461,3 +461,109 @@ This is a test-harness correction, with no new production migration or runtime
 activation. A reviewed revert restores the earlier incorrect fixture request
 sequence. Hosted initial-boundary and full-matrix acceptance remain required;
 physical second-device qualification is still separate.
+
+## Terminal proof fixture contract correction
+
+The successor-planning candidate `5ecefd7fc083781decf6d7dbad7375abd1734547`
+passed all 21 prerequisite parents and 168 subcases once in
+[first-boundary job 116412922117](https://github.com/tyhuang9/rig/actions/runs/38732307284/job/116412922117).
+The actual checkout `242ad5b62cf0195715158df72e88b68655c2e698` had the same
+tree as the candidate. The live `a0-sql-claim` child failed after 294.65 seconds:
+its operation was historical, inactive and released, but terminal proof was
+`unavailable`. Independent cleanup passed. Raw log SHA-256:
+`d4126beee646f5293f5d2a1c0b8e78a82418038583a4d93d382ead5da6cfc7c3`.
+The collapsed helper location does not identify which recovery/read phase
+failed; the complete matrix remains unaccepted.
+
+Static tracing found two fixture contract errors. An ordinary status GET is a
+read-only projection of retained state and deliberately leaves physical proof
+unavailable. The authenticated retry of the exact original commit request is
+the existing normal-mode path for freshly verifying terminal and current
+physical evidence. Recovery-only mode uses the existing audited reconcile
+path. Also, `terminalProofDigest` identifies a purpose-bound physical proof;
+it is not the protected terminal receipt digest. The latter is exposed as
+`operation.terminalReceiptDigest` and retained in the terminal SQL command.
+
+The correction must keep terminal proof mandatory, bind any retry to the exact
+original request and retained operation/current identities, and compare the
+protected receipt with the receipt digest in both the API and SQL. It must not
+turn an unavailable GET into verified evidence without a successful fresh
+proof response. Production behavior, recovery authorization, SQL history and
+the 33-boundary/30-scenario requirement remain unchanged.
+
+
+### Strict terminal fixture verification
+
+The fixture now retains defensive copies of each original reviewed commit
+request and rejects replacement under the same operation identity. Normal-mode
+replay requires HTTP 200, no creation or recovery requirement, released fencing,
+both verified physical proofs, and exact complete operation/current-authority
+equality with the diagnostic read. Failure cannot fall back to GET evidence.
+The protected receipt binds the API receipt digest and final SQL command's
+operation, sequence, state, disposition and receipt digest. Audited reconcile
+keeps its existing path and uses the corrected durable receipt assertion.
+
+Two new offline controls are mandatory in both hosted prerequisite selectors
+and discovery assertions. The initial combined Windows ingress invocation hit
+its existing ten-minute deadline during the final reconciliation parent's
+`fixed_abort` subcase after the other seven parents passed. Its failed raw log
+is retained with SHA-256
+`4c9c1dc2373a49d50a4894b7df3d1489235c534f43ec5ef5dd494aabb3a91749`.
+The same eight parents were then rerun in three disjoint invocations, each
+retaining `-test.count=1 -test.timeout=10m`. No source or CI deadline changed.
+
+Final verification passed **37 parents and 247 subcases per OS**
+with exact discovery, uncached execution, no skips, and matching source hashes
+before and after execution. Windows ingress time is the sum of its three
+successful partition durations:
+
+| Scope | Parents | Subcases | Windows seconds | Linux seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Required controller controls | 23 | 192 | 2.213 | 3.268 |
+| Production replay/reconcile contracts | 8 | 24 | 986.141 | 125.527 |
+| Authenticated controller contracts | 6 | 31 | 0.019 | 0.186 |
+
+
+Commands again compile with `go test -tags live_docker -c`, explicitly discover
+the recorded rosters, and execute through `go tool test2json` using
+`-test.count=1 -test.timeout=10m`. Windows/Linux CLI builds and live-tag vet
+passed, as did canonical generation and whitespace checks. Docs checks are
+recorded with the publication evidence. The actual workflow filter passed
+13 synthetic cases; syntax and structural comparison preserve the complete
+33-boundary/30-scenario matrix, other jobs, deadlines and independent cleanup.
+Workflow SHA-256:
+`bff40dfe88c5876d73b8d1a8e4e65b3c812aece0f8a4e5f306144dc2f72b468b`.
+
+Source pins, exact commands and raw logs are retained in wrapper
+`temp/m3-lan-external-db-20261015/terminal-fixture-verification/`.
+
+- `cmd-final-native`: `292fc912787e4119a3660d80388a41d48a0ac327ed19ee49b32872cd79315f57`.
+
+- `cmd-final-wsl`: `fa4f6c3c7e53802098342133d02f3aa8852b5a550b77c0dc434a9ecd7b5ae1ac`.
+
+- `ingress-core-partition-native`: `26e8019791bd87c34c8a14ba58a37a76c48df0a7edacae4c3d7cfbd5160757e7`.
+
+- `ingress-replay-partition-native`: `a8f9cc4147534adde1bdd765f7ca5f8cc37a637c091d8b0a0b35d804cead90e2`.
+
+- `ingress-reconcile-partition-native`: `1a98be57e7ffc19bc7f32003b137253db732c7d66d955ec53776c2051ba7113b`.
+
+- `ingress-final-wsl`: `0bb932d1189e1f16f1dec1a40be73c2579faae25147235fae0a1da4dc8749afe`.
+
+- `controller-partition-native`: `89607ff8148c683027c1419196e4409992d2b5bf0bd425fa83a504560ea89aa6`.
+
+- `controller-final-wsl`: `ed5c304027b4028f8b6d11a7249ae76ed51fa0a18b445e0dfebd5a632aa1e4e0`.
+
+
+Independent static integration review found no remaining blocker after fixing
+synchronized test observations and same-operation request-replacement coverage.
+This is not CodeRabbit review. Local Docker/race execution remains unavailable;
+broad repository, frontend and browser suites were not repeated for this
+test-only correction. Real initial-boundary and full-matrix acceptance remain
+required. The pending-route historical-current scenario stays strict and has
+not been accepted; a later current revision must not acquire historical physical
+proof by assumption. Physical second-device qualification is separate.
+
+This follow-up changes only test helpers, controls, CI prerequisites and this
+evidence document. A reviewed revert restores the earlier incorrect fixture
+expectations. It does not change production state or migration history, and
+the user's running controller has not been restarted or deployed.
