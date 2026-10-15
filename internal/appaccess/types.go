@@ -368,7 +368,7 @@ func GatewayRebindRosterEntryDigest(entry GatewayRebindRosterEntry) (string, err
 		!validUUID(entry.AccessRevisionID) || entry.AccessRevisionNumber <= 0 ||
 		!validDigest(entry.AccessSpecDigest) || !validUUID(entry.GrantAttemptID) ||
 		entry.GrantStateSequence <= 0 || !validDigest(entry.GrantProtectedStateDigest) ||
-		!validUUID(entry.ServingDeploymentID) || !validUUID(entry.ServingReleaseID) ||
+		!validUUID(entry.ServingDeploymentID) || !validReleaseID(entry.ServingReleaseID) ||
 		(entry.ServingSlot != "blue" && entry.ServingSlot != "green") || entry.RouteGeneration <= 0 {
 		return "", ErrInvalidInput
 	}
@@ -510,6 +510,21 @@ func validApproval(approval Approval, action ApprovalAction, digest string) bool
 func validUUID(value string) bool {
 	parsed, err := uuid.Parse(value)
 	return err == nil && parsed.String() == value
+}
+
+func validReleaseID(value string) bool {
+	if validUUID(value) {
+		return true
+	}
+	if len(value) != 32 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func validDigest(value string) bool {

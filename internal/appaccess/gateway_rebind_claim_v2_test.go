@@ -271,9 +271,15 @@ func TestGatewayRebindRuntimeHeadHistoryIsSealedAndValidated(t *testing.T) {
 }
 
 func TestClaimGatewayRebindV2PersistsExactPreparedClaimAndRoster(t *testing.T) {
-	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	fixture := newGatewayRebindFixtureOnDBWithClaimAndReleaseID(t, appAccessDB(t), false, false,
+		rebindTestSnapshotReleaseID)
 	finishGatewayRebindFixtureWork(t, fixture.db)
 	proposal := gatewayRebindV2ProposalForFixture(t, fixture)
+	if len(proposal.Roster) != 1 || len(proposal.RuntimeHeads) != 1 ||
+		proposal.Roster[0].ServingReleaseID != rebindTestSnapshotReleaseID ||
+		proposal.RuntimeHeads[0].ReleaseID != rebindTestSnapshotReleaseID {
+		t.Fatal("snapshot release identity was changed while constructing the v2 proposal")
+	}
 	claim, created, err := fixture.repository.ClaimGatewayRebindV2(context.Background(), proposal)
 	if err != nil || !created {
 		t.Fatalf("claim=%#v created=%t error=%v", claim, created, err)
@@ -288,8 +294,26 @@ func TestClaimGatewayRebindV2PersistsExactPreparedClaimAndRoster(t *testing.T) {
 	}
 
 	storedRoster, err := readGatewayRebindRosterV2(context.Background(), fixture.db, proposal.Spec.OperationID)
-	if err != nil || len(storedRoster) != 1 || storedRoster[0].EntryDigest != proposal.Roster[0].EntryDigest {
+	if err != nil || len(storedRoster) != 1 || storedRoster[0].EntryDigest != proposal.Roster[0].EntryDigest ||
+		storedRoster[0].ServingReleaseID != rebindTestSnapshotReleaseID {
 		t.Fatalf("stored roster=%#v error=%v", storedRoster, err)
+	}
+	storedHeads, err := readGatewayRebindRetainedRuntimeHeads(context.Background(), fixture.db,
+		proposal.Spec.OperationID)
+	if err != nil || !reflect.DeepEqual(storedHeads, proposal.RuntimeHeads) ||
+		storedHeads[0].ReleaseID != rebindTestSnapshotReleaseID {
+		t.Fatalf("stored runtime heads=%#v want=%#v error=%v", storedHeads, proposal.RuntimeHeads, err)
+	}
+	wantHeadDigest, err := gatewayRebindRuntimeHeadV2Digest(proposal.Spec.OperationID, 1,
+		proposal.RuntimeHeads[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var storedHeadDigest string
+	if err := fixture.db.QueryRow(`SELECT entry_digest FROM lan_gateway_rebind_runtime_heads
+		WHERE operation_id=? AND ordinal=1`, proposal.Spec.OperationID).Scan(&storedHeadDigest); err != nil ||
+		storedHeadDigest != wantHeadDigest {
+		t.Fatalf("retained runtime-head digest=%q want=%q error=%v", storedHeadDigest, wantHeadDigest, err)
 	}
 }
 

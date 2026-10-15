@@ -1,6 +1,6 @@
 # M3 supported-controller fixture startup investigation
 
-Status: diagnostic and cleanup repair candidate; M3 remains incomplete.
+Status: materialized release identity repair candidate; M3 remains incomplete.
 This branch starts from PR #160 at
 `950944edc9e028ce407060e4e726521876ae1c14`. Its initial revision changes test
 infrastructure. The follow-up adds closed diagnostic metadata to production
@@ -293,3 +293,107 @@ revision restores digest-only diagnostics and its earlier cleanup behavior;
 reverting the refinement removes checkpoint detail. Neither action makes the
 failed matrix an accepted result. No deployment or controller activation is
 part of this change.
+
+## Materialized release identity repair
+
+The diagnostic at `6b43271d73eaf88ea9a86359c4bd7a158b18791f` narrowed the hosted
+failure to `startup_snapshot_runtime_heads` with cause `invalid_stored_state`.
+[Job 116379868073](https://github.com/tyhuang9/rig/actions/runs/38722389935/job/116379868073)
+failed the initial `boundary/a0-sql-claim` child before daemon assembly (150.12s).
+All 20 prerequisite parents and 157 subcases ran and passed once, and independent
+cleanup passed. The checkout tree matched the published head. Raw log SHA-256:
+`a6a3409b930aecbbfa3a4ea66e6c7b61cb8248ae7c6929d73c0ac3d865234f7d`.
+
+Both local and GitHub snapshot materializers generate 16 random bytes encoded
+as 32 lowercase hexadecimal characters. Generated runtime state already accepts
+that format and canonical UUIDs. The startup head reader, rebind roster/head
+digests, serving census and retained-head SQL insert trigger instead required
+UUIDs. The offline fixture used a UUID, hiding the producer/consumer mismatch.
+Changing its release IDs to the materializer format reproduced rejection against
+unchanged production. The failed native reproduction is retained with log SHA-256
+`f11eb0183c5e5d6b75eb363a1ba40b5045f4ef151a1cf018846e1311e202bbaa`.
+
+The repair applies a release-specific canonical UUID-or-hex32 check at the five
+Go validation sites and aligns the two rebind API fields with the existing
+general release-ID contract. It preserves exact ID bytes, digest versions and
+serialization, SQL relationships, authority checks and immutable history. Other
+identifiers remain UUID-only. It adds no ID normalization, retry, timeout or
+Docker behavior change.
+
+The first broader verification exposed the same restriction in migration 035's
+retained-head insert trigger: 140 appaccess parents passed on each OS and the
+new hex32 claim-persistence case failed. Migration 035 remains unchanged. The
+additive, mirrored migration `037_lan_gateway_rebind_release_identity.sql`
+replaces only that insert trigger. All predicates outside release validation
+remain identical, including prepared-claim authority, exact runtime parents,
+ordinal ordering, slot/generation and timestamp checks. Release values must be
+text with exact character and byte lengths; embedded NUL suffixes and BLOB
+values are rejected. No existing row or digest is rewritten, and update/delete
+retention triggers remain installed.
+
+### Verification boundary for the repair
+
+Local verification receipts are retained in wrapper
+`temp/m3-lan-external-db-20261015/release-identity-verification/`. They distinguish
+the failing producer-format reproduction, the intermediate SQL-trigger failure,
+and subsequent migration-enabled results. Verification includes both valid
+formats, malformed boundaries, crossed release relationships, legacy digest
+compatibility, retained claim replay, migration upgrade/rollback and unchanged
+history. The final source passed **214 parent tests and 360 subcases per
+platform**, with explicit discovery, uncached execution and no failures or skips:
+
+| Package | Parents | Subcases | Windows seconds | Linux seconds |
+| --- | ---: | ---: | ---: | ---: |
+| `internal/appaccess` (complete package) | 141 | 278 | 26.703 | 28.281 |
+| `internal/database` (complete package) | 60 | 50 | 21.094 | 23.235 |
+| `internal/generatedingress` (serving restore/census) | 11 | 30 | 309.953 | 42.157 |
+| `internal/controller` (release contract/routes) | 2 | 2 | 0.735 | 0.907 |
+
+The runners compile with `go test -tags live_docker -c`, discover each exact
+roster and execute through `go tool test2json` with `-test.count=1` and
+`-test.timeout=10m`. These selected tests do not require Docker. Recorded source
+hashes match before and after each run. Non-database runs exclude only the new
+database test file from their hash set; that file is not compiled by those
+packages and is covered by the complete database runs.
+
+Windows and Linux `go build ./cmd/hostd` and
+`go vet -tags live_docker ./cmd/hostd ./internal/appaccess ./internal/generatedingress ./internal/database ./internal/controller`
+passed. `pwsh -NoProfile -File scripts/check-generation.ps1` passed, including
+the migration mirror, generated OpenAPI artifacts and registered-route checks.
+The frozen offline frontend install, all 544 frontend tests and canonical
+`scripts/check-embedded.ps1` production build/asset comparison passed. Docs
+workflow, build and accessibility checks also passed. Independent static
+security review found no blocking issue.
+
+Final raw test log SHA-256 values:
+
+- Windows appaccess: `50db821bc03a7982321d518b1b6b4d7a362fc81f46b634ef06e8d11eb70d765a`.
+- Linux appaccess: `4e77c90478e06c92abba511b64118f0b96b41ecc4e672940dab11086d1f50d0e`.
+- Windows database: `86e041220e8c5b15be9e5e56b3094229885aa2f69cd9f5ad747a7527b6ea52a2`.
+- Linux database: `b3f644322762c6def075dd06b82f7569c8fe214666530488479348234527b453`.
+- Windows ingress: `1739c65b804819173e104bb56c2fdc3bf26b84a8d9bd4bc75f6ce8c094dedc46`.
+- Linux ingress: `5be7b41f63b78feeefd46501f55d513431c25d602cd8079e25c7cb88eee09092`.
+- Windows contract: `7e611489886c79e44bf9b2f93772560c27b448a91984e617cb8d2b00a26152e5`.
+- Linux contract: `81fdf8a415a73f161513e38589a4c10e88c9ca8ed7c34b9ed1f95b5ff9fa7714`.
+
+Local Docker and race execution remain unavailable. Repository-wide `make test`,
+the browser suite and manual screen-reader checks were not repeated locally;
+the published candidate needs hosted platform and Docker verification.
+
+The preceding hosted passes apply to `6b43271`, not the release-identity repair.
+The repair still requires hosted initial-child acceptance followed by the full
+33-boundary/30-scenario matrix. Physical second-device LAN qualification remains
+separate. External databases remain application-owned and configured through
+scoped runtime secrets; no managed database or Neon provisioning is added.
+
+### Migration and rollback limits
+
+The existing migration runner applies the trigger replacement and its ledger
+entry in one transaction. This development work does not restart or migrate the
+user's running controller. Migration 037 runs when a controller with this code
+opens its database through the normal migration path.
+
+A code revert does not remove an already-applied migration. Older readers reject
+materialized hex32 IDs, so reverting can restore the startup failure. Any
+predicate downgrade requires a separately reviewed additive migration. Never
+rewrite release IDs or delete operation history to make an older reader pass.

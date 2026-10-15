@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/hostd/hostd/internal/appaccess"
@@ -448,6 +449,59 @@ func TestGatewayCurrentServingRuntimeCensusRejectsIncompleteOrCrossedComponents(
 	// Ensure repository errors cannot be confused with an empty, authorized census.
 	if _, err := f.manager.RestoreGatewayCurrentServingStartup(context.Background(), nil); !IsCode(err, DiagnosticValidationFailed) {
 		t.Fatal("missing repository accepted")
+	}
+}
+
+func TestGatewayCurrentServingRuntimeCensusAcceptsExactReleaseIdentityFormats(t *testing.T) {
+	f, selection, _ := gatewayCurrentServingRestoreSQLFixture(t)
+	snapshot, err := f.repository.HostingGatewayStartupSnapshot(context.Background())
+	if err != nil || !gatewayCurrentServingRuntimeCensusMatches(*selection.State, snapshot) || len(snapshot.RuntimeHeads) == 0 {
+		t.Fatalf("positive census setup: %v", err)
+	}
+	const hexRelease = "0123456789abcdef0123456789abcdef"
+	for _, test := range []struct {
+		name    string
+		release string
+		valid   bool
+	}{
+		{"uuid", "14141414-1414-4414-8414-141414141414", true},
+		{"materialized release", hexRelease, true},
+		{"empty", "", false},
+		{"uppercase hex", strings.ToUpper(hexRelease), false},
+		{"short hex", hexRelease[:31], false},
+		{"long hex", hexRelease + "0", false},
+		{"nonhex", hexRelease[:31] + "g", false},
+		{"whitespace", " " + hexRelease, false},
+		{"noncanonical uuid", "14141414-1414-4414-8414-14141414141A", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			changed := snapshot
+			changed.RuntimeHeads = append([]appaccess.GatewayRebindRuntimeHead(nil), snapshot.RuntimeHeads...)
+			changed.RuntimeComponents = append([]appaccess.GatewayStartupRuntimeComponent(nil), snapshot.RuntimeComponents...)
+			appID := changed.RuntimeHeads[0].AppID
+			changed.RuntimeHeads[0].ReleaseID = test.release
+			for i := range changed.RuntimeComponents {
+				if changed.RuntimeComponents[i].AppID == appID {
+					changed.RuntimeComponents[i].ReleaseID = test.release
+				}
+			}
+			if got := gatewayCurrentServingRuntimeCensusMatches(*selection.State, changed); got != test.valid {
+				t.Fatalf("release identity accepted=%t, want=%t", got, test.valid)
+			}
+			if !test.valid {
+				return
+			}
+			// A valid format must not permit a component from another release.
+			for i := range changed.RuntimeComponents {
+				if changed.RuntimeComponents[i].AppID == appID {
+					changed.RuntimeComponents[i].ReleaseID = "fedcba9876543210fedcba9876543210"
+					break
+				}
+			}
+			if gatewayCurrentServingRuntimeCensusMatches(*selection.State, changed) {
+				t.Fatal("crossed release identity accepted")
+			}
+		})
 	}
 }
 

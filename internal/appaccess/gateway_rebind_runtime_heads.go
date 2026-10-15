@@ -87,7 +87,7 @@ func readGatewayRebindRuntimeHeads(ctx context.Context,
 		}
 		value.DeploymentID, value.ReleaseID, value.Slot = deploymentID.String, releaseID.String, slot.String
 		value.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt.String)
-		if err != nil || !validUUID(value.DeploymentID) || !validUUID(value.ReleaseID) ||
+		if err != nil || !validUUID(value.DeploymentID) || !validReleaseID(value.ReleaseID) ||
 			(value.Slot != "blue" && value.Slot != "green") || value.UpdatedAt.IsZero() ||
 			!strings.HasSuffix(updatedAt.String, "Z") {
 			_ = rows.Close()

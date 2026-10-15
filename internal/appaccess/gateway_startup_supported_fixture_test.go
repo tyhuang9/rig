@@ -81,6 +81,11 @@ func TestHostingGatewayStartupSnapshotAcceptsSupportedFixtureCombinedStateAfterR
 	for index, appID := range apps {
 		grants = append(grants, commitSupportedFixtureGrant(t, repository, profile, upgrade, appID, index))
 	}
+	beforeSnapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
+	if err != nil {
+		stage, cause := HostingGatewayStartupDiagnostic(err)
+		t.Fatalf("supported fixture combined startup snapshot diagnostic=(%q,%q)", stage, cause)
+	}
 	before := readSupportedFixtureAuthority(t, repository, grants)
 	if !reflect.DeepEqual(before.profile, profile) || !reflect.DeepEqual(before.upgrade, upgrade) ||
 		!reflect.DeepEqual(before.heads, wantHeads) || before.rebind.Active != nil ||
@@ -92,10 +97,6 @@ func TestHostingGatewayStartupSnapshotAcceptsSupportedFixtureCombinedStateAfterR
 	assertSupportedFixtureHasNoRebindClaims(t, setupDB)
 	historyBefore := readSupportedFixtureHistory(t, setupDB)
 	assertSupportedFixtureHistoryShape(t, historyBefore, len(grants))
-	beforeSnapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
-	if err != nil {
-		t.Fatal("read supported fixture combined startup snapshot before reopen:", err)
-	}
 
 	if err := setupDB.Close(); err != nil {
 		t.Fatal("close supported fixture database:", err)
@@ -111,7 +112,8 @@ func TestHostingGatewayStartupSnapshotAcceptsSupportedFixtureCombinedStateAfterR
 	changesBefore := readSupportedFixtureTotalChanges(t, reopenedDB)
 	snapshot, err := reopened.HostingGatewayStartupSnapshot(ctx)
 	if err != nil {
-		t.Fatal("read supported fixture combined startup snapshot:", err)
+		stage, cause := HostingGatewayStartupDiagnostic(err)
+		t.Fatalf("reopened supported fixture combined startup snapshot diagnostic=(%q,%q)", stage, cause)
 	}
 	changesAfter := readSupportedFixtureTotalChanges(t, reopenedDB)
 	if changesAfter != changesBefore {
@@ -289,7 +291,9 @@ func seedSupportedFixtureRuntime(t *testing.T, db *sql.DB, appID string) (
 ) {
 	t.Helper()
 	ctx := context.Background()
-	planID, releaseID := uuid.NewString(), uuid.NewString()
+	// releasesnapshot.MaterializeLocal and releasesnapshot.Materialize produce
+	// 16 random bytes encoded as 32 lowercase hexadecimal release IDs.
+	planID, releaseID := uuid.NewString(), supportedFixtureDigest(appID + "-release-id")[:32]
 	deploymentID, jobID := uuid.NewString(), uuid.NewString()
 	stamp := formatTime(testNow)
 	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(

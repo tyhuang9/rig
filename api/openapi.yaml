@@ -1264,7 +1264,7 @@ components:
         sourceProfileSpecDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
         predecessorTransferDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
         servingDeploymentId: {type: string, format: uuid}
-        servingReleaseId: {type: string, format: uuid}
+        servingReleaseId: {type: string, pattern: '^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$'}
         servingSlot: {type: string, enum: [blue, green]}
         routeGeneration: {type: integer, format: int64, minimum: 1}
     LANGatewayRebindRuntimeHead:
@@ -1274,7 +1274,7 @@ components:
       properties:
         appId: {type: string, format: uuid}
         deploymentId: {type: string, format: uuid}
-        releaseId: {type: string, format: uuid}
+        releaseId: {type: string, pattern: '^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$'}
         slot: {type: string, enum: [blue, green]}
         generation: {type: integer, format: int64, minimum: 1}
         updatedAt: {type: string, format: date-time}

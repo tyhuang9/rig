@@ -61,6 +61,71 @@ func TestGatewayRebindV1CanonicalDigestsRemainStable(t *testing.T) {
 	}
 }
 
+func TestGatewayRebindRosterDigestsAcceptSnapshotReleaseIDs(t *testing.T) {
+	v1UUID := gatewayRebindV1GoldenEntry()
+	v1UUIDDigest, err := GatewayRebindRosterEntryDigest(v1UUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1Snapshot := v1UUID
+	v1Snapshot.ServingReleaseID = rebindTestSnapshotReleaseID
+	v1SnapshotDigest, err := GatewayRebindRosterEntryDigest(v1Snapshot)
+	if err != nil || v1SnapshotDigest == v1UUIDDigest {
+		t.Fatalf("v1 snapshot release entry digest=%q UUID digest=%q error=%v",
+			v1SnapshotDigest, v1UUIDDigest, err)
+	}
+	v1Snapshot.EntryDigest = v1SnapshotDigest
+	v1RosterDigest, err := GatewayRebindRosterDigest([]GatewayRebindRosterEntry{v1Snapshot})
+	if err != nil || v1RosterDigest == "" || v1Snapshot.ServingReleaseID != rebindTestSnapshotReleaseID {
+		t.Fatalf("v1 snapshot release roster digest=%q entry=%#v error=%v",
+			v1RosterDigest, v1Snapshot, err)
+	}
+
+	v2UUID := gatewayRebindV2GoldenEntry(nil)
+	v2UUIDDigest, err := GatewayRebindRosterEntryV2Digest(v2UUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Snapshot := v2UUID
+	v2Snapshot.ServingReleaseID = rebindTestSnapshotReleaseID
+	v2SnapshotDigest, err := GatewayRebindRosterEntryV2Digest(v2Snapshot)
+	if err != nil || v2SnapshotDigest == v2UUIDDigest {
+		t.Fatalf("v2 snapshot release entry digest=%q UUID digest=%q error=%v",
+			v2SnapshotDigest, v2UUIDDigest, err)
+	}
+	v2Snapshot.EntryDigest = v2SnapshotDigest
+	v2RosterDigest, err := GatewayRebindRosterV2Digest([]GatewayRebindRosterEntryV2{v2Snapshot})
+	if err != nil || v2RosterDigest == "" || v2Snapshot.ServingReleaseID != rebindTestSnapshotReleaseID {
+		t.Fatalf("v2 snapshot release roster digest=%q entry=%#v error=%v",
+			v2RosterDigest, v2Snapshot, err)
+	}
+}
+
+func TestGatewayReleaseIDValidationIsCanonicalAndBounded(t *testing.T) {
+	for _, value := range []string{rebindTypeTestRelease, rebindTestSnapshotReleaseID} {
+		if !validReleaseID(value) {
+			t.Fatalf("canonical release ID %q was rejected", value)
+		}
+	}
+	if validUUID(rebindTestSnapshotReleaseID) {
+		t.Fatal("snapshot release ID widened UUID validation")
+	}
+	for name, value := range map[string]string{
+		"uppercase hex":     strings.ToUpper(rebindTestSnapshotReleaseID),
+		"short hex":         rebindTestSnapshotReleaseID[:31],
+		"long hex":          rebindTestSnapshotReleaseID + "0",
+		"nonhex":            "g" + rebindTestSnapshotReleaseID[1:],
+		"whitespace":        " " + rebindTestSnapshotReleaseID[1:],
+		"noncanonical UUID": "{" + rebindTypeTestRelease + "}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if validReleaseID(value) {
+				t.Fatalf("invalid release ID %q was accepted", value)
+			}
+		})
+	}
+}
+
 func TestGatewayRebindV2CanonicalTypesBindTypedSourceAndTransferChain(t *testing.T) {
 	entry := gatewayRebindV2GoldenEntry(nil)
 	entryDigest, err := GatewayRebindRosterEntryV2Digest(entry)
@@ -109,6 +174,16 @@ func TestGatewayRebindRuntimeHeadsV2DigestBindsCompleteCanonicalCensus(t *testin
 	if digest != want {
 		t.Fatalf("runtime-head digest changed: got %s want %s", digest, want)
 	}
+	snapshotHeads := append([]GatewayRebindRuntimeHead(nil), heads...)
+	snapshotHeads[0].ReleaseID = rebindTestSnapshotReleaseID
+	snapshotDigest, err := GatewayRebindRuntimeHeadsV2Digest(rebindTypeTestOperation, snapshotHeads)
+	if err != nil || snapshotDigest == digest || snapshotHeads[0].ReleaseID != rebindTestSnapshotReleaseID {
+		t.Fatalf("snapshot release runtime-head digest=%q UUID digest=%q error=%v",
+			snapshotDigest, digest, err)
+	}
+	if repeated, err := GatewayRebindRuntimeHeadsV2Digest(rebindTypeTestOperation, snapshotHeads); err != nil || repeated != snapshotDigest {
+		t.Fatalf("snapshot release runtime-head digest was not deterministic: digest=%q error=%v", repeated, err)
+	}
 
 	sameInstant := append([]GatewayRebindRuntimeHead(nil), heads...)
 	sameInstant[0].UpdatedAt = sameInstant[0].UpdatedAt.In(time.FixedZone("test-offset", -6*60*60))
@@ -127,6 +202,7 @@ func TestGatewayRebindRuntimeHeadsV2DigestBindsCompleteCanonicalCensus(t *testin
 		"noncanonical deployment": func(values []GatewayRebindRuntimeHead) {
 			values[0].DeploymentID = strings.ToUpper(values[0].DeploymentID)
 		},
+		"invalid release":     func(values []GatewayRebindRuntimeHead) { values[0].ReleaseID = strings.Repeat("g", 32) },
 		"inactive generation": func(values []GatewayRebindRuntimeHead) { values[0].Generation = 0 },
 		"missing timestamp":   func(values []GatewayRebindRuntimeHead) { values[0].UpdatedAt = time.Time{} },
 	} {
