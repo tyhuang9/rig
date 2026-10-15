@@ -37,6 +37,10 @@ rebind_typed_pattern='^TestGatewayRebindTyped'
 rebind_withdrawal_pattern='^TestGatewayRebindTyped(Rollback|ForwardOnly)'
 rebind_completed_pattern='^TestGatewayRebindTyped(Completed|Committed|Recovery|Undurable)'
 rebind_composition_pattern='^TestGatewayRebindConcreteComposition'
+# Keep complete startup/adoption and transferred-lifecycle parent trees in
+# complementary batches; none of these changes extends the test deadline.
+rebind_composition_startup_pattern='^TestGatewayRebindConcreteComposition(ReconstructsFreshA0|RecoversUnboundCreate)'
+rebind_composition_transferred_pattern='^TestGatewayRebindConcreteCompositionTransferred'
 rebind_second_generation_pattern='^TestGatewayRebindConcreteCompositionSecondGeneration'
 rebind_legacy_source_pattern='^TestGatewayRebindConcreteCompositionLegacySource'
 current_pattern='^Test(ManagedGatewayCurrent|GatewayCurrent|InspectGatewayCurrent)'
@@ -112,7 +116,15 @@ case "$suite" in
     ;;
   rebind-composition-native)
     packages=(./internal/generatedingress)
-    filter=(-run "$rebind_composition_pattern" -skip "$rebind_second_generation_pattern|$rebind_legacy_source_pattern")
+    filter=(-run "$rebind_composition_pattern" -skip "$rebind_second_generation_pattern|$rebind_legacy_source_pattern|$rebind_composition_startup_pattern|$rebind_composition_transferred_pattern")
+    ;;
+  rebind-composition-startup)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_composition_startup_pattern")
+    ;;
+  rebind-composition-transferred)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_composition_transferred_pattern")
     ;;
   rebind-composition-second-generation)
     packages=(./internal/generatedingress)
