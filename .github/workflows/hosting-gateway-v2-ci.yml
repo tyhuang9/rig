@@ -208,7 +208,7 @@ jobs:
           retention-days: 7
 
   supported-hostd-rebind-crash-matrix-complete:
-    name: Supported hostd rebind crash matrix complete
+    name: Supported hostd rebind crash and recovery matrix
     needs: [supported-hostd-rebind-crash-matrix]
     if: always()
     runs-on: ubuntu-24.04

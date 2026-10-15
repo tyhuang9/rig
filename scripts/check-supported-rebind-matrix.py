@@ -169,6 +169,7 @@ def validate_workflow(root: Path, contract: dict[str, Any]) -> None:
         fail("hosted CI partition aggregate job is absent")
     aggregate = aggregate_match.group("body")
     for fragment in (
+        "name: Supported hostd rebind crash and recovery matrix\n",
         "needs: [supported-hostd-rebind-crash-matrix]",
         "if: always()",
         "MATRIX_RESULT: ${{ needs.supported-hostd-rebind-crash-matrix.result }}",
@@ -306,7 +307,7 @@ def verify_events(contract: dict[str, Any], group_id: str, events_path: Path) ->
 
 
 def write_result(path: Path, command: list[str], returncode: int | None, elapsed_seconds: float,
-                 *, timed_out: bool = False) -> None:
+                 *, timed_out: bool = False, residual_process_group: bool = False) -> None:
     path.write_text(
         json.dumps(
             {
@@ -314,6 +315,7 @@ def write_result(path: Path, command: list[str], returncode: int | None, elapsed
                 "returncode": returncode,
                 "elapsed_seconds": round(elapsed_seconds, 3),
                 "timed_out": timed_out,
+                "residual_process_group": residual_process_group,
             },
             sort_keys=True,
         )
@@ -328,17 +330,18 @@ def go_re2_literal(value: str) -> str:
     return rf"\Q{value}\E"
 
 
-def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+def terminate_process_group(process: subprocess.Popen[bytes]) -> bool:
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGKILL)
         else:
             process.kill()
     except ProcessLookupError:
-        return
+        return False
+    return True
 
 
-def run_case_command(command: list[str], root: Path, timeout_seconds: float) -> tuple[bytes, int | None, bool]:
+def run_case_command(command: list[str], root: Path, timeout_seconds: float) -> tuple[bytes, int | None, bool, bool]:
     popen_arguments: dict[str, Any] = {
         "cwd": root,
         "stdout": subprocess.PIPE,
@@ -351,13 +354,17 @@ def run_case_command(command: list[str], root: Path, timeout_seconds: float) -> 
     process = subprocess.Popen(command, **popen_arguments)
     try:
         output, _ = process.communicate(timeout=timeout_seconds)
-        return output, process.returncode, False
+        # A Go package timeout can exit before its hostd child, whose output
+        # does not use this pipe. Retire the owned group even when pipe draining
+        # finishes normally; the independent Docker census still must pass.
+        residual_process_group = os.name == "posix" and terminate_process_group(process)
+        return output, process.returncode, False, residual_process_group
     except subprocess.TimeoutExpired as error:
         partial_output = error.output or b""
         terminate_process_group(process)
         try:
             output, _ = process.communicate(timeout=10)
-            return output or partial_output, process.returncode, True
+            return output or partial_output, process.returncode, True, False
         except subprocess.TimeoutExpired as second_error:
             partial_output = second_error.output or partial_output
             terminate_process_group(process)
@@ -367,7 +374,7 @@ def run_case_command(command: list[str], root: Path, timeout_seconds: float) -> 
                 pass
             if process.stdout is not None:
                 process.stdout.close()
-            return partial_output, process.returncode, True
+            return partial_output, process.returncode, True, False
 
 
 def posix_process_ended(process_id: int, timeout_seconds: float) -> bool:
@@ -432,7 +439,7 @@ def run_group(root: Path, contract: dict[str, Any], group_id: str, events_path: 
         case_result = log_directory / f"{prefix}.result.json"
         case_started = time.monotonic()
         try:
-            output, returncode, timed_out = run_case_command(command, root, case_window)
+            output, returncode, timed_out, residual_process_group = run_case_command(command, root, case_window)
         except OSError as error:
             case_log.write_bytes(b"")
             write_result(case_result, command, None, time.monotonic() - case_started)
@@ -444,7 +451,10 @@ def run_group(root: Path, contract: dict[str, Any], group_id: str, events_path: 
                 all_events.write(b"\n")
         if emit_output:
             emit_case_output(output)
-        write_result(case_result, command, returncode, time.monotonic() - case_started, timed_out=timed_out)
+        write_result(case_result, command, returncode, time.monotonic() - case_started,
+                     timed_out=timed_out, residual_process_group=residual_process_group)
+        if residual_process_group:
+            fail(f"case {case!r} left an owned process group after command exit; logs are in {log_directory}")
         if timed_out:
             fail(f"case {case!r} exceeded its bounded execution window; logs are in {log_directory}")
         if returncode is None:
@@ -589,7 +599,7 @@ def self_test(root: Path, contract: dict[str, Any]) -> None:
                 child_code,
             ]
             started = time.monotonic()
-            _, returncode, timed_out = run_case_command(pipe_holder, root, 5)
+            _, returncode, timed_out, _ = run_case_command(pipe_holder, root, 5)
             try:
                 child_process_id = int(marker.read_text(encoding="utf-8"))
             except (OSError, ValueError) as error:
@@ -601,6 +611,41 @@ def self_test(root: Path, contract: dict[str, Any]) -> None:
                 or not posix_process_ended(child_process_id, 5)
             ):
                 fail("self-test process-group timeout did not kill a pipe-holding child")
+
+            for exit_code in (0, 7):
+                detached_marker = temporary_path / f"detached-child-{exit_code}.pid"
+                detached_parent = parent_code.replace(
+                    "subprocess.Popen([sys.executable, '-c', sys.argv[2], str(marker)])",
+                    "subprocess.Popen([sys.executable, '-c', sys.argv[2], str(marker)], "
+                    "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+                ) + "raise SystemExit(int(sys.argv[3]))\n"
+                output, actual_exit, timed_out, residue = run_case_command(
+                    [sys.executable, "-c", detached_parent, str(detached_marker), child_code, str(exit_code)],
+                    root,
+                    5,
+                )
+                try:
+                    descendant_id = int(detached_marker.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as error:
+                    fail(f"self-test detached child did not publish its process id: {error}")
+                try:
+                    if actual_exit != exit_code or timed_out or not residue or not posix_process_ended(descendant_id, 5):
+                        fail("self-test completed command retained a detached-output child")
+                    if exit_code == 0:
+                        from unittest.mock import patch
+                        with patch.dict(run_group.__globals__, run_case_command=lambda *_: (output, actual_exit, timed_out, residue)):
+                            expect_contract_error("successful command with process residue", lambda: run_group(
+                                root, contract, first_group, command_events, command_logs, sys.executable, emit_output=False
+                            ))
+                        results = [read_json(path) for path in command_logs.glob("*.result.json")]
+                        if not any(result["returncode"] == 0 and result["residual_process_group"] for result in results):
+                            fail("self-test process residue did not retain original successful exit evidence")
+                finally:
+                    if not posix_process_ended(descendant_id, 0):
+                        try:
+                            os.kill(descendant_id, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
 
 
 def parse_args() -> argparse.Namespace:

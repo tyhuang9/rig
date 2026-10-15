@@ -46,9 +46,11 @@ it cannot select a sibling as an acceptable substitute. Each invocation keeps
 `live_docker`, `-count=1`, verbose JSON events, the real runtime flags and the
 existing `COMMIT`/`ABORT` assertions in the test harness.
 
-Each exact invocation has a 30-minute Go package deadline: up to 20 minutes for
-the observed live operation and a ten-minute cleanup reserve. The helper adds a
-two-minute process-reap allowance and will not start a case unless its full
+Each exact invocation has a 30-minute Go package deadline. The companion child
+readiness repair reserves ten minutes for cleanup during startup waits, leaving
+up to twenty minutes of case working time; this CI-only change does not itself
+enforce that reserve. The helper adds a two-minute compilation/completion
+allowance and will not start a case unless its full
 32-minute window fits before the 110-minute group deadline. The CI step has a
 115-minute deadline and its job has a 130-minute deadline. All are below the
 former 345-minute package, 350-minute step and 360-minute job limits.
@@ -72,12 +74,22 @@ exits while a same-process-group child holds the inherited output pipe. The
 runner must kill that child without waiting indefinitely before the cleanup
 census is allowed to run.
 
+The owned process group is also terminated after a command returns normally,
+including a nonzero Go exit. This covers a package timeout that leaves a hostd
+child with separately redirected output. The controls exercise both zero and
+nonzero parent exits with such a descendant. Killing an owned process group
+does not remove Docker resources. A remaining process group fails the case
+even when the Go command returned zero, and the original command status is
+retained in its result file. The independent resource census remains required.
+
 The event verifier requires exactly one `run` and `pass` for every selected
 child, one parent `run` and `pass` per child invocation, and one package pass
 per invocation. A missing event, unexpected sibling, failure or skip fails the
 group. The aggregate job runs under `if: always()` and accepts only an overall
 matrix result of `success`, so a failed, cancelled or skipped partition cannot
 be hidden by successful controls in other partitions.
+The aggregate retains the original check name, `Supported hostd rebind crash
+and recovery matrix`, for existing required-check references.
 
 ## Local contract evidence
 
@@ -115,3 +127,12 @@ to run]`. The generation check exited zero and reported `ok
 github.com/hostd/hostd/internal/controller 0.649s`. The local Windows host has
 no Docker daemon, so the 63 real runtime cases remain pending hosted execution
 on the exact published candidate.
+
+The review follow-up reran both Python checks on Windows and WSL on
+2026-10-15 at 22:57 UTC; all four commands exited zero. The exact helper SHA256
+was `9c35b4523d281e1e16f6ec15e94cbb7afeeabab1850587158be9d1b97d68f63b`.
+Linux controls proved pipe-holder timeout cleanup and redirected-output child
+cleanup after both zero and nonzero parent exits; a zero exit with remaining
+children was rejected with the original exit evidence retained. The updated
+parser also accepted the previously recorded F A0 event stream. That replay
+checks parsing only and is not another Docker execution.
