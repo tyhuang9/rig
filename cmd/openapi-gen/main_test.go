@@ -121,3 +121,27 @@ func TestOptionalPointerReferencePreservesAbsentNestedSetup(t *testing.T) {
 		t.Fatal("required optional-pointer extension accepted")
 	}
 }
+
+func TestExportedNamePreservesIdentityAndNormalizesIDBoundaries(t *testing.T) {
+	t.Parallel()
+
+	for input, expected := range map[string]string{
+		"id":                      "ID",
+		"appId":                   "AppID",
+		"profileIdDigest":         "ProfileIDDigest",
+		"request_id":              "RequestID",
+		"request-id-digest":       "RequestIDDigest",
+		"identity":                "Identity",
+		"idempotencyKey":          "IdempotencyKey",
+		"protectedIdentityDigest": "ProtectedIdentityDigest",
+		"identityId":              "IdentityID",
+	} {
+		input, expected := input, expected
+		t.Run(input, func(t *testing.T) {
+			t.Parallel()
+			if actual := exportedName(input); actual != expected {
+				t.Fatalf("exportedName(%q) = %q, want %q", input, actual, expected)
+			}
+		})
+	}
+}

@@ -7,7 +7,7 @@ type Operation struct {
 	Path   string
 }
 
-const SourceSHA256 = "167e0f26ffc22636aaeb72948d6ebf31d7cb7f749ff6074a822a132e9f6b0dfd"
+const SourceSHA256 = "bb03a9ccef2f6ce597f9c466a6a97045c698ab1cafe8bc279662c82a0bc4adba"
 
 var Operations = map[string]Operation{
 	"acceptApplicationDeploymentPlan":           {Method: "PUT", Path: "/api/v1/apps/{appId}/deployment-plan"},
@@ -16,6 +16,7 @@ var Operations = map[string]Operation{
 	"bootstrap":                                 {Method: "POST", Path: "/api/v1/auth/bootstrap"},
 	"bootstrapStatus":                           {Method: "GET", Path: "/api/v1/auth/bootstrap/status"},
 	"cancelJob":                                 {Method: "POST", Path: "/api/v1/jobs/{jobId}/cancel"},
+	"commitLANGatewayRebind":                    {Method: "POST", Path: "/api/v1/system/lan-gateway-rebind"},
 	"configureLANGatewayProfile":                {Method: "POST", Path: "/api/v1/system/lan-gateway-profile"},
 	"createApplication":                         {Method: "POST", Path: "/api/v1/apps"},
 	"deployApplication":                         {Method: "POST", Path: "/api/v1/apps/{appId}/deployments"},
@@ -35,12 +36,15 @@ var Operations = map[string]Operation{
 	"getDeploymentJobByIdempotency":             {Method: "GET", Path: "/api/v1/apps/{appId}/deployment-jobs/by-idempotency"},
 	"getJob":                                    {Method: "GET", Path: "/api/v1/jobs/{jobId}"},
 	"getLANGatewayProfile":                      {Method: "GET", Path: "/api/v1/system/lan-gateway-profile"},
+	"getLANGatewayRebind":                       {Method: "GET", Path: "/api/v1/system/lan-gateway-rebind/{operationId}"},
 	"getLANGatewayUpgrade":                      {Method: "GET", Path: "/api/v1/system/lan-gateway-upgrade"},
 	"getLANRecoveryHead":                        {Method: "GET", Path: "/api/v1/lan/recovery"},
 	"getRelayStatus":                            {Method: "GET", Path: "/api/v1/relay/status"},
 	"grantApplicationLANAccess":                 {Method: "POST", Path: "/api/v1/apps/{appId}/lan-access/grants"},
 	"grantRuntimeApproval":                      {Method: "POST", Path: "/api/v1/apps/{appId}/runtime-approvals"},
 	"inspectImport":                             {Method: "POST", Path: "/api/v1/apps/import/inspect"},
+	"inspectLANGatewayRebind":                   {Method: "POST", Path: "/api/v1/system/lan-gateway-rebind/proposal"},
+	"inspectLANGatewayRebindRecovery":           {Method: "POST", Path: "/api/v1/system/lan-gateway-rebind/{operationId}/recovery-proposal"},
 	"listApplications":                          {Method: "GET", Path: "/api/v1/apps"},
 	"listDefaultGitHubRepositories":             {Method: "GET", Path: "/api/v1/source-connections/default/github/repositories"},
 	"listDeployments":                           {Method: "GET", Path: "/api/v1/apps/{appId}/deployments"},
@@ -60,6 +64,7 @@ var Operations = map[string]Operation{
 	"pollDefaultGitHubDeviceConnection":         {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/{authorizationId}/poll"},
 	"pollGitHubDeviceConnection":                {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/device/poll"},
 	"pollRelayEnrollment":                       {Method: "POST", Path: "/api/v1/relay/enrollments/{enrollmentId}/poll"},
+	"reconcileLANGatewayRebind":                 {Method: "POST", Path: "/api/v1/system/lan-gateway-rebind/{operationId}/reconcile"},
 	"refreshSourceConnection":                   {Method: "POST", Path: "/api/v1/source-connections/{connectionId}/refresh"},
 	"removeRelayBinding":                        {Method: "DELETE", Path: "/api/v1/relay/bindings/{bindingId}"},
 	"replaceApplicationConfiguration":           {Method: "PUT", Path: "/api/v1/apps/{appId}/configuration"},
@@ -253,6 +258,18 @@ type Capabilities struct {
 	FakeRuntime       bool `json:"fakeRuntime"`
 	GeneratedRuntime  bool `json:"generatedRuntime"`
 	GithubConnections bool `json:"githubConnections"`
+}
+
+type CommitLANGatewayRebindRequest struct {
+	ConfigureApprovalDigest        string                `json:"configureApprovalDigest"`
+	OperationID                    string                `json:"operationId"`
+	ProposalDigest                 string                `json:"proposalDigest"`
+	RebindApprovalDigest           string                `json:"rebindApprovalDigest"`
+	SuccessorProfile               LANGatewayProfileSpec `json:"successorProfile"`
+	SuccessorProfileOperationID    string                `json:"successorProfileOperationId"`
+	SuccessorProfileRevisionID     string                `json:"successorProfileRevisionId"`
+	SuccessorProfileRevisionNumber int64                 `json:"successorProfileRevisionNumber"`
+	Version                        int                   `json:"version"`
 }
 
 type ConfigurationEntry struct {
@@ -591,6 +608,17 @@ type HostResources struct {
 	MemoryTotalBytes     int64 `json:"memoryTotalBytes"`
 }
 
+type InspectLANGatewayRebindRecoveryRequest struct {
+}
+
+type InspectLANGatewayRebindRequest struct {
+	OperationID                    string                `json:"operationId"`
+	SuccessorProfile               LANGatewayProfileSpec `json:"successorProfile"`
+	SuccessorProfileOperationID    string                `json:"successorProfileOperationId"`
+	SuccessorProfileRevisionID     string                `json:"successorProfileRevisionId"`
+	SuccessorProfileRevisionNumber int64                 `json:"successorProfileRevisionNumber"`
+}
+
 type InspectRequest struct {
 	GithubSource GitHubSource          `json:"githubSource,omitempty"`
 	Setup        *DeploymentSetupInput `json:"setup,omitempty"`
@@ -801,6 +829,158 @@ type LANGatewayProfileSpec struct {
 	SelectedIpv4 string `json:"selectedIpv4"`
 }
 
+type LANGatewayRebindCurrentAuthority struct {
+	Kind                  string `json:"kind"`
+	OperationID           string `json:"operationId"`
+	ProfileRevisionID     string `json:"profileRevisionId"`
+	ProfileRevisionNumber int64  `json:"profileRevisionNumber"`
+	ProfileSpecDigest     string `json:"profileSpecDigest"`
+	TerminalReceiptDigest string `json:"terminalReceiptDigest,omitempty"`
+}
+
+type LANGatewayRebindCurrentLineage struct {
+	Kind                    string `json:"kind"`
+	OperationID             string `json:"operationId"`
+	ProfileRevisionID       string `json:"profileRevisionId"`
+	ProfileRevisionNumber   int64  `json:"profileRevisionNumber"`
+	ProfileSpecDigest       string `json:"profileSpecDigest"`
+	ProtectedGeneration     int64  `json:"protectedGeneration"`
+	ProtectedIdentityDigest string `json:"protectedIdentityDigest"`
+	ProtectedIntentDigest   string `json:"protectedIntentDigest,omitempty"`
+	ProtectedJournalDigest  string `json:"protectedJournalDigest,omitempty"`
+	TerminalReceiptDigest   string `json:"terminalReceiptDigest,omitempty"`
+}
+
+type LANGatewayRebindMutation struct {
+	Created                  bool                              `json:"created"`
+	CurrentAttestationDigest string                            `json:"currentAttestationDigest,omitempty"`
+	CurrentProof             string                            `json:"currentProof"`
+	FenceReleased            bool                              `json:"fenceReleased"`
+	Operation                LANGatewayRebindOperation         `json:"operation"`
+	RecoveryRequired         bool                              `json:"recoveryRequired"`
+	SelectedCurrentAuthority *LANGatewayRebindCurrentAuthority `json:"selectedCurrentAuthority,omitempty"`
+	TerminalProof            string                            `json:"terminalProof"`
+	TerminalProofDigest      string                            `json:"terminalProofDigest,omitempty"`
+}
+
+type LANGatewayRebindOperation struct {
+	DatabaseCommitObserved bool   `json:"databaseCommitObserved"`
+	OperationID            string `json:"operationId"`
+	StateSequence          int64  `json:"stateSequence"`
+	StoredState            string `json:"storedState"`
+	TerminalDisposition    string `json:"terminalDisposition,omitempty"`
+	TerminalReceiptDigest  string `json:"terminalReceiptDigest,omitempty"`
+}
+
+type LANGatewayRebindProtectedRecovery struct {
+	FixedDisposition      string `json:"fixedDisposition,omitempty"`
+	Generation            int64  `json:"generation"`
+	Phase                 string `json:"phase,omitempty"`
+	Presence              string `json:"presence"`
+	RecordSequence        int64  `json:"recordSequence"`
+	TerminalReceiptDigest string `json:"terminalReceiptDigest,omitempty"`
+}
+
+type LANGatewayRebindReconcileResponse struct {
+	Status  LANGatewayRebindStatus `json:"status"`
+	Version int                    `json:"version"`
+}
+
+type LANGatewayRebindRecoveryReview struct {
+	OperationID            string                 `json:"operationId"`
+	RecoveryApprovalDigest string                 `json:"recoveryApprovalDigest,omitempty"`
+	RecoveryDigest         string                 `json:"recoveryDigest,omitempty"`
+	Status                 LANGatewayRebindStatus `json:"status"`
+	Version                int                    `json:"version"`
+}
+
+type LANGatewayRebindReview struct {
+	ConfigureApprovalDigest string                        `json:"configureApprovalDigest"`
+	ProposalDigest          string                        `json:"proposalDigest"`
+	RebindApprovalDigest    string                        `json:"rebindApprovalDigest"`
+	Roster                  []LANGatewayRebindRosterEntry `json:"roster"`
+	RuntimeHeads            []LANGatewayRebindRuntimeHead `json:"runtimeHeads"`
+	Spec                    LANGatewayRebindSpec          `json:"spec"`
+	Version                 int                           `json:"version"`
+}
+
+type LANGatewayRebindRosterEntry struct {
+	AccessRevisionID            string `json:"accessRevisionId"`
+	AccessRevisionNumber        int64  `json:"accessRevisionNumber"`
+	AccessSpecDigest            string `json:"accessSpecDigest"`
+	AllocationID                string `json:"allocationId"`
+	AllocationOwnerOperationID  string `json:"allocationOwnerOperationId"`
+	AllocationState             string `json:"allocationState"`
+	AppID                       string `json:"appId"`
+	GrantAttemptID              string `json:"grantAttemptId"`
+	GrantProtectedStateDigest   string `json:"grantProtectedStateDigest"`
+	GrantStateSequence          int64  `json:"grantStateSequence"`
+	OperationID                 string `json:"operationId"`
+	Ordinal                     int64  `json:"ordinal"`
+	Port                        int    `json:"port"`
+	PredecessorTransferDigest   string `json:"predecessorTransferDigest,omitempty"`
+	RouteGeneration             int64  `json:"routeGeneration"`
+	ServingDeploymentID         string `json:"servingDeploymentId"`
+	ServingReleaseID            string `json:"servingReleaseId"`
+	ServingSlot                 string `json:"servingSlot"`
+	SourceProfileRevisionID     string `json:"sourceProfileRevisionId"`
+	SourceProfileRevisionNumber int64  `json:"sourceProfileRevisionNumber"`
+	SourceProfileSpecDigest     string `json:"sourceProfileSpecDigest"`
+	Version                     int    `json:"version"`
+}
+
+type LANGatewayRebindRuntimeHead struct {
+	AppID        string `json:"appId"`
+	DeploymentID string `json:"deploymentId"`
+	Generation   int64  `json:"generation"`
+	ReleaseID    string `json:"releaseId"`
+	Slot         string `json:"slot"`
+	UpdatedAt    string `json:"updatedAt"`
+}
+
+type LANGatewayRebindSource struct {
+	Lineage                     LANGatewayRebindCurrentLineage `json:"lineage"`
+	PredecessorCheckpointDigest string                         `json:"predecessorCheckpointDigest"`
+	SourceStateDigest           string                         `json:"sourceStateDigest"`
+	SourceStateRevision         int64                          `json:"sourceStateRevision"`
+	SourceStateVersion          int64                          `json:"sourceStateVersion"`
+}
+
+type LANGatewayRebindSpec struct {
+	OperationID                    string                 `json:"operationId"`
+	Predecessor                    LANGatewayRebindSource `json:"predecessor"`
+	RosterCount                    int64                  `json:"rosterCount"`
+	RosterDigest                   string                 `json:"rosterDigest"`
+	RosterVersion                  int                    `json:"rosterVersion"`
+	RuntimeHeadsCount              int64                  `json:"runtimeHeadsCount"`
+	RuntimeHeadsDigest             string                 `json:"runtimeHeadsDigest"`
+	RuntimeHeadsVersion            int                    `json:"runtimeHeadsVersion"`
+	SuccessorProfile               LANGatewayProfileSpec  `json:"successorProfile"`
+	SuccessorProfileOperationID    string                 `json:"successorProfileOperationId"`
+	SuccessorProfileRevisionID     string                 `json:"successorProfileRevisionId"`
+	SuccessorProfileRevisionNumber int64                  `json:"successorProfileRevisionNumber"`
+	SuccessorProtectedGeneration   int64                  `json:"successorProtectedGeneration"`
+	Version                        int                    `json:"version"`
+}
+
+type LANGatewayRebindStatus struct {
+	Active                   bool                               `json:"active"`
+	AllowedActions           []string                           `json:"allowedActions"`
+	Availability             string                             `json:"availability"`
+	CurrentAttestationDigest string                             `json:"currentAttestationDigest,omitempty"`
+	CurrentProof             string                             `json:"currentProof"`
+	HistoricalTerminal       bool                               `json:"historicalTerminal"`
+	Operation                *LANGatewayRebindOperation         `json:"operation,omitempty"`
+	OperationFence           string                             `json:"operationFence"`
+	OperationID              string                             `json:"operationId"`
+	Protected                *LANGatewayRebindProtectedRecovery `json:"protected,omitempty"`
+	RecoveryPolicy           string                             `json:"recoveryPolicy,omitempty"`
+	SelectedCurrentAuthority *LANGatewayRebindCurrentAuthority  `json:"selectedCurrentAuthority,omitempty"`
+	TerminalProof            string                             `json:"terminalProof"`
+	TerminalProofDigest      string                             `json:"terminalProofDigest,omitempty"`
+	Version                  int                                `json:"version"`
+}
+
 type LANGatewayUpgradeClaim struct {
 	OperationID           string `json:"operationId"`
 	ProfileRevisionID     string `json:"profileRevisionId"`
@@ -917,6 +1097,13 @@ type Problem struct {
 	Status    int               `json:"status"`
 	Title     string            `json:"title"`
 	Type      string            `json:"type"`
+}
+
+type ReconcileLANGatewayRebindRequest struct {
+	Action                 string `json:"action"`
+	RecoveryApprovalDigest string `json:"recoveryApprovalDigest"`
+	RecoveryDigest         string `json:"recoveryDigest"`
+	Version                int    `json:"version"`
 }
 
 type RelayBindingStatus struct {

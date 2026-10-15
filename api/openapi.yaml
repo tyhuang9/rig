@@ -30,12 +30,13 @@ x-rig-problem-codes:
   deployment_plan_forbidden: {description: Administrator access is required to accept a deployment plan or approve its migration, statuses: [403]}
   relay_unavailable: {description: The configured controller relay is unavailable, statuses: [503]}
   lan_gateway_forbidden: {description: Administrator access is required to inspect or configure the LAN gateway profile, statuses: [403]}
-  invalid_lan_gateway_request: {description: The LAN gateway profile request is invalid, statuses: [422]}
+  invalid_lan_gateway_request: {description: The LAN gateway request is invalid or exceeds its bounded request size, statuses: [400, 413, 422]}
   lan_gateway_interface_changed: {description: The selected host interface or private IPv4 address is no longer uniquely available, statuses: [409]}
   lan_gateway_conflict: {description: The LAN gateway profile changed or is pinned by active LAN state, statuses: [409]}
   lan_gateway_replay_conflict: {description: The LAN gateway operation identifier was already used for a different request, statuses: [409]}
-  lan_gateway_approval_mismatch: {description: The supplied confirmation digest does not approve the exact LAN gateway profile, statuses: [409]}
+  lan_gateway_approval_mismatch: {description: Current administrator confirmation or the supplied digest does not approve the exact LAN gateway request, statuses: [403, 409]}
   lan_gateway_unavailable: {description: LAN gateway profile state or safe host interface discovery is unavailable, statuses: [503]}
+  lan_gateway_rebind_not_found: {description: Complete validated history proves the requested LAN gateway rebind operation is absent, statuses: [404]}
   lan_access_forbidden: {description: Administrator access is required to manage or inspect application LAN access, statuses: [403]}
   invalid_lan_access_request: {description: The application LAN access request is invalid, statuses: [422]}
   lan_access_conflict: {description: The application LAN access state or reservation changed, statuses: [409]}
@@ -47,7 +48,7 @@ x-rig-problem-codes:
   lan_disable_replay_conflict: {description: The LAN disable operation identifier was reused with different input, statuses: [409]}
   lan_disable_approval_mismatch: {description: Confirmation does not approve the exact application LAN disable, statuses: [409]}
   lan_disable_unavailable: {description: The LAN disable could not be safely reconciled, statuses: [503]}
-  capability_unavailable: {description: The requested operation requires a runtime capability that is disabled, statuses: [409]}
+  capability_unavailable: {description: The requested operation requires a runtime capability that is disabled or unavailable, statuses: [409, 503]}
 x-job-responses: &jobResponses
   '200': {description: Existing idempotent job, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
   '202': {description: Job accepted, content: {application/json: {schema: {$ref: '#/components/schemas/JobMutationResponse'}}}}
@@ -560,6 +561,61 @@ paths:
         '200': {description: Existing exact idempotent desired profile revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayProfileMutation'}}}}
         '201': {description: New desired LAN gateway profile revision, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayProfileMutation'}}}}
         default: {$ref: '#/components/responses/Problem'}
+  /api/v1/system/lan-gateway-rebind:
+    post:
+      operationId: commitLANGatewayRebind
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_conflict, lan_gateway_approval_mismatch, lan_gateway_unavailable, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Starts or exactly replays one administrator-reviewed LAN gateway rebind. Configure and rebind approvals remain distinct, and the server reconstructs physical proof under its writer locks. A recovery-required response grants no new operation or recovery authority.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/CommitLANGatewayRebindRequest'}}}}
+      responses:
+        '200': {description: Exact retained operation status or idempotent terminal replay, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayRebindMutation'}}}}
+        '201': {description: Newly admitted operation reached a fully verified terminal result, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayRebindMutation'}}}}
+        default: {$ref: '#/components/responses/NoStoreProblem'}
+  /api/v1/system/lan-gateway-rebind/proposal:
+    post:
+      operationId: inspectLANGatewayRebind
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_conflict, lan_gateway_approval_mismatch, lan_gateway_unavailable, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Returns a read-only review of one explicit successor and the complete server-built roster and runtime heads. The review and its separate approval digests are advisory; this operation creates no claim and performs no protected, Docker, route, database, or other effect.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/InspectLANGatewayRebindRequest'}}}}
+      responses:
+        '200': {description: Canonical rebind review and two distinct approval digests, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayRebindReview'}}}}
+        default: {$ref: '#/components/responses/NoStoreProblem'}
+  /api/v1/system/lan-gateway-rebind/{operationId}:
+    parameters: [{name: operationId, in: path, required: true, schema: {type: string, format: uuid}}]
+    get:
+      operationId: getLANGatewayRebind
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_conflict, lan_gateway_approval_mismatch, lan_gateway_unavailable, lan_gateway_rebind_not_found, capability_unavailable]
+      security: [{sessionCookie: []}]
+      description: Returns one exact retained operation with separately qualified terminal, selected-current, fence, and recovery evidence. It performs no recovery or effect. In recovery-only mode the path must match the startup-validated operation pin.
+      responses:
+        '200': {description: Curated exact operation status, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayRebindStatus'}}}}
+        '404': {description: Complete validated history proves the exact operation is absent, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+        default: {$ref: '#/components/responses/NoStoreProblem'}
+  /api/v1/system/lan-gateway-rebind/{operationId}/recovery-proposal:
+    parameters: [{name: operationId, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: inspectLANGatewayRebindRecovery
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_conflict, lan_gateway_approval_mismatch, lan_gateway_unavailable, lan_gateway_rebind_not_found, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Returns a fresh actor-bound reconciliation review for the exact operation. The server derives policy and allowed actions from durable evidence; the request cannot select a direction, replace original approvals, or grant effect authority. Recovery-only mode requires the startup-validated operation pin.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/InspectLANGatewayRebindRecoveryRequest'}}}}
+      responses:
+        '200': {description: Curated recovery review and separate request-scoped consent digest when reconciliation is executable, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayRebindRecoveryReview'}}}}
+        '404': {description: Complete validated history proves the exact operation is absent, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}}
+        default: {$ref: '#/components/responses/NoStoreProblem'}
+  /api/v1/system/lan-gateway-rebind/{operationId}/reconcile:
+    parameters: [{name: operationId, in: path, required: true, schema: {type: string, format: uuid}}]
+    post:
+      operationId: reconcileLANGatewayRebind
+      x-rig-problem-codes: [lan_gateway_forbidden, invalid_lan_gateway_request, lan_gateway_conflict, lan_gateway_approval_mismatch, lan_gateway_unavailable, capability_unavailable]
+      security: [{sessionCookie: [], csrfHeader: []}]
+      description: Revalidates and reconciles one exact retained operation using fresh request-scoped administrator consent. The server derives direction from immutable evidence, preserves both original approvals, and never accepts a client phase, direction, receipt, resource command, or replacement actor. Recovery-only mode requires the startup-validated operation pin and remains restricted after a terminal response until a fresh process proves normal startup.
+      requestBody: {required: true, content: {application/json: {schema: {$ref: '#/components/schemas/ReconcileLANGatewayRebindRequest'}}}}
+      responses:
+        '200': {description: Freshly verified terminal operation status; this response does not relax the current process recovery gate, headers: {Cache-Control: {schema: {type: string, const: no-store}}}, content: {application/json: {schema: {$ref: '#/components/schemas/LANGatewayRebindReconcileResponse'}}}}
+        default: {$ref: '#/components/responses/NoStoreProblem'}
   /api/v1/system/lan-gateway-upgrade:
     get:
       operationId: getLANGatewayUpgrade
@@ -683,6 +739,10 @@ components:
   responses:
     Problem:
       description: RFC 9457 problem response
+      content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
+    NoStoreProblem:
+      description: RFC 9457 problem response for sensitive LAN gateway state
+      headers: {Cache-Control: {schema: {type: string, const: no-store}}}
       content: {application/problem+json: {schema: {$ref: '#/components/schemas/Problem'}}}
   schemas:
     Problem:
@@ -1088,6 +1148,221 @@ components:
       properties:
         profile: {$ref: '#/components/schemas/LANGatewayProfileRevision'}
         created: {type: boolean}
+    InspectLANGatewayRebindRequest:
+      type: object
+      additionalProperties: false
+      required: [operationId, successorProfileRevisionId, successorProfileRevisionNumber, successorProfileOperationId, successorProfile]
+      properties:
+        operationId: {type: string, format: uuid}
+        successorProfileRevisionId: {type: string, format: uuid}
+        successorProfileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        successorProfileOperationId: {type: string, format: uuid}
+        successorProfile: {$ref: '#/components/schemas/LANGatewayProfileSpec'}
+    CommitLANGatewayRebindRequest:
+      type: object
+      additionalProperties: false
+      required: [operationId, successorProfileRevisionId, successorProfileRevisionNumber, successorProfileOperationId, successorProfile, version, proposalDigest, configureApprovalDigest, rebindApprovalDigest]
+      properties:
+        operationId: {type: string, format: uuid}
+        successorProfileRevisionId: {type: string, format: uuid}
+        successorProfileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        successorProfileOperationId: {type: string, format: uuid}
+        successorProfile: {$ref: '#/components/schemas/LANGatewayProfileSpec'}
+        version: {type: integer, const: 1}
+        proposalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        configureApprovalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        rebindApprovalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayRebindCurrentLineage:
+      type: object
+      additionalProperties: false
+      required: [kind, operationId, profileRevisionId, profileRevisionNumber, profileSpecDigest, protectedGeneration, protectedIdentityDigest]
+      properties:
+        kind: {type: string, enum: [gateway_upgrade, gateway_rebind]}
+        operationId: {type: string, format: uuid}
+        profileRevisionId: {type: string, format: uuid}
+        profileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        profileSpecDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        protectedGeneration: {type: integer, format: int64, minimum: 0}
+        protectedIdentityDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        protectedJournalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        protectedIntentDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        terminalReceiptDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayRebindSource:
+      type: object
+      additionalProperties: false
+      required: [lineage, sourceStateVersion, sourceStateRevision, sourceStateDigest, predecessorCheckpointDigest]
+      properties:
+        lineage: {$ref: '#/components/schemas/LANGatewayRebindCurrentLineage'}
+        sourceStateVersion: {type: integer, format: int64, minimum: 1}
+        sourceStateRevision: {type: integer, format: int64, minimum: 0}
+        sourceStateDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        predecessorCheckpointDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayRebindSpec:
+      type: object
+      additionalProperties: false
+      required: [version, operationId, predecessor, successorProtectedGeneration, successorProfileRevisionId, successorProfileRevisionNumber, successorProfileOperationId, successorProfile, rosterVersion, rosterDigest, rosterCount, runtimeHeadsVersion, runtimeHeadsDigest, runtimeHeadsCount]
+      properties:
+        version: {type: integer, const: 2}
+        operationId: {type: string, format: uuid}
+        predecessor: {$ref: '#/components/schemas/LANGatewayRebindSource'}
+        successorProtectedGeneration: {type: integer, format: int64, minimum: 1}
+        successorProfileRevisionId: {type: string, format: uuid}
+        successorProfileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        successorProfileOperationId: {type: string, format: uuid}
+        successorProfile: {$ref: '#/components/schemas/LANGatewayProfileSpec'}
+        rosterVersion: {type: integer, const: 2}
+        rosterDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        rosterCount: {type: integer, format: int64, minimum: 0}
+        runtimeHeadsVersion: {type: integer, const: 1}
+        runtimeHeadsDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        runtimeHeadsCount: {type: integer, format: int64, minimum: 0}
+    LANGatewayRebindRosterEntry:
+      type: object
+      additionalProperties: false
+      required: [version, operationId, ordinal, appId, allocationId, port, allocationOwnerOperationId, allocationState, accessRevisionId, accessRevisionNumber, accessSpecDigest, grantAttemptId, grantStateSequence, grantProtectedStateDigest, sourceProfileRevisionId, sourceProfileRevisionNumber, sourceProfileSpecDigest, servingDeploymentId, servingReleaseId, servingSlot, routeGeneration]
+      properties:
+        version: {type: integer, const: 2}
+        operationId: {type: string, format: uuid}
+        ordinal: {type: integer, format: int64, minimum: 1}
+        appId: {type: string, format: uuid}
+        allocationId: {type: string, format: uuid}
+        port: {type: integer, minimum: 8100, maximum: 8119}
+        allocationOwnerOperationId: {type: string, format: uuid}
+        allocationState: {type: string, enum: [reserved, active, uncertain]}
+        accessRevisionId: {type: string, format: uuid}
+        accessRevisionNumber: {type: integer, format: int64, minimum: 1}
+        accessSpecDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        grantAttemptId: {type: string, format: uuid}
+        grantStateSequence: {type: integer, format: int64, minimum: 1}
+        grantProtectedStateDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        sourceProfileRevisionId: {type: string, format: uuid}
+        sourceProfileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        sourceProfileSpecDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        predecessorTransferDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        servingDeploymentId: {type: string, format: uuid}
+        servingReleaseId: {type: string, format: uuid}
+        servingSlot: {type: string, enum: [blue, green]}
+        routeGeneration: {type: integer, format: int64, minimum: 1}
+    LANGatewayRebindRuntimeHead:
+      type: object
+      additionalProperties: false
+      required: [appId, deploymentId, releaseId, slot, generation, updatedAt]
+      properties:
+        appId: {type: string, format: uuid}
+        deploymentId: {type: string, format: uuid}
+        releaseId: {type: string, format: uuid}
+        slot: {type: string, enum: [blue, green]}
+        generation: {type: integer, format: int64, minimum: 1}
+        updatedAt: {type: string, format: date-time}
+    LANGatewayRebindReview:
+      type: object
+      additionalProperties: false
+      required: [version, spec, roster, runtimeHeads, proposalDigest, configureApprovalDigest, rebindApprovalDigest]
+      properties:
+        version: {type: integer, const: 1}
+        spec: {$ref: '#/components/schemas/LANGatewayRebindSpec'}
+        roster: {type: array, items: {$ref: '#/components/schemas/LANGatewayRebindRosterEntry'}}
+        runtimeHeads: {type: array, items: {$ref: '#/components/schemas/LANGatewayRebindRuntimeHead'}}
+        proposalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        configureApprovalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        rebindApprovalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayRebindOperation:
+      type: object
+      additionalProperties: false
+      required: [operationId, storedState, stateSequence, databaseCommitObserved]
+      properties:
+        operationId: {type: string, format: uuid}
+        storedState: {type: string, enum: [prepared, successor_ready, database_committed, unresolved, committed, rolled_back]}
+        stateSequence: {type: integer, format: int64, minimum: 1}
+        databaseCommitObserved: {type: boolean}
+        terminalDisposition: {type: string, enum: [commit, abort]}
+        terminalReceiptDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayRebindCurrentAuthority:
+      type: object
+      additionalProperties: false
+      required: [kind, operationId, profileRevisionId, profileRevisionNumber, profileSpecDigest]
+      properties:
+        kind: {type: string, enum: [gateway_upgrade, gateway_rebind]}
+        operationId: {type: string, format: uuid}
+        profileRevisionId: {type: string, format: uuid}
+        profileRevisionNumber: {type: integer, format: int64, minimum: 1}
+        profileSpecDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        terminalReceiptDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayRebindMutation:
+      type: object
+      additionalProperties: false
+      required: [created, recoveryRequired, operation, terminalProof, currentProof, fenceReleased]
+      properties:
+        created: {type: boolean}
+        recoveryRequired: {type: boolean}
+        operation: {$ref: '#/components/schemas/LANGatewayRebindOperation'}
+        terminalProof: {type: string, enum: [unknown, verified, unavailable]}
+        terminalProofDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        selectedCurrentAuthority: {$ref: '#/components/schemas/LANGatewayRebindCurrentAuthority', x-go-pointer: true}
+        currentProof: {type: string, enum: [unknown, verified, unavailable]}
+        currentAttestationDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        fenceReleased: {type: boolean}
+    LANGatewayRebindProtectedRecovery:
+      type: object
+      additionalProperties: false
+      required: [presence, generation, recordSequence]
+      properties:
+        presence: {type: string, enum: [validated_absent, validated_present, validated_checkpoint_terminal]}
+        generation: {type: integer, format: int64, minimum: 1}
+        phase: {type: string, minLength: 1, maxLength: 128}
+        recordSequence: {type: integer, format: int64, minimum: 0}
+        fixedDisposition: {type: string, enum: [none, commit, abort]}
+        terminalReceiptDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayRebindStatus:
+      type: object
+      additionalProperties: false
+      required: [version, operationId, availability, active, historicalTerminal, terminalProof, currentProof, operationFence, allowedActions]
+      properties:
+        version: {type: integer, const: 1}
+        operationId: {type: string, format: uuid}
+        availability: {type: string, enum: [available, validated_absent, unavailable]}
+        active: {type: boolean}
+        operation: {$ref: '#/components/schemas/LANGatewayRebindOperation', x-go-pointer: true}
+        protected: {$ref: '#/components/schemas/LANGatewayRebindProtectedRecovery', x-go-pointer: true}
+        historicalTerminal: {type: boolean}
+        selectedCurrentAuthority: {$ref: '#/components/schemas/LANGatewayRebindCurrentAuthority', x-go-pointer: true}
+        terminalProof: {type: string, enum: [unknown, verified, unavailable]}
+        terminalProofDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        currentProof: {type: string, enum: [unknown, verified, unavailable]}
+        currentAttestationDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        operationFence: {type: string, enum: [held, released, unavailable]}
+        recoveryPolicy: {type: string, enum: [evidence_decides, forward_only, rollback_only]}
+        allowedActions: {type: array, maxItems: 1, items: {type: string, enum: [reconcile]}}
+    InspectLANGatewayRebindRecoveryRequest:
+      type: object
+      additionalProperties: false
+      properties: {}
+    LANGatewayRebindRecoveryReview:
+      type: object
+      additionalProperties: false
+      required: [operationId, version, status]
+      properties:
+        operationId: {type: string, format: uuid}
+        version: {type: integer, const: 1}
+        status: {$ref: '#/components/schemas/LANGatewayRebindStatus'}
+        recoveryDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        recoveryApprovalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    ReconcileLANGatewayRebindRequest:
+      type: object
+      additionalProperties: false
+      required: [version, action, recoveryDigest, recoveryApprovalDigest]
+      properties:
+        version: {type: integer, const: 1}
+        action: {type: string, const: reconcile}
+        recoveryDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+        recoveryApprovalDigest: {type: string, pattern: '^[a-f0-9]{64}$'}
+    LANGatewayRebindReconcileResponse:
+      type: object
+      additionalProperties: false
+      required: [version, status]
+      properties:
+        version: {type: integer, const: 1}
+        status: {$ref: '#/components/schemas/LANGatewayRebindStatus'}
     UpgradeLANGatewayRequest:
       type: object
       additionalProperties: false

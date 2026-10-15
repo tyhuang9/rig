@@ -141,6 +141,10 @@ type Manager struct {
 	// gatewayRebindCrossStoreDriver is replaceable only by package tests. The
 	// production adapter performs the normalized typed-source physical flow.
 	gatewayRebindCrossStoreDriver gatewayRebindCrossStoreDriver
+	// Written only under the Manager and gateway locks after fresh final-census
+	// and database-fence readbacks, then cleared after the matching terminal
+	// release sequence.
+	gatewayRebindTerminalReleaseEvent GatewayRebindDurableBoundaryEvent
 }
 
 // contextMutex lets a route observation abandon lock contention when its

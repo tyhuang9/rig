@@ -16,8 +16,8 @@ const (
 )
 
 // GatewayRebindRecoveryRuntime owns protected-state inspection, lock ordering,
-// physical proof and deterministic reconciliation. These handlers are dormant:
-// no route or production capability is registered here.
+// physical proof and deterministic reconciliation. Recovery-only requests are
+// additionally restricted to the startup-validated kind and operation pin.
 type GatewayRebindRecoveryRuntime interface {
 	InspectGatewayRebindOperation(context.Context, generatedingress.GatewayRebindRecoveryReadRepository, string) (generatedingress.GatewayRebindOperationInspection, error)
 	InspectGatewayRebindRecoveryReview(context.Context, generatedingress.GatewayRebindRecoveryReadRepository, string, string, func(context.Context) error) (generatedingress.GatewayRebindRecoveryReview, error)
@@ -72,8 +72,15 @@ func (s *Server) getLANGatewayRebind(w http.ResponseWriter, r *http.Request) {
 	if !s.gatewayRebindRecoveryCapability(w, r, operationGetLANGatewayRebind) {
 		return
 	}
-	operationID, err := readLANGatewayRebindStatusRequest(r)
+	operationID, err := readLANGatewayRebindOperationPath(r, http.MethodGet)
 	if err != nil {
+		s.gatewayRebindRecoveryProblem(w, r, operationGetLANGatewayRebind, err)
+		return
+	}
+	if !s.gatewayRebindRecoveryOperationAllowed(w, r, operationGetLANGatewayRebind, operationID) {
+		return
+	}
+	if err := readLANGatewayRebindStatusBody(r); err != nil {
 		s.gatewayRebindRecoveryProblem(w, r, operationGetLANGatewayRebind, err)
 		return
 	}
@@ -112,8 +119,15 @@ func (s *Server) inspectLANGatewayRebindRecovery(w http.ResponseWriter, r *http.
 	if !s.gatewayRebindRecoveryCapability(w, r, operationInspectLANGatewayRebindRecovery) {
 		return
 	}
-	operationID, err := readLANGatewayRebindRecoveryPreviewRequest(r)
+	operationID, err := readLANGatewayRebindOperationPath(r, http.MethodPost)
 	if err != nil {
+		s.gatewayRebindRecoveryProblem(w, r, operationInspectLANGatewayRebindRecovery, err)
+		return
+	}
+	if !s.gatewayRebindRecoveryOperationAllowed(w, r, operationInspectLANGatewayRebindRecovery, operationID) {
+		return
+	}
+	if err := readLANGatewayRebindRecoveryPreviewBody(r); err != nil {
 		s.gatewayRebindRecoveryProblem(w, r, operationInspectLANGatewayRebindRecovery, err)
 		return
 	}
@@ -161,6 +175,9 @@ func (s *Server) reconcileLANGatewayRebind(w http.ResponseWriter, r *http.Reques
 		s.gatewayRebindRecoveryProblem(w, r, operationReconcileLANGatewayRebind, err)
 		return
 	}
+	if !s.gatewayRebindRecoveryOperationAllowed(w, r, operationReconcileLANGatewayRebind, operationID) {
+		return
+	}
 	body, err := readLANGatewayRebindReconcileRequest(r, operationID)
 	if err != nil {
 		s.gatewayRebindRecoveryProblem(w, r, operationReconcileLANGatewayRebind, err)
@@ -204,9 +221,32 @@ func (s *Server) gatewayRebindRecoveryCapability(w http.ResponseWriter, r *http.
 	if !s.requireAdministrator(w, r, operation, "lan_gateway_forbidden", "Administrator access is required") {
 		return false
 	}
+	if s.RecoveryOnly && (s.RecoveryKind != RecoveryGatewayRebind || !validCanonicalUUID(s.RecoveryOperationID)) {
+		s.gatewayRebindRecoveryProblem(w, r, operation, appaccess.ErrConflict)
+		return false
+	}
 	if !s.GeneratedRuntime || s.GatewayRebindRecoveries == nil || s.GatewayRebindRecoveryRuntime == nil {
 		s.handlerProblem(w, r, operation, http.StatusServiceUnavailable,
 			"capability_unavailable", "LAN gateway rebind recovery is unavailable", 0)
+		return false
+	}
+	return true
+}
+
+// gatewayRebindRecoveryOperationAllowed binds recovery-only HTTP authority to
+// the one operation validated during startup. This check deliberately runs
+// before session binding and every repository, runtime, audit or effect call.
+// Normal mode may inspect or reconcile any exact retained operation using the
+// same fresh runtime validation and interactive authorization requirements.
+func (s *Server) gatewayRebindRecoveryOperationAllowed(w http.ResponseWriter, r *http.Request,
+	operation, operationID string,
+) bool {
+	if !s.RecoveryOnly {
+		return true
+	}
+	if s.RecoveryKind != RecoveryGatewayRebind || !validCanonicalUUID(s.RecoveryOperationID) ||
+		operationID != s.RecoveryOperationID {
+		s.gatewayRebindRecoveryProblem(w, r, operation, appaccess.ErrConflict)
 		return false
 	}
 	return true

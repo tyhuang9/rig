@@ -19,6 +19,7 @@ type gatewayRebindCrossStoreRepository interface {
 type gatewayRebindTransitionRepository interface {
 	gatewayRebindProposalRepository
 	ApplyGatewayRebindTransition(context.Context, appaccess.GatewayRebindTransitionProof) (appaccess.GatewayRebindTransitionCommand, error)
+	CheckGatewayRebindFence(context.Context) error
 }
 
 type gatewayRebindTypedPhysicalResult struct {
@@ -185,6 +186,7 @@ func (m *Manager) runGatewayRebindCommitLocked(ctx context.Context,
 		return err
 	}
 	terminalSQL := false
+	m.gatewayRebindTerminalReleaseEvent = GatewayRebindDurableBoundaryEvent{}
 	defer func() {
 		if releaseGateway == nil && releaseEffects == nil {
 			return
@@ -192,6 +194,7 @@ func (m *Manager) runGatewayRebindCommitLocked(ctx context.Context,
 		if terminalSQL {
 			resultErr = m.releaseGatewayRebindTerminalLocks(releaseEffects, releaseGateway, resultErr)
 		} else {
+			m.gatewayRebindTerminalReleaseEvent = GatewayRebindDurableBoundaryEvent{}
 			if releaseGateway != nil {
 				if releaseErr := releaseGateway(); releaseErr != nil {
 					resultErr = &Error{Code: DiagnosticRouteUnresolved}
@@ -222,7 +225,16 @@ func (m *Manager) continueGatewayRebindPreparedLocked(ctx context.Context,
 		if storeErr != nil {
 			return storeErr
 		}
-		return store.installExact(appendCtx, record)
+		if err := store.installExact(appendCtx, record); err != nil {
+			return err
+		}
+		m.observeGatewayRebindDurableBoundary(appendCtx, GatewayRebindDurableBoundaryEvent{
+			Boundary: GatewayRebindBoundaryProtectedProgressReadback, OperationID: record.OperationID,
+			SQLPhase: appaccess.GatewayRebindPrepared, ProtectedPhase: string(record.Phase),
+			ProtectedGeneration: record.Generation,
+			ProtectedSequence:   record.Sequence, Digest: record.Digest,
+		})
+		return nil
 	}
 	request := gatewayRebindPhysicalReconcileRequest{
 		Attempt: prepared, Mode: gatewayRebindPhysicalReconcileUndecided,
@@ -268,9 +280,12 @@ func (m *Manager) continueGatewayRebindPreparedLocked(ctx context.Context,
 		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
 	request.Mode, request.Terminal = gatewayRebindPhysicalReconcileForwardOnly, &receipt
-	if installErr := terminalStore.installExact(ctx, receipt); installErr != nil {
+	if installErr := terminalStore.installExactObserved(ctx, receipt, func() {
+		m.observeGatewayRebindTerminalInstalled(ctx, receipt)
+	}); installErr != nil {
 		return GatewayRebindCommitResult{}, terminalSQL, installErr
 	}
+	m.observeGatewayRebindTerminalReadback(ctx, receipt)
 
 	snapshot, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil {
@@ -285,7 +300,7 @@ func (m *Manager) continueGatewayRebindPreparedLocked(ctx context.Context,
 	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
 		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
-	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
+	if _, err = m.applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
 		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	transfers, err := newGatewayRebindTransfersV2(prepared.Intent, receipt, prepared.Checkpoint)
@@ -314,7 +329,7 @@ func (m *Manager) continueGatewayRebindPreparedLocked(ctx context.Context,
 	if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
 		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
-	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
+	if _, err = m.applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
 		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 
@@ -331,6 +346,11 @@ func (m *Manager) continueGatewayRebindPreparedLocked(ctx context.Context,
 	if err != nil || !validSHA256(attestation) {
 		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
+	m.observeGatewayRebindDurableBoundary(ctx, GatewayRebindDurableBoundaryEvent{
+		Boundary: GatewayRebindBoundaryCurrentAttestation, OperationID: prepared.Claim.Spec.OperationID,
+		SQLPhase: appaccess.GatewayRebindDatabaseCommitted, ProtectedGeneration: receipt.Generation,
+		Digest: attestation, Disposition: appaccess.GatewayRebindDispositionCommit,
+	})
 	// Physical proof is only evidence for the exact state that was observed.
 	// Re-read both stores before releasing the SQL fence so an ordinary current
 	// route write cannot be acknowledged by a stale local attestation.
@@ -356,13 +376,15 @@ func (m *Manager) continueGatewayRebindPreparedLocked(ctx context.Context,
 	if err != nil {
 		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
-	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
+	command, err := m.applyGatewayRebindTransitionReconciled(ctx, repository, proof)
+	if err != nil {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, terminalSQL, err
 	}
 	confirmed, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || confirmed.Active != nil || confirmed.CurrentSource == nil ||
-		*confirmed.CurrentSource != gatewayCurrentAuthority(baseline.Lineage) {
+		*confirmed.CurrentSource != gatewayCurrentAuthority(baseline.Lineage) ||
+		!gatewayRebindSnapshotRetainsCommand(confirmed, command) {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
@@ -371,6 +393,12 @@ func (m *Manager) continueGatewayRebindPreparedLocked(ctx context.Context,
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
 	}
+	finalEvent := m.observeGatewayRebindFinalCensusReadback(ctx, receipt, appaccess.GatewayRebindCommitted)
+	if repository.CheckGatewayRebindFence(ctx) != nil {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, terminalSQL, gatewayRebindProposalError(ctx)
+	}
+	m.observeGatewayRebindFenceClearReadback(ctx, finalEvent)
 	result.FinalPhase, result.Disposition = appaccess.GatewayRebindCommitted, appaccess.GatewayRebindDispositionCommit
 	result.TerminalReceiptDigest = receipt.Digest
 	result.SelectedCurrentAuthority = *confirmed.CurrentSource
@@ -407,7 +435,9 @@ func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Conte
 	if err != nil {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
-	if installErr := store.installExact(ctx, receipt); installErr != nil {
+	if installErr := store.installExactObserved(ctx, receipt, func() {
+		m.observeGatewayRebindTerminalInstalled(ctx, receipt)
+	}); installErr != nil {
 		// A failed acknowledgement may still have installed the exact immutable
 		// receipt. Select its actual form before rechecking serving authority.
 		if retained, readErr := store.load(); readErr == nil && reflect.DeepEqual(retained, receipt) {
@@ -418,6 +448,7 @@ func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Conte
 		}
 		return GatewayRebindCommitResult{}, installErr
 	}
+	m.observeGatewayRebindTerminalReadback(ctx, receipt)
 	transition, err := gatewayRebindTransitionProofV2(snapshot, prepared.Claim, receipt,
 		appaccess.GatewayRebindRolledBack, gatewayCurrentRouteState{}, nil, "")
 	if err != nil {
@@ -430,7 +461,7 @@ func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Conte
 	if !m.gatewayRebindCommitBarrierLatch().CompareAndSwap(false, true) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
-	command, err := applyGatewayRebindTransitionReconciled(ctx, repository, transition)
+	command, err := m.applyGatewayRebindTransitionReconciled(ctx, repository, transition)
 	if err != nil {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, err
@@ -447,6 +478,17 @@ func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Conte
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	confirmedSelection, err := m.selectGatewayCurrentLocked(ctx, confirmed)
+	if err != nil || gatewayCurrentAuthority(confirmedSelection.Lineage) != expectedAuthority {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	finalEvent := m.observeGatewayRebindFinalCensusReadback(ctx, receipt, appaccess.GatewayRebindRolledBack)
+	if repository.CheckGatewayRebindFence(ctx) != nil {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	m.observeGatewayRebindFenceClearReadback(ctx, finalEvent)
 	return GatewayRebindCommitResult{
 		OperationID: prepared.Claim.Spec.OperationID, InitialPhase: snapshot.Phase,
 		FinalPhase: appaccess.GatewayRebindRolledBack, Disposition: appaccess.GatewayRebindDispositionAbort,
@@ -456,14 +498,22 @@ func (m *Manager) finishGatewayRebindRollbackAfterIntentLocked(ctx context.Conte
 
 func (m *Manager) releaseGatewayRebindTerminalLocks(releaseEffects, releaseGateway func() error, prior error) error {
 	failed := prior
+	event := m.gatewayRebindTerminalReleaseEvent
+	// Consume the old operation's metadata while the Manager and gateway locks
+	// are still held. The local copy remains bound to both release callbacks;
+	// clearing after the gateway unlock could erase a successor operation that
+	// acquires the Manager lock before this caller returns.
+	m.gatewayRebindTerminalReleaseEvent = GatewayRebindDurableBoundaryEvent{}
 	if releaseEffects != nil {
-		if err := releaseEffects(); err != nil {
+		if err := m.releaseGatewayRebindTerminalBoundary(context.Background(),
+			GatewayRebindTerminalReleaseEffects, releaseEffects, event); err != nil {
 			failed = errors.Join(failed, &Error{Code: DiagnosticRouteUnresolved})
 			m.gatewayRebindFailStopLatch().Store(true)
 		}
 	}
 	if releaseGateway != nil {
-		if err := releaseGateway(); err != nil {
+		if err := m.releaseGatewayRebindTerminalBoundary(context.Background(),
+			GatewayRebindTerminalReleaseGateway, releaseGateway, event); err != nil {
 			failed = errors.Join(failed, &Error{Code: DiagnosticRouteUnresolved})
 			m.gatewayRebindFailStopLatch().Store(true)
 		}
@@ -580,9 +630,15 @@ func (m *Manager) completeGatewayRebindPreparedWithoutIntentAbortLocked(ctx cont
 		return GatewayRebindCommitResult{}, err
 	}
 	store, err := newGatewayRebindTerminalStoreV2(m.options.DataRoot, receipt.Generation, receipt.OperationID)
-	if err != nil || store.installExact(ctx, receipt) != nil {
+	if err != nil {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	if err := store.installExactObserved(ctx, receipt, func() {
+		m.observeGatewayRebindTerminalInstalled(ctx, receipt)
+	}); err != nil {
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	m.observeGatewayRebindTerminalReadback(ctx, receipt)
 	confirmedSnapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(ctx)
 	confirmedHistory, historyErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	confirmedReceipt, terminalErr := gatewayRebindActiveTerminalV2(confirmedHistory, claim)
@@ -600,7 +656,7 @@ func (m *Manager) completeGatewayRebindPreparedWithoutIntentAbortLocked(ctx cont
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
-	command, err := applyGatewayRebindTransitionReconciled(ctx, repository, transition)
+	command, err := m.applyGatewayRebindTransitionReconciled(ctx, repository, transition)
 	if err != nil {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, err
@@ -617,6 +673,17 @@ func (m *Manager) completeGatewayRebindPreparedWithoutIntentAbortLocked(ctx cont
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	confirmedSelection, err := m.selectGatewayCurrentLocked(ctx, confirmed)
+	if err != nil || gatewayCurrentAuthority(confirmedSelection.Lineage) != expectedAuthority {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	finalEvent := m.observeGatewayRebindFinalCensusReadback(ctx, receipt, appaccess.GatewayRebindRolledBack)
+	if repository.CheckGatewayRebindFence(ctx) != nil {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	m.observeGatewayRebindFenceClearReadback(ctx, finalEvent)
 	return GatewayRebindCommitResult{OperationID: operationID, InitialPhase: appaccess.GatewayRebindPrepared,
 		FinalPhase: appaccess.GatewayRebindRolledBack, Disposition: appaccess.GatewayRebindDispositionAbort,
 		TerminalReceiptDigest: receipt.Digest, SelectedCurrentAuthority: *confirmed.CurrentSource, FenceReleased: true}, nil
@@ -668,6 +735,24 @@ func gatewayRebindTransitionProofV2(snapshot appaccess.GatewayRebindRecoverySnap
 		proof.Transfers = append([]appaccess.GatewayRebindAllocationTransfer(nil), transfers...)
 	}
 	return proof, nil
+}
+
+func (m *Manager) applyGatewayRebindTransitionReconciled(ctx context.Context,
+	repository gatewayRebindTransitionRepository, proof appaccess.GatewayRebindTransitionProof,
+) (appaccess.GatewayRebindTransitionCommand, error) {
+	command, err := applyGatewayRebindTransitionReconciled(ctx, repository, proof)
+	if err != nil {
+		return appaccess.GatewayRebindTransitionCommand{}, err
+	}
+	event := GatewayRebindDurableBoundaryEvent{
+		Boundary: GatewayRebindBoundarySQLTransitionReadback, OperationID: proof.OperationID,
+		SQLPhase: proof.NextState, ProtectedPhase: proof.ProtectedPhase,
+		ProtectedGeneration: proof.ProtectedGeneration,
+		ProtectedSequence:   proof.ProtectedRecordSequence, Digest: command.CommandDigest,
+		Disposition: proof.TerminalDisposition,
+	}
+	m.observeGatewayRebindDurableBoundary(ctx, event)
+	return command, nil
 }
 
 func applyGatewayRebindTransitionReconciled(ctx context.Context, repository gatewayRebindTransitionRepository,

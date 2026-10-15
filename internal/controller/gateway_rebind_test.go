@@ -227,7 +227,8 @@ func TestLANGatewayRebindAdapterPreviewsCompleteCensus(t *testing.T) {
 		json.Unmarshal(response.Body.Bytes(), &result) != nil || len(result.Roster) != 2 || len(result.RuntimeHeads) != 1 ||
 		result.Roster[1].AppID != runtime.review.Inspection.Roster[1].AppID || result.RuntimeHeads[0].AppID != runtime.review.Inspection.RuntimeHeads[0].AppID ||
 		result.ProposalDigest != runtime.review.ProposalDigest || !reflect.DeepEqual(result.Spec, runtime.review.Inspection.Spec) ||
-		strings.Contains(response.Body.String(), `"Inspection"`) || strings.Contains(response.Body.String(), `"SourceStateDigest"`) {
+		strings.Contains(response.Body.String(), `"Inspection"`) || strings.Contains(response.Body.String(), `"SourceStateDigest"`) ||
+		strings.Contains(response.Body.String(), `"entryDigest"`) || strings.Contains(response.Body.String(), `"predecessorTransferDigest"`) {
 		t.Fatalf("preview=%d %s", response.Code, response.Body.String())
 	}
 }

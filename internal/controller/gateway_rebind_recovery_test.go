@@ -433,6 +433,130 @@ func TestLANGatewayRebindRecoveryHandlersRefuseBeforeRuntime(t *testing.T) {
 	}
 }
 
+func TestLANGatewayRebindRecoveryHandlersEnforceKindAndPinBeforeRuntime(t *testing.T) {
+	for _, kind := range []string{"status", "review", "reconcile"} {
+		for _, fixture := range []struct {
+			name string
+			kind string
+			pin  string
+		}{
+			{"wrong recovery kind", RecoveryGatewayUpgrade, rebindRequestOperation},
+			{"missing recovery pin", RecoveryGatewayRebind, ""},
+			{"different recovery pin", RecoveryGatewayRebind, rebindProfileOperation},
+		} {
+			t.Run(kind+"/"+fixture.name, func(t *testing.T) {
+				server, request, runtime, _ := newRebindRecoveryHandlerFixture(t, kind)
+				server.RecoveryOnly = true
+				server.RecoveryKind = fixture.kind
+				server.RecoveryOperationID = fixture.pin
+				response := invokeRebindRecoveryHandler(server, request, kind)
+				if response.Code != http.StatusConflict || runtime.calls != 0 ||
+					response.Header().Get("Cache-Control") != "no-store" ||
+					!strings.Contains(response.Body.String(), `"code":"lan_gateway_conflict"`) {
+					t.Fatalf("response=%d calls=%d headers=%v body=%s",
+						response.Code, runtime.calls, response.Header(), response.Body.String())
+				}
+			})
+		}
+	}
+}
+
+func TestLANGatewayRebindCanonicalRoutesAndRecoveryOnlyPolicy(t *testing.T) {
+	wantRoutes := map[string]string{
+		operationInspectLANGatewayRebind:         http.MethodPost + " /api/v1/system/lan-gateway-rebind/proposal",
+		operationCommitLANGatewayRebind:          http.MethodPost + " /api/v1/system/lan-gateway-rebind",
+		operationGetLANGatewayRebind:             http.MethodGet + " /api/v1/system/lan-gateway-rebind/{operationId}",
+		operationInspectLANGatewayRebindRecovery: http.MethodPost + " /api/v1/system/lan-gateway-rebind/{operationId}/recovery-proposal",
+		operationReconcileLANGatewayRebind:       http.MethodPost + " /api/v1/system/lan-gateway-rebind/{operationId}/reconcile",
+	}
+	gotRoutes := make(map[string]string, len(wantRoutes))
+	for _, route := range (&Server{}).apiRoutes() {
+		if _, ok := wantRoutes[route.operationID]; ok {
+			gotRoutes[route.operationID] = route.method + " " + route.path
+		}
+	}
+	if len(gotRoutes) != len(wantRoutes) {
+		t.Fatalf("registered rebind routes=%v", gotRoutes)
+	}
+	for operation, want := range wantRoutes {
+		if gotRoutes[operation] != want {
+			t.Errorf("route %s=%q want %q", operation, gotRoutes[operation], want)
+		}
+	}
+
+	runtime := &rebindRecoveryHandlerRuntime{inspection: rebindRecoveryTerminalInspection()}
+	server := &Server{
+		Auth:                         controllerAuthFake{user: auth.User{ID: rebindRequestRevision, Role: "administrator"}},
+		GeneratedRuntime:             true,
+		GatewayRebindRecoveries:      &rebindRecoveryHandlerRepository{},
+		GatewayRebindRecoveryRuntime: runtime,
+		RecoveryOnly:                 true,
+		RecoveryKind:                 RecoveryGatewayRebind,
+		RecoveryOperationID:          rebindRequestOperation,
+		Logger:                       relayTestLogger(),
+	}
+	handler := server.Handler()
+
+	if response := relayAuthenticatedRequest(handler, http.MethodGet, "/api/v1/auth/me", ""); response.Code != http.StatusOK {
+		t.Fatalf("authentication route=%d %s", response.Code, response.Body.String())
+	}
+	statusPath := "/api/v1/system/lan-gateway-rebind/" + rebindRequestOperation
+	response := relayAuthenticatedRequest(handler, http.MethodGet, statusPath, "")
+	if response.Code != http.StatusOK || runtime.calls != 1 || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("pinned status=%d calls=%d body=%s", response.Code, runtime.calls, response.Body.String())
+	}
+
+	for _, route := range []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{http.MethodGet, "/api/v1/system/status", ""},
+		{http.MethodPost, "/api/v1/system/lan-gateway-rebind/proposal", `{}`},
+		{http.MethodPost, "/api/v1/system/lan-gateway-rebind", `{}`},
+	} {
+		response = relayAuthenticatedRequest(handler, route.method, route.path, route.body)
+		assertGatewayProblem(t, response, http.StatusServiceUnavailable, "gateway_reconciliation_required")
+		if runtime.calls != 1 {
+			t.Fatalf("restricted route reached runtime: %s %s calls=%d", route.method, route.path, runtime.calls)
+		}
+	}
+
+	for _, route := range []struct {
+		method string
+		suffix string
+		body   string
+	}{
+		{http.MethodGet, "", ""},
+		{http.MethodPost, "/recovery-proposal", `{}`},
+		{http.MethodPost, "/reconcile", `{"version":1,"action":"reconcile","recoveryDigest":"` +
+			strings.Repeat("a", 64) + `","recoveryApprovalDigest":"` + strings.Repeat("b", 64) + `"}`},
+	} {
+		response = relayAuthenticatedRequest(handler, route.method,
+			"/api/v1/system/lan-gateway-rebind/"+rebindProfileOperation+route.suffix, route.body)
+		assertGatewayProblem(t, response, http.StatusConflict, "lan_gateway_conflict")
+		if runtime.calls != 1 {
+			t.Fatalf("different operation reached runtime: %s calls=%d", route.suffix, runtime.calls)
+		}
+	}
+
+	request := httptest.NewRequest(http.MethodPost, statusPath+"/recovery-proposal", strings.NewReader(`{}`))
+	request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: "session"})
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	assertGatewayProblem(t, response, http.StatusForbidden, "csrf_failed")
+	if runtime.calls != 1 {
+		t.Fatalf("missing CSRF reached runtime: calls=%d", runtime.calls)
+	}
+
+	// A terminal response never relaxes this process's recovery-only gate.
+	response = relayAuthenticatedRequest(handler, http.MethodGet, "/api/v1/system/status", "")
+	assertGatewayProblem(t, response, http.StatusServiceUnavailable, "gateway_reconciliation_required")
+	response = relayAuthenticatedRequest(handler, http.MethodPost, "/api/v1/system/lan-gateway-rebind", `{}`)
+	assertGatewayProblem(t, response, http.StatusServiceUnavailable, "gateway_reconciliation_required")
+}
+
 func TestLANGatewayRebindRecoveryHandlersRejectAmbiguousRequests(t *testing.T) {
 	for _, fixture := range []struct {
 		name, kind string

@@ -81,6 +81,7 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 		}
 		return GatewayRebindStartupRecoveryResult{}, err
 	}
+	m.gatewayRebindTerminalReleaseEvent = GatewayRebindDurableBoundaryEvent{}
 	defer func() {
 		// Startup recovery always releases the effects lease before the
 		// gateway lock. A failed release latches the process before another
@@ -237,7 +238,16 @@ func (m *Manager) recoverGatewayRebindStartupExpectedLocked(ctx context.Context,
 		if storeErr != nil {
 			return storeErr
 		}
-		return store.installExact(appendCtx, record)
+		if err := store.installExact(appendCtx, record); err != nil {
+			return err
+		}
+		m.observeGatewayRebindDurableBoundary(appendCtx, GatewayRebindDurableBoundaryEvent{
+			Boundary: GatewayRebindBoundaryProtectedProgressReadback, OperationID: record.OperationID,
+			SQLPhase: snapshot.Phase, ProtectedPhase: string(record.Phase),
+			ProtectedGeneration: record.Generation,
+			ProtectedSequence:   record.Sequence, Digest: record.Digest,
+		})
+		return nil
 	}
 	mode := gatewayRebindPhysicalReconcileUndecided
 	if receipt != nil {
@@ -504,9 +514,15 @@ func (m *Manager) installGatewayRebindTerminalForPhysicalLocked(ctx context.Cont
 		return gatewayRebindTerminalReceiptV2{}, err
 	}
 	store, err := newGatewayRebindTerminalStoreV2(m.options.DataRoot, receipt.Generation, receipt.OperationID)
-	if err != nil || store.installExact(ctx, receipt) != nil {
+	if err != nil {
 		return gatewayRebindTerminalReceiptV2{}, gatewayRebindProposalError(ctx)
 	}
+	if err := store.installExactObserved(ctx, receipt, func() {
+		m.observeGatewayRebindTerminalInstalled(ctx, receipt)
+	}); err != nil {
+		return gatewayRebindTerminalReceiptV2{}, gatewayRebindProposalError(ctx)
+	}
+	m.observeGatewayRebindTerminalReadback(ctx, receipt)
 	return receipt, nil
 }
 
@@ -532,7 +548,7 @@ func (m *Manager) applyGatewayRebindRetainedRollbackLocked(ctx context.Context,
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
-	command, err := applyGatewayRebindTransitionReconciled(ctx, repository, proof)
+	command, err := m.applyGatewayRebindTransitionReconciled(ctx, repository, proof)
 	if err != nil {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, err
@@ -540,11 +556,21 @@ func (m *Manager) applyGatewayRebindRetainedRollbackLocked(ctx context.Context,
 	confirmed, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	expected := gatewayCurrentAuthority(receipt.Predecessor.Lineage)
 	if err != nil || confirmed.Active != nil || confirmed.CurrentSource == nil ||
-		*confirmed.CurrentSource != expected || !gatewayRebindSnapshotRetainsCommand(confirmed, command) ||
-		repository.CheckGatewayRebindFence(ctx) != nil {
+		*confirmed.CurrentSource != expected || !gatewayRebindSnapshotRetainsCommand(confirmed, command) {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	confirmedSelection, err := m.selectGatewayCurrentLocked(ctx, confirmed)
+	if err != nil || gatewayCurrentAuthority(confirmedSelection.Lineage) != expected {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	finalEvent := m.observeGatewayRebindFinalCensusReadback(ctx, receipt, appaccess.GatewayRebindRolledBack)
+	if repository.CheckGatewayRebindFence(ctx) != nil {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	m.observeGatewayRebindFenceClearReadback(ctx, finalEvent)
 	return GatewayRebindCommitResult{OperationID: claim.Spec.OperationID, InitialPhase: snapshot.Phase,
 		FinalPhase: appaccess.GatewayRebindRolledBack, Disposition: appaccess.GatewayRebindDispositionAbort,
 		TerminalReceiptDigest: receipt.Digest, SelectedCurrentAuthority: expected, FenceReleased: true}, nil
@@ -591,7 +617,7 @@ func (m *Manager) recoverGatewayRebindCommitTerminalLocked(ctx context.Context,
 			if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
 				return GatewayRebindCommitResult{}, err
 			}
-			if _, applyErr := applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
+			if _, applyErr := m.applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
 				return GatewayRebindCommitResult{}, applyErr
 			}
 		case appaccess.GatewayRebindSuccessorReady:
@@ -607,7 +633,7 @@ func (m *Manager) recoverGatewayRebindCommitTerminalLocked(ctx context.Context,
 			if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
 				return GatewayRebindCommitResult{}, err
 			}
-			if _, applyErr := applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
+			if _, applyErr := m.applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
 				return GatewayRebindCommitResult{}, applyErr
 			}
 		case appaccess.GatewayRebindDatabaseCommitted:
@@ -626,7 +652,7 @@ func (m *Manager) recoverGatewayRebindCommitTerminalLocked(ctx context.Context,
 			if err := driver.confirmForwardServingLocked(ctx, request); err != nil {
 				return GatewayRebindCommitResult{}, err
 			}
-			if _, applyErr := applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
+			if _, applyErr := m.applyGatewayRebindTransitionReconciled(ctx, repository, proof); applyErr != nil {
 				return GatewayRebindCommitResult{}, applyErr
 			}
 		default:
@@ -655,6 +681,11 @@ func (m *Manager) recoverGatewayRebindDatabaseCommittedLocked(ctx context.Contex
 	if err != nil || !validSHA256(attestation) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	m.observeGatewayRebindDurableBoundary(ctx, GatewayRebindDurableBoundaryEvent{
+		Boundary: GatewayRebindBoundaryCurrentAttestation, OperationID: receipt.OperationID,
+		SQLPhase: snapshot.Phase, ProtectedGeneration: receipt.Generation,
+		Digest: attestation, Disposition: appaccess.GatewayRebindDispositionCommit,
+	})
 	fresh, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(snapshot, fresh) {
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
@@ -675,14 +706,15 @@ func (m *Manager) recoverGatewayRebindDatabaseCommittedLocked(ctx context.Contex
 	if err != nil {
 		return GatewayRebindCommitResult{}, err
 	}
-	if _, err = applyGatewayRebindTransitionReconciled(ctx, repository, proof); err != nil {
+	command, err := m.applyGatewayRebindTransitionReconciled(ctx, repository, proof)
+	if err != nil {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, err
 	}
 	confirmed, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || confirmed.Active != nil || confirmed.CurrentSource == nil ||
 		*confirmed.CurrentSource != gatewayCurrentAuthority(baseline.Lineage) ||
-		repository.CheckGatewayRebindFence(ctx) != nil {
+		!gatewayRebindSnapshotRetainsCommand(confirmed, command) {
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
@@ -691,6 +723,12 @@ func (m *Manager) recoverGatewayRebindDatabaseCommittedLocked(ctx context.Contex
 		m.gatewayRebindFailStopLatch().Store(true)
 		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
 	}
+	finalEvent := m.observeGatewayRebindFinalCensusReadback(ctx, receipt, appaccess.GatewayRebindCommitted)
+	if repository.CheckGatewayRebindFence(ctx) != nil {
+		m.gatewayRebindFailStopLatch().Store(true)
+		return GatewayRebindCommitResult{}, gatewayRebindProposalError(ctx)
+	}
+	m.observeGatewayRebindFenceClearReadback(ctx, finalEvent)
 	return GatewayRebindCommitResult{OperationID: prepared.Claim.Spec.OperationID, InitialPhase: initial,
 		FinalPhase: appaccess.GatewayRebindCommitted, Disposition: appaccess.GatewayRebindDispositionCommit,
 		TerminalReceiptDigest: receipt.Digest, SelectedCurrentAuthority: *confirmed.CurrentSource,
@@ -748,6 +786,12 @@ func (m *Manager) recoverGatewayRebindCommittedCurrentLocked(ctx context.Context
 		if err != nil || !validSHA256(attestation) || selection.State == nil {
 			return GatewayRebindStartupRecoveryResult{}, gatewayRebindProposalError(ctx)
 		}
+		m.observeGatewayRebindDurableBoundary(ctx, GatewayRebindDurableBoundaryEvent{
+			Boundary: GatewayRebindBoundaryCurrentAttestation, OperationID: selection.Lineage.OperationID,
+			SQLPhase:            appaccess.GatewayRebindCommitted,
+			ProtectedGeneration: selection.Lineage.ProtectedGeneration, Digest: attestation,
+			Disposition: appaccess.GatewayRebindDispositionCommit,
+		})
 		result.CurrentStateVersion = selection.State.Version
 		result.CurrentStateRevision = selection.State.Revision
 		result.CurrentStateDigest = selection.State.Digest

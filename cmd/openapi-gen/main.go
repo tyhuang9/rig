@@ -347,7 +347,7 @@ func exportedName(value string) string {
 	if unicode.IsDigit([]rune(name)[0]) {
 		name = "Field" + name
 	}
-	name = strings.ReplaceAll(name, "Id", "ID")
+	name = normalizeIDInitialism(name)
 	name = strings.ReplaceAll(name, "Csrf", "CSRF")
 	if name == "Os" {
 		name = "OS"
@@ -356,6 +356,21 @@ func exportedName(value string) string {
 		name = "OK"
 	}
 	return name
+}
+
+func normalizeIDInitialism(value string) string {
+	runes := []rune(value)
+	var normalized strings.Builder
+	for index := 0; index < len(runes); index++ {
+		if runes[index] == 'I' && index+1 < len(runes) && runes[index+1] == 'd' &&
+			(index+2 == len(runes) || unicode.IsUpper(runes[index+2]) || unicode.IsDigit(runes[index+2])) {
+			normalized.WriteString("ID")
+			index++
+			continue
+		}
+		normalized.WriteRune(runes[index])
+	}
+	return normalized.String()
 }
 
 func fatal(err error) {

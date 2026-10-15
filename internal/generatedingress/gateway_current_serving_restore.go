@@ -122,6 +122,7 @@ func (m *Manager) RestoreGatewayCurrentServingStartup(ctx context.Context,
 		}
 		return false, err
 	}
+	m.gatewayRebindTerminalReleaseEvent = GatewayRebindDurableBoundaryEvent{}
 	defer func() { resultErr = m.releaseGatewayRebindTerminalLocks(releaseEffects, releaseGateway, resultErr) }()
 	return m.restoreGatewayCurrentServingLocked(ctx, repository)
 }

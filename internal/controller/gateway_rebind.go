@@ -14,8 +14,9 @@ const (
 	operationCommitLANGatewayRebind  = "commitLANGatewayRebind"
 )
 
-// GatewayRebindRuntime owns admission, writer locks and physical proof. These
-// handlers are dormant: no route or production capability is registered here.
+// GatewayRebindRuntime owns admission, writer locks and physical proof. The
+// controller exposes only this narrow facade; it cannot manufacture physical
+// evidence or bypass the runtime's lock and authorization boundaries.
 type GatewayRebindRuntime interface {
 	InspectGatewayRebindCommitReview(context.Context, generatedingress.GatewayRebindProposalRepository, generatedingress.GatewayRebindProposalInput) (generatedingress.GatewayRebindCommitReview, error)
 	CommitGatewayRebind(context.Context, generatedingress.GatewayRebindCommitRepository, generatedingress.GatewayRebindCommitRequest, string, func(context.Context) error) (generatedingress.GatewayRebindCommitResponse, error)
@@ -23,15 +24,44 @@ type GatewayRebindRuntime interface {
 
 // The proposal uses the existing versioned public spec and roster formats. It
 // omits internal inspections, protected paths, session data and physical proof.
-// These private wire types will enter the generated API contract with routes.
+// These private wire types mirror the generated API contract without exposing
+// effect-authority internals to the controller.
 type lanGatewayRebindReview struct {
-	Version                 int                                    `json:"version"`
-	Spec                    appaccess.GatewayRebindSpecV2          `json:"spec"`
-	Roster                  []appaccess.GatewayRebindRosterEntryV2 `json:"roster"`
-	RuntimeHeads            []lanGatewayRebindRuntimeHead          `json:"runtimeHeads"`
-	ProposalDigest          string                                 `json:"proposalDigest"`
-	ConfigureApprovalDigest string                                 `json:"configureApprovalDigest"`
-	RebindApprovalDigest    string                                 `json:"rebindApprovalDigest"`
+	Version                 int                           `json:"version"`
+	Spec                    appaccess.GatewayRebindSpecV2 `json:"spec"`
+	Roster                  []lanGatewayRebindRosterEntry `json:"roster"`
+	RuntimeHeads            []lanGatewayRebindRuntimeHead `json:"runtimeHeads"`
+	ProposalDigest          string                        `json:"proposalDigest"`
+	ConfigureApprovalDigest string                        `json:"configureApprovalDigest"`
+	RebindApprovalDigest    string                        `json:"rebindApprovalDigest"`
+}
+
+// lanGatewayRebindRosterEntry omits the private entry digest and represents a
+// missing predecessor transfer by omitting that field rather than serializing
+// a nullable internal pointer. This keeps the generated public contract exact.
+type lanGatewayRebindRosterEntry struct {
+	Version                     int    `json:"version"`
+	OperationID                 string `json:"operationId"`
+	Ordinal                     int64  `json:"ordinal"`
+	AppID                       string `json:"appId"`
+	AllocationID                string `json:"allocationId"`
+	Port                        uint16 `json:"port"`
+	AllocationOwnerOperationID  string `json:"allocationOwnerOperationId"`
+	AllocationState             string `json:"allocationState"`
+	AccessRevisionID            string `json:"accessRevisionId"`
+	AccessRevisionNumber        int64  `json:"accessRevisionNumber"`
+	AccessSpecDigest            string `json:"accessSpecDigest"`
+	GrantAttemptID              string `json:"grantAttemptId"`
+	GrantStateSequence          int64  `json:"grantStateSequence"`
+	GrantProtectedStateDigest   string `json:"grantProtectedStateDigest"`
+	SourceProfileRevisionID     string `json:"sourceProfileRevisionId"`
+	SourceProfileRevisionNumber int64  `json:"sourceProfileRevisionNumber"`
+	SourceProfileSpecDigest     string `json:"sourceProfileSpecDigest"`
+	PredecessorTransferDigest   string `json:"predecessorTransferDigest,omitempty"`
+	ServingDeploymentID         string `json:"servingDeploymentId"`
+	ServingReleaseID            string `json:"servingReleaseId"`
+	ServingSlot                 string `json:"servingSlot"`
+	RouteGeneration             int64  `json:"routeGeneration"`
 }
 
 type lanGatewayRebindRuntimeHead struct {
@@ -104,10 +134,29 @@ func (s *Server) inspectLANGatewayRebind(w http.ResponseWriter, r *http.Request)
 	}
 	result := lanGatewayRebindReview{
 		Version: review.Version, Spec: review.Inspection.Spec,
-		Roster:         append([]appaccess.GatewayRebindRosterEntryV2{}, review.Inspection.Roster...),
+		Roster:         make([]lanGatewayRebindRosterEntry, 0, len(review.Inspection.Roster)),
 		RuntimeHeads:   make([]lanGatewayRebindRuntimeHead, 0, len(review.Inspection.RuntimeHeads)),
 		ProposalDigest: review.ProposalDigest, ConfigureApprovalDigest: review.ConfigureApprovalDigest,
 		RebindApprovalDigest: review.RebindApprovalDigest,
+	}
+	for _, entry := range review.Inspection.Roster {
+		projected := lanGatewayRebindRosterEntry{
+			Version: entry.Version, OperationID: entry.OperationID, Ordinal: entry.Ordinal,
+			AppID: entry.AppID, AllocationID: entry.AllocationID, Port: entry.Port,
+			AllocationOwnerOperationID: entry.AllocationOwnerOperationID, AllocationState: string(entry.AllocationState),
+			AccessRevisionID: entry.AccessRevisionID, AccessRevisionNumber: entry.AccessRevisionNumber,
+			AccessSpecDigest: entry.AccessSpecDigest, GrantAttemptID: entry.GrantAttemptID,
+			GrantStateSequence: entry.GrantStateSequence, GrantProtectedStateDigest: entry.GrantProtectedStateDigest,
+			SourceProfileRevisionID:     entry.SourceProfileRevisionID,
+			SourceProfileRevisionNumber: entry.SourceProfileRevisionNumber,
+			SourceProfileSpecDigest:     entry.SourceProfileSpecDigest,
+			ServingDeploymentID:         entry.ServingDeploymentID, ServingReleaseID: entry.ServingReleaseID,
+			ServingSlot: entry.ServingSlot, RouteGeneration: entry.RouteGeneration,
+		}
+		if entry.PredecessorTransferDigest != nil {
+			projected.PredecessorTransferDigest = *entry.PredecessorTransferDigest
+		}
+		result.Roster = append(result.Roster, projected)
 	}
 	for _, head := range review.Inspection.RuntimeHeads {
 		result.RuntimeHeads = append(result.RuntimeHeads, lanGatewayRebindRuntimeHead{

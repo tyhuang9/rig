@@ -17,7 +17,7 @@ const maxGatewayRebindRequestBodyBytes = 16 << 10
 
 // These private request values carry review input, never an actor or physical
 // proof. Admission must independently reconstruct and authorize the proposal
-// under the ingress writer locks. No rebind route is registered here.
+// under the ingress writer locks.
 type lanGatewayRebindCommitRequest struct {
 	Version                 int
 	Proposal                generatedingress.GatewayRebindProposalInput

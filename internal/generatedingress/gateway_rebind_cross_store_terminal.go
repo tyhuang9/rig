@@ -474,6 +474,12 @@ func (s *gatewayRebindTerminalStoreV2) load() (gatewayRebindTerminalReceiptV2, e
 }
 
 func (s *gatewayRebindTerminalStoreV2) installExact(ctx context.Context, value gatewayRebindTerminalReceiptV2) error {
+	return s.installExactObserved(ctx, value, nil)
+}
+
+func (s *gatewayRebindTerminalStoreV2) installExactObserved(ctx context.Context,
+	value gatewayRebindTerminalReceiptV2, afterDurableInstall func(),
+) error {
 	if s == nil || s.directory == nil || ctx == nil || ctx.Err() != nil || s.generation != value.Generation ||
 		s.operationID != value.OperationID || !validGatewayRebindTerminalReceiptV2(value) {
 		return errors.New("invalid typed rebind terminal install")
@@ -492,6 +498,12 @@ func (s *gatewayRebindTerminalStoreV2) installExact(ctx context.Context, value g
 	state := gatewayUpgradeStateStore{directory: s.directory}
 	if err := state.writeExact(s.path, s.purpose, value, true, maxGatewayRebindFinalHandoverTerminalBytes); err != nil {
 		return err
+	}
+	// This callback is an observer-only crash boundary. It cannot replace the
+	// mandatory decrypt/readback and complete protected-history confirmation
+	// below, and exact replay above never reports a new durable installation.
+	if afterDurableInstall != nil {
+		afterDurableInstall()
 	}
 	installed, err := s.load()
 	if err != nil || !reflect.DeepEqual(installed, value) {

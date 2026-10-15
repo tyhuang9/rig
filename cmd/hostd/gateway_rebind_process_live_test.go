@@ -1,0 +1,1068 @@
+//go:build live_docker
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/apicontract"
+	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/generatedingress"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+)
+
+const (
+	liveHostdRebindChildEnvironment    = "RIG_TEST_LIVE_HOSTD_REBIND_CHILD"
+	liveHostdRebindManifestEnvironment = "RIG_TEST_LIVE_HOSTD_REBIND_MANIFEST"
+)
+
+type liveHostdRebindChildManifest struct {
+	DataRoot       string `json:"dataRoot"`
+	Listen         string `json:"listen"`
+	OperationID    string `json:"operationId,omitempty"`
+	BoundaryID     string `json:"boundaryId,omitempty"`
+	ScenarioID     string `json:"scenarioId,omitempty"`
+	ReadyMarker    string `json:"readyMarker"`
+	BoundaryMarker string `json:"boundaryMarker"`
+	EffectLedger   string `json:"effectLedger"`
+	RequestArm     string `json:"requestArm"`
+}
+
+type liveHostdRebindReadyMarker struct {
+	Address      string `json:"address"`
+	RecoveryOnly bool   `json:"recoveryOnly"`
+	RecoveryKind string `json:"recoveryKind,omitempty"`
+	OperationID  string `json:"operationId,omitempty"`
+}
+
+type liveHostdRebindBoundaryMarker struct {
+	Boundary            string `json:"boundary"`
+	OperationID         string `json:"operationId"`
+	SQLPhase            string `json:"sqlPhase,omitempty"`
+	ProtectedPhase      string `json:"protectedPhase,omitempty"`
+	ProtectedGeneration uint64 `json:"protectedGeneration,omitempty"`
+	ProtectedSequence   uint64 `json:"protectedSequence,omitempty"`
+	Digest              string `json:"digest,omitempty"`
+	Disposition         string `json:"disposition,omitempty"`
+}
+
+// liveHostdRebindRunner delegates every command to the production ExecRunner.
+// Its observer can only record a completed coordinator boundary and wait for
+// the parent to kill the process. It receives no repository, Manager, lock or
+// effect object and cannot manufacture a successful coordinator result.
+type liveHostdRebindRunner struct {
+	delegate runtimeprocess.ExecRunner
+	manifest liveHostdRebindChildManifest
+
+	lostAck                    atomic.Bool
+	preclaimBlocked            atomic.Bool
+	emergencyStartupFailure    atomic.Bool
+	emergencyWithdrawalFailure atomic.Bool
+	resourceMu                 sync.Mutex
+	stageContainerID           string
+	finalContainerID           string
+	protectedPhase             string
+	protectedSequence          uint64
+}
+
+func (r *liveHostdRebindRunner) Run(ctx context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	if r.manifest.ScenarioID == "cancellation-before-write" &&
+		liveHostdRebindDockerRead(request.Args) &&
+		liveHostdRebindRegularFileExists(r.manifest.RequestArm) &&
+		r.preclaimBlocked.CompareAndSwap(false, true) {
+		_ = liveHostdRebindWriteExclusiveJSON(r.manifest.BoundaryMarker, liveHostdRebindBoundaryMarker{
+			Boundary: "preclaim_read_blocked", OperationID: r.manifest.OperationID,
+		})
+		<-ctx.Done()
+		return runtimeprocess.CommandResult{}, ctx.Err()
+	}
+	if r.manifest.ScenarioID == "emergency-withdrawal-failure" {
+		if liveHostdRebindCommandHas(request.Args, "container", "inspect") &&
+			r.emergencyStartupFailure.CompareAndSwap(false, true) {
+			return runtimeprocess.CommandResult{}, errors.New("test-owned startup observation failure")
+		}
+		if r.emergencyStartupFailure.Load() && liveHostdRebindCommandHas(request.Args, "container", "stop") &&
+			r.emergencyWithdrawalFailure.CompareAndSwap(false, true) {
+			_ = liveHostdRebindWriteExclusiveJSON(r.manifest.BoundaryMarker, liveHostdRebindBoundaryMarker{
+				Boundary: "emergency_withdrawal_failed", OperationID: r.manifest.OperationID,
+			})
+			return runtimeprocess.CommandResult{}, errors.New("test-owned emergency withdrawal failure")
+		}
+	}
+	result, err := r.delegate.Run(ctx, request)
+	if err == nil {
+		if recordErr := r.recordReplayEffect(request.Args); recordErr != nil {
+			return result, recordErr
+		}
+	}
+	r.rememberCreatedContainer(request.Args, result, err)
+	injectedRollback := ((r.manifest.ScenarioID == "" && (r.manifest.BoundaryID == "r01-rollback-intent" ||
+		r.manifest.BoundaryID == "r02-rollback-completed")) ||
+		r.manifest.ScenarioID == "literal-unresolved-precommit") &&
+		r.stageStartCommand(request.Args)
+	injectedLostAck := r.manifest.ScenarioID != "" &&
+		r.lostAcknowledgementCommand(r.manifest.ScenarioID, request.Args)
+	if err != nil || r.lostAck.Load() || (!injectedRollback && !injectedLostAck) {
+		return result, err
+	}
+	if !r.lostAck.CompareAndSwap(false, true) {
+		return result, err
+	}
+	if liveHostdRebindLostEffectScenario(r.manifest.ScenarioID) {
+		_ = liveHostdRebindWriteExclusiveJSON(r.manifest.BoundaryMarker, liveHostdRebindBoundaryMarker{
+			Boundary:    "completed_effect_ack_lost:" + r.manifest.ScenarioID,
+			OperationID: r.manifest.OperationID,
+		})
+		// Do not return the completed command result to the coordinator. The
+		// parent kills this exact process while the real effect is complete and
+		// its durable protected acknowledgment is still absent.
+		select {}
+	}
+	// The real command has completed. Clear captured output so an injected
+	// acknowledgement loss cannot leak command results or be mistaken for an
+	// observed object ID by the coordinator.
+	for index := range result.Stdout {
+		result.Stdout[index] = 0
+	}
+	for index := range result.Stderr {
+		result.Stderr[index] = 0
+	}
+	result.Stdout, result.Stderr = nil, nil
+	if strings.HasPrefix(r.manifest.ScenarioID, "pending-") {
+		_ = liveHostdRebindWriteExclusiveJSON(r.manifest.BoundaryMarker, liveHostdRebindBoundaryMarker{
+			Boundary: "current_effect_ack_lost", OperationID: r.manifest.OperationID,
+		})
+		select {}
+	}
+	return result, errors.New("test-owned completed effect acknowledgement lost")
+}
+
+func liveHostdRebindDockerRead(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	switch args[0] + " " + args[1] {
+	case "container inspect", "image inspect", "network inspect", "volume inspect",
+		"network ls", "volume ls":
+		return true
+	case "ps -aq", "ps --all", "ps -a":
+		return true
+	default:
+		return false
+	}
+}
+
+func liveHostdRebindRegularFileExists(path string) bool {
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0
+}
+
+func (r *liveHostdRebindRunner) recordReplayEffect(args []string) error {
+	if r.manifest.ScenarioID != "terminal-replay" || !liveHostdRebindDockerMutation(args) {
+		return nil
+	}
+	r.resourceMu.Lock()
+	defer r.resourceMu.Unlock()
+	file, err := os.OpenFile(r.manifest.EffectLedger, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString(args[0] + " " + args[1] + "\n")
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	return errors.Join(writeErr, file.Close())
+}
+
+func liveHostdRebindDockerMutation(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	switch args[0] + " " + args[1] {
+	case "network create", "network rm", "network connect", "network disconnect",
+		"volume create", "volume rm", "container create", "container start",
+		"container stop", "container rm":
+		return true
+	case "container cp":
+		return len(args) == 4 && filepath.IsAbs(args[2]) && args[3] != "-" && strings.Contains(args[3], ":")
+	case "container exec":
+		return liveHostdRebindCommandContains(args, "reload") ||
+			liveHostdRebindCommandContains(args, "mv") || liveHostdRebindCommandContains(args, "cp")
+	default:
+		return false
+	}
+}
+
+func TestLiveHostdRebindDockerMutationClassifiesCopyDirection(t *testing.T) {
+	t.Parallel()
+	hostSource := filepath.Join(os.TempDir(), "rebind-config.json")
+	if !liveHostdRebindDockerMutation([]string{"container", "cp", hostSource, "container-id:/config/active.json"}) {
+		t.Fatal("host-to-container configuration copy was not classified as an effect")
+	}
+	if liveHostdRebindDockerMutation([]string{"container", "cp", "container-id:/config/.", "-"}) {
+		t.Fatal("container-to-stdout attestation copy was classified as an effect")
+	}
+}
+
+func liveHostdRebindLostEffectScenario(id string) bool {
+	switch id {
+	case "lost-network-create-ack", "lost-config-volume-create-ack", "lost-data-volume-create-ack",
+		"lost-stage-container-create-ack", "lost-stage-config-copy-ack", "lost-stage-start-ack",
+		"lost-final-config-copy-ack", "lost-final-container-create-ack", "lost-cutover-ack",
+		"lost-successor-serving-ack":
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *liveHostdRebindRunner) rememberCreatedContainer(args []string,
+	result runtimeprocess.CommandResult, err error,
+) {
+	if err != nil || !liveHostdRebindCommandHas(args, "container", "create") {
+		return
+	}
+	id := strings.TrimSpace(string(result.Stdout))
+	if id == "" {
+		return
+	}
+	r.resourceMu.Lock()
+	defer r.resourceMu.Unlock()
+	switch {
+	case liveHostdRebindCommandContains(args, "io.rig.gateway-role=stage"):
+		r.stageContainerID = id
+	case liveHostdRebindCommandContains(args, "io.rig.gateway-role=final"):
+		r.finalContainerID = id
+	}
+}
+
+func (r *liveHostdRebindRunner) lostAcknowledgementCommand(scenario string, args []string) bool {
+	r.resourceMu.Lock()
+	stageID, finalID := r.stageContainerID, r.finalContainerID
+	r.resourceMu.Unlock()
+	switch scenario {
+	case "lost-network-create-ack":
+		return liveHostdRebindCommandHas(args, "network", "create") &&
+			liveHostdRebindCommandContains(args, "io.rig.operation-id="+r.manifest.OperationID)
+	case "lost-config-volume-create-ack":
+		return liveHostdRebindCommandHas(args, "volume", "create") &&
+			liveHostdRebindCommandContains(args, "io.rig.gateway-role=config-volume")
+	case "lost-data-volume-create-ack":
+		return liveHostdRebindCommandHas(args, "volume", "create") &&
+			liveHostdRebindCommandContains(args, "io.rig.gateway-role=data-volume")
+	case "lost-stage-container-create-ack":
+		return liveHostdRebindCommandHas(args, "container", "create") &&
+			liveHostdRebindCommandContains(args, "io.rig.gateway-role=stage")
+	case "lost-final-container-create-ack":
+		return liveHostdRebindCommandHas(args, "container", "create") &&
+			liveHostdRebindCommandContains(args, "io.rig.gateway-role=final")
+	case "lost-stage-config-copy-ack":
+		return r.writeCopyCommand(args, stageID, 7, "stage_config_intent", "stage.json")
+	case "lost-final-config-copy-ack":
+		// The final configuration is deliberately installed through the
+		// still-running stage container before that container is retired and
+		// the stopped final container is created from the same volumes.
+		return r.writeCopyCommand(args, stageID, 11, "final_config_intent", "active.json")
+	case "lost-stage-start-ack":
+		return liveHostdRebindContainerCommand(args, "start", stageID)
+	case "lost-cutover-ack":
+		return len(args) == 5 && liveHostdRebindCommandHas(args, "container", "stop", "--time", "10") &&
+			stageID != "" && finalID != "" &&
+			strings.TrimPrefix(args[4], "sha256:") != strings.TrimPrefix(stageID, "sha256:") &&
+			strings.TrimPrefix(args[4], "sha256:") != strings.TrimPrefix(finalID, "sha256:")
+	case "lost-successor-serving-ack":
+		return liveHostdRebindContainerCommand(args, "start", finalID)
+	case "pending-route-restart", "pending-lan-restart", "pending-lan-batch-restart":
+		return liveHostdRebindCurrentConfigPublishCommand(args)
+	default:
+		return false
+	}
+}
+
+func (r *liveHostdRebindRunner) writeCopyCommand(args []string, containerID string,
+	wantSequence uint64, wantPhase, wantFilename string,
+) bool {
+	r.resourceMu.Lock()
+	sequence, phase := r.protectedSequence, r.protectedPhase
+	r.resourceMu.Unlock()
+	if sequence != wantSequence || phase != wantPhase || containerID == "" || len(args) != 4 ||
+		!liveHostdRebindCommandHas(args, "container", "cp") || filepath.Clean(args[2]) != args[2] ||
+		!filepath.IsAbs(args[2]) || args[3] != containerID+":/config/"+wantFilename {
+		return false
+	}
+	info, err := os.Lstat(args[2])
+	return err == nil && info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0
+}
+
+func (r *liveHostdRebindRunner) stageStartCommand(args []string) bool {
+	r.resourceMu.Lock()
+	stageID := r.stageContainerID
+	r.resourceMu.Unlock()
+	return liveHostdRebindContainerCommand(args, "start", stageID)
+}
+
+func (r *liveHostdRebindRunner) ObserveGatewayRebindDurableBoundary(ctx context.Context,
+	event generatedingress.GatewayRebindDurableBoundaryEvent,
+) {
+	if event.OperationID == r.manifest.OperationID && string(event.Boundary) == "protected_progress_readback" {
+		r.resourceMu.Lock()
+		r.protectedPhase, r.protectedSequence = event.ProtectedPhase, event.ProtectedSequence
+		r.resourceMu.Unlock()
+	}
+	if r.manifest.BoundaryID == "" || event.OperationID != r.manifest.OperationID ||
+		!liveHostdRebindBoundaryMatches(r.manifest.BoundaryID, event) {
+		return
+	}
+	marker := liveHostdRebindBoundaryMarker{
+		Boundary: string(event.Boundary), OperationID: event.OperationID, SQLPhase: string(event.SQLPhase),
+		ProtectedPhase: event.ProtectedPhase, ProtectedGeneration: event.ProtectedGeneration,
+		ProtectedSequence: event.ProtectedSequence, Digest: event.Digest,
+		Disposition: string(event.Disposition),
+	}
+	_ = liveHostdRebindWriteExclusiveJSON(r.manifest.BoundaryMarker, marker)
+	if r.manifest.ScenarioID == "cancellation-after-write" {
+		<-ctx.Done()
+		return
+	}
+	select {}
+}
+
+func (r *liveHostdRebindRunner) GatewayRebindTerminalReleaseFault(
+	kind generatedingress.GatewayRebindTerminalReleaseKind,
+) error {
+	want := generatedingress.GatewayRebindTerminalReleaseKind("")
+	switch r.manifest.ScenarioID {
+	case "effects-release-fault":
+		want = generatedingress.GatewayRebindTerminalReleaseEffects
+	case "gateway-release-fault":
+		want = generatedingress.GatewayRebindTerminalReleaseGateway
+	}
+	if kind == want {
+		return errors.New("test-owned post-release ambiguity")
+	}
+	return nil
+}
+
+// This child test calls the exact production daemon assembly. The only
+// injected value is one CommandRunner which delegates all commands and owns
+// the package-private observer described above.
+func TestLiveControllerGatewayRebindCrashMatrixChild(t *testing.T) {
+	if os.Getenv(liveHostdRebindChildEnvironment) != "1" {
+		return
+	}
+	manifest, err := liveHostdRebindReadChildManifest(os.Getenv(liveHostdRebindManifestEnvironment))
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "invalid private rebind child manifest")
+		os.Exit(2)
+	}
+	runner := &liveHostdRebindRunner{manifest: manifest}
+	exitCode := runServerWithAssembly([]string{"--data-root", manifest.DataRoot, "--listen", manifest.Listen,
+		"--generated-runtime", "--github-connections=false"}, hostdDaemonAssemblyOptions{
+		runner: runner,
+		ready: func(value hostdDaemonReady) {
+			_ = liveHostdRebindWriteExclusiveJSON(manifest.ReadyMarker, liveHostdRebindReadyMarker{
+				Address: value.Address, RecoveryOnly: value.RecoveryOnly,
+				RecoveryKind: value.RecoveryKind, OperationID: value.OperationID,
+			})
+		},
+	})
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+type liveHostdRebindChild struct {
+	command  *exec.Cmd
+	manifest liveHostdRebindChildManifest
+	stderr   bytes.Buffer
+
+	waitOnce sync.Once
+	waitDone chan struct{}
+	waitErr  error
+}
+
+func liveHostdRebindStartChild(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	operationID, boundaryID, scenarioID string,
+) *liveHostdRebindChild {
+	t.Helper()
+	directory, err := os.MkdirTemp(fixture.root, "hostd-rebind-child-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := liveHostdRebindChildManifest{
+		DataRoot: fixture.dataRoot, Listen: fixture.listen, OperationID: operationID,
+		BoundaryID: boundaryID, ScenarioID: scenarioID,
+		ReadyMarker:    filepath.Join(directory, "ready.json"),
+		BoundaryMarker: filepath.Join(directory, "boundary.json"),
+		EffectLedger:   filepath.Join(directory, "effects.log"),
+		RequestArm:     filepath.Join(directory, "request-arm.json"),
+	}
+	manifestPath := filepath.Join(directory, "manifest.json")
+	if err := liveHostdRebindWritePrivateJSON(manifestPath, manifest); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0],
+		"-test.run=^TestLiveControllerGatewayRebindCrashMatrixChild$", "-test.count=1", "-test.timeout=40m")
+	command.Env = liveHostdRebindChildEnvironmentValues(manifestPath)
+	child := &liveHostdRebindChild{command: command, manifest: manifest, waitDone: make(chan struct{})}
+	command.Stdout = io.Discard
+	command.Stderr = &child.stderr
+	if err := command.Start(); err != nil {
+		t.Fatal("start full hostd child:", err)
+	}
+	t.Cleanup(func() { liveHostdRebindCleanupChild(t, child) })
+	return child
+}
+
+func (c *liveHostdRebindChild) startWait() {
+	c.waitOnce.Do(func() {
+		go func() {
+			c.waitErr = c.command.Wait()
+			close(c.waitDone)
+		}()
+	})
+}
+
+func liveHostdRebindKillAndReap(t *testing.T, child *liveHostdRebindChild) {
+	t.Helper()
+	if child == nil || child.command == nil || child.command.Process == nil {
+		t.Fatal("full hostd child identity is missing")
+	}
+	if err := child.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		t.Fatal("SIGKILL full hostd child:", err)
+	}
+	child.startWait()
+	select {
+	case <-child.waitDone:
+	case <-time.After(20 * time.Second):
+		t.Fatal("SIGKILLed full hostd child was not reaped")
+	}
+}
+
+func liveHostdRebindCleanupChild(t *testing.T, child *liveHostdRebindChild) {
+	t.Helper()
+	if child == nil || child.command == nil || child.command.Process == nil {
+		return
+	}
+	child.startWait()
+	select {
+	case <-child.waitDone:
+		return
+	default:
+	}
+	_ = child.command.Process.Kill()
+	select {
+	case <-child.waitDone:
+	case <-time.After(20 * time.Second):
+		t.Errorf("full hostd child was not reaped during parent cleanup")
+	}
+}
+
+func liveHostdRebindWaitReady(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	child *liveHostdRebindChild,
+) liveHostdRebindReadyMarker {
+	t.Helper()
+	var marker liveHostdRebindReadyMarker
+	liveHostdRebindWaitJSON(t, fixture.ctx, child, child.manifest.ReadyMarker, &marker, "daemon assembly")
+	if marker.Address != fixture.listen {
+		t.Fatalf("full hostd ready address changed: got=%q want=%q", marker.Address, fixture.listen)
+	}
+	// A callback proves assembly only. The authenticated request below proves
+	// the actual handler is accepting requests before this child is used.
+	want := http.StatusNotFound
+	if marker.RecoveryOnly && marker.RecoveryKind == "gateway_rebind" {
+		want = http.StatusConflict
+	} else if marker.RecoveryOnly {
+		want = http.StatusServiceUnavailable
+	}
+	probe := uuid.NewString()
+	status, _, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet,
+		"/api/v1/system/lan-gateway-rebind/"+probe, nil)
+	if err != nil || status != want {
+		t.Fatalf("full hostd authenticated readiness: status=%d want=%d error=%v", status, want, err)
+	}
+	return marker
+}
+
+func liveHostdRebindWaitBoundary(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	child *liveHostdRebindChild,
+) liveHostdRebindBoundaryMarker {
+	t.Helper()
+	var marker liveHostdRebindBoundaryMarker
+	liveHostdRebindWaitJSON(t, fixture.ctx, child, child.manifest.BoundaryMarker, &marker, "durable boundary")
+	if marker.OperationID != child.manifest.OperationID || marker.Boundary == "" {
+		t.Fatalf("boundary marker is not pinned to the requested operation")
+	}
+	return marker
+}
+
+func liveHostdRebindWaitJSON(t *testing.T, ctx context.Context, child *liveHostdRebindChild,
+	path string, output any, purpose string,
+) {
+	t.Helper()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		body, err := os.ReadFile(path)
+		if err == nil {
+			if len(body) == 0 || len(body) > 8192 || json.Unmarshal(body, output) != nil {
+				t.Fatalf("%s marker is invalid", purpose)
+			}
+			return
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read %s marker: %v", purpose, err)
+		}
+		child.startWait()
+		select {
+		case <-child.waitDone:
+			t.Fatalf("full hostd child exited before %s: %v stderr=%q", purpose, child.waitErr,
+				liveHostdRebindClosedDiagnostic(child.stderr.String()))
+		case <-ticker.C:
+		case <-ctx.Done():
+			t.Fatalf("timeout waiting for %s: %v", purpose, ctx.Err())
+		}
+	}
+}
+
+func liveHostdRebindReadChildManifest(path string) (liveHostdRebindChildManifest, error) {
+	var manifest liveHostdRebindChildManifest
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Ext(path) != ".json" {
+		return manifest, errors.New("invalid manifest path")
+	}
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return manifest, errors.New("unsafe manifest permissions")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || len(body) == 0 || len(body) > 8192 || json.Unmarshal(body, &manifest) != nil ||
+		!liveHostdRebindSafeRoot(manifest.DataRoot) || !liveHostdRebindSafeAddress(manifest.Listen) ||
+		!liveHostdRebindSafeMarker(manifest.ReadyMarker, filepath.Dir(path), "ready.json") ||
+		!liveHostdRebindSafeMarker(manifest.BoundaryMarker, filepath.Dir(path), "boundary.json") ||
+		!liveHostdRebindSafeMarker(manifest.EffectLedger, filepath.Dir(path), "effects.log") ||
+		!liveHostdRebindSafeMarker(manifest.RequestArm, filepath.Dir(path), "request-arm.json") ||
+		(manifest.OperationID != "" && uuid.Validate(manifest.OperationID) != nil) ||
+		(manifest.BoundaryID != "" && !liveHostdRebindKnownBoundary(manifest.BoundaryID)) ||
+		(manifest.ScenarioID != "" && !liveHostdRebindKnownScenario(manifest.ScenarioID)) {
+		return liveHostdRebindChildManifest{}, errors.New("invalid manifest")
+	}
+	return manifest, nil
+}
+
+func liveHostdRebindWritePrivateJSON(path string, value any) error {
+	body, err := json.Marshal(value)
+	if err != nil || len(body) == 0 || len(body) > 8192 {
+		return errors.New("invalid private JSON")
+	}
+	return os.WriteFile(path, body, 0o600)
+}
+
+func liveHostdRebindWriteExclusiveJSON(path string, value any) error {
+	body, err := json.Marshal(value)
+	if err != nil || len(body) == 0 || len(body) > 8192 {
+		return errors.New("invalid marker JSON")
+	}
+	directory := filepath.Dir(path)
+	file, err := os.CreateTemp(directory, "."+filepath.Base(path)+"-*.tmp")
+	if err != nil {
+		return err
+	}
+	temporary := file.Name()
+	defer os.Remove(temporary)
+	if err = file.Chmod(0o600); err == nil {
+		_, err = file.Write(body)
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	err = errors.Join(err, file.Close())
+	if err != nil {
+		return err
+	}
+	// A hard link publishes the already closed and synced inode atomically and
+	// fails if another writer has published this one-shot marker.
+	if err = os.Link(temporary, path); err != nil {
+		return err
+	}
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	return errors.Join(dir.Sync(), dir.Close())
+}
+
+func liveHostdRebindSafeRoot(path string) bool {
+	return path != "" && filepath.IsAbs(path) && filepath.Clean(path) == path && filepath.Base(path) == "hostd-supported-rebind"
+}
+
+func liveHostdRebindSafeAddress(value string) bool {
+	if !strings.HasPrefix(value, "127.0.0.1:") {
+		return false
+	}
+	port, err := strconv.Atoi(strings.TrimPrefix(value, "127.0.0.1:"))
+	return err == nil && port > 0 && port <= 65535
+}
+
+func liveHostdRebindSafeMarker(path, parent, base string) bool {
+	return path != "" && filepath.IsAbs(path) && filepath.Clean(path) == path && filepath.Dir(path) == parent &&
+		filepath.Base(path) == base
+}
+
+func liveHostdRebindChildEnvironmentValues(manifest string) []string {
+	result := make([]string, 0, len(os.Environ())+2)
+	for _, value := range os.Environ() {
+		if strings.HasPrefix(value, liveHostdRebindChildEnvironment+"=") ||
+			strings.HasPrefix(value, liveHostdRebindManifestEnvironment+"=") {
+			continue
+		}
+		result = append(result, value)
+	}
+	return append(result, liveHostdRebindChildEnvironment+"=1", liveHostdRebindManifestEnvironment+"="+manifest)
+}
+
+func liveHostdRebindKnownBoundary(id string) bool {
+	for _, entry := range gatewayRebindLiveBoundaries {
+		if entry.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func liveHostdRebindKnownScenario(id string) bool {
+	for _, entry := range gatewayRebindLiveScenarios {
+		if entry.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func liveHostdRebindBoundaryMatches(id string, event generatedingress.GatewayRebindDurableBoundaryEvent) bool {
+	boundary := string(event.Boundary)
+	phase := string(event.ProtectedPhase)
+	switch id {
+	case "a0-sql-claim":
+		return boundary == "sql_claim_readback" && event.SQLPhase == "prepared"
+	case "p0-predecessor-checkpoint":
+		return boundary == "protected_checkpoint_readback"
+	case "p1-protected-intent":
+		return boundary == "protected_intent_readback"
+	case "r01-rollback-intent":
+		return boundary == "protected_progress_readback" && phase == "rollback_intent"
+	case "r02-rollback-completed":
+		return boundary == "protected_progress_readback" && phase == "handover_rolled_back"
+	case "s01-protected-terminal-installed":
+		return boundary == "protected_terminal_installed" && event.SQLPhase == ""
+	case "s02-protected-terminal-readback":
+		return boundary == "protected_terminal_readback"
+	case "s03-successor-ready":
+		return boundary == "sql_transition_readback" && event.SQLPhase == "successor_ready"
+	case "s04-database-committed":
+		return boundary == "sql_transition_readback" && event.SQLPhase == "database_committed"
+	case "s05-current-attestation":
+		return boundary == "current_attestation" && event.SQLPhase == "database_committed"
+	case "s06-terminal-sql":
+		return boundary == "sql_transition_readback" && event.SQLPhase == "committed"
+	case "s07-stable-final-census":
+		return boundary == "final_census_readback" && event.SQLPhase == "committed"
+	case "s08-fence-transition":
+		return boundary == "fence_clear_readback" && event.SQLPhase == "committed"
+	case "s09-effects-lease-release":
+		return boundary == "effects_release" && event.SQLPhase == "committed"
+	case "s10-gateway-lock-release", "s11-response-loss":
+		return boundary == "gateway_release" && event.SQLPhase == "committed"
+	}
+	if strings.HasPrefix(id, "p") && len(id) >= 3 {
+		sequence, err := strconv.Atoi(id[1:3])
+		return err == nil && boundary == "protected_progress_readback" &&
+			event.ProtectedSequence == uint64(sequence) && phase == liveHostdRebindProgressPhase(uint64(sequence))
+	}
+	return false
+}
+
+func liveHostdRebindProgressPhase(sequence uint64) string {
+	return map[uint64]string{
+		1: "successor_intent", 2: "stage_intent", 3: "stage_intent", 4: "stage_intent",
+		5: "stage_intent", 6: "stage_intent", 7: "stage_config_intent", 8: "stage_config_copied",
+		9: "stage_start_intent", 10: "stage_serving", 11: "final_config_intent",
+		12: "final_config_copied", 13: "final_handover_intent", 14: "final_container_bound",
+		15: "cutover_intent", 16: "successor_serving", 17: "handover_committed",
+	}[sequence]
+}
+
+func liveHostdRebindCommandHas(args []string, values ...string) bool {
+	if len(args) < len(values) {
+		return false
+	}
+	for index, value := range values {
+		if args[index] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func liveHostdRebindCommandContains(args []string, value string) bool {
+	for _, arg := range args {
+		if arg == value {
+			return true
+		}
+	}
+	return false
+}
+
+func liveHostdRebindContainerCommand(args []string, action, id string) bool {
+	if id == "" || !liveHostdRebindCommandHas(args, "container", action) {
+		return false
+	}
+	for _, arg := range args[2:] {
+		if strings.TrimPrefix(arg, "sha256:") == strings.TrimPrefix(id, "sha256:") {
+			return true
+		}
+	}
+	return false
+}
+
+func liveHostdRebindCurrentConfigPublishCommand(args []string) bool {
+	return liveHostdRebindCommandHas(args, "container", "exec") &&
+		liveHostdRebindCommandContains(args, "mv") &&
+		liveHostdRebindCommandContains(args, "/config/active.next.json")
+}
+
+func liveHostdRebindHTTP(ctx context.Context, fixture *liveHostdGatewayRebindFixture,
+	method, path string, input any,
+) (int, []byte, error) {
+	var body io.Reader
+	if input != nil {
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			return 0, nil, err
+		}
+		body = bytes.NewReader(encoded)
+	}
+	request, err := http.NewRequestWithContext(ctx, method, "http://"+fixture.listen+path, body)
+	if err != nil {
+		return 0, nil, err
+	}
+	request.AddCookie(&http.Cookie{Name: auth.SessionCookie, Value: fixture.session.Token})
+	if input != nil {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	if method != http.MethodGet {
+		request.Header.Set("X-CSRF-Token", fixture.session.CSRF)
+	}
+	client := &http.Client{Timeout: 30 * time.Minute}
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	contents, err := io.ReadAll(io.LimitReader(response.Body, 512<<10))
+	return response.StatusCode, contents, err
+}
+
+func liveHostdRebindClosedDiagnostic(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "empty"
+	}
+	sum := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+type liveHostdRebindReview struct {
+	Version                 int             `json:"version"`
+	ProposalDigest          string          `json:"proposalDigest"`
+	ConfigureApprovalDigest string          `json:"configureApprovalDigest"`
+	RebindApprovalDigest    string          `json:"rebindApprovalDigest"`
+	Spec                    json.RawMessage `json:"spec"`
+}
+
+type liveHostdRebindStatus struct {
+	Version         int      `json:"version"`
+	OperationID     string   `json:"operationId"`
+	Availability    string   `json:"availability"`
+	Active          bool     `json:"active"`
+	Historical      bool     `json:"historicalTerminal"`
+	TerminalProof   string   `json:"terminalProof"`
+	CurrentProof    string   `json:"currentProof"`
+	OperationFence  string   `json:"operationFence"`
+	RecoveryPolicy  string   `json:"recoveryPolicy,omitempty"`
+	AllowedActions  []string `json:"allowedActions"`
+	TerminalDigest  string   `json:"terminalProofDigest,omitempty"`
+	CurrentDigest   string   `json:"currentAttestationDigest,omitempty"`
+	SelectedCurrent *struct {
+		OperationID string `json:"operationId"`
+	} `json:"selectedCurrentAuthority,omitempty"`
+	Operation *struct {
+		StoredState            string `json:"storedState"`
+		DatabaseCommitObserved bool   `json:"databaseCommitObserved"`
+		TerminalDisposition    string `json:"terminalDisposition,omitempty"`
+	} `json:"operation,omitempty"`
+}
+
+type liveHostdRebindRecoveryReview struct {
+	OperationID            string                `json:"operationId"`
+	Version                int                   `json:"version"`
+	Status                 liveHostdRebindStatus `json:"status"`
+	RecoveryDigest         string                `json:"recoveryDigest,omitempty"`
+	RecoveryApprovalDigest string                `json:"recoveryApprovalDigest,omitempty"`
+}
+
+func liveHostdRebindConfigureSuccessor(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	target apicontract.LANGatewayProfileSpec,
+) apicontract.LANGatewayProfileRevision {
+	t.Helper()
+	query := fmt.Sprintf("?interfaceId=%s&selectedIpv4=%s&portStart=%d&portEnd=%d",
+		urlQuery(target.InterfaceID), urlQuery(target.SelectedIpv4), target.PortStart, target.PortEnd)
+	status, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet,
+		"/api/v1/system/lan-gateway-profile"+query, nil)
+	var read apicontract.LANGatewayProfileRead
+	if err != nil || status != http.StatusOK || json.Unmarshal(body, &read) != nil || read.Proposal == nil {
+		t.Fatalf("inspect successor profile: status=%d error=%v", status, err)
+	}
+	operationID := uuid.NewString()
+	status, body, err = liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
+		"/api/v1/system/lan-gateway-profile", apicontract.ConfigureLANGatewayProfileRequest{
+			OperationID: operationID, ExpectedRevisionNumber: read.ExpectedRevisionNumber,
+			Spec: read.Proposal.Spec, ApprovalDigest: read.Proposal.ApprovalDigest,
+		})
+	var mutation apicontract.LANGatewayProfileMutation
+	if err != nil || status != http.StatusCreated || json.Unmarshal(body, &mutation) != nil ||
+		mutation.Profile.OperationID != operationID {
+		t.Fatalf("configure successor profile: status=%d error=%v", status, err)
+	}
+	return mutation.Profile
+}
+
+func liveHostdRebindPrepareRequest(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	operationID string, profile apicontract.LANGatewayProfileRevision,
+) map[string]any {
+	t.Helper()
+	inspect := map[string]any{
+		"operationId": operationID, "successorProfileRevisionId": profile.ID,
+		"successorProfileRevisionNumber": profile.RevisionNumber,
+		"successorProfileOperationId":    profile.OperationID, "successorProfile": profile.Spec,
+	}
+	status, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
+		"/api/v1/system/lan-gateway-rebind/proposal", inspect)
+	var review liveHostdRebindReview
+	if err != nil || status != http.StatusOK || json.Unmarshal(body, &review) != nil || review.Version != 1 ||
+		review.ProposalDigest == "" || review.ConfigureApprovalDigest == "" || review.RebindApprovalDigest == "" {
+		t.Fatalf("inspect rebind: status=%d error=%v", status, err)
+	}
+	inspect["version"] = review.Version
+	inspect["proposalDigest"] = review.ProposalDigest
+	inspect["configureApprovalDigest"] = review.ConfigureApprovalDigest
+	inspect["rebindApprovalDigest"] = review.RebindApprovalDigest
+	return inspect
+}
+
+func liveHostdRebindRecover(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	operationID string, ready liveHostdRebindReadyMarker,
+) liveHostdRebindStatus {
+	t.Helper()
+	path := "/api/v1/system/lan-gateway-rebind/" + operationID
+	statusCode, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet, path, nil)
+	var status liveHostdRebindStatus
+	if err != nil || statusCode != http.StatusOK || json.Unmarshal(body, &status) != nil ||
+		status.OperationID != operationID {
+		t.Fatalf("read retained rebind: status=%d error=%v", statusCode, err)
+	}
+	if !ready.RecoveryOnly {
+		liveHostdRebindAssertDurableTerminal(t, fixture, status, operationID, false)
+		return status
+	}
+	if ready.RecoveryKind != "gateway_rebind" || ready.OperationID != operationID {
+		t.Fatal("recovery-only full hostd did not retain the exact rebind pin")
+	}
+	// Cross-operation reads are rejected before runtime/repository/effect work.
+	statusCode, _, err = liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet,
+		"/api/v1/system/lan-gateway-rebind/"+uuid.NewString(), nil)
+	if err != nil || statusCode != http.StatusConflict {
+		t.Fatalf("cross-operation recovery read: status=%d error=%v", statusCode, err)
+	}
+	statusCode, body, err = liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
+		path+"/recovery-proposal", map[string]any{})
+	var review liveHostdRebindRecoveryReview
+	if err != nil || statusCode != http.StatusOK || json.Unmarshal(body, &review) != nil ||
+		review.OperationID != operationID || review.RecoveryDigest == "" || review.RecoveryApprovalDigest == "" {
+		t.Fatalf("inspect exact recovery: status=%d error=%v", statusCode, err)
+	}
+	statusCode, body, err = liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost, path+"/reconcile", map[string]any{
+		"version": 1, "action": "reconcile", "recoveryDigest": review.RecoveryDigest,
+		"recoveryApprovalDigest": review.RecoveryApprovalDigest,
+	})
+	var response struct {
+		Version int                   `json:"version"`
+		Status  liveHostdRebindStatus `json:"status"`
+	}
+	if err != nil || statusCode != http.StatusOK || json.Unmarshal(body, &response) != nil ||
+		response.Version != 1 || response.Status.OperationID != operationID {
+		t.Fatalf("reconcile exact recovery: status=%d error=%v", statusCode, err)
+	}
+	// The same process remains recovery-only even after a terminal result.
+	statusCode, _, err = liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
+		"/api/v1/system/lan-gateway-rebind/proposal", map[string]any{})
+	if err != nil || statusCode != http.StatusServiceUnavailable {
+		t.Fatalf("recovery process reopened normal admission: status=%d error=%v", statusCode, err)
+	}
+	liveHostdRebindAssertDurableTerminal(t, fixture, response.Status, operationID, true)
+	return response.Status
+}
+
+func liveHostdRebindAssertDurableTerminal(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	status liveHostdRebindStatus, operationID string, recoveryAudited bool,
+) {
+	t.Helper()
+	liveHostdRebindAssertTerminal(t, status, operationID)
+	db, err := database.Open(fixture.dataRoot)
+	if err != nil {
+		t.Fatal("open retained rebind database:", err)
+	}
+	repository := appaccess.New(db)
+	snapshot, snapshotErr := repository.GatewayRebindRecoverySnapshot(context.Background())
+	fenceErr := repository.CheckGatewayRebindFence(context.Background())
+	var auditCount int
+	auditErr := db.QueryRow(`SELECT COUNT(*) FROM audit_events
+		WHERE resource_type='lan_gateway_rebind' AND action=? AND resource_id=?`,
+		appaccess.GatewayRebindReconcilePurpose, operationID).Scan(&auditCount)
+	closeErr := db.Close()
+	if snapshotErr != nil || fenceErr != nil || auditErr != nil || closeErr != nil || snapshot.Active != nil {
+		t.Fatalf("terminal SQL/fence evidence is incomplete: snapshot=%v fence=%v audit=%v close=%v active=%v",
+			snapshotErr, fenceErr, auditErr, closeErr, snapshot.Active != nil)
+	}
+	if recoveryAudited && auditCount != 1 || !recoveryAudited && auditCount > 1 {
+		t.Fatalf("exact reconcile audit count=%d recoveryAudited=%v", auditCount, recoveryAudited)
+	}
+	var history *appaccess.GatewayRebindHistoryEntry
+	for index := range snapshot.History {
+		candidate := &snapshot.History[index]
+		if candidate.Claim.V2 != nil && candidate.Claim.V2.Spec.OperationID == operationID {
+			if history != nil {
+				t.Fatal("duplicate retained rebind history")
+			}
+			history = candidate
+		}
+	}
+	if history == nil || history.Claim.SpecVersion != appaccess.GatewayRebindSpecVersionV2 ||
+		history.Claim.V2 == nil || len(history.Events) < 2 || len(history.Commands) != len(history.Events)-1 ||
+		len(history.RosterV2) != len(fixture.appIDs) || len(history.RuntimeHeads) != len(fixture.appIDs) {
+		t.Fatalf("retained SQL history cardinality is incomplete: %#v", history)
+	}
+	claim := history.Claim.V2
+	if history.Events[0].OperationID != operationID || history.Events[0].Sequence != 1 ||
+		history.Events[0].State != appaccess.GatewayRebindPrepared || claim.State != history.Events[len(history.Events)-1].State {
+		t.Fatal("retained SQL history does not begin at A0 or end at the claim state")
+	}
+	for index := 1; index < len(history.Events); index++ {
+		previous, event, command := history.Events[index-1], history.Events[index], history.Commands[index-1]
+		if event.OperationID != operationID || event.Sequence != int64(index+1) || event.CreatedAt.Before(previous.CreatedAt) ||
+			command.OperationID != operationID || command.PreviousState != previous.State || command.NextState != event.State ||
+			command.Sequence != event.Sequence || command.PreviousSequence != previous.Sequence || command.CommandDigest == "" ||
+			command.ProtectedRecordDigest == "" {
+			t.Fatalf("retained SQL event/command order failed at index %d", index)
+		}
+	}
+	receipt := liveHostdRebindReadTerminal(t, fixture.dataRoot, operationID)
+	if receipt.OperationID != operationID || receipt.Digest != status.TerminalDigest ||
+		receipt.ProtectedRecordDigest == "" || receipt.ClaimRequestDigest != claim.RequestDigest ||
+		receipt.ClaimSpecDigest != claim.RebindApproval.SpecDigest {
+		t.Fatal("protected terminal does not bind the retained SQL claim")
+	}
+	switch status.Operation.TerminalDisposition {
+	case "commit":
+		if claim.State != appaccess.GatewayRebindCommitted || receipt.Disposition != appaccess.GatewayRebindDispositionCommit ||
+			snapshot.CurrentSource == nil || snapshot.CurrentSource.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
+			snapshot.CurrentSource.OperationID != operationID || snapshot.CurrentDatabaseCommittedEvent == nil ||
+			snapshot.CurrentDatabaseCommittedEvent.OperationID != operationID ||
+			len(history.Transfers) != len(history.RosterV2) || len(snapshot.CurrentTransfers) != len(history.Transfers) {
+			t.Fatal("committed SQL/current/grant-transfer evidence is incomplete")
+		}
+		seenSuccessor, seenDatabase := false, false
+		for _, event := range history.Events {
+			seenSuccessor = seenSuccessor || event.State == appaccess.GatewayRebindSuccessorReady
+			seenDatabase = seenDatabase || event.State == appaccess.GatewayRebindDatabaseCommitted
+		}
+		if !seenSuccessor || !seenDatabase {
+			t.Fatal("committed history omitted successor-ready or database-committed evidence")
+		}
+		liveHostdRebindAssertOwnedResourceCounts(t, fixture, operationID,
+			map[string]int{"container": 1, "network": 1, "volume": 2})
+	case "abort":
+		if claim.State != appaccess.GatewayRebindRolledBack || receipt.Disposition != appaccess.GatewayRebindDispositionAbort ||
+			len(history.Transfers) != 0 || snapshot.CurrentSource == nil || snapshot.CurrentSource.OperationID == operationID {
+			t.Fatal("rolled-back SQL/current evidence is incomplete")
+		}
+		for _, event := range history.Events {
+			if event.State == appaccess.GatewayRebindDatabaseCommitted {
+				t.Fatal("rolled-back history contains immutable database commit evidence")
+			}
+		}
+		liveHostdRebindAssertOwnedResourceCounts(t, fixture, operationID,
+			map[string]int{"container": 0, "network": 0, "volume": 0})
+	default:
+		t.Fatalf("unknown terminal disposition %q", status.Operation.TerminalDisposition)
+	}
+}
+
+func liveHostdRebindAssertOwnedResourceCounts(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	operationID string, expected map[string]int,
+) {
+	t.Helper()
+	for _, kind := range []string{"container", "network", "volume"} {
+		args := []string{kind, "ls", "-q", "--filter", "label=io.rig.operation-id=" + operationID}
+		if kind == "container" {
+			args = []string{"ps", "-aq", "--no-trunc", "--filter", "label=io.rig.operation-id=" + operationID}
+		}
+		body, err := controllerJourneyDocker(fixture.ctx, fixture.docker, nil, args...)
+		ids := strings.Fields(string(body))
+		if err != nil || len(ids) != expected[kind] {
+			t.Fatalf("terminal exact-owned %s census=%d want=%d error=%v", kind, len(ids), expected[kind], err)
+		}
+		for _, id := range ids {
+			labels, labelErr := lanTwoAppDockerLabels(fixture.ctx, fixture.docker, kind, id)
+			if labelErr != nil || labels["io.rig.operation-id"] != operationID {
+				t.Fatalf("terminal %s %q lost exact operation ownership: %v", kind, id, labelErr)
+			}
+		}
+	}
+}
+
+func liveHostdRebindAssertTerminal(t *testing.T, status liveHostdRebindStatus, operationID string) {
+	t.Helper()
+	if status.OperationID != operationID || status.Active || !status.Historical || status.TerminalProof != "verified" ||
+		status.OperationFence != "released" || status.Operation == nil || status.Operation.TerminalDisposition == "" ||
+		status.TerminalDigest == "" {
+		t.Fatalf("rebind terminal proof is incomplete: operation=%q active=%v historical=%v terminal=%q fence=%q",
+			status.OperationID, status.Active, status.Historical, status.TerminalProof, status.OperationFence)
+	}
+	if status.Operation.TerminalDisposition == "commit" &&
+		(status.CurrentProof != "verified" || status.CurrentDigest == "" || status.SelectedCurrent == nil ||
+			status.SelectedCurrent.OperationID != operationID || !status.Operation.DatabaseCommitObserved) {
+		t.Fatal("committed rebind lacks immutable database/current proof")
+	}
+}

@@ -23,8 +23,15 @@ func readLANGatewayRebindStatusRequest(r *http.Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := readLANGatewayRebindStatusBody(r); err != nil {
+		return "", err
+	}
+	return operationID, nil
+}
+
+func readLANGatewayRebindStatusBody(r *http.Request) error {
 	if len(r.Header.Values("Content-Encoding")) != 0 {
-		return "", appaccess.ErrInvalidInput
+		return appaccess.ErrInvalidInput
 	}
 	if r.Body != nil {
 		defer r.Body.Close()
@@ -32,10 +39,10 @@ func readLANGatewayRebindStatusRequest(r *http.Request) (string, error) {
 		// and adapters that construct requests without an HTTP server parser.
 		body, readErr := io.ReadAll(io.LimitReader(r.Body, 1))
 		if readErr != nil || len(body) != 0 {
-			return "", appaccess.ErrInvalidInput
+			return appaccess.ErrInvalidInput
 		}
 	}
-	return operationID, nil
+	return nil
 }
 
 func readLANGatewayRebindRecoveryPreviewRequest(r *http.Request) (string, error) {
@@ -43,10 +50,17 @@ func readLANGatewayRebindRecoveryPreviewRequest(r *http.Request) (string, error)
 	if err != nil {
 		return "", err
 	}
-	// The operation is supplied exclusively by the matched path. The preview
-	// accepts an empty object, never client-selected policy, state or authority.
-	if _, err := readLANGatewayRebindFields(r); err != nil {
+	if err := readLANGatewayRebindRecoveryPreviewBody(r); err != nil {
 		return "", err
 	}
 	return operationID, nil
+}
+
+func readLANGatewayRebindRecoveryPreviewBody(r *http.Request) error {
+	// The operation is supplied exclusively by the matched path. The preview
+	// accepts an empty object, never client-selected policy, state or authority.
+	if _, err := readLANGatewayRebindFields(r); err != nil {
+		return err
+	}
+	return nil
 }

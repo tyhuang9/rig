@@ -379,7 +379,7 @@ func TestGatewayRebindStartupFreshDatabaseAndManagerReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	prepared, err := prepareGatewayRebindStartup(context.Background(), f.configuration, f.db, f.dockerExecutable, directories)
-	if err != nil || prepared != nil {
+	if err != nil || prepared.disposition != gatewayRebindStartupNormal || prepared.preparation.ingress != nil {
 		t.Fatalf("fresh preparation=%+v error=%v", prepared, err)
 	}
 	admit, err := deploymentEffectsAdmission(f.db, directories.WorkingDirectory)
@@ -421,8 +421,69 @@ func TestGatewayRebindStartupFreshDatabaseAndManagerReuse(t *testing.T) {
 	// A fabricated checkpoint cannot cause the same manager to skip a fresh
 	// protected/SQL selection after admission.
 	_, err = inspectGatewayStartupAfterPreparation(context.Background(), f.configuration, f.db, f.dockerExecutable, directories,
-		&gatewayRebindStartupPreparation{ingress: gate.ingress, current: newGatewayStartupRecoveryFixture(false).before})
+		gatewayRebindStartupDecision{disposition: gatewayRebindStartupNormal,
+			preparation: gatewayRebindStartupPreparation{ingress: gate.ingress,
+				current: newGatewayStartupRecoveryFixture(false).before}})
 	if err == nil {
 		t.Fatal("accepted a stale preparation checkpoint")
+	}
+}
+
+func TestGatewayRebindRecoveryPinBindsImmutableDirection(t *testing.T) {
+	operationID := uuid.NewString()
+	committed := &appaccess.GatewayRebindEvent{OperationID: operationID, Sequence: 3,
+		State: appaccess.GatewayRebindDatabaseCommitted, CreatedAt: time.Now().UTC()}
+	currentOperationID := uuid.NewString()
+	inspection := generatedingress.GatewayRebindCurrentInspection{
+		SelectedCurrentAuthority: appaccess.GatewayCurrentAuthorityRef{OperationID: currentOperationID},
+		ActiveOperationID:        operationID, ActiveSpecVersion: appaccess.GatewayRebindSpecVersionV2,
+		ActivePhase: appaccess.GatewayRebindUnresolved, ActiveDatabaseCommittedEvent: committed,
+		ActiveDatabaseCommitObserved: true, ActiveRecoveryPolicy: appaccess.GatewayRebindRecoveryForwardOnly,
+		ActiveProtectedEvidence: appaccess.GatewayRebindProtectedRecoveryEvidence{
+			OperationID: operationID, Generation: 2, ScanDigest: strings.Repeat("a", 64),
+			FixedDisposition: appaccess.GatewayRebindDispositionCommit,
+		},
+		SelectedCurrentEvidence: appaccess.GatewayRebindSelectedCurrentEvidence{
+			Lineage: appaccess.GatewayCurrentLineageRef{OperationID: currentOperationID},
+		},
+	}
+	pin, err := gatewayRebindRecoveryPinForInspection(inspection)
+	if err != nil || pin.OperationID != operationID || pin.Policy != appaccess.GatewayRebindRecoveryForwardOnly ||
+		pin.DatabaseCommittedEvent == nil || pin.DatabaseCommittedEvent == committed ||
+		pin.DatabaseCommittedEvent.Sequence != committed.Sequence {
+		t.Fatalf("forward pin=%+v error=%v", pin, err)
+	}
+	committed.Sequence++
+	if pin.DatabaseCommittedEvent.Sequence == committed.Sequence {
+		t.Fatal("startup pin retained a mutable committed-event pointer")
+	}
+	inspection.ActiveProtectedEvidence.FixedDisposition = appaccess.GatewayRebindDispositionAbort
+	if _, err := gatewayRebindRecoveryPinForInspection(inspection); err == nil {
+		t.Fatal("forward-only pin accepted contradictory protected abort evidence")
+	}
+	inspection.ActiveProtectedEvidence.FixedDisposition = appaccess.GatewayRebindDispositionCommit
+	inspection.ActiveDatabaseCommittedEvent.Sequence = 0
+	if _, err := gatewayRebindRecoveryPinForInspection(inspection); err == nil {
+		t.Fatal("forward-only pin accepted an invalid committed event")
+	}
+
+	inspection.ActiveDatabaseCommittedEvent = nil
+	inspection.ActiveDatabaseCommitObserved = false
+	if _, err := gatewayRebindRecoveryPinForInspection(inspection); err != nil {
+		t.Fatalf("forward-only pin refused immutable protected commit evidence: %v", err)
+	}
+	inspection.ActiveProtectedEvidence.FixedDisposition = appaccess.GatewayRebindDispositionNone
+	if _, err := gatewayRebindRecoveryPinForInspection(inspection); err == nil {
+		t.Fatal("forward-only pin accepted no immutable commit evidence")
+	}
+	inspection.ActiveRecoveryPolicy = appaccess.GatewayRebindRecoveryRollbackOnly
+	inspection.ActiveRollbackAllowed = true
+	inspection.ActiveProtectedEvidence.FixedDisposition = appaccess.GatewayRebindDispositionAbort
+	if _, err := gatewayRebindRecoveryPinForInspection(inspection); err != nil {
+		t.Fatalf("rollback-only pin refused exact abort evidence: %v", err)
+	}
+	inspection.FenceReleased = true
+	if _, err := gatewayRebindRecoveryPinForInspection(inspection); err == nil {
+		t.Fatal("recovery pin accepted a released fence")
 	}
 }
