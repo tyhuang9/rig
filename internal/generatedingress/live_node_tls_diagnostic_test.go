@@ -17,7 +17,7 @@ const (
 	liveNodeTLSDiagnosticFlag      = "rig-live-node-tls-diagnostic"
 	liveNodeTLSDiagnosticProtocol  = "1"
 	liveNodeTLSDiagnosticLimit     = 512
-	liveNodeTLSDiagnosticMaxPhases = 7
+	liveNodeTLSDiagnosticMaxPhases = 9
 	liveNodeTLSStartupAllowance    = 15 * time.Second
 	liveNodeTLSCompletionAllowance = 5 * time.Second
 	liveNodeTLSKillReapAllowance   = 2 * time.Second
@@ -93,6 +93,8 @@ const (
 	liveNodeTLSDiagnosticContextUnknown           liveNodeTLSDiagnosticContextCategory = "unknown"
 	liveNodeTLSDiagnosticContextNoObservedJSEntry liveNodeTLSDiagnosticContextCategory = "no-observed-js-entry"
 	liveNodeTLSDiagnosticContextStartup           liveNodeTLSDiagnosticContextCategory = "startup"
+	liveNodeTLSDiagnosticContextHTTPSLoaded       liveNodeTLSDiagnosticContextCategory = "https-loaded"
+	liveNodeTLSDiagnosticContextRequestCreating   liveNodeTLSDiagnosticContextCategory = "request-creating"
 	liveNodeTLSDiagnosticContextRequestCreated    liveNodeTLSDiagnosticContextCategory = "request-created"
 	liveNodeTLSDiagnosticContextRequestSent       liveNodeTLSDiagnosticContextCategory = "request-sent"
 	liveNodeTLSDiagnosticContextResponse          liveNodeTLSDiagnosticContextCategory = "response"
@@ -105,6 +107,8 @@ const (
 var liveNodeTLSDiagnosticPhaseSequences = [][]liveNodeTLSDiagnosticContextCategory{
 	{
 		liveNodeTLSDiagnosticContextStartup,
+		liveNodeTLSDiagnosticContextHTTPSLoaded,
+		liveNodeTLSDiagnosticContextRequestCreating,
 		liveNodeTLSDiagnosticContextRequestCreated,
 		liveNodeTLSDiagnosticContextRequestSent,
 		liveNodeTLSDiagnosticContextResponse,
@@ -113,6 +117,8 @@ var liveNodeTLSDiagnosticPhaseSequences = [][]liveNodeTLSDiagnosticContextCatego
 	},
 	{
 		liveNodeTLSDiagnosticContextStartup,
+		liveNodeTLSDiagnosticContextHTTPSLoaded,
+		liveNodeTLSDiagnosticContextRequestCreating,
 		liveNodeTLSDiagnosticContextRequestCreated,
 		liveNodeTLSDiagnosticContextRequestSent,
 		liveNodeTLSDiagnosticContextRequestError,
@@ -120,6 +126,8 @@ var liveNodeTLSDiagnosticPhaseSequences = [][]liveNodeTLSDiagnosticContextCatego
 	},
 	{
 		liveNodeTLSDiagnosticContextStartup,
+		liveNodeTLSDiagnosticContextHTTPSLoaded,
+		liveNodeTLSDiagnosticContextRequestCreating,
 		liveNodeTLSDiagnosticContextRequestCreated,
 		liveNodeTLSDiagnosticContextRequestSent,
 		liveNodeTLSDiagnosticContextTimer,
@@ -128,6 +136,8 @@ var liveNodeTLSDiagnosticPhaseSequences = [][]liveNodeTLSDiagnosticContextCatego
 	},
 	{
 		liveNodeTLSDiagnosticContextStartup,
+		liveNodeTLSDiagnosticContextHTTPSLoaded,
+		liveNodeTLSDiagnosticContextRequestCreating,
 		liveNodeTLSDiagnosticContextRequestCreated,
 		liveNodeTLSDiagnosticContextRequestSent,
 		liveNodeTLSDiagnosticContextResponse,
@@ -136,6 +146,8 @@ var liveNodeTLSDiagnosticPhaseSequences = [][]liveNodeTLSDiagnosticContextCatego
 	},
 	{
 		liveNodeTLSDiagnosticContextStartup,
+		liveNodeTLSDiagnosticContextHTTPSLoaded,
+		liveNodeTLSDiagnosticContextRequestCreating,
 		liveNodeTLSDiagnosticContextRequestCreated,
 		liveNodeTLSDiagnosticContextRequestSent,
 		liveNodeTLSDiagnosticContextResponse,
@@ -251,6 +263,8 @@ func liveNodeTLSDiagnosticParentContext(ctx context.Context) string {
 
 func TestLiveNodeTLSDiagnosticContext(t *testing.T) {
 	validResponse := []byte("rig-live-node-tls-diagnostic 1 startup 22\n" +
+		"rig-live-node-tls-diagnostic 1 https-loaded\n" +
+		"rig-live-node-tls-diagnostic 1 request-creating\n" +
 		"rig-live-node-tls-diagnostic 1 request-created\n" +
 		"rig-live-node-tls-diagnostic 1 request-sent\n" +
 		"rig-live-node-tls-diagnostic 1 response\n" +
@@ -266,16 +280,18 @@ func TestLiveNodeTLSDiagnosticContext(t *testing.T) {
 		want      liveNodeTLSDiagnosticContextCategory
 	}{
 		{name: "valid response", stderr: validResponse, want: liveNodeTLSDiagnosticContextStdoutCallback},
-		{name: "valid request error", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 20\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 request-sent\nrig-live-node-tls-diagnostic 1 request-error\n"), want: liveNodeTLSDiagnosticContextRequestError},
-		{name: "valid timer", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 20\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 request-sent\nrig-live-node-tls-diagnostic 1 timer\n"), want: liveNodeTLSDiagnosticContextTimer},
-		{name: "response then timer", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 20\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 request-sent\nrig-live-node-tls-diagnostic 1 response\nrig-live-node-tls-diagnostic 1 timer\n"), want: liveNodeTLSDiagnosticContextTimer},
-		{name: "response then request error", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 20\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 request-sent\nrig-live-node-tls-diagnostic 1 response\nrig-live-node-tls-diagnostic 1 request-error\n"), want: liveNodeTLSDiagnosticContextRequestError},
+		{name: "valid request error", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 20\nrig-live-node-tls-diagnostic 1 https-loaded\nrig-live-node-tls-diagnostic 1 request-creating\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 request-sent\nrig-live-node-tls-diagnostic 1 request-error\n"), want: liveNodeTLSDiagnosticContextRequestError},
+		{name: "valid timer", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 20\nrig-live-node-tls-diagnostic 1 https-loaded\nrig-live-node-tls-diagnostic 1 request-creating\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 request-sent\nrig-live-node-tls-diagnostic 1 timer\n"), want: liveNodeTLSDiagnosticContextTimer},
+		{name: "response then timer", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 20\nrig-live-node-tls-diagnostic 1 https-loaded\nrig-live-node-tls-diagnostic 1 request-creating\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 request-sent\nrig-live-node-tls-diagnostic 1 response\nrig-live-node-tls-diagnostic 1 timer\n"), want: liveNodeTLSDiagnosticContextTimer},
+		{name: "response then request error", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 20\nrig-live-node-tls-diagnostic 1 https-loaded\nrig-live-node-tls-diagnostic 1 request-creating\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 request-sent\nrig-live-node-tls-diagnostic 1 response\nrig-live-node-tls-diagnostic 1 request-error\n"), want: liveNodeTLSDiagnosticContextRequestError},
 		{name: "empty capture is no observed entry", stderr: nil, want: liveNodeTLSDiagnosticContextNoObservedJSEntry},
 		{name: "unmarked stderr is unknown", stderr: []byte("node warning\n"), want: liveNodeTLSDiagnosticContextUnknown},
 		{name: "truncated", stderr: validResponse[:20], truncated: true, want: liveNodeTLSDiagnosticContextUnknown},
-		{name: "malformed", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22\nrig-live-node-tls-diagnostic 1 request-created extra\n"), want: liveNodeTLSDiagnosticContextUnknown},
-		{name: "unknown phase", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22\nrig-live-node-tls-diagnostic 1 request-created\nrig-live-node-tls-diagnostic 1 custom\n"), want: liveNodeTLSDiagnosticContextUnknown},
-		{name: "out of order", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22\nrig-live-node-tls-diagnostic 1 request-sent\n"), want: liveNodeTLSDiagnosticContextUnknown},
+		{name: "malformed", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22\nrig-live-node-tls-diagnostic 1 https-loaded extra\n"), want: liveNodeTLSDiagnosticContextUnknown},
+		{name: "unknown phase", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22\nrig-live-node-tls-diagnostic 1 https-loaded\nrig-live-node-tls-diagnostic 1 request-creating\nrig-live-node-tls-diagnostic 1 custom\n"), want: liveNodeTLSDiagnosticContextUnknown},
+		{name: "dropped phase", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22\nrig-live-node-tls-diagnostic 1 https-loaded\nrig-live-node-tls-diagnostic 1 request-created\n"), want: liveNodeTLSDiagnosticContextUnknown},
+		{name: "duplicate phase", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22\nrig-live-node-tls-diagnostic 1 https-loaded\nrig-live-node-tls-diagnostic 1 https-loaded\n"), want: liveNodeTLSDiagnosticContextUnknown},
+		{name: "out of order", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22\nrig-live-node-tls-diagnostic 1 request-creating\n"), want: liveNodeTLSDiagnosticContextUnknown},
 		{name: "wrong protocol", stderr: []byte("rig-live-node-tls-diagnostic 2 startup 22\n"), want: liveNodeTLSDiagnosticContextUnknown},
 		{name: "non numeric node version", stderr: []byte("rig-live-node-tls-diagnostic 1 startup v22\n"), want: liveNodeTLSDiagnosticContextUnknown},
 		{name: "partial record", stderr: []byte("rig-live-node-tls-diagnostic 1 startup 22"), want: liveNodeTLSDiagnosticContextUnknown},
@@ -286,6 +302,59 @@ func TestLiveNodeTLSDiagnosticContext(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLiveNodeTLSDiagnosticSequencePrefixes(t *testing.T) {
+	for sequenceIndex, sequence := range liveNodeTLSDiagnosticPhaseSequences {
+		for length := 1; length <= len(sequence); length++ {
+			evidence := liveNodeTLSDiagnosticEvidence(liveNodeTLSDiagnosticTrace(sequence[:length], "22"), false)
+			if evidence.context != sequence[length-1] || evidence.nodeMajor != "22" {
+				t.Fatalf("sequence=%d prefix=%d context=%s node=%s", sequenceIndex, length, evidence.context, evidence.nodeMajor)
+			}
+		}
+	}
+	longest := liveNodeTLSDiagnosticPhaseSequences[len(liveNodeTLSDiagnosticPhaseSequences)-1]
+	overlong := append(liveNodeTLSDiagnosticTrace(longest, "22"),
+		[]byte("rig-live-node-tls-diagnostic 1 stdout-callback\n")...)
+	if got := liveNodeTLSDiagnosticContext(overlong, false); got != liveNodeTLSDiagnosticContextUnknown {
+		t.Fatalf("overlong trace context=%s", got)
+	}
+}
+
+func TestLiveNodeTLSDiagnosticLongestTraceBound(t *testing.T) {
+	longest := liveNodeTLSDiagnosticPhaseSequences[len(liveNodeTLSDiagnosticPhaseSequences)-1]
+	if len(longest) != liveNodeTLSDiagnosticMaxPhases {
+		t.Fatalf("longest phases=%d want=%d", len(longest), liveNodeTLSDiagnosticMaxPhases)
+	}
+	trace := liveNodeTLSDiagnosticTrace(longest, "65535")
+	if len(trace) > liveNodeTLSDiagnosticLimit {
+		t.Fatalf("longest trace bytes=%d limit=%d", len(trace), liveNodeTLSDiagnosticLimit)
+	}
+	buffer := newLiveNodeTLSDiagnosticStderrBuffer(liveNodeTLSDiagnosticLimit)
+	if count, err := buffer.Write(trace); err != nil || count != len(trace) || buffer.Truncated() {
+		t.Fatal("longest valid trace was not retained intact")
+	}
+	evidence := liveNodeTLSDiagnosticEvidence(buffer.Bytes(), buffer.Truncated())
+	if evidence.context != liveNodeTLSDiagnosticContextStdoutCallback || evidence.nodeMajor != "65535" {
+		t.Fatalf("longest trace context=%s node=%s", evidence.context, evidence.nodeMajor)
+	}
+}
+
+func liveNodeTLSDiagnosticTrace(phases []liveNodeTLSDiagnosticContextCategory, major string) []byte {
+	var trace strings.Builder
+	for index, phase := range phases {
+		trace.WriteString(liveNodeTLSDiagnosticFlag)
+		trace.WriteByte(' ')
+		trace.WriteString(liveNodeTLSDiagnosticProtocol)
+		trace.WriteByte(' ')
+		trace.WriteString(string(phase))
+		if index == 0 {
+			trace.WriteByte(' ')
+			trace.WriteString(major)
+		}
+		trace.WriteByte('\n')
+	}
+	return []byte(trace.String())
 }
 
 func TestLiveNodeTLSDiagnosticStderrBufferBoundsOutput(t *testing.T) {
