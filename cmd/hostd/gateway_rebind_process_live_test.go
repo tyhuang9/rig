@@ -40,6 +40,16 @@ const (
 	// emitted by the parent test process.
 	liveHostdRebindStartupDiagnosticMaxBytes   = 64 << 10
 	liveHostdRebindStartupDiagnosticMaxRecords = 64
+
+	// The fixture owns a four-minute cleanup, the registered two-app fixture
+	// owns another four minutes, and test-owned network cleanup has one minute.
+	// Keep a further twenty seconds for reaping the exact child, rounded up to
+	// ten minutes so an enclosing Go test deadline cannot interrupt cleanup.
+	liveHostdRebindStartupCleanupReserve = 10 * time.Minute
+	// A full daemon normally starts far faster. This cap turns a child-internal
+	// stall into a reportable test failure without extending any child deadline.
+	liveHostdRebindStartupReadinessCap = 10 * time.Minute
+	liveHostdRebindChildReapTimeout    = 20 * time.Second
 )
 
 type liveHostdRebindChildManifest struct {
@@ -468,19 +478,35 @@ func (c *liveHostdRebindChild) startWait() {
 	})
 }
 
-func liveHostdRebindKillAndReap(t *testing.T, child *liveHostdRebindChild) {
-	t.Helper()
-	if child == nil || child.command == nil || child.command.Process == nil {
-		t.Fatal("full hostd child identity is missing")
-	}
-	if err := child.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		t.Fatal("SIGKILL full hostd child:", err)
+func liveHostdRebindKillAndReapError(child *liveHostdRebindChild) error {
+	if child == nil || child.command == nil || child.command.Process == nil || child.waitDone == nil {
+		return errors.New("full hostd child identity is missing")
 	}
 	child.startWait()
 	select {
 	case <-child.waitDone:
-	case <-time.After(20 * time.Second):
-		t.Fatal("SIGKILLed full hostd child was not reaped")
+		return nil
+	default:
+	}
+	var killErr error
+	if err := child.command.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		killErr = fmt.Errorf("SIGKILL full hostd child: %w", err)
+	}
+	select {
+	case <-child.waitDone:
+		// On Windows a process that exited between the first wait check and
+		// TerminateProcess can report access denied. Its completed Wait still
+		// proves this exact child was reaped, so there is nothing left to kill.
+		return nil
+	case <-time.After(liveHostdRebindChildReapTimeout):
+		return errors.Join(killErr, errors.New("SIGKILLed full hostd child was not reaped"))
+	}
+}
+
+func liveHostdRebindKillAndReap(t *testing.T, child *liveHostdRebindChild) {
+	t.Helper()
+	if err := liveHostdRebindKillAndReapError(child); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -489,17 +515,8 @@ func liveHostdRebindCleanupChild(t *testing.T, child *liveHostdRebindChild) {
 	if child == nil || child.command == nil || child.command.Process == nil {
 		return
 	}
-	child.startWait()
-	select {
-	case <-child.waitDone:
-		return
-	default:
-	}
-	_ = child.command.Process.Kill()
-	select {
-	case <-child.waitDone:
-	case <-time.After(20 * time.Second):
-		t.Errorf("full hostd child was not reaped during parent cleanup")
+	if err := liveHostdRebindKillAndReapError(child); err != nil {
+		t.Error(err)
 	}
 }
 
@@ -507,10 +524,30 @@ func liveHostdRebindWaitReady(t *testing.T, fixture *liveHostdGatewayRebindFixtu
 	child *liveHostdRebindChild,
 ) liveHostdRebindReadyMarker {
 	t.Helper()
+	deadline, hasDeadline := t.Deadline()
+	marker, err := liveHostdRebindWaitReadyResult(fixture, child, deadline, hasDeadline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return marker
+}
+
+func liveHostdRebindWaitReadyResult(fixture *liveHostdGatewayRebindFixture,
+	child *liveHostdRebindChild, deadline time.Time, hasDeadline bool,
+) (liveHostdRebindReadyMarker, error) {
 	var marker liveHostdRebindReadyMarker
-	liveHostdRebindWaitJSON(t, fixture.ctx, child, child.manifest.ReadyMarker, &marker, "daemon assembly")
+	budget, err := liveHostdRebindStartupReadinessBudget(time.Now(), deadline, hasDeadline)
+	if err != nil {
+		return marker, liveHostdRebindReadyFailure(child, "daemon assembly", err)
+	}
+	ctx, cancel := context.WithTimeout(fixture.ctx, budget)
+	defer cancel()
+	if err := liveHostdRebindWaitJSON(ctx, child, child.manifest.ReadyMarker, &marker, "daemon assembly"); err != nil {
+		return marker, liveHostdRebindReadyFailure(child, "daemon assembly", err)
+	}
 	if marker.Address != fixture.listen {
-		t.Fatalf("full hostd ready address changed: got=%q want=%q", marker.Address, fixture.listen)
+		return marker, liveHostdRebindReadyFailure(child, "daemon assembly",
+			fmt.Errorf("full hostd ready address changed: got=%q want=%q", marker.Address, fixture.listen))
 	}
 	// A callback proves assembly only. The authenticated request below proves
 	// the actual handler is accepting requests before this child is used.
@@ -521,12 +558,22 @@ func liveHostdRebindWaitReady(t *testing.T, fixture *liveHostdGatewayRebindFixtu
 		want = http.StatusServiceUnavailable
 	}
 	probe := uuid.NewString()
-	status, _, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet,
-		"/api/v1/system/lan-gateway-rebind/"+probe, nil)
-	if err != nil || status != want {
-		t.Fatalf("full hostd authenticated readiness: status=%d want=%d error=%v", status, want, err)
+	if err := ctx.Err(); err != nil {
+		return marker, liveHostdRebindReadyFailure(child, "authenticated readiness", err)
 	}
-	return marker
+	status, _, err := liveHostdRebindHTTP(ctx, fixture, http.MethodGet,
+		"/api/v1/system/lan-gateway-rebind/"+probe, nil)
+	if contextErr := ctx.Err(); contextErr != nil {
+		return marker, liveHostdRebindReadyFailure(child, "authenticated readiness", contextErr)
+	}
+	if err != nil || status != want {
+		return marker, liveHostdRebindReadyFailure(child, "authenticated readiness",
+			fmt.Errorf("status=%d want=%d error=%v", status, want, err))
+	}
+	if err := ctx.Err(); err != nil {
+		return marker, liveHostdRebindReadyFailure(child, "authenticated readiness", err)
+	}
+	return marker, nil
 }
 
 func liveHostdRebindWaitBoundary(t *testing.T, fixture *liveHostdGatewayRebindFixture,
@@ -534,39 +581,86 @@ func liveHostdRebindWaitBoundary(t *testing.T, fixture *liveHostdGatewayRebindFi
 ) liveHostdRebindBoundaryMarker {
 	t.Helper()
 	var marker liveHostdRebindBoundaryMarker
-	liveHostdRebindWaitJSON(t, fixture.ctx, child, child.manifest.BoundaryMarker, &marker, "durable boundary")
+	if err := liveHostdRebindWaitJSON(fixture.ctx, child, child.manifest.BoundaryMarker, &marker, "durable boundary"); err != nil {
+		if liveHostdRebindChildWaited(child) {
+			t.Fatalf("%v stderr=%q", err, liveHostdRebindClosedDiagnostic(child.stderr.String()))
+		}
+		t.Fatal(err)
+	}
 	if marker.OperationID != child.manifest.OperationID || marker.Boundary == "" {
 		t.Fatalf("boundary marker is not pinned to the requested operation")
 	}
 	return marker
 }
 
-func liveHostdRebindWaitJSON(t *testing.T, ctx context.Context, child *liveHostdRebindChild,
+func liveHostdRebindWaitJSON(ctx context.Context, child *liveHostdRebindChild,
 	path string, output any, purpose string,
-) {
-	t.Helper()
+) error {
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("timeout waiting for %s: %w", purpose, err)
+		}
 		body, err := os.ReadFile(path)
 		if err == nil {
 			if len(body) == 0 || len(body) > 8192 || json.Unmarshal(body, output) != nil {
-				t.Fatalf("%s marker is invalid", purpose)
+				return fmt.Errorf("%s marker is invalid", purpose)
 			}
-			return
+			if err := ctx.Err(); err != nil {
+				return fmt.Errorf("timeout waiting for %s: %w", purpose, err)
+			}
+			return nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("read %s marker: %v", purpose, err)
+			return fmt.Errorf("read %s marker: %w", purpose, err)
 		}
 		child.startWait()
 		select {
 		case <-child.waitDone:
-			t.Fatalf("full hostd child exited before %s: %v stderr=%q", purpose, child.waitErr,
-				liveHostdRebindClosedDiagnostic(child.stderr.String()))
+			return fmt.Errorf("full hostd child exited before %s: %v", purpose, child.waitErr)
 		case <-ticker.C:
 		case <-ctx.Done():
-			t.Fatalf("timeout waiting for %s: %v", purpose, ctx.Err())
+			return fmt.Errorf("timeout waiting for %s: %w", purpose, ctx.Err())
 		}
+	}
+}
+
+func liveHostdRebindStartupReadinessBudget(now, deadline time.Time, hasDeadline bool) (time.Duration, error) {
+	if !hasDeadline {
+		return liveHostdRebindStartupReadinessCap, nil
+	}
+	budget := deadline.Sub(now) - liveHostdRebindStartupCleanupReserve
+	if budget <= 0 {
+		return 0, fmt.Errorf("test deadline leaves no startup readiness time after %s cleanup reserve",
+			liveHostdRebindStartupCleanupReserve)
+	}
+	if budget < liveHostdRebindStartupReadinessCap {
+		return budget, nil
+	}
+	return liveHostdRebindStartupReadinessCap, nil
+}
+
+func liveHostdRebindReadyFailure(child *liveHostdRebindChild, purpose string, cause error) error {
+	if err := liveHostdRebindKillAndReapError(child); err != nil {
+		return fmt.Errorf("full hostd child readiness failure before %s: %v; child cleanup failed: %w",
+			purpose, cause, err)
+	}
+	// exec.Cmd.Wait has returned before the buffer is read, so the child stderr
+	// writer cannot race this closed digest and allowlist classification.
+	return fmt.Errorf("full hostd child readiness failure before %s: %v stderr=%q",
+		purpose, cause, liveHostdRebindClosedDiagnostic(child.stderr.String()))
+}
+
+func liveHostdRebindChildWaited(child *liveHostdRebindChild) bool {
+	if child == nil || child.waitDone == nil {
+		return false
+	}
+	select {
+	case <-child.waitDone:
+		return true
+	default:
+		return false
 	}
 }
 

@@ -1,0 +1,112 @@
+{
+  "test_name": "TestLiveControllerGatewayRebindCrashMatrix",
+  "package": "github.com/hostd/hostd/cmd/hostd",
+  "max_cases_per_group": 8,
+  "go_timeout_minutes": 30,
+  "group_timeout_minutes": 110,
+  "groups": [
+    {
+      "id": "partition-01",
+      "cases": [
+        "boundary/a0-sql-claim",
+        "boundary/p01-successor-intent",
+        "boundary/p05-data-volume-bound",
+        "boundary/p09-stage-start-intent",
+        "boundary/p13-final-handover-intent",
+        "boundary/p17-handover-completed",
+        "boundary/s03-successor-ready",
+        "boundary/s07-stable-final-census"
+      ]
+    },
+    {
+      "id": "partition-02",
+      "cases": [
+        "boundary/p0-predecessor-checkpoint",
+        "boundary/p02-image-observed",
+        "boundary/p06-stage-container-bound",
+        "boundary/p10-stage-serving",
+        "boundary/p14-final-container-bound",
+        "scenario/lost-final-container-create-ack",
+        "boundary/s04-database-committed",
+        "boundary/s08-fence-transition"
+      ]
+    },
+    {
+      "id": "partition-03",
+      "cases": [
+        "boundary/p1-protected-intent",
+        "boundary/p03-network-bound",
+        "boundary/p07-stage-config-intent",
+        "boundary/p11-final-config-intent",
+        "boundary/p15-cutover-intent",
+        "scenario/literal-unresolved-precommit",
+        "boundary/s05-current-attestation",
+        "boundary/s09-effects-lease-release"
+      ]
+    },
+    {
+      "id": "partition-04",
+      "cases": [
+        "boundary/p04-config-volume-bound",
+        "boundary/p08-stage-config-copied",
+        "boundary/p12-final-config-copied",
+        "boundary/p16-successor-serving",
+        "boundary/s01-protected-terminal-installed",
+        "boundary/s02-protected-terminal-readback",
+        "boundary/s06-terminal-sql",
+        "boundary/s10-gateway-lock-release"
+      ]
+    },
+    {
+      "id": "partition-05",
+      "cases": [
+        "boundary/s11-response-loss",
+        "scenario/lost-network-create-ack",
+        "scenario/lost-config-volume-create-ack",
+        "scenario/lost-data-volume-create-ack",
+        "scenario/lost-stage-container-create-ack",
+        "scenario/lost-stage-config-copy-ack",
+        "scenario/lost-stage-start-ack",
+        "scenario/lost-final-config-copy-ack"
+      ]
+    },
+    {
+      "id": "partition-06",
+      "cases": [
+        "boundary/r01-rollback-intent",
+        "scenario/lost-cutover-ack",
+        "scenario/lost-successor-serving-ack",
+        "boundary/r02-rollback-completed",
+        "scenario/literal-unresolved-database-committed",
+        "scenario/terminal-replay",
+        "scenario/selected-current-restoration",
+        "scenario/pending-route-restart"
+      ]
+    },
+    {
+      "id": "partition-07",
+      "cases": [
+        "scenario/pending-lan-restart",
+        "scenario/pending-lan-batch-restart",
+        "scenario/competing-controller",
+        "scenario/original-role-revocation",
+        "scenario/current-role-revocation",
+        "scenario/cancellation-before-write",
+        "scenario/cancellation-after-write",
+        "scenario/ownership-drift"
+      ]
+    },
+    {
+      "id": "partition-08",
+      "cases": [
+        "scenario/configuration-drift",
+        "scenario/census-drift",
+        "scenario/effects-release-fault",
+        "scenario/gateway-release-fault",
+        "scenario/emergency-withdrawal-failure",
+        "scenario/recovery-worker-isolation",
+        "scenario/recovery-background-isolation"
+      ]
+    }
+  ]
+}
