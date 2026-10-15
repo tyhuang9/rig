@@ -397,3 +397,67 @@ A code revert does not remove an already-applied migration. Older readers reject
 materialized hex32 IDs, so reverting can restore the startup failure. Any
 predicate downgrade requires a separately reviewed additive migration. Never
 rewrite release IDs or delete operation history to make an older reader pass.
+
+
+## Unpersisted successor fixture correction
+
+The release-identity candidate `5637b68fd7426517a29152bb2f5edfc81db75e21`
+advanced through normal daemon readiness and the successor advisory read.
+[First-boundary job116402057714](https://github.com/tyhuang9/rig/actions/runs/38729070015/job/116402057714)
+then failed `configure successor profile: status=409 error=<nil>` (140.26s
+child). Its actual checkout tree matched the candidate; all 20 prerequisite
+parents and 157 subcases passed once, and independent cleanup passed. Raw log
+SHA-256: `ef5b135c0dde3f7c1581e710c15423c5ae59748eafe4e0c0f96219fa989e893f`.
+
+Static tracing found a deterministic fixture/protocol mismatch. The fixture
+retains a committed upgrade and active allocations, which intentionally block
+ordinary profile configuration. It nevertheless attempted that ordinary POST
+before requesting a rebind proposal. Rebind admission requires a fresh,
+unpersisted successor identity; an already stored successor is also rejected.
+The HTTP status alone does not identify the exact public problem code.
+
+The fixture now plans a successor from the advisory GET, retaining fresh
+revision/operation identities and current revision plus one through proposal
+review and commit. It does not mutate the ordinary profile endpoint. Production
+authorization, profile pins, exact relationship checks and SQL history remain
+unchanged. The new offline planning control is required before both hosted
+supported-daemon jobs. The 33-boundary/30-scenario matrix, timeouts, Docker
+behavior and cleanup remain unchanged.
+
+The final fixture source passed **28 parent tests and 168 subcases per OS**,
+with explicit discovery, uncached execution and no failures or skips:
+
+| Scope | Parents | Subcases | Windows seconds | Linux seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Required controller controls, including successor planning | 21 | 168 | 2.844 | 3.859 |
+| Real SQL profile pins and unpersisted claim contracts | 4 | 0 | 1.031 | 1.344 |
+| Authenticated profile read/conflict contracts | 2 | 0 | 1.547 | 1.797 |
+| Rebind proposal/admission with real repository | 1 | 0 | 1.735 | 1.390 |
+
+The runner again used `go test -tags live_docker -c`, exact test discovery and
+`go tool test2json` with `-test.count=1 -test.timeout=10m` on Windows and WSL.
+Every recorded Go/SQL/API source hash matched before and after execution. The
+new HTTP regression exercises the actual fixture helper and request construction;
+its simulated server does not establish runtime or Docker acceptance.
+
+Windows/Linux CLI builds and live-tag vet passed, as did canonical generation,
+final docs workflow/build/accessibility, formatting and whitespace checks. The
+workflow check passed 13 synthetic cases against the actual first-boundary
+filter, checked shell syntax, and confirmed other jobs, full matrix, deadlines
+and independent cleanup were unchanged. Workflow SHA-256:
+`f10ed280f1136d68a27664ba493f5234749debbe6af036ccfe7bbcc14244ea5e`.
+
+Exact commands, source pins and logs are retained in wrapper
+`temp/m3-lan-external-db-20261015/successor-fixture-verification/`. Final controller
+control log SHA-256 values are
+`9e7f1e564b1a540048f13e0dd240dc644f24176e30f86234e6df6e20339b5d3f`
+(Windows) and
+`847049cc6fac83151d3f33b52d90f3a6720767aa2423a921639bb3991294aa10`
+(Linux). Independent static integration review found no blocking issue.
+Local race and Docker checks remain unavailable; broad repository/browser and
+frontend suites were not repeated for this fixture-only follow-up.
+
+This is a test-harness correction, with no new production migration or runtime
+activation. A reviewed revert restores the earlier incorrect fixture request
+sequence. Hosted initial-boundary and full-matrix acceptance remain required;
+physical second-device qualification is still separate.

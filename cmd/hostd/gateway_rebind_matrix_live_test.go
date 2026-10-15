@@ -65,8 +65,8 @@ func liveHostdRebindRunCrashCase(t *testing.T, boundaryID, scenarioID string) {
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, target)
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	successor := liveHostdRebindPlanSuccessor(t, fixture, target)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	commitDone := make(chan error, 1)
 	go func() {
 		status, _, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
@@ -227,11 +227,11 @@ func liveHostdRebindRunReleaseFault(t *testing.T, scenarioID string) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before release-fault admission")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	statusCode, _, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
 		"/api/v1/system/lan-gateway-rebind", commit)
 	if err != nil || statusCode < 500 {
@@ -254,11 +254,11 @@ func liveHostdRebindRunCompetingController(t *testing.T) {
 	if liveHostdRebindWaitReady(t, fixture, owner).RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before contender case")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	requestContext, cancel := context.WithCancel(fixture.ctx)
 	defer cancel()
 	commitDone := make(chan struct{})
@@ -311,11 +311,11 @@ func liveHostdRebindRunCancellationBeforeWrite(t *testing.T) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before cancellation case")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	if err := liveHostdRebindWriteExclusiveJSON(child.manifest.RequestArm, map[string]string{
 		"operationId": operationID,
 	}); err != nil {
@@ -364,11 +364,11 @@ func liveHostdRebindRunCancellationAfterWrite(t *testing.T) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before post-write cancellation")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	requestContext, cancelRequest := context.WithCancel(fixture.ctx)
 	requestDone := make(chan error, 1)
 	go func() {

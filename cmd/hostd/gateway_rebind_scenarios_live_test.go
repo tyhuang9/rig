@@ -199,11 +199,11 @@ func liveHostdRebindPrepareLiteralUnresolvedWithSetup(t *testing.T, databaseComm
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh unresolved fixture entered recovery")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	requestDone := make(chan struct{})
 	go func() {
 		defer close(requestDone)
@@ -230,11 +230,11 @@ func liveHostdRebindRunOriginalRoleRevocation(t *testing.T) {
 	}
 	operationID := uuid.NewString()
 	fixture.registerOperation(operationID)
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	db, err := database.Open(fixture.dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -391,11 +391,11 @@ func liveHostdRebindCompleteHistorical(t *testing.T, fixture *liveHostdGatewayRe
 	if ready.RecoveryOnly {
 		t.Fatal("fresh historical fixture entered recovery")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	statusCode, _, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
 		"/api/v1/system/lan-gateway-rebind", commit)
 	if err != nil || (statusCode != http.StatusCreated && statusCode != http.StatusOK) {
@@ -417,11 +417,11 @@ func liveHostdRebindRunTerminalReplay(t *testing.T) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh replay fixture entered recovery")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	requestDone := make(chan struct{})
 	go func() {
 		defer close(requestDone)
@@ -739,11 +739,11 @@ func liveHostdRebindDriftScenario(t *testing.T, kind string) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh drift fixture entered recovery")
 	}
-	profile := liveHostdRebindConfigureSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
+	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
 	})
-	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, profile)
+	commit := liveHostdRebindPrepareRequest(t, fixture, operationID, successor)
 	requestContext, cancelRequest := context.WithCancel(fixture.ctx)
 	defer cancelRequest()
 	requestDone := make(chan struct{})

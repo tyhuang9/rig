@@ -1028,40 +1028,75 @@ type liveHostdRebindRecoveryReview struct {
 	RecoveryApprovalDigest string                `json:"recoveryApprovalDigest,omitempty"`
 }
 
-func liveHostdRebindConfigureSuccessor(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+// liveHostdRebindSuccessorDraft is intentionally only the private request
+// identity for a rebind successor. It is not a persisted or approved gateway
+// profile revision: the rebind claim retains this identity together with the
+// reviewed configure approval after it has checked the current profile under
+// the writer reservation.
+type liveHostdRebindSuccessorDraft struct {
+	RevisionID     string
+	RevisionNumber int64
+	OperationID    string
+	Spec           apicontract.LANGatewayProfileSpec
+}
+
+const liveHostdRebindMaxRevisionNumber = int64(1<<63 - 1)
+
+// liveHostdRebindPlanSuccessor reads the current profile and prepares a
+// synthetic successor identity for the existing rebind proposal/commit flow.
+// It must not advance the ordinary profile head because active LAN bindings
+// deliberately pin that head until the rebind is admitted.
+func liveHostdRebindPlanSuccessor(t *testing.T, fixture *liveHostdGatewayRebindFixture,
 	target apicontract.LANGatewayProfileSpec,
-) apicontract.LANGatewayProfileRevision {
+) liveHostdRebindSuccessorDraft {
 	t.Helper()
+	draft, err := liveHostdRebindPlanSuccessorProfile(fixture, target)
+	if err != nil {
+		t.Fatalf("plan successor profile: %v", err)
+	}
+	return draft
+}
+
+func liveHostdRebindPlanSuccessorProfile(fixture *liveHostdGatewayRebindFixture,
+	target apicontract.LANGatewayProfileSpec,
+) (liveHostdRebindSuccessorDraft, error) {
+	if fixture == nil || fixture.ctx == nil {
+		return liveHostdRebindSuccessorDraft{}, errors.New("successor fixture is unavailable")
+	}
 	query := fmt.Sprintf("?interfaceId=%s&selectedIpv4=%s&portStart=%d&portEnd=%d",
 		urlQuery(target.InterfaceID), urlQuery(target.SelectedIpv4), target.PortStart, target.PortEnd)
 	status, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet,
 		"/api/v1/system/lan-gateway-profile"+query, nil)
+	if err != nil {
+		return liveHostdRebindSuccessorDraft{}, fmt.Errorf("read successor profile: %w", err)
+	}
+	if status != http.StatusOK {
+		return liveHostdRebindSuccessorDraft{}, fmt.Errorf("read successor profile: status=%d", status)
+	}
 	var read apicontract.LANGatewayProfileRead
-	if err != nil || status != http.StatusOK || json.Unmarshal(body, &read) != nil || read.Proposal == nil {
-		t.Fatalf("inspect successor profile: status=%d error=%v", status, err)
+	if json.Unmarshal(body, &read) != nil {
+		return liveHostdRebindSuccessorDraft{}, errors.New("read successor profile: invalid response")
 	}
-	operationID := uuid.NewString()
-	status, body, err = liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
-		"/api/v1/system/lan-gateway-profile", apicontract.ConfigureLANGatewayProfileRequest{
-			OperationID: operationID, ExpectedRevisionNumber: read.ExpectedRevisionNumber,
-			Spec: read.Proposal.Spec, ApprovalDigest: read.Proposal.ApprovalDigest,
-		})
-	var mutation apicontract.LANGatewayProfileMutation
-	if err != nil || status != http.StatusCreated || json.Unmarshal(body, &mutation) != nil ||
-		mutation.Profile.OperationID != operationID {
-		t.Fatalf("configure successor profile: status=%d error=%v", status, err)
+	if read.DesiredProfile == nil || read.Proposal == nil || read.DesiredProfile.RevisionNumber <= 0 ||
+		read.ExpectedRevisionNumber != read.DesiredProfile.RevisionNumber ||
+		read.DesiredProfile.RevisionNumber == liveHostdRebindMaxRevisionNumber ||
+		read.Proposal.Spec != target {
+		return liveHostdRebindSuccessorDraft{}, errors.New("successor profile state is inconsistent")
 	}
-	return mutation.Profile
+	return liveHostdRebindSuccessorDraft{
+		RevisionID: uuid.NewString(), RevisionNumber: read.DesiredProfile.RevisionNumber + 1,
+		OperationID: uuid.NewString(), Spec: target,
+	}, nil
 }
 
 func liveHostdRebindPrepareRequest(t *testing.T, fixture *liveHostdGatewayRebindFixture,
-	operationID string, profile apicontract.LANGatewayProfileRevision,
+	operationID string, successor liveHostdRebindSuccessorDraft,
 ) map[string]any {
 	t.Helper()
 	inspect := map[string]any{
-		"operationId": operationID, "successorProfileRevisionId": profile.ID,
-		"successorProfileRevisionNumber": profile.RevisionNumber,
-		"successorProfileOperationId":    profile.OperationID, "successorProfile": profile.Spec,
+		"operationId": operationID, "successorProfileRevisionId": successor.RevisionID,
+		"successorProfileRevisionNumber": successor.RevisionNumber,
+		"successorProfileOperationId":    successor.OperationID, "successorProfile": successor.Spec,
 	}
 	status, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodPost,
 		"/api/v1/system/lan-gateway-rebind/proposal", inspect)
