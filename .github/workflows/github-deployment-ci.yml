@@ -214,7 +214,9 @@ jobs:
         suite:
           - gateway-v2
           - rebind-history
+          - rebind-startup-runtime
           - rebind-recovery
+          - rebind-recovery-guards
           - rebind-current
           - rebind-config
           - rebind-resources
