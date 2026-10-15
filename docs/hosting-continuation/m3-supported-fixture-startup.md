@@ -189,6 +189,42 @@ No local Docker or controller activation was performed. The next hosted
 first-boundary result, full supported matrix and physical LAN qualification
 remain required before M3 acceptance.
 
+## Hosted snapshot failure and offline reproduction
+
+At source `d5cf6f0`, [the hosted first-boundary job](https://github.com/tyhuang9/rig/actions/runs/38713250279/job/116349613973)
+failed before the first child assembled the daemon. Its closed diagnostic was
+`startup_snapshot`: the first combined SQLite read failed before protected-state
+or Docker inspection. The 17 prerequisite controls and 121 subcases passed, as
+did independent cleanup. The log SHA-256 is
+`8c23259ab97949890984957f4ee985316671e94220218a130f3ba9be21c1143f`.
+This is a failed boundary, not supported-matrix or M3 acceptance.
+
+The offline regression
+`TestHostingGatewayStartupSnapshotAcceptsSupportedFixtureCombinedStateAfterReopen`
+constructs one committed native upgrade, two committed grants, two active runtime
+heads and four components through public state transitions, using the established
+SQL seeding pattern only for prerequisite application/release/deployment records.
+It requires exact identities and complete snapshot equality before and after
+closing/reopening the database. It checks unchanged claim/event/audit counts and
+no writes during the reopened snapshot read. It does not execute controller
+handlers, containers or protected-state inspection.
+
+On unchanged production source, the regression and six related snapshot tests
+passed on Windows and Linux: **7 parent tests and 17 subcases per platform**, no
+failures or skips. Exact discovery and all 955 source hashes were verified. The
+initial run exposed an incorrect test expectation using the reserved allocation
+returned before grant commit; the fixture now reads the current active allocation
+through the public repository after commit. The failed run remains recorded.
+
+These successful offline reads do not reproduce or repair the hosted failure.
+They narrow the missing evidence to live record details or the hosted environment;
+no validator has been relaxed. Receipts and executable commands are in
+`temp/m3-lan-external-db-20261015/snapshot-reproduction-verification/` in the
+workspace wrapper. Final raw test log hashes:
+
+- Windows: `2c42d5471e76d937e218729b21990a8f332113fb8c99b101f75d9a2230c2c9a3`.
+- Linux: `dc84d1bff31be000817ace3d93ec032b57a6680375ba579221bdd4df7f88194b`.
+
 ## Rollback
 
 Revert the relevant diagnostic commit through the PR process if needed. No
