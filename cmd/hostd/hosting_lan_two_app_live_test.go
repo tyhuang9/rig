@@ -47,8 +47,8 @@ import (
 )
 
 const (
-	lanTwoAppClientNetwork = "rig-lan-two-app-test-client"
-	lanTwoAppNodeImage     = "node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e"
+	lanTwoAppClientNetworkPrefix = "rig-lan-two-app-test-client"
+	lanTwoAppNodeImage           = "node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e"
 )
 
 // The opt-in job runs on a disposable Linux runner. Every administrative
@@ -77,6 +77,8 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	transportServer := lanTwoAppTransportFixture(t, installed, "lan-transport-server.mjs")
+	transportClient := lanTwoAppTransportFixture(t, installed, "lan-transport-client.cjs")
 	tracked, err := controllerJourneyTrackedFixtureFiles(installed)
 	if err != nil {
 		t.Fatal(err)
@@ -89,7 +91,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	// external PostgreSQL dependency with a small, explicit HTTP test fixture.
 	// This staged source is the immutable archive served by the controlled
 	// GitHub provider; no repository fixture or product code is changed.
-	if err := os.WriteFile(filepath.Join(source, "api", "src", "server.js"), []byte(lanTwoAppAPISource), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(source, "api", "src", "server.js"), transportServer, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	provider := controllerJourneyNewGitHubProvider(t, source)
@@ -242,7 +244,8 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	lanTwoAppNamespaceProbe(t, ctx, docker, selected.IPv4, portA, portB, ports[2], controllerPort, appA.id, appB.id)
+	lanTwoAppNamespaceProbe(t, ctx, docker, selected.IPv4, portA, portB, ports[2], controllerPort,
+		appA.id, appB.id, transportClient, "lan-a-v1", "lan-b-v1")
 
 	beforeB := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-q", "--filter", "label=io.rig.application="+appB.id)
 	if len(strings.Split(beforeB, ",")) != 2 || beforeB == "" {
@@ -259,6 +262,8 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	}
 	lanTwoAppDeployJob(t, &request, jobStore, deploymentStore, composition.state, appA.id, appA.plan, configA)
 	lanTwoAppProbeMatrix(t, ctx, selected.IPv4, portA, portB, ports[2], "lan-a-v2", "lan-b-v1")
+	lanTwoAppNamespaceProbe(t, ctx, docker, selected.IPv4, portA, portB, ports[2], controllerPort,
+		appA.id, appB.id, transportClient, "lan-a-v2", "lan-b-v1")
 	lanTwoAppProbe(t, ctx, selected.IPv4, portB, selected.IPv4, "/api/notes", http.StatusOK, "b-persistent-note")
 	if got := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-q", "--filter", "label=io.rig.application="+appB.id); got != beforeB {
 		t.Fatal("redeploying A replaced B's runtime containers")
@@ -319,31 +324,14 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	}
 }
 
-// This staged API keeps the committed frontend usable without any external
-// database. Its note store is deliberately per-container and disposable.
-const lanTwoAppAPISource = `import {createServer} from 'node:http';
-const marker=process.env.API_RUNTIME_MARKER||'unset';
-const notes=[];
-const json=(res,status,value)=>{res.writeHead(status,{'content-type':'application/json'});res.end(JSON.stringify(value));};
-createServer((req,res)=>{
-  if(req.url==='/readyz'||req.url==='/healthz')return json(res,200,{status:'ready'});
-  if(req.url==='/api/version')return json(res,200,{sourceVersion:'lan-fixture',runtimeMarker:marker});
-  if(req.url==='/api/notes'&&req.method==='GET')return json(res,200,{notes});
-  if(req.url==='/api/notes'&&req.method==='POST'){
-    let body='';req.on('data',part=>{body+=part;if(body.length>4096)req.destroy();});
-    req.on('end',()=>{try{
-      const value=JSON.parse(body).body;
-      if(typeof value!=='string'||!value.trim()||value.length>500)return json(res,400,{error:'note_body_invalid'});
-      const note={id:notes.length+1,body:value.trim(),createdAt:new Date().toISOString()};
-      notes.push(note);json(res,201,{note});
-    }catch{json(res,400,{error:'note_body_invalid'});}});return;
-  }
-  if(req.url==='/api/events'){
-    res.writeHead(200,{'content-type':'text/event-stream','cache-control':'no-store'});
-    res.end('event: fixture\ndata: '+JSON.stringify({runtimeMarker:marker})+'\n\n');return;
-  }
-  res.writeHead(404);res.end();
-}).listen(Number(process.env.PORT||3000),'0.0.0.0');`
+func lanTwoAppTransportFixture(t *testing.T, installed, name string) []byte {
+	t.Helper()
+	fixture, err := os.ReadFile(filepath.Join(installed, "api", "fixtures", name))
+	if err != nil || len(fixture) == 0 {
+		t.Fatalf("read exact LAN transport fixture %s", name)
+	}
+	return fixture
+}
 
 type lanTwoAppAPI struct {
 	t       *testing.T
@@ -729,7 +717,6 @@ func lanTwoAppDockerPreflight(t *testing.T, ctx context.Context, docker string) 
 		{"network", "rig-generated-caddy-ingress-v1"},
 		{"container", "rig-generated-caddy-v2"}, {"volume", "rig-generated-caddy-config-v2"},
 		{"volume", "rig-generated-caddy-data-v2"}, {"network", "rig-generated-caddy-ingress-v2"},
-		{"network", lanTwoAppClientNetwork},
 	} {
 		if controllerJourneyExists(t, ctx, docker, resource.kind, resource.name) {
 			t.Fatalf("disposable daemon already has %s %s", resource.kind, resource.name)
@@ -882,13 +869,14 @@ func lanTwoAppWriteNote(t *testing.T, ctx context.Context, address string, port 
 // This client has its own bridge and network namespace. It cannot inherit the
 // controller process's host loopback or share the ingress container namespace.
 func lanTwoAppNamespaceProbe(t *testing.T, ctx context.Context, docker, address string, portA, portB, unused uint16,
-	controllerPort int, appAID, appBID string,
+	controllerPort int, appAID, appBID string, clientSource []byte, markerA, markerB string,
 ) {
 	t.Helper()
 	clientOperationID := uuid.NewString()
+	networkName := lanTwoAppClientNetworkPrefix + "-" + strings.ReplaceAll(clientOperationID, "-", "")[:12]
 	created, err := controllerJourneyDocker(ctx, docker, nil, "network", "create", "--driver", "bridge",
 		"--label", "io.rig.managed=lan-test-client", "--label", "io.rig.operation-id="+clientOperationID,
-		lanTwoAppClientNetwork)
+		networkName)
 	if err != nil {
 		t.Fatal("create separate Docker client network")
 	}
@@ -911,7 +899,7 @@ func lanTwoAppNamespaceProbe(t *testing.T, ctx context.Context, docker, address 
 				}
 			}
 		}
-		if !controllerJourneyExists(t, cleanup, docker, "network", lanTwoAppClientNetwork) {
+		if !controllerJourneyExists(t, cleanup, docker, "network", networkName) {
 			return
 		}
 		var inspected struct {
@@ -919,7 +907,7 @@ func lanTwoAppNamespaceProbe(t *testing.T, ctx context.Context, docker, address 
 			Name   string            `json:"Name"`
 			Labels map[string]string `json:"Labels"`
 		}
-		body, err := controllerJourneyDocker(cleanup, docker, nil, "network", "inspect", lanTwoAppClientNetwork)
+		body, err := controllerJourneyDocker(cleanup, docker, nil, "network", "inspect", networkName)
 		var rows []struct {
 			ID     string            `json:"Id"`
 			Name   string            `json:"Name"`
@@ -930,7 +918,7 @@ func lanTwoAppNamespaceProbe(t *testing.T, ctx context.Context, docker, address 
 			return
 		}
 		inspected = rows[0]
-		if inspected.ID != networkID || inspected.Name != lanTwoAppClientNetwork ||
+		if inspected.ID != networkID || inspected.Name != networkName ||
 			inspected.Labels["io.rig.managed"] != "lan-test-client" || inspected.Labels["io.rig.operation-id"] != clientOperationID {
 			t.Error("client network identity changed; retaining")
 			return
@@ -939,48 +927,16 @@ func lanTwoAppNamespaceProbe(t *testing.T, ctx context.Context, docker, address 
 			t.Error("remove exact separate client network")
 		}
 	})
-	args := []string{"run", "--rm", "--network", lanTwoAppClientNetwork,
+	args := []string{"run", "--rm", "--network", networkName,
 		"--label", "io.rig.managed=lan-test-client", "--label", "io.rig.operation-id=" + clientOperationID,
 		"--entrypoint", "node",
-		lanTwoAppNodeImage, "-e", lanTwoAppClientScript,
+		lanTwoAppNodeImage, "-e", string(clientSource), "--", "--rig-lan-transport-client",
 		address, strconv.Itoa(int(portA)), strconv.Itoa(int(portB)), strconv.Itoa(int(unused)), strconv.Itoa(controllerPort),
-		appAID, appBID}
+		appAID, appBID, markerA, markerB}
 	if _, err := controllerJourneyDocker(ctx, docker, nil, args...); err != nil {
 		t.Fatal("independent Docker client failed LAN/Host/controller denial probes")
 	}
 }
-
-const lanTwoAppClientScript = `const http=require('node:http');
-const [ip,a,b,unused,controller,appA,appB]=process.argv.slice(1);
-function get(port,host,path){return new Promise((resolve,reject)=>{
- const req=http.get({host:ip,port:Number(port),path,headers:{host,connection:'close'},timeout:6000},res=>{
-  let text='';res.on('data',chunk=>text+=chunk);res.on('end',()=>resolve({status:res.statusCode,text}));
- });req.on('timeout',()=>req.destroy(new Error('timeout')));req.on('error',reject);
-});}
-(async()=>{
-for(const [port,host,path,status,marker] of [
- [a,ip,'/api/version',200,'lan-a-v1'],[b,ip,'/api/version',200,'lan-b-v1'],
- [a,ip+':'+a,'/api/version',200,'lan-a-v1'],[b,ip+':'+b,'/api/version',200,'lan-b-v1'],
- [a,'wrong.invalid','/api/version',404,''],[b,'wrong.invalid','/api/version',404,''],
- [a,ip,'/api/v1/system/lan-gateway-profile',404,''],
- [b,ip,'/api/v1/system/lan-gateway-profile',404,''],
- [unused,ip,'/',404,''],[unused,ip+':'+unused,'/',404,'']]){
- const result=await get(port,host,path);
- if(result.status!==status||(marker&&!result.text.includes(marker)))throw Error('LAN probe mismatch');
-}
-for(const port of [a,b])for(const appId of [appA,appB]){
- const result=await get(port,appId+'.rig.localhost','/api/version');
- if(result.status!==404)throw Error('controller-local Host routed through LAN port');
-}
-for(const appId of [appA,appB]){
- let localDenied=false;
- try{await get(8080,appId+'.rig.localhost','/api/version');}catch{localDenied=true;}
- if(!localDenied)throw Error('controller-local route reachable on selected interface');
-}
-let denied=false;
-try{await get(controller,ip,'/api/v1/system/lan-gateway-profile');}catch{denied=true;}
-if(!denied)throw Error('controller admin route reachable from separate client network');
-})().catch(error=>{console.error(error.message);process.exitCode=1;});`
 
 func lanTwoAppRegisterCleanup(t *testing.T, docker, dataRoot, upgradeID string, appIDs *[]string) {
 	t.Helper()
