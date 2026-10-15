@@ -450,9 +450,10 @@ func (m *Manager) scanGatewayUpgradeHistoryLockedMode(allowCurrentTail bool, par
 	return result, err
 }
 
-// scanGatewayUpgradeHistoryLockedModeRebindAware is available only to the
-// protected rebind history reader. Normal ownership and startup callers use
-// the legacy wrapper above and fail closed when any rebind artifact exists.
+// scanGatewayUpgradeHistoryLockedModeRebindAware is available only to protected
+// rebind readers, proof-bound prepared startup, and the runtime ownership path
+// after it freshly proves a complete native-ABORT census. Ordinary startup uses
+// the legacy wrapper above and fails closed when any rebind artifact exists.
 func (m *Manager) scanGatewayUpgradeHistoryLockedModeRebindAware(allowCurrentTail bool, partialOperationID string) (gatewayUpgradeHistory, gatewayHistorySnapshot, error) {
 	return m.scanGatewayUpgradeHistoryLockedModeWithSnapshot(allowCurrentTail, partialOperationID, true)
 }

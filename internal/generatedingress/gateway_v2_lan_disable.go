@@ -298,7 +298,7 @@ func (m *Manager) DisableGatewayV2LAN(ctx context.Context, request GatewayV2LAND
 	if currentResult, handled, err := m.disableGatewayCurrentLANStateMachineLocked(workCtx, request, authorize); err != nil || handled {
 		return currentResult, err
 	}
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(workCtx)
 	if err != nil || !committed || store == nil || state.Pending != nil ||
 		!gatewayV2LANDisableStateMatches(state, request) {
 		return GatewayV2LANDisableResult{}, gatewayV2LANDisableError(workCtx)
@@ -376,7 +376,7 @@ func (m *Manager) ObserveGatewayV2LANDisable(ctx context.Context, request Gatewa
 	if observation, handled, err := m.observeGatewayCurrentLANDisableLocked(proofCtx, request); err != nil || handled {
 		return observation, err
 	}
-	_, state, journal, committed, err := m.committedV2Locked()
+	_, state, journal, committed, err := m.committedV2Locked(proofCtx)
 	if err != nil || !committed || !gatewayV2LANDisableStateMatches(state, request) {
 		return GatewayV2LANDisableObservation{}, gatewayV2LANDisableError(proofCtx)
 	}
@@ -465,7 +465,7 @@ func (m *Manager) withGatewayV2LANDisableResolution(ctx context.Context, request
 	); err != nil || handled {
 		return err
 	}
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(workCtx)
 	if err != nil || !committed || store == nil || !gatewayV2LANDisableStateMatches(state, request) {
 		return gatewayV2LANDisableError(workCtx)
 	}

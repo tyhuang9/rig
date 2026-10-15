@@ -153,7 +153,7 @@ func (m *Manager) grantGatewayV2LAN(ctx context.Context, request gatewayV2LANGra
 		return currentResult, err
 	}
 
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(ctx)
 	if err != nil || !committed || store == nil || state.Pending != nil {
 		return gatewayV2LANGrantResult{}, gatewayV2LANGrantError(ctx)
 	}
@@ -357,7 +357,7 @@ func (m *Manager) withGatewayV2LANCommitResolution(ctx context.Context, request 
 	if driver == nil {
 		driver = managerGatewayV2LANGrantDriver{manager: m}
 	}
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(proofCtx)
 	if err != nil || !committed || store == nil {
 		if !stopLatestOwnedGatewayV2LANLocked(ctx, m, driver) {
 			return &Error{Code: DiagnosticRouteUnresolved, candidateMayBeLive: true}
@@ -478,7 +478,7 @@ func (m *Manager) WithGatewayV2LANAbsenceResolution(ctx context.Context, request
 		return err
 	}
 
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(proofCtx)
 	if err != nil || !committed || store == nil || state.Pending != nil ||
 		state.Profile.RevisionID != request.GatewayProfileRevisionID ||
 		state.Profile.RevisionNumber != request.GatewayProfileRevisionNumber ||
@@ -548,7 +548,7 @@ func (m *Manager) withGatewayV2LANObservation(ctx context.Context, request Gatew
 		return err
 	}
 
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(proofCtx)
 	if err != nil || !committed || store == nil {
 		return gatewayV2LANGrantError(proofCtx)
 	}
@@ -618,7 +618,7 @@ func (m *Manager) WithGatewayV2LANCommitRecovery(ctx context.Context, request Ga
 		return err
 	}
 
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(recoveryCtx)
 	if err != nil || !committed || store == nil || state.Pending == nil ||
 		state.Pending.Kind != gatewayV2PendingLANWithdrawal {
 		return gatewayV2LANGrantError(recoveryCtx)
@@ -755,7 +755,7 @@ func (m *Manager) WithGatewayV2LANRollbackResolution(ctx context.Context, reques
 		return err
 	}
 
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(recoveryCtx)
 	if err != nil || !committed || store == nil {
 		return gatewayV2LANGrantError(recoveryCtx)
 	}
@@ -829,7 +829,7 @@ func (m *Manager) RecoverGatewayV2LAN(ctx context.Context, request GatewayV2LANG
 		return currentRecovery, err
 	}
 
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(recoveryCtx)
 	if err != nil || !committed || store == nil {
 		return GatewayV2LANGrantRecovery{}, gatewayV2LANGrantError(recoveryCtx)
 	}
@@ -1164,7 +1164,7 @@ func (d managerGatewayV2LANGrantDriver) apply(ctx context.Context, state gateway
 	if d.manager == nil {
 		return gatewayV2LANGrantError(ctx)
 	}
-	_, durableState, journal, committed, err := d.manager.committedV2Locked()
+	_, durableState, journal, committed, err := d.manager.committedV2Locked(ctx)
 	if err != nil || !committed || durableState.OperationID != state.OperationID ||
 		journal.OperationID != state.OperationID || journal.Target.IdentityDigest != state.Identity.Digest ||
 		!validSHA256(journal.Resources.FinalContainerID) {
@@ -1179,7 +1179,7 @@ func (d managerGatewayV2LANGrantDriver) applyCommitRecovery(ctx context.Context,
 	if d.manager == nil || guard == nil {
 		return gatewayV2LANGrantError(ctx)
 	}
-	_, durableState, journal, committed, err := d.manager.committedV2Locked()
+	_, durableState, journal, committed, err := d.manager.committedV2Locked(ctx)
 	if err != nil || !committed || durableState.OperationID != state.OperationID ||
 		journal.OperationID != state.OperationID || journal.Target.IdentityDigest != state.Identity.Digest ||
 		!validSHA256(journal.Resources.FinalContainerID) {

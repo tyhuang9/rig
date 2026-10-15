@@ -313,7 +313,21 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 			emergencyStop()
 			return 1
 		}
-		confirmedInspection, inspectErr := runtime.ingress.InspectGatewayV2Startup(context.Background(), gatewayStartupClaims(confirmedSnapshot.Upgrades))
+		var confirmedInspection generatedingress.GatewayV2StartupInspection
+		var inspectErr error
+		if preparedGateway.preparation.ingress == nil {
+			confirmedInspection, inspectErr = runtime.ingress.InspectGatewayV2Startup(context.Background(),
+				gatewayStartupClaims(confirmedSnapshot.Upgrades))
+		} else {
+			confirmationProof, proofErr := refreshGatewayRebindStartupProof(context.Background(), runtime.ingress,
+				appaccess.New(db), preparedGateway.preparation.current)
+			if proofErr != nil {
+				inspectErr = proofErr
+			} else {
+				confirmedInspection, inspectErr = runtime.ingress.InspectGatewayV2StartupPreparedRebind(context.Background(),
+					gatewayStartupClaims(confirmedSnapshot.Upgrades), confirmationProof)
+			}
+		}
 		if inspectErr != nil || confirmedInspection != gate.inspection {
 			logger.Error("gateway startup inspection changed after recovery", "error", inspectErr)
 			emergencyStop()

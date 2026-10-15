@@ -44,12 +44,39 @@ type gatewayV2StartupClaimSet struct {
 	activeID    string
 }
 
+type gatewayV2PreparedRebindStartupRepository struct {
+	GatewayRebindCurrentStateRepository
+	fenceCheck func(context.Context) error
+}
+
+func (r gatewayV2PreparedRebindStartupRepository) CheckGatewayRebindFence(ctx context.Context) error {
+	return r.fenceCheck(ctx)
+}
+
 // InspectGatewayV2Startup classifies startup while holding both gateway
 // writer locks. It is deliberately read-only: it does not recover, provision,
 // install receipts, transition journals, or mutate Docker resources.
 func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV2StartupClaim) (
 	inspection GatewayV2StartupInspection, resultErr error,
 ) {
+	return m.inspectGatewayV2Startup(ctx, claims, nil)
+}
+
+// InspectGatewayV2StartupPreparedRebind classifies ordinary startup after the
+// caller has completed rebind recovery. The preparation proof grants no
+// authority by itself: this method rebuilds the complete SQL/protected current
+// inspection under the same gateway lock used by startup, requires exact proof
+// equality before and after classification, and only then admits retained
+// rebind artifacts to the upgrade-history snapshot reader.
+func (m *Manager) InspectGatewayV2StartupPreparedRebind(ctx context.Context, claims []GatewayV2StartupClaim,
+	prepared GatewayRebindCurrentInspection,
+) (inspection GatewayV2StartupInspection, resultErr error) {
+	return m.inspectGatewayV2Startup(ctx, claims, &prepared)
+}
+
+func (m *Manager) inspectGatewayV2Startup(ctx context.Context, claims []GatewayV2StartupClaim,
+	prepared *GatewayRebindCurrentInspection,
+) (inspection GatewayV2StartupInspection, resultErr error) {
 	claimSet, err := validateGatewayV2StartupClaims(claims)
 	if m == nil || ctx == nil || err != nil {
 		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticErrorWithCode(
@@ -67,6 +94,11 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 				DiagnosticRouteUnresolved, gatewayStartupDiagnosticCheckpointUpgradeGatewayUnlock)
 		}
 	}()
+	allowPreparedRebind := prepared != nil
+	if allowPreparedRebind && !m.gatewayV2PreparedRebindStartupProofMatchesLocked(ctx, *prepared) {
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeCurrentBinding)
+	}
 
 	current, currentSQL, currentPresent, currentCheckpoint, err :=
 		m.readOptionalGatewayCurrentSelectionDiagnosticLocked(ctx)
@@ -83,9 +115,13 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 			return GatewayV2StartupInspection{}, gatewayStartupDiagnosticErrorWithCheckpoint(
 				currentErr, gatewayStartupDiagnosticCheckpointUpgradeCurrentBinding)
 		}
+		if allowPreparedRebind && !m.gatewayV2PreparedRebindStartupProofMatchesLocked(ctx, *prepared) {
+			return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+				ctx, gatewayStartupDiagnosticCheckpointUpgradeCurrentStability)
+		}
 		return currentInspection, nil
 	}
-	history, err := m.scanGatewayUpgradeHistoryLockedMode(true, claimSet.activeID)
+	history, err := m.scanGatewayV2StartupHistoryLocked(true, claimSet.activeID, allowPreparedRebind)
 	if err != nil {
 		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
 			ctx, gatewayStartupDiagnosticCheckpointUpgradeHistory)
@@ -244,7 +280,7 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
 			ctx, gatewayStartupDiagnosticCheckpointUpgradeSourceStability)
 	}
-	confirmedHistory, err := m.scanGatewayUpgradeHistoryLockedMode(true, claimSet.activeID)
+	confirmedHistory, err := m.scanGatewayV2StartupHistoryLocked(true, claimSet.activeID, allowPreparedRebind)
 	if err != nil || !sameGatewayV2StartupHistory(history, confirmedHistory) {
 		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
 			ctx, gatewayStartupDiagnosticCheckpointUpgradeHistoryStability)
@@ -263,7 +299,45 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 		}
 		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(ctx, confirmedCheckpoint)
 	}
+	if allowPreparedRebind && !m.gatewayV2PreparedRebindStartupProofMatchesLocked(ctx, *prepared) {
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeCurrentStability)
+	}
 	return inspection, nil
+}
+
+func (m *Manager) gatewayV2PreparedRebindStartupProofMatchesLocked(ctx context.Context,
+	prepared GatewayRebindCurrentInspection,
+) bool {
+	if m == nil || ctx == nil || ctx.Err() != nil || m.options.RebindCurrentStateRepository == nil ||
+		m.options.RebindFenceCheck == nil ||
+		prepared.ActiveOperationID != "" || prepared.ActiveSpecVersion != 0 || prepared.ActivePhase != "" ||
+		prepared.ActiveDatabaseCommittedEvent != nil || prepared.ActiveDatabaseCommitObserved ||
+		prepared.ActiveRollbackAllowed || prepared.ActiveRecoveryPolicy != "" ||
+		prepared.ActiveProtectedEvidence != (appaccess.GatewayRebindProtectedRecoveryEvidence{}) ||
+		!prepared.FenceReleased || prepared.SelectedCurrentAuthority.Kind == "" || len(prepared.Retained) == 0 {
+		return false
+	}
+	repository := gatewayV2PreparedRebindStartupRepository{
+		GatewayRebindCurrentStateRepository: m.options.RebindCurrentStateRepository,
+		fenceCheck:                          m.options.RebindFenceCheck,
+	}
+	confirmed, err := m.inspectGatewayRebindCurrentLocked(ctx, repository)
+	if err != nil || !reflect.DeepEqual(confirmed, prepared) {
+		return false
+	}
+	_, err = m.scanGatewayRebindCompletedProtectedHistoryLocked()
+	return err == nil
+}
+
+func (m *Manager) scanGatewayV2StartupHistoryLocked(allowCurrentTail bool, partialOperationID string,
+	allowPreparedRebind bool,
+) (gatewayUpgradeHistory, error) {
+	if !allowPreparedRebind {
+		return m.scanGatewayUpgradeHistoryLockedMode(allowCurrentTail, partialOperationID)
+	}
+	history, _, err := m.scanGatewayUpgradeHistoryLockedModeRebindAware(allowCurrentTail, partialOperationID)
+	return history, err
 }
 
 func (m *Manager) proveGatewayV2StartupPending(ctx context.Context, source routeState,

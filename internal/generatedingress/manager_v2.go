@@ -23,12 +23,16 @@ const (
 // committedV2Locked selects the state owner while the gateway lock is held.
 // A partial, corrupt, or non-committed pair is an unresolved migration and can
 // never fall through to legacy Docker mutation.
-func (m *Manager) committedV2Locked() (*gatewayUpgradeStateStore, gatewayV2RouteState, gatewayMigrationJournal, bool, error) {
+func (m *Manager) committedV2Locked(ctx context.Context) (*gatewayUpgradeStateStore, gatewayV2RouteState, gatewayMigrationJournal, bool, error) {
 	history, err := m.scanGatewayUpgradeHistoryLocked()
+	if err == nil {
+		return history.store, history.state, history.journal, history.committed, nil
+	}
+	store, state, journal, committed, err := m.committedV2AfterNativeRebindAbortLocked(ctx)
 	if err != nil {
 		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{}, false, &Error{Code: DiagnosticRouteUnresolved}
 	}
-	return history.store, history.state, history.journal, history.committed, nil
+	return store, state, journal, committed, nil
 }
 
 func (m *Manager) observeV2Topology(ctx context.Context, source routeState, state gatewayV2RouteState, journal gatewayMigrationJournal) gatewayObservedTopology {

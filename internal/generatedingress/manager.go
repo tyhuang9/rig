@@ -258,7 +258,7 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	if handled, err := m.switchGatewayCurrentStateMachineLocked(ctx, request); err != nil || handled {
 		return err
 	}
-	if store, state, journal, committed, err := m.committedV2Locked(); err != nil {
+	if store, state, journal, committed, err := m.committedV2Locked(ctx); err != nil {
 		return markCandidateMayBeLive(err)
 	} else if committed {
 		return m.switchCommittedV2Locked(ctx, store, state, journal, request)
@@ -384,7 +384,7 @@ func (m *Manager) Provision(ctx context.Context) (resultErr error) {
 		return err
 	}
 	defer releaseGatewayLock(release, &resultErr)
-	if store, state, journal, committed, err := m.committedV2Locked(); err != nil {
+	if store, state, journal, committed, err := m.committedV2Locked(ctx); err != nil {
 		return err
 	} else if committed {
 		return m.recoverCommittedV2Locked(ctx, store, state, journal)
@@ -1504,7 +1504,7 @@ func (m *Manager) WithObservation(ctx context.Context, appID string, fn func(con
 	}
 	defer releaseGatewayLock(release, &resultErr)
 
-	_, state, journal, committed, err := m.committedV2Locked()
+	_, state, journal, committed, err := m.committedV2Locked(lockContext)
 	if err != nil {
 		return err
 	}
@@ -1542,7 +1542,7 @@ func (m *Manager) WithObservation(ctx context.Context, appID string, fn func(con
 }
 
 func (m *Manager) observeLocked(ctx context.Context, appID string) (Observation, error) {
-	if _, state, journal, committed, err := m.committedV2Locked(); err != nil {
+	if _, state, journal, committed, err := m.committedV2Locked(ctx); err != nil {
 		return Observation{}, err
 	} else if committed {
 		return m.observeCommittedV2Locked(ctx, state, journal, appID)

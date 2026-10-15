@@ -77,7 +77,7 @@ func (m *Manager) AttestGatewayV2LANDisableSuccessor(ctx context.Context,
 	defer releaseGatewayLock(release, &resultErr)
 	proofCtx, cancelProof := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancelProof()
-	store, state, journal, committed, err := m.committedV2Locked()
+	store, state, journal, committed, err := m.committedV2Locked(proofCtx)
 	if err != nil || !committed || store == nil || !validGatewayV2RouteState(state) || state.Pending != nil {
 		return gatewayV2LANDisableError(proofCtx)
 	}
