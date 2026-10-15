@@ -18,6 +18,8 @@ func TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly(t *testing.T) {
 	scenarios := readGatewayRebindHarnessSource(t, root, "cmd/hostd/gateway_rebind_scenarios_live_test.go")
 	fixture := readGatewayRebindHarnessSource(t, root, "cmd/hostd/gateway_rebind_fixture_live_test.go")
 	supported := strings.Join([]string{process, matrix, scenarios}, "\n")
+	// gofmt aligns adjacent assembly fields; whitespace does not change wiring.
+	supported = strings.Join(strings.Fields(supported), " ")
 
 	for _, required := range []string{
 		"exec.Command(os.Args[0]", "runServerWithAssembly(", "hostdDaemonAssemblyOptions{",

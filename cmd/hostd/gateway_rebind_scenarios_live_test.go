@@ -37,6 +37,7 @@ var liveHostdRebindAdversarialScenarios = map[string]func(*testing.T){
 	"census-drift":                          liveHostdRebindRunCensusDrift,
 	"emergency-withdrawal-failure":          liveHostdRebindRunEmergencyWithdrawalFailure,
 	"recovery-worker-isolation":             liveHostdRebindRunRecoveryWorkerIsolation,
+	"recovery-background-isolation":         liveHostdRebindRunRecoveryBackgroundIsolation,
 }
 
 type liveHostdRebindTerminalReceipt struct {
@@ -177,8 +178,17 @@ func liveHostdRebindRunLiteralUnresolved(t *testing.T, databaseCommitted bool) {
 func liveHostdRebindPrepareLiteralUnresolved(t *testing.T, databaseCommitted bool) (
 	*liveHostdGatewayRebindFixture, string,
 ) {
+	return liveHostdRebindPrepareLiteralUnresolvedWithSetup(t, databaseCommitted, nil)
+}
+
+func liveHostdRebindPrepareLiteralUnresolvedWithSetup(t *testing.T, databaseCommitted bool,
+	setup func(*liveHostdGatewayRebindFixture),
+) (*liveHostdGatewayRebindFixture, string) {
 	t.Helper()
 	fixture := newLiveHostdGatewayRebindFixture(t)
+	if setup != nil {
+		setup(fixture)
+	}
 	operationID := uuid.NewString()
 	fixture.registerOperation(operationID)
 	boundary, scenario := "s02-protected-terminal-readback", "literal-unresolved-precommit"

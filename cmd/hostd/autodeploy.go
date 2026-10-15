@@ -28,7 +28,9 @@ type autoDeployFactory func() (autoDeployRunner, error)
 
 // startAutoDeploy is safe-by-default. Auto-deploy is an optional coordinator;
 // its absence or failure never affects the manual deployment worker.
-func startAutoDeploy(ctx context.Context, cfg config.Config, logger *slog.Logger, factory autoDeployFactory) (<-chan struct{}, func(), func()) {
+func startAutoDeploy(ctx context.Context, cfg config.Config, logger *slog.Logger, factory autoDeployFactory,
+	observeStart hostdBackgroundStartObserver,
+) (<-chan struct{}, func(), func()) {
 	done := make(chan struct{})
 	noopWake := func() {}
 	if (!cfg.ComposeRuntime && !cfg.GeneratedRuntime) || !cfg.GitHubConnectionsEnabled() {
@@ -36,6 +38,9 @@ func startAutoDeploy(ctx context.Context, cfg config.Config, logger *slog.Logger
 		return done, noopWake, noopWake
 	}
 	target := &autoDeployWakeTarget{}
+	if observeStart != nil {
+		observeStart(hostdBackgroundAutoDeploy)
+	}
 	go func() {
 		defer close(done)
 		if factory == nil {

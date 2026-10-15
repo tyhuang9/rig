@@ -50,9 +50,9 @@ jobs:
           output="$(mktemp)"
           trap 'rm -f "$output"' EXIT
           package_name='github.com/hostd/hostd/cmd/hostd'
-          test_pattern='^(TestGatewayRebindLiveRequiredManifestIsClosed|TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly|TestLiveHostdRebindDockerMutationClassifiesCopyDirection)$'
+          test_pattern='^(TestGatewayRebindLiveRequiredManifestIsClosed|TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly|TestLiveHostdRebindDockerMutationClassifiesCopyDirection|TestAutoDeployStartObserverReportsOnlyEnabledLaunch|TestControllerRelayStartObserverReportsOnlyEnabledLaunch|TestGatewayRebindBackgroundLedgerAndDenyTransport|TestGatewayRebindBackgroundLedgerWriteFailureIsRetained|TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods|TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept)$'
           go test -tags live_docker -json -v -count=1 -timeout=2m ./cmd/hostd -run "$test_pattern" | tee "$output"
-          jq -e -s --arg package_name "$package_name" --argjson test_names '["TestGatewayRebindLiveRequiredManifestIsClosed","TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly","TestLiveHostdRebindDockerMutationClassifiesCopyDirection"]' '
+          jq -e -s --arg package_name "$package_name" --argjson test_names '["TestGatewayRebindLiveRequiredManifestIsClosed","TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly","TestLiveHostdRebindDockerMutationClassifiesCopyDirection","TestAutoDeployStartObserverReportsOnlyEnabledLaunch","TestControllerRelayStartObserverReportsOnlyEnabledLaunch","TestGatewayRebindBackgroundLedgerAndDenyTransport","TestGatewayRebindBackgroundLedgerWriteFailureIsRetained","TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods","TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept"]' '
             [.[] | select(.Package == $package_name)] as $events |
             all($test_names[]; . as $name |
               ([$events[] | select(.Test == $name and .Action == "run")] | length) == 1 and
@@ -82,8 +82,10 @@ jobs:
             ([$events[] | select(.Test == $test_name and (.Action == "fail" or .Action == "skip"))] | length) == 0 and
             ([$events[] | select(((.Test // "") | startswith($test_name + "/boundary/")) and .Action == "run")] | length) == 33 and
             ([$events[] | select(((.Test // "") | startswith($test_name + "/boundary/")) and .Action == "pass")] | length) == 33 and
-            ([$events[] | select(((.Test // "") | startswith($test_name + "/scenario/")) and .Action == "run")] | length) == 29 and
-            ([$events[] | select(((.Test // "") | startswith($test_name + "/scenario/")) and .Action == "pass")] | length) == 29 and
+            ([$events[] | select(((.Test // "") | startswith($test_name + "/scenario/")) and .Action == "run")] | length) == 30 and
+            ([$events[] | select(((.Test // "") | startswith($test_name + "/scenario/")) and .Action == "pass")] | length) == 30 and
+            ([$events[] | select(.Test == ($test_name + "/scenario/recovery-background-isolation") and .Action == "run")] | length) == 1 and
+            ([$events[] | select(.Test == ($test_name + "/scenario/recovery-background-isolation") and .Action == "pass")] | length) == 1 and
             ([$events[] | select((((.Test // "") | startswith($test_name + "/boundary/")) or ((.Test // "") | startswith($test_name + "/scenario/"))) and (.Action == "fail" or .Action == "skip"))] | length) == 0
           ' "$output" > /dev/null
 

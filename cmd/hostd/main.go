@@ -48,14 +48,27 @@ type hostdDaemonReady struct {
 	OperationID  string
 }
 
+// hostdBackgroundComponent identifies one optional daemon graph whose start is
+// owned by normal startup. Its finite values keep the private test observer
+// descriptive without granting it any lifecycle control.
+type hostdBackgroundComponent uint8
+
+const (
+	hostdBackgroundAutoDeploy hostdBackgroundComponent = iota + 1
+	hostdBackgroundControllerRelay
+)
+
+type hostdBackgroundStartObserver func(hostdBackgroundComponent)
+
 // hostdDaemonAssemblyOptions is a package-private construction seam. Tests can
 // supply a command runner and observe completed listener/handler assembly, but
 // they still execute this production startup, controller, handler and worker
 // path. No command-line, environment or HTTP switch exposes these controls.
 type hostdDaemonAssemblyOptions struct {
-	runner runtimeprocess.CommandRunner
-	listen func(string, string) (net.Listener, error)
-	ready  func(hostdDaemonReady)
+	runner          runtimeprocess.CommandRunner
+	listen          func(string, string) (net.Listener, error)
+	ready           func(hostdDaemonReady)
+	backgroundStart hostdBackgroundStartObserver
 }
 
 func runServer(args []string) int {
@@ -357,11 +370,11 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 	}
 	autoDeployDone, autoDeployWake, autoDeployReconcile := startAutoDeploy(ctx, cfg, logger, func() (autoDeployRunner, error) {
 		return newGeneratedAwareAutoDeployRunner(cfg, autoDeployRepository, sources, j, autoDeployPreflight, logger)
-	})
+	}, assembly.backgroundStart)
 	relayManagement := newControllerRelayManagementTarget()
 	relayDone := startControllerRelay(ctx, cfg, logger, relayManagement, func() (controllerRelayRunner, error) {
 		return newControllerRelayRuntime(cfg, db, sources, logger, autoDeployWake, autoDeployReconcile)
-	})
+	}, assembly.backgroundStart)
 	effectiveAutoDeploy := (cfg.ComposeRuntime || cfg.GeneratedRuntime) && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
 	appAccessRepository := appaccess.New(db)
 	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, GeneratedIngress: runtime.ingress, GeneratedRuntimeState: runtime.state, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, GatewayProfiles: appAccessRepository, GatewayUpgrades: appAccessRepository, AppAccess: appAccessRepository, AppGrants: appAccessRepository, AppDisables: appAccessRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}

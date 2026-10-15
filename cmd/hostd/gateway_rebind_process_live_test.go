@@ -37,15 +37,18 @@ const (
 )
 
 type liveHostdRebindChildManifest struct {
-	DataRoot       string `json:"dataRoot"`
-	Listen         string `json:"listen"`
-	OperationID    string `json:"operationId,omitempty"`
-	BoundaryID     string `json:"boundaryId,omitempty"`
-	ScenarioID     string `json:"scenarioId,omitempty"`
-	ReadyMarker    string `json:"readyMarker"`
-	BoundaryMarker string `json:"boundaryMarker"`
-	EffectLedger   string `json:"effectLedger"`
-	RequestArm     string `json:"requestArm"`
+	DataRoot         string `json:"dataRoot"`
+	Listen           string `json:"listen"`
+	OperationID      string `json:"operationId,omitempty"`
+	BoundaryID       string `json:"boundaryId,omitempty"`
+	ScenarioID       string `json:"scenarioId,omitempty"`
+	ReadyMarker      string `json:"readyMarker"`
+	BoundaryMarker   string `json:"boundaryMarker"`
+	EffectLedger     string `json:"effectLedger"`
+	RequestArm       string `json:"requestArm"`
+	BackgroundLedger string `json:"backgroundLedger"`
+	NetworkLedger    string `json:"networkLedger"`
+	RelayLedger      string `json:"relayLedger"`
 }
 
 type liveHostdRebindReadyMarker struct {
@@ -378,10 +381,21 @@ func TestLiveControllerGatewayRebindCrashMatrixChild(t *testing.T) {
 		os.Exit(2)
 	}
 	runner := &liveHostdRebindRunner{manifest: manifest}
-	exitCode := runServerWithAssembly([]string{"--data-root", manifest.DataRoot, "--listen", manifest.Listen,
-		"--generated-runtime", "--github-connections=false"}, hostdDaemonAssemblyOptions{
-		runner: runner,
+	arguments := []string{"--data-root", manifest.DataRoot, "--listen", manifest.Listen,
+		"--generated-runtime", "--github-connections=false"}
+	background, backgroundCleanup, backgroundErr := liveHostdRebindBackgroundChildControls(manifest, arguments)
+	if backgroundErr != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "invalid rebind background child control")
+		os.Exit(2)
+	}
+	defer backgroundCleanup()
+	exitCode := runServerWithAssembly(background.args, hostdDaemonAssemblyOptions{
+		runner:          runner,
+		backgroundStart: background.observe,
 		ready: func(value hostdDaemonReady) {
+			if diagnostic := background.verify(); diagnostic != "" {
+				panic("rebind background child observer failed: " + diagnostic)
+			}
 			_ = liveHostdRebindWriteExclusiveJSON(manifest.ReadyMarker, liveHostdRebindReadyMarker{
 				Address: value.Address, RecoveryOnly: value.RecoveryOnly,
 				RecoveryKind: value.RecoveryKind, OperationID: value.OperationID,
@@ -414,10 +428,13 @@ func liveHostdRebindStartChild(t *testing.T, fixture *liveHostdGatewayRebindFixt
 	manifest := liveHostdRebindChildManifest{
 		DataRoot: fixture.dataRoot, Listen: fixture.listen, OperationID: operationID,
 		BoundaryID: boundaryID, ScenarioID: scenarioID,
-		ReadyMarker:    filepath.Join(directory, "ready.json"),
-		BoundaryMarker: filepath.Join(directory, "boundary.json"),
-		EffectLedger:   filepath.Join(directory, "effects.log"),
-		RequestArm:     filepath.Join(directory, "request-arm.json"),
+		ReadyMarker:      filepath.Join(directory, "ready.json"),
+		BoundaryMarker:   filepath.Join(directory, "boundary.json"),
+		EffectLedger:     filepath.Join(directory, "effects.log"),
+		RequestArm:       filepath.Join(directory, "request-arm.json"),
+		BackgroundLedger: filepath.Join(directory, "background-starts.log"),
+		NetworkLedger:    filepath.Join(directory, "background-network.log"),
+		RelayLedger:      filepath.Join(directory, "background-relay-accepts.log"),
 	}
 	manifestPath := filepath.Join(directory, "manifest.json")
 	if err := liveHostdRebindWritePrivateJSON(manifestPath, manifest); err != nil {
@@ -563,6 +580,9 @@ func liveHostdRebindReadChildManifest(path string) (liveHostdRebindChildManifest
 		!liveHostdRebindSafeMarker(manifest.BoundaryMarker, filepath.Dir(path), "boundary.json") ||
 		!liveHostdRebindSafeMarker(manifest.EffectLedger, filepath.Dir(path), "effects.log") ||
 		!liveHostdRebindSafeMarker(manifest.RequestArm, filepath.Dir(path), "request-arm.json") ||
+		!liveHostdRebindSafeMarker(manifest.BackgroundLedger, filepath.Dir(path), "background-starts.log") ||
+		!liveHostdRebindSafeMarker(manifest.NetworkLedger, filepath.Dir(path), "background-network.log") ||
+		!liveHostdRebindSafeMarker(manifest.RelayLedger, filepath.Dir(path), "background-relay-accepts.log") ||
 		(manifest.OperationID != "" && uuid.Validate(manifest.OperationID) != nil) ||
 		(manifest.BoundaryID != "" && !liveHostdRebindKnownBoundary(manifest.BoundaryID)) ||
 		(manifest.ScenarioID != "" && !liveHostdRebindKnownScenario(manifest.ScenarioID)) {
