@@ -116,7 +116,8 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 	if err := controllerJourneyStageSource(installed, source, tracked); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(source, "api", "src", "server.js"), []byte(lanTwoAppAPISource), 0o600); err != nil {
+	transportServer := lanTwoAppTransportFixture(t, installed, "lan-transport-server.mjs")
+	if err := os.WriteFile(filepath.Join(source, "api", "src", "server.js"), transportServer, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	provider := controllerJourneyNewGitHubProvider(t, source)
