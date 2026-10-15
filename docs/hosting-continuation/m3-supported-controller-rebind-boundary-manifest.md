@@ -1,6 +1,6 @@
 # Supported controller rebind crash boundary manifest
 
-Status: candidate source contract, 2026-10-14. This document defines the
+Status: candidate source contract, 2026-10-15. This document defines the
 required full-hostd crash and recovery evidence. It does not record a passing
 Docker run or physical LAN qualification.
 
@@ -33,11 +33,11 @@ Each crash case follows the same protocol:
    and commit remain closed in that process, including after reconciliation.
 8. A second fresh process must prove normal startup. It verifies retained SQL
    order and audit, protected digests and receipts, selected authority, runtime
-   heads and grants, serving or withdrawal, fence and latch state. It also
-   proves the seeded ordinary job stayed queued. The recovery-only assembly's
-   direct construction also proves that no worker, auto-deploy runner or relay
-   graph is started; auto-deploy and relay are not independently seeded live
-   effect sentinels in this matrix.
+   heads and grants, serving or withdrawal, fence and latch state. Separate
+   isolation scenarios require the seeded ordinary job to stay queued during
+   recovery, and enabled auto-deploy/relay startup to remain absent through
+   reconciliation in the same restricted process. A fresh normal child must
+   start both enabled components and advance their database sentinels.
 9. The parent removes and rechecks exact containers, networks, volumes, images,
    builders, adapters and child processes even when setup, crash or restart
    fails.
@@ -128,12 +128,23 @@ then revokes that live session before submitting reconcile with those exact
 digests; the denied request must leave the operation active and unchanged.
 
 The recovery process must retain its restricted routes after a terminal result.
-The live sentinel proves an already queued ordinary job remains untouched. The
-source anchor proves `runRecoveryOnlyController` directly constructs only the
-pinned controller server and does not call the ordinary worker, auto-deploy or
-relay startup paths. This matrix does not claim independent live auto-deploy or
-relay effect sentinels. Normal admission is proved only by a later fresh process
-after exact terminal, current, fence and release validation.
+The `recovery-worker-isolation` scenario requires an already queued ordinary job
+to remain untouched. The additional `recovery-background-isolation` scenario
+enables GitHub and relay configuration, records passive pre-launch observations,
+and seeds an expired auto-deploy lease and a disconnected relay session epoch in
+the disposable database. All observations and retained sentinel values must stay
+unchanged through readiness, authenticated requests and completed reconciliation
+in the same recovery process.
+
+A fresh normal child must then record exactly one start per enabled component,
+clear the expired lease and advance the relay epoch. These positive controls
+establish that startup would be observable. They run before deployment preflight
+and relay credential recovery. The fixture uses no active/pending relay key or
+credential file, restricts relay origin to loopback HTTPS and denies GitHub HTTP
+transport in the child. The private observer cannot authorize or replace a
+factory or runtime action. Normal admission still follows exact terminal,
+current, fence and release validation. The closed manifest now requires 33 crash
+boundaries and 30 scenarios; hosted execution is required to establish acceptance.
 
 ## Qualification boundary
 
