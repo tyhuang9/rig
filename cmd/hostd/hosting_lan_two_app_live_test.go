@@ -948,7 +948,19 @@ func lanTwoAppNamespaceProbe(t *testing.T, ctx context.Context, docker, address 
 	}
 }
 
+type lanTwoAppLegacyCleanupGuard func(context.Context, string, string, string, map[string]string) (string, bool)
+
 func lanTwoAppRegisterCleanup(t *testing.T, docker, dataRoot, upgradeID string, appIDs *[]string) {
+	lanTwoAppRegisterCleanupWithLegacyGuard(t, docker, dataRoot, upgradeID, appIDs, nil)
+}
+
+// lanTwoAppRegisterCleanupWithLegacyGuard keeps the original two-app cleanup
+// behavior for existing callers. A fixture that has retained a v1 predecessor
+// may supply an exact captured-identity guard before this callback removes the
+// canonical v1 resources by name.
+func lanTwoAppRegisterCleanupWithLegacyGuard(t *testing.T, docker, dataRoot, upgradeID string, appIDs *[]string,
+	legacyGuard lanTwoAppLegacyCleanupGuard,
+) {
 	t.Helper()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
@@ -986,9 +998,18 @@ func lanTwoAppRegisterCleanup(t *testing.T, docker, dataRoot, upgradeID string, 
 				t.Errorf("retain uncertain %s %s", resource.kind, resource.name)
 				continue
 			}
-			args := []string{resource.kind, "rm", resource.name}
+			removalIdentity := resource.name
+			if resource.version == "v1" && legacyGuard != nil {
+				var verified bool
+				removalIdentity, verified = legacyGuard(ctx, docker, resource.kind, resource.name, labels)
+				if !verified {
+					t.Errorf("retain uncertain %s %s", resource.kind, resource.name)
+					continue
+				}
+			}
+			args := []string{resource.kind, "rm", removalIdentity}
 			if resource.kind == "container" {
-				args = []string{"container", "rm", "--force", resource.name}
+				args = []string{"container", "rm", "--force", removalIdentity}
 			}
 			if _, err := controllerJourneyDocker(ctx, docker, nil, args...); err != nil {
 				t.Errorf("remove exact %s %s", resource.kind, resource.name)

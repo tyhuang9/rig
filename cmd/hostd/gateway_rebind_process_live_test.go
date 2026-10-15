@@ -34,6 +34,12 @@ import (
 const (
 	liveHostdRebindChildEnvironment    = "RIG_TEST_LIVE_HOSTD_REBIND_CHILD"
 	liveHostdRebindManifestEnvironment = "RIG_TEST_LIVE_HOSTD_REBIND_MANIFEST"
+
+	// These limits apply only to the closed test-harness classification below.
+	// The complete stderr stream remains digest-only evidence; it is never
+	// emitted by the parent test process.
+	liveHostdRebindStartupDiagnosticMaxBytes   = 64 << 10
+	liveHostdRebindStartupDiagnosticMaxRecords = 64
 )
 
 type liveHostdRebindChildManifest struct {
@@ -810,7 +816,134 @@ func liveHostdRebindClosedDiagnostic(value string) string {
 		return "empty"
 	}
 	sum := sha256.Sum256([]byte(value))
-	return "sha256:" + hex.EncodeToString(sum[:])
+	diagnostic := "sha256:" + hex.EncodeToString(sum[:])
+	if code := liveHostdRebindStartupDiagnosticCode(value); code != "" {
+		return diagnostic + " startup=" + code
+	}
+	return diagnostic
+}
+
+// liveHostdRebindStartupDiagnosticCode accepts only the fixed slog message
+// values emitted before the full daemon signals readiness. It deliberately
+// ignores every other JSON field, including the error value, and examines a
+// bounded prefix of stderr. A later emergency-stop record therefore cannot
+// replace the first primary startup failure.
+func liveHostdRebindStartupDiagnosticCode(stderr string) string {
+	if len(stderr) > liveHostdRebindStartupDiagnosticMaxBytes {
+		stderr = stderr[:liveHostdRebindStartupDiagnosticMaxBytes]
+	}
+	limited := []byte(stderr)
+	var secondary string
+	for records := 0; len(limited) > 0 && records < liveHostdRebindStartupDiagnosticMaxRecords; records++ {
+		line := limited
+		if newline := bytes.IndexByte(limited, '\n'); newline >= 0 {
+			line, limited = limited[:newline], limited[newline+1:]
+		} else {
+			limited = nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		var record struct {
+			Message string `json:"msg"`
+		}
+		if json.Unmarshal(line, &record) != nil {
+			continue
+		}
+		code, isPrimary, ok := liveHostdRebindKnownStartupMessage(record.Message)
+		if !ok {
+			continue
+		}
+		if isPrimary {
+			return code
+		}
+		if secondary == "" {
+			secondary = code
+		}
+	}
+	return secondary
+}
+
+// liveHostdRebindKnownStartupMessage is intentionally a closed mapping of
+// exact message literals in cmd/hostd/main.go. Do not derive codes from text
+// supplied by the child or add arbitrary structured-log attributes here.
+func liveHostdRebindKnownStartupMessage(message string) (code string, primary bool, ok bool) {
+	switch message {
+	case "controller listener reservation failed":
+		return "listener_reservation", true, true
+	case "controller owner directory setup failed":
+		return "owner_directory", true, true
+	case "controller data root ownership failed":
+		return "owner_lease", true, true
+	case "Docker executable resolution failed":
+		return "docker_resolution", true, true
+	case "database startup failed":
+		return "database", true, true
+	case "gateway rebind startup preparation failed":
+		return "rebind_preparation", true, true
+	case "gateway rebind startup returned a refusing decision":
+		return "rebind_refusal", true, true
+	case "gateway rebind recovery startup decision failed validation":
+		return "rebind_recovery_validation", true, true
+	case "recovery controller authentication setup failed":
+		return "recovery_authentication", true, true
+	case "deployment effects admission setup failed":
+		return "effects_admission_setup", true, true
+	case "deployment effects startup admission failed":
+		return "effects_admission", true, true
+	case "deployment effects startup admission returned no release":
+		return "effects_admission_release", true, true
+	case "gateway startup inspection failed":
+		return "gateway_inspection", true, true
+	case "LAN access startup quarantine failed":
+		return "lan_quarantine", true, true
+	case "controller authentication setup failed":
+		return "authentication", true, true
+	case "LAN gateway rebind fence changed before controller startup":
+		return "controller_fence", true, true
+	case "local machine setup failed":
+		return "local_machine", true, true
+	case "local diagnostics persistence failed":
+		return "diagnostics", true, true
+	case "application configuration setup failed":
+		return "configuration_setup", true, true
+	case "application configuration recovery failed":
+		return "configuration_recovery", true, true
+	case "GitHub App configuration failed":
+		return "github_configuration", true, true
+	case "release snapshot configuration failed":
+		return "snapshot_setup", true, true
+	case "release snapshot recovery failed":
+		return "snapshot_recovery", true, true
+	case "deployment plan storage setup failed":
+		return "plan_setup", true, true
+	case "deployment plan recovery failed":
+		return "plan_recovery", true, true
+	case "runtime composition failed":
+		return "runtime_composition", true, true
+	case "hosting gateway startup claim snapshot changed":
+		return "gateway_snapshot_changed", true, true
+	case "gateway startup inspection changed after recovery":
+		return "gateway_inspection_changed", true, true
+	case "LAN access startup inspection changed after recovery":
+		return "lan_inspection_changed", true, true
+	case "LAN gateway rebind fence changed before worker start":
+		return "worker_fence", true, true
+	case "runtime recovery failed":
+		return "runtime_recovery", true, true
+	case "generated auto-deploy preflight setup failed":
+		return "autodeploy_preflight", true, true
+	case "deployment effects startup admission release failed":
+		return "effects_admission_release_cleanup", false, true
+	case "deployment effects startup admission release failed before recovery controller":
+		return "effects_admission_release_before_recovery", true, true
+	case "owned gateway emergency stop could not be verified":
+		return "emergency_stop", false, true
+	case "controller data root ownership release failed":
+		return "owner_lease_release", false, true
+	}
+	return "", false, false
 }
 
 type liveHostdRebindReview struct {
