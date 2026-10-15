@@ -12,6 +12,8 @@ import {
   type BootstrapStatus,
   type CreateApplicationRequest,
   type ConfigureLANGatewayProfileRequest,
+  type CommitLANGatewayRebindRequest,
+  type ControllerRecovery,
   type CSRFResponse,
   type Deployment,
   type DeploymentList,
@@ -42,8 +44,16 @@ import {
   type LANAppGrantMutation,
   type LANAppGrantRead,
   type LANRecoveryHead,
+  type InspectLANGatewayRebindRecoveryRequest,
+  type InspectLANGatewayRebindRequest,
+  type LANGatewayRebindMutation,
+  type LANGatewayRebindReconcileResponse,
+  type LANGatewayRebindRecoveryReview,
+  type LANGatewayRebindReview,
+  type LANGatewayRebindStatus,
   type LANGatewayProfileMutation,
   type LANGatewayProfileRead,
+  type LANGatewayProfileRevision,
   type LANGatewayProfileSpec,
   type LANGatewayUpgradeMutation,
   type LANGatewayUpgradeRead,
@@ -54,6 +64,7 @@ import {
   type ReplaceApplicationConfigurationRequest,
   type ReplaceScopedApplicationConfigurationRequest,
   type RelayStatus,
+  type ReconcileLANGatewayRebindRequest,
   type RelayBindingStatus,
   type RelayEnrollmentStart,
   type RelayEnrollmentStatus,
@@ -84,6 +95,8 @@ export type {
   ApproveLANAppAccessRequest,
   CreateApplicationRequest,
   ConfigureLANGatewayProfileRequest,
+  CommitLANGatewayRebindRequest,
+  ControllerRecovery,
   GitHubBranch,
   GitHubDeviceAuthorization,
   GitHubConnectionAuthorization,
@@ -110,9 +123,17 @@ export type {
   LANAppGrantMutation,
   LANAppGrantRead,
   LANRecoveryHead,
+  InspectLANGatewayRebindRecoveryRequest,
+  InspectLANGatewayRebindRequest,
+  LANGatewayRebindMutation,
+  LANGatewayRebindReconcileResponse,
+  LANGatewayRebindRecoveryReview,
+  LANGatewayRebindReview,
+  LANGatewayRebindStatus,
   LANGatewayCandidate,
   LANGatewayProfileMutation,
   LANGatewayProfileRead,
+  LANGatewayProfileRevision,
   LANGatewayProfileSpec,
   LANGatewayUpgradeMutation,
   LANGatewayUpgradeProposal,
@@ -135,6 +156,7 @@ export type {
   RuntimeApproval,
   GrantLANAppAccessRequest,
   RelayStatus,
+  ReconcileLANGatewayRebindRequest,
   RelayBindingStatus,
   RelayEnrollmentStart,
   RelayEnrollmentStatus,
@@ -180,6 +202,14 @@ export function isGatewayReconciliationRequired(error: unknown): error is APIErr
 export function subscribeGatewayReconciliationRequired(listener: GatewayReconciliationListener) {
   gatewayReconciliationListeners.add(listener);
   return () => { gatewayReconciliationListeners.delete(listener); };
+}
+
+export function enterGatewayReconciliationRecovery() {
+  publishGatewayReconciliationRequired(new APIError({
+    status: 503,
+    code: "gateway_reconciliation_required",
+    detail: "Gateway recovery requested",
+  }));
 }
 
 function publishGatewayReconciliationRequired(error: APIError) {
@@ -503,6 +533,7 @@ export const api = {
   csrf: rotateCSRF,
   logout: () => request<void>(operations.logout.path, { method: "DELETE" }),
   status: () => request<SystemStatus>(operations.systemStatus.path, { cache: "no-store" }),
+  getControllerRecovery: () => request<ControllerRecovery>(operations.getControllerRecovery.path, { cache: "no-store" }),
   lanRecoveryHead: () => request<LANRecoveryHead>(operations.getLANRecoveryHead.path, { cache: "no-store" }),
   lanGatewayProfile: (spec?: LANGatewayProfileSpec) =>
     request<LANGatewayProfileRead>(lanGatewayProfilePath(spec), { cache: "no-store" }),
@@ -517,6 +548,33 @@ export const api = {
       method: operations.upgradeLANGateway.method,
       body: JSON.stringify(data),
     }),
+  recoverLANGatewayUpgrade: (data: UpgradeLANGatewayRequest) =>
+    request<LANGatewayUpgradeMutation>(operations.upgradeLANGateway.path, {
+      method: operations.upgradeLANGateway.method,
+      body: JSON.stringify(data),
+    }, false),
+  inspectLANGatewayRebind: (data: InspectLANGatewayRebindRequest) =>
+    request<LANGatewayRebindReview>(operations.inspectLANGatewayRebind.path, {
+      method: operations.inspectLANGatewayRebind.method,
+      body: JSON.stringify(data),
+    }),
+  commitLANGatewayRebind: (data: CommitLANGatewayRebindRequest) =>
+    request<LANGatewayRebindMutation>(operations.commitLANGatewayRebind.path, {
+      method: operations.commitLANGatewayRebind.method,
+      body: JSON.stringify(data),
+    }, false),
+  getLANGatewayRebind: (operationId: string) =>
+    request<LANGatewayRebindStatus>(operationPath(operations.getLANGatewayRebind.path, { operationId }), { cache: "no-store" }),
+  inspectLANGatewayRebindRecovery: (operationId: string, data: InspectLANGatewayRebindRecoveryRequest = {}) =>
+    request<LANGatewayRebindRecoveryReview>(operationPath(operations.inspectLANGatewayRebindRecovery.path, { operationId }), {
+      method: operations.inspectLANGatewayRebindRecovery.method,
+      body: JSON.stringify(data),
+    }),
+  reconcileLANGatewayRebind: (operationId: string, data: ReconcileLANGatewayRebindRequest) =>
+    request<LANGatewayRebindReconcileResponse>(operationPath(operations.reconcileLANGatewayRebind.path, { operationId }), {
+      method: operations.reconcileLANGatewayRebind.method,
+      body: JSON.stringify(data),
+    }, false),
   apps: () => request<ApplicationList>(operations.listApplications.path),
   app: (id: string) => request<Application>(operationPath(operations.getApplication.path, { appId: id })),
   getApplicationAutoDeploy: (id: string) =>
