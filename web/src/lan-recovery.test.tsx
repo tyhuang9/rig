@@ -173,7 +173,7 @@ describe("authenticated operator mode gate", () => {
     render(<QueryClientProvider client={client}><AuthenticatedOperatorGate onSignOut={() => undefined}><div>Normal operator routes</div></AuthenticatedOperatorGate></QueryClientProvider>);
 
     expect(await screen.findByRole("heading", { name: "LAN gateway recovery required" })).not.toBeNull();
-    expect(rebind).toHaveBeenCalledWith(operationId);
+    await waitFor(() => expect(rebind).toHaveBeenCalledWith(operationId));
     expect(legacyHead).not.toHaveBeenCalled();
     expect(screen.queryByText("Normal operator routes")).toBeNull();
   });
