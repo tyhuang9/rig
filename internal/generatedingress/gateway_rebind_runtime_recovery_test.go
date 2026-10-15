@@ -32,15 +32,23 @@ func (r *gatewayRebindCompositionRejectTransition) ApplyGatewayRebindTransition(
 // Model a new process lifetime, not a second Manager in the failed process.
 // Only the new Manager gets new latches; the old latches are never cleared.
 // Docker resources, protected files, SQL and configuration remain the same.
-func newGatewayRebindCompositionRecoveryProcess(t *testing.T, source *Manager,
+func newGatewayRebindCompositionRecoveryProcessWithDriver(t *testing.T, source *Manager,
 	runner *gatewayRebindCompositionRunner,
-) *Manager {
+) (*Manager, *gatewayRebindCompositionDriver) {
 	t.Helper()
 	fresh := freshGatewayRebindRecoveryManager(source)
 	fresh.gatewayRebindFailStop = &atomic.Bool{}
 	fresh.gatewayRebindCommitBarrier = &atomic.Bool{}
 	driver := &gatewayRebindCompositionDriver{t: t, runner: runner}
 	driver.install(fresh)
+	return fresh, driver
+}
+
+func newGatewayRebindCompositionRecoveryProcess(t *testing.T, source *Manager,
+	runner *gatewayRebindCompositionRunner,
+) *Manager {
+	t.Helper()
+	fresh, _ := newGatewayRebindCompositionRecoveryProcessWithDriver(t, source, runner)
 	return fresh
 }
 

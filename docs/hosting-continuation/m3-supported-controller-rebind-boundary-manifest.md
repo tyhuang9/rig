@@ -48,27 +48,35 @@ rejects missing, duplicate, unknown or skipped manifest entries.
 
 ## Ordered durable writes and effects
 
-| ID | Required proven boundary | Recovery direction |
+These outcomes describe this healthy, exactly owned fixture after restart.
+Early prepared/progress states have no fixed terminal disposition: recovery
+revalidates retained authority and physical evidence, then tries forward
+completion. A failure may require compensation. A recorded abort, commit
+receipt or immutable database-commit event constrains that choice; this matrix
+does not grant permission to override it. The two explicit rollback boundaries
+retain their deliberately injected forward failure and must abort.
+
+| ID | Required proven boundary | Expected healthy-fixture result |
 | --- | --- | --- |
-| `a0-sql-claim` | Prepared SQL claim exists while checkpoint, intent, progress and terminal are absent. | Rollback only after fresh exact no-effect proof. |
-| `p0-predecessor-checkpoint` | Exact predecessor checkpoint is durable and readable. | Rollback. |
-| `p1-protected-intent` | Protected intent is digest-bound to A0, checkpoint, roster and runtime heads. | Rollback. |
-| `p01-successor-intent` | Protected progress sequence 1 records successor intent. | Rollback. |
-| `p02-image-observed` | Sequence 2 binds the immutable image and stage plan. | Rollback. |
-| `p03-network-bound` | Sequence 3 binds the successor network and ownership. | Rollback. |
-| `p04-config-volume-bound` | Sequence 4 binds the config volume. | Rollback. |
-| `p05-data-volume-bound` | Sequence 5 binds the data volume. | Rollback. |
-| `p06-stage-container-bound` | Sequence 6 binds the stopped stage container. | Rollback. |
-| `p07-stage-config-intent` | Sequence 7 precedes the stage config copy. | Rollback. |
-| `p08-stage-config-copied` | Sequence 8 attests copied stage config bytes. | Rollback. |
-| `p09-stage-start-intent` | Sequence 9 precedes the exact stage start. | Rollback. |
-| `p10-stage-serving` | Sequence 10 binds the serving stage endpoint. | Rollback. |
-| `p11-final-config-intent` | Sequence 11 precedes the final config copy. | Rollback. |
-| `p12-final-config-copied` | Sequence 12 attests copied final config bytes. | Rollback. |
-| `p13-final-handover-intent` | Sequence 13 binds predecessor observation and application networks. | Rollback. |
-| `p14-final-container-bound` | Sequence 14 binds the final successor container. | Rollback. |
-| `p15-cutover-intent` | Sequence 15 binds the exact cutover observation. | Rollback. |
-| `p16-successor-serving` | Sequence 16 proves successor serving after cutover. | Rollback unless later immutable commit evidence fixes forward direction. |
+| `a0-sql-claim` | Prepared SQL claim exists while checkpoint, intent, progress and terminal are absent. | Commit after fresh exact no-effect proof and safe prepared-state reconstruction. |
+| `p0-predecessor-checkpoint` | Exact predecessor checkpoint is durable and readable. | Commit after fresh proof and safe reconstruction of the remaining prepared prefix. |
+| `p1-protected-intent` | Protected intent is digest-bound to A0, checkpoint, roster and runtime heads. | Commit after fresh proof and safe progress initialization. |
+| `p01-successor-intent` | Protected progress sequence 1 records successor intent. | Commit after verified forward recovery. |
+| `p02-image-observed` | Sequence 2 binds the immutable image and stage plan. | Commit after verified forward recovery. |
+| `p03-network-bound` | Sequence 3 binds the successor network and ownership. | Commit after verified forward recovery. |
+| `p04-config-volume-bound` | Sequence 4 binds the config volume. | Commit after verified forward recovery. |
+| `p05-data-volume-bound` | Sequence 5 binds the data volume. | Commit after verified forward recovery. |
+| `p06-stage-container-bound` | Sequence 6 binds the stopped stage container. | Commit after verified forward recovery. |
+| `p07-stage-config-intent` | Sequence 7 precedes the stage config copy. | Commit after verified forward recovery. |
+| `p08-stage-config-copied` | Sequence 8 attests copied stage config bytes. | Commit after verified forward recovery. |
+| `p09-stage-start-intent` | Sequence 9 precedes the exact stage start. | Commit after verified forward recovery. |
+| `p10-stage-serving` | Sequence 10 binds the serving stage endpoint. | Commit after verified forward recovery. |
+| `p11-final-config-intent` | Sequence 11 precedes the final config copy. | Commit after verified forward recovery. |
+| `p12-final-config-copied` | Sequence 12 attests copied final config bytes. | Commit after verified forward recovery. |
+| `p13-final-handover-intent` | Sequence 13 binds predecessor observation and application networks. | Commit after verified forward recovery. |
+| `p14-final-container-bound` | Sequence 14 binds the final successor container. | Commit after verified forward recovery. |
+| `p15-cutover-intent` | Sequence 15 binds the exact cutover observation. | Commit after verified forward recovery. |
+| `p16-successor-serving` | Sequence 16 proves successor serving after cutover. | Commit after fresh physical serving and retained-authority proof. |
 | `p17-handover-completed` | Sequence 17 proves resources, final serving and predecessor withdrawal. | Forward. |
 | `r01-rollback-intent` | Rollback intent binds the exact-owned cleanup set and predecessor route. | Rollback. |
 | `r02-rollback-completed` | Rollback completion proves owned resources absent and predecessor serving. | Rollback terminal. |
@@ -99,6 +107,20 @@ final container, cutover and successor serving effects. Recovery must inspect
 exact ownership and completed physical state before it repeats, adopts, removes
 or refuses an effect.
 
+All ten healthy lost-acknowledgment cases require commit. The typed v2 forward
+driver can bind an already observed network, volume or stage container only
+after exact ownership and persisted-prefix checks; it must not repeat creation
+or accept an arbitrary resource. The later effects likewise require fresh exact
+proof before adoption. These are strict fixture outcomes, not permission to
+accept either terminal result. Forced rollback retains its separately recorded
+cleanup authority and abort decision.
+
+This adoption applies only to the exact expected next resource whose durable
+binding acknowledgment was interrupted. The controller contract's refusal for
+unbound or foreign resources still applies when the full expected identity,
+ownership, inventory or retained-prefix proof is unavailable or inconsistent.
+No resource gains authority merely because it exists or has a similar name.
+
 ## Required adversarial and restart cases
 
 The same manifest requires both fixed precommit `unresolved` rollback and
@@ -123,7 +145,8 @@ The prewrite cancellation case first completes proposal review, arms a private
 child-only barrier, sends the commit over authenticated HTTP, and cancels only
 after the server reaches a read-only Docker admission check before A0. The
 postwrite case cancels after the A0 SQL claim readback while the process stays
-alive. The current-role case obtains both recovery digests as an administrator,
+alive. Its subsequent healthy startup recovery must commit; the A0 claim has
+no fixed abort receipt. The current-role case obtains both recovery digests as an administrator,
 then revokes that live session before submitting reconcile with those exact
 digests; the denied request must leave the operation active and unchanged.
 

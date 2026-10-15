@@ -1,6 +1,6 @@
 # M3 supported-controller fixture startup investigation
 
-Status: terminal-proof fixture correction candidate; M3 remains incomplete.
+Status: healthy recovery fixture correction; hosted acceptance pending and M3 incomplete.
 This branch starts from PR #160 at
 `950944edc9e028ce407060e4e726521876ae1c14`. Its initial revision changes test
 infrastructure. The follow-up adds closed diagnostic metadata to production
@@ -567,3 +567,208 @@ This follow-up changes only test helpers, controls, CI prerequisites and this
 evidence document. A reviewed revert restores the earlier incorrect fixture
 expectations. It does not change production state or migration history, and
 the user's running controller has not been restarted or deployed.
+
+## Healthy recovery outcome correction
+
+At `26f8af2`, [first-boundary job 116438117641](https://github.com/tyhuang9/rig/actions/runs/38739773712/job/116438117641)
+passed all 23 prerequisite parents and 192 subcases, then failed the live A0
+child after 269.79s. Terminal-proof and durable-history verification completed,
+but the fixture expected abort while the retained operation was committed with
+database commit observed and sequence 4. Independent cleanup passed. The full
+matrix was skipped by its prerequisite and remains unaccepted.
+
+Actual checkout `6c532cfdbfc769c3f6ae9ab8dfb8a3d0fe1d230d` matched the candidate
+tree `a773802f0bed8be867e99ea1996b6e74316ce55e`. Raw log SHA-256:
+`a2d9ecb033044ab3a46515300bb380ebd5e2683159d151d3cc9119a58b7960ab`.
+Evidence is retained in wrapper
+`temp/m3-lan-external-db-20261015/pr161-terminal-fixture-ci-evidence/116438117641/`.
+The collapsed helper location does not distinguish the first recovery assertion
+from the third normal-process assertion.
+
+Read-only causal review found the early crash manifest's blanket abort
+expectations inconsistent with the existing controller contract and production
+recovery behavior. A raw A0 claim has no fixed disposition. Recovery requires
+fresh exact proof before reconstructing the prepared prefix, then attempts
+forward completion under retained authority. The already reviewed A0 contract
+and its executable evidence require `evidence_decides`; absence of effects is
+not a fixed abort decision. Database-commit observation derives from the
+immutable SQL event, not merely admission or successor-profile persistence.
+
+The fixture correction preserves strict outcomes: the 31 healthy forward
+boundary cases must commit and the two explicitly forced rollback boundaries
+must abort. Production policy, authority checks, exact physical proof,
+immutable terminal choices, all 33 boundary IDs, all 30 scenario IDs, cleanup
+and deadlines remain unchanged. Lost-effect and cancellation scenarios require
+separate examination of their persisted binding and failure evidence; a missing
+acknowledgment alone does not authorize resource adoption or choose an outcome.
+
+The scenario audit requires all ten healthy lost acknowledgments to commit.
+The typed v2 forward driver binds an already observed network, volume or stage
+container only after exact ownership and persisted-prefix checks. Legacy
+standalone-stage refusal behavior does not define this typed v2 contract. The
+six later effects likewise require exact reconciliation. Cancellation after
+raw A0 likewise requires healthy forward completion. Literal precommit
+`unresolved` retains its deliberately forced, durable abort decision; the
+database-committed variant retains commit. Refusal, isolation, current-recovery
+precedence and release-failure assertions remain unchanged.
+
+Expected-next adoption is narrower than accepting an arbitrary unbound resource:
+the immutable identity, ownership, inventory and retained prefix must all match
+the reviewed operation. The controller contract's unbound/foreign-resource
+refusal continues to apply when that complete proof is missing or inconsistent.
+The new positive adoption regressions do not establish concurrent network drift
+or every negative ownership case for all four typed binding methods; the live
+ownership/configuration-drift scenarios remain required and unchanged.
+
+New offline regressions use real repository/protected stores and the existing
+simulated Docker backend. A0 coverage has two explicit phases: the existing
+injected physical-reader seam reconstructs P01 from stable simulated proof,
+then the public startup entry point completes recovery. Direct public A0
+recovery constructs real host-network reads and remains a live Docker gate:
+
+- Raw A0 starts with SQL sequence 1, a held fence, no protected prefix and no
+  physical effects; after proof-backed reconstruction, healthy public startup
+  recovery must commit at sequence 4.
+- A forced forward failure records abort before a rejected SQL terminal write;
+  a new manager must finish that same abort at sequence 2 without repeating
+  physical effects.
+- Each early unacknowledged create retains SQL sequence 1 and protected progress
+  2, 3, 4 or 5 with exactly the next resource present but unbound. Recovery must
+  prove and bind that exact resource, finish commit without repeating creation,
+  preserve immutable history, and replay without new effects.
+
+The manifest control independently checks the 31/2 boundary split and the ten
+lost-acknowledgment cases, all requiring commit. Crash assertion diagnostics identify the first recovery
+or third normal process, resolving the ambiguous collapsed helper location in
+the hosted failure. These offline checks support the fixture expectations;
+they do not replace execution of the real Docker matrix.
+
+### Initial offline failures and review corrections
+
+The first new regression runs failed on both Windows and Linux; those results
+are retained, not counted as acceptance. Both A0 parents failed before their
+intended effects because the public admission-proof path used actual host
+network discovery, outside the synthetic fixture. All four early lost-create
+cases committed, contradicting the initial abort expectation. Independent
+review traced this to the typed v2 driver's explicit exact-resource forward
+binding paths; legacy standalone stage tests had been the wrong contract to
+apply. The correction uses the explicit two-phase offline A0 boundary and
+strict commit for all ten healthy lost acknowledgments, without changing
+production recovery or weakening ownership checks.
+
+Initial Linux log SHA-256:
+`447bccad3b1156431dd6d0eeefd41ae0a01ccd944dc4b3e5dafa8a28ced33a55`.
+Initial Windows log SHA-256:
+`8d7264fe75c4489d0ed41103c1bc3887aa19c09853506b7fbdd9a98c1cb4069d`.
+Both logs, source pins and the initial independent review are retained in
+wrapper `temp/m3-lan-external-db-20261015/healthy-recovery-verification/`.
+
+The first two-phase A0 rerun also failed on both platforms after reconstruction
+succeeded. Independent review found that the generic admission-proof fixture
+described a different Docker network census from the composition backend used
+by subsequent recovery. The correction derives both phases' observations from
+the same unchanged simulated inventory and retains the exact topology check.
+The rejected rerun logs are retained with SHA-256
+`296a797e45ef026054e375e7b460ca6e10a8d3b0a2324cad290c3d27a80ad104`
+(Linux) and
+`61adc695ae69f7f3e3c127713cbe147204bef8b9b309895565867716c1e952e5`
+(Windows). The four exact-create adoption cases and the three existing
+physical-proof controls separately passed on Linux at this intermediate source;
+final verification must still cover the final source.
+
+### Final scoped verification for the healthy outcome correction
+
+Windows and Linux each passed **40 scoped parent tests and 221 subcases**,
+with explicit discovery, uncached execution and no skips or failures in these
+final invocations. These are targeted regression checks, not the full suite.
+
+| Scope | Parents | Subcases | Windows seconds | Linux seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Required controller controls | 23 | 192 | 3.063 | 3.875 |
+| Two-phase A0 recovery | 2 | 0 | 215.843 | 29.781 |
+| Four early lost-create acknowledgments | 1 | 4 | 343.984 | 48.562 |
+| Forward and retained rollback composition | 2 | 3 | 456.407 | 66.110 |
+| Fixed rollback history | 3 | 4 | 108.625 | 14.265 |
+| Exact adoption and boundary drift controls | 6 | 5 | 143.609 | 16.766 |
+| Physical proof and post-claim drift | 3 | 13 | 58.188 | 7.734 |
+
+The final native adoption invocation was interrupted without a terminal test
+result: its session handle was absent and process inspection found no running
+verification process. Its partial log is retained and is not acceptance.
+Only that unfinished roster and the remaining proof roster were executed
+again; the completed rosters were retained. The interruption cause is unknown.
+The completed replacement runs are included in the table above.
+
+The final P12 proof wording was corrected from stage config to final config
+after ingress verification. Byte-for-byte before/after evidence proves that
+this one cmd test description was the only source change. All ingress sources
+and dependencies remain identical to their successful runs. The 23 cmd controls
+were rerun on both platforms at the final source, followed by both CLI builds,
+live-tag vet and the canonical generation check.
+
+Exact execution uses `go test -tags live_docker -c`, explicit test discovery,
+and `go tool test2json` with `-test.count=1 -test.timeout=10m` against each
+recorded roster. Linux binaries are cross-compiled then executed in WSL.
+Build/vet commands are `go build ./cmd/hostd` (to retained platform outputs)
+and `go vet -tags live_docker ./cmd/hostd ./internal/appaccess
+./internal/generatedingress ./internal/database ./internal/controller`.
+Canonical generation is `pwsh -NoProfile -File scripts/check-generation.ps1`.
+All use the repository Go toolchain and read-only module resolution.
+
+The 33 boundary IDs, 30 scenario IDs and hosting workflow remain unchanged.
+New regression names match the existing `rebind-composition-native` CI selector.
+Whitespace and source-scope checks pass. Documentation verification uses the
+frozen offline install followed by `check:workflow`, `build` and
+`check:accessibility`; publication retains their final results.
+
+Full commands, independent review records, rosters, source pins, partial
+invocations and final results are retained in wrapper
+`temp/m3-lan-external-db-20261015/healthy-recovery-verification/`,
+with final CLI receipts in `healthy-recovery-manifest-final/`.
+Final test log SHA-256 values:
+
+- `wording-cmd-native`: `6b312667cc559601fe94947cf3973ade4397ae5c9a67885cc198ca899ebee4b7`.
+
+- `final-a0-native`: `10aef1181b0d6253a371d8079d753fba1ee99ec79891f718047f61c96c2bb570`.
+
+- `final-unbound-native`: `e04928a102b12e8802d6f15b7cbb00d9f3d2233b4113b3a9f1ba8626b25a42cc`.
+
+- `final-composition-native`: `13d015bf6bd0e761455f53f4fc45b5bf4e676eceed4e272e4badaef4a597d071`.
+
+- `final-rollback-native`: `db0e840ba6cc9dfd91dc010a50482e8a67360a4f0bb4f7b14803a5fac4523219`.
+
+- `resumed-adoption-native`: `3feb13c2291c2010c2e45311fcdf3765736a612ee6757eab1962644c908ff80e`.
+
+- `final-proof-native`: `6fc557d21c552ef4b3f3af8a506c6c6f1a328f5f21e05d294509b0270862bf3b`.
+
+- `wording-cmd-wsl`: `9146a34f2abbea2ea99ae0a80a6270de5b7e65907ba4f5c4e71328382c94b005`.
+
+- `aligned-a0-wsl`: `b84b78aae24f2e1bd7e39ca6e522c001d62fe33507e33af0fe90c7d3d39e91bb`.
+
+- `final-unbound-wsl`: `e8cb31c211b7917bdeb75996e8fb2211c0b36f08213925a3a2f058b7bf570b57`.
+
+- `final-composition-wsl`: `60553ab25d213eaea5ad659ab3ab43b9675619ae08633d4877ee0936d399482f`.
+
+- `final-rollback-wsl`: `be86fcd824fa75e6196c2d09aa6cd1ccce523f1f0bb41cdb935adc87ae0dc048`.
+
+- `final-adoption-wsl`: `2784a9aaf5af95986dc1278472b2ca6b90c9657585d5785d376abe7526e56f01`.
+
+- `final-proof-wsl`: `03454797d742959809c768c95cc1e725124de0de508037a76c62da841126e5e2`.
+
+Independent manual code and final integration review address this latest
+five-test-file/two-document correction; they are not CodeRabbit review or
+acceptance of all earlier production changes in this cumulative PR.
+The actual Docker first-boundary rerun, full 33/30 matrix, independent cleanup
+and hosted race gates remain required. Broad frontend/browser suites were not
+repeated for this test-only follow-up; no live controller was activated.
+Physical second-device LAN and app-owned external database qualification remain
+outstanding, so M3 is not complete.
+
+A separate existing-head hosted race job failed before test execution while
+downloading `modernc.org/sqlite` from the Go module proxy (HTTP/2 stream error).
+This is a dependency-fetch failure, not a passing or failing runtime case:
+[job 116442298160](https://github.com/tyhuang9/rig/actions/runs/38739774139/job/116442298160),
+exact checkout tree `a773802f0bed8be867e99ea1996b6e74316ce55e`, raw log SHA-256
+`731390b348283fde27215aae3717a45db0294d51f405429922814cb6be139b06`.
+The updated head must rerun this gate; no source workaround is justified by
+that external fetch error alone.

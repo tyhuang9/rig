@@ -14,11 +14,13 @@ import (
 // only when the child can prove the named durable write or completed effect;
 // reaching a timer or beginning an operation is never sufficient.
 type gatewayRebindLiveBoundary struct {
-	ID         string
-	Direction  string
-	Proof      string
-	SourceFile string
-	Source     string
+	ID string
+	// ExpectedTerminalDisposition records the deterministic terminal result
+	// required by this exact fixture. It is not a general recovery policy.
+	ExpectedTerminalDisposition string
+	Proof                       string
+	SourceFile                  string
+	Source                      string
 }
 
 // Keep this list independent from gatewayRebindLiveBoundaries. The control
@@ -61,39 +63,39 @@ s11-response-loss
 `
 
 var gatewayRebindLiveBoundaries = []gatewayRebindLiveBoundary{
-	{"a0-sql-claim", "rollback", "prepared SQL claim exists; protected checkpoint, intent, progress and terminal are absent", "internal/generatedingress/gateway_rebind_cross_store_prepare.go", "gatewayRebindAfterClaim"},
-	{"p0-predecessor-checkpoint", "rollback", "exact predecessor checkpoint is readable; protected intent/progress are absent", "internal/generatedingress/gateway_rebind_cross_store_prepare.go", "gatewayRebindAfterPreparedCheckpoint"},
-	{"p1-protected-intent", "rollback", "exact protected intent is readable and digest-bound to A0 and P0", "internal/generatedingress/gateway_rebind_cross_store_prepare.go", "gatewayRebindAfterPreparedIntent"},
-	{"p01-successor-intent", "rollback", "protected progress sequence 1 is successor_intent", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressSuccessorIntent"},
-	{"p02-image-observed", "rollback", "protected progress sequence 2 binds the observed immutable image and stage plan", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 2:"},
-	{"p03-network-bound", "rollback", "protected progress sequence 3 binds the created successor network and ownership", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 3:"},
-	{"p04-config-volume-bound", "rollback", "protected progress sequence 4 binds the successor config volume", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 4:"},
-	{"p05-data-volume-bound", "rollback", "protected progress sequence 5 binds the successor data volume", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 5:"},
-	{"p06-stage-container-bound", "rollback", "protected progress sequence 6 binds the stopped stage container", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 6:"},
-	{"p07-stage-config-intent", "rollback", "protected progress sequence 7 records the stage config copy intent", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressStageConfigIntent"},
-	{"p08-stage-config-copied", "rollback", "protected progress sequence 8 attests the copied stage config", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressStageConfigCopied"},
-	{"p09-stage-start-intent", "rollback", "protected progress sequence 9 records the exact stage start intent", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressStageStartIntent"},
-	{"p10-stage-serving", "rollback", "protected progress sequence 10 binds the serving stage endpoint", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressStageServing"},
-	{"p11-final-config-intent", "rollback", "protected progress sequence 11 records the final config copy intent", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressFinalConfigIntent"},
-	{"p12-final-config-copied", "rollback", "protected progress sequence 12 attests the final config copy", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressFinalConfigCopied"},
-	{"p13-final-handover-intent", "rollback", "protected progress sequence 13 binds predecessor observation and application networks", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressFinalHandoverIntent"},
-	{"p14-final-container-bound", "rollback", "protected progress sequence 14 binds the final successor container", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressFinalContainerBound"},
-	{"p15-cutover-intent", "rollback", "protected progress sequence 15 binds the cutover observation", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressCutoverIntent"},
-	{"p16-successor-serving", "rollback", "protected progress sequence 16 proves successor serving after cutover", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressSuccessorServing"},
-	{"p17-handover-completed", "forward", "protected progress sequence 17 proves final resources, predecessor withdrawal and handover", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressHandoverCommitted"},
-	{"r01-rollback-intent", "rollback", "protected rollback intent binds every exact-owned resource and predecessor route", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressRollbackIntent"},
-	{"r02-rollback-completed", "rollback", "protected rollback completion proves owned resources absent and predecessor serving", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressHandoverRolledBack"},
-	{"s01-protected-terminal-installed", "forward", "exact protected terminal receipt is durably installed after the physical result and before decrypt/readback", "internal/generatedingress/gateway_rebind_durable_boundary.go", "GatewayRebindBoundaryProtectedTerminalInstalled"},
-	{"s02-protected-terminal-readback", "forward", "the installed terminal receipt reads back with the exact operation, generation, sequence and digest", "internal/generatedingress/gateway_rebind_durable_boundary.go", "GatewayRebindBoundaryProtectedTerminalReadback"},
-	{"s03-successor-ready", "forward", "immutable SQL successor_ready transition follows terminal publication and revalidated physical serving", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "appaccess.GatewayRebindSuccessorReady"},
-	{"s04-database-committed", "forward", "one SQL transaction records database_committed, current profile and grant transfers", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "appaccess.GatewayRebindDatabaseCommitted"},
-	{"s05-current-attestation", "forward", "selected-current physical attestation is bound to the exact terminal lineage before terminal SQL", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "GatewayRebindBoundaryCurrentAttestation"},
-	{"s06-terminal-sql", "forward", "terminal SQL transition retains the terminal receipt, immutable database event and current attestation", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "appaccess.GatewayRebindCommitted"},
-	{"s07-stable-final-census", "forward", "fresh SQL, protected history, selected current and runtime census remain stable", "internal/generatedingress/gateway_rebind_cross_store_recovery.go", "sameGatewayCurrentSelection"},
-	{"s08-fence-transition", "forward", "active claim is absent and CheckGatewayRebindFence is clear", "internal/generatedingress/gateway_rebind_cross_store_recovery.go", "CheckGatewayRebindFence"},
-	{"s09-effects-lease-release", "forward", "deployment-effects lease release completes successfully", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "releaseEffects()"},
-	{"s10-gateway-lock-release", "forward", "gateway OS lock release completes after the effects lease", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "releaseGateway()"},
-	{"s11-response-loss", "forward", "terminal response is intentionally dropped only after both releases", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "releaseGatewayRebindTerminalLocks"},
+	{"a0-sql-claim", "commit", "prepared SQL claim exists; protected checkpoint, intent, progress and terminal are absent", "internal/generatedingress/gateway_rebind_cross_store_prepare.go", "gatewayRebindAfterClaim"},
+	{"p0-predecessor-checkpoint", "commit", "exact predecessor checkpoint is readable; protected intent/progress are absent", "internal/generatedingress/gateway_rebind_cross_store_prepare.go", "gatewayRebindAfterPreparedCheckpoint"},
+	{"p1-protected-intent", "commit", "exact protected intent is readable and digest-bound to A0 and P0", "internal/generatedingress/gateway_rebind_cross_store_prepare.go", "gatewayRebindAfterPreparedIntent"},
+	{"p01-successor-intent", "commit", "protected progress sequence 1 is successor_intent", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressSuccessorIntent"},
+	{"p02-image-observed", "commit", "protected progress sequence 2 binds the observed immutable image and stage plan", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 2:"},
+	{"p03-network-bound", "commit", "protected progress sequence 3 binds the created successor network and ownership", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 3:"},
+	{"p04-config-volume-bound", "commit", "protected progress sequence 4 binds the successor config volume", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 4:"},
+	{"p05-data-volume-bound", "commit", "protected progress sequence 5 binds the successor data volume", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 5:"},
+	{"p06-stage-container-bound", "commit", "protected progress sequence 6 binds the stopped stage container", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "case 6:"},
+	{"p07-stage-config-intent", "commit", "protected progress sequence 7 records the stage config copy intent", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressStageConfigIntent"},
+	{"p08-stage-config-copied", "commit", "protected progress sequence 8 attests the copied stage config", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressStageConfigCopied"},
+	{"p09-stage-start-intent", "commit", "protected progress sequence 9 records the exact stage start intent", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressStageStartIntent"},
+	{"p10-stage-serving", "commit", "protected progress sequence 10 binds the serving stage endpoint", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressStageServing"},
+	{"p11-final-config-intent", "commit", "protected progress sequence 11 records the final config copy intent", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressFinalConfigIntent"},
+	{"p12-final-config-copied", "commit", "protected progress sequence 12 attests the final config copy", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressFinalConfigCopied"},
+	{"p13-final-handover-intent", "commit", "protected progress sequence 13 binds predecessor observation and application networks", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressFinalHandoverIntent"},
+	{"p14-final-container-bound", "commit", "protected progress sequence 14 binds the final successor container", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressFinalContainerBound"},
+	{"p15-cutover-intent", "commit", "protected progress sequence 15 binds the cutover observation", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressCutoverIntent"},
+	{"p16-successor-serving", "commit", "protected progress sequence 16 proves successor serving after cutover", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressSuccessorServing"},
+	{"p17-handover-completed", "commit", "protected progress sequence 17 proves final resources, predecessor withdrawal and handover", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressHandoverCommitted"},
+	{"r01-rollback-intent", "abort", "protected rollback intent binds every exact-owned resource and predecessor route", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressRollbackIntent"},
+	{"r02-rollback-completed", "abort", "protected rollback completion proves owned resources absent and predecessor serving", "internal/generatedingress/gateway_rebind_progress.go", "gatewayRebindProgressHandoverRolledBack"},
+	{"s01-protected-terminal-installed", "commit", "exact protected terminal receipt is durably installed after the physical result and before decrypt/readback", "internal/generatedingress/gateway_rebind_durable_boundary.go", "GatewayRebindBoundaryProtectedTerminalInstalled"},
+	{"s02-protected-terminal-readback", "commit", "the installed terminal receipt reads back with the exact operation, generation, sequence and digest", "internal/generatedingress/gateway_rebind_durable_boundary.go", "GatewayRebindBoundaryProtectedTerminalReadback"},
+	{"s03-successor-ready", "commit", "immutable SQL successor_ready transition follows terminal publication and revalidated physical serving", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "appaccess.GatewayRebindSuccessorReady"},
+	{"s04-database-committed", "commit", "one SQL transaction records database_committed, current profile and grant transfers", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "appaccess.GatewayRebindDatabaseCommitted"},
+	{"s05-current-attestation", "commit", "selected-current physical attestation is bound to the exact terminal lineage before terminal SQL", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "GatewayRebindBoundaryCurrentAttestation"},
+	{"s06-terminal-sql", "commit", "terminal SQL transition retains the terminal receipt, immutable database event and current attestation", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "appaccess.GatewayRebindCommitted"},
+	{"s07-stable-final-census", "commit", "fresh SQL, protected history, selected current and runtime census remain stable", "internal/generatedingress/gateway_rebind_cross_store_recovery.go", "sameGatewayCurrentSelection"},
+	{"s08-fence-transition", "commit", "active claim is absent and CheckGatewayRebindFence is clear", "internal/generatedingress/gateway_rebind_cross_store_recovery.go", "CheckGatewayRebindFence"},
+	{"s09-effects-lease-release", "commit", "deployment-effects lease release completes successfully", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "releaseEffects()"},
+	{"s10-gateway-lock-release", "commit", "gateway OS lock release completes after the effects lease", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "releaseGateway()"},
+	{"s11-response-loss", "commit", "terminal response is intentionally dropped only after both releases", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "releaseGatewayRebindTerminalLocks"},
 }
 
 type gatewayRebindLiveScenario struct {
@@ -135,6 +137,36 @@ emergency-withdrawal-failure
 recovery-worker-isolation
 recovery-background-isolation
 `
+
+const gatewayRebindRequiredLostAcknowledgementScenarioIDs = `
+lost-network-create-ack
+lost-config-volume-create-ack
+lost-data-volume-create-ack
+lost-stage-container-create-ack
+lost-stage-config-copy-ack
+lost-stage-start-ack
+lost-final-config-copy-ack
+lost-final-container-create-ack
+lost-cutover-ack
+lost-successor-serving-ack
+`
+
+// gatewayRebindLiveLostAcknowledgementExpectedTerminalDispositions covers the
+// exact fixture cases where a completed Docker effect loses only its
+// coordinator acknowledgement and is adopted on restart. It has no fallback
+// for other scenarios.
+var gatewayRebindLiveLostAcknowledgementExpectedTerminalDispositions = map[string]string{
+	"lost-network-create-ack":         "commit",
+	"lost-config-volume-create-ack":   "commit",
+	"lost-data-volume-create-ack":     "commit",
+	"lost-stage-container-create-ack": "commit",
+	"lost-stage-config-copy-ack":      "commit",
+	"lost-stage-start-ack":            "commit",
+	"lost-final-config-copy-ack":      "commit",
+	"lost-final-container-create-ack": "commit",
+	"lost-cutover-ack":                "commit",
+	"lost-successor-serving-ack":      "commit",
+}
 
 var gatewayRebindLiveScenarios = []gatewayRebindLiveScenario{
 	{"lost-network-create-ack", "network exists with exact ownership although its Docker success was not returned", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "bindNetwork"},
@@ -182,9 +214,69 @@ func TestGatewayRebindLiveRequiredManifestIsClosed(t *testing.T) {
 			entry := gatewayRebindLiveScenarios[index]
 			return entry.ID, entry.Proof, entry.SourceFile, entry.Source
 		})
+	validateGatewayRebindLiveTerminalExpectations(t)
+}
+
+func validateGatewayRebindLiveTerminalExpectations(t *testing.T) {
+	t.Helper()
+	boundaryCounts := map[string]int{}
 	for _, entry := range gatewayRebindLiveBoundaries {
-		if entry.Direction != "rollback" && entry.Direction != "forward" {
-			t.Errorf("boundary %q has unknown direction %q", entry.ID, entry.Direction)
+		want := "commit"
+		if entry.ID == "r01-rollback-intent" || entry.ID == "r02-rollback-completed" {
+			want = "abort"
+		}
+		if entry.ExpectedTerminalDisposition != want {
+			t.Errorf("boundary %q terminal disposition=%q want=%q", entry.ID,
+				entry.ExpectedTerminalDisposition, want)
+		}
+		boundaryCounts[entry.ExpectedTerminalDisposition]++
+	}
+	if boundaryCounts["commit"] != 31 || boundaryCounts["abort"] != 2 ||
+		len(boundaryCounts) != 2 {
+		t.Errorf("boundary terminal disposition counts=%v want commit=31 abort=2", boundaryCounts)
+	}
+
+	scenarios := make(map[string]struct{}, len(gatewayRebindLiveScenarios))
+	for _, entry := range gatewayRebindLiveScenarios {
+		scenarios[entry.ID] = struct{}{}
+	}
+	wantLoss := map[string]string{
+		"lost-network-create-ack":         "commit",
+		"lost-config-volume-create-ack":   "commit",
+		"lost-data-volume-create-ack":     "commit",
+		"lost-stage-container-create-ack": "commit",
+		"lost-stage-config-copy-ack":      "commit",
+		"lost-stage-start-ack":            "commit",
+		"lost-final-config-copy-ack":      "commit",
+		"lost-final-container-create-ack": "commit",
+		"lost-cutover-ack":                "commit",
+		"lost-successor-serving-ack":      "commit",
+	}
+	lossIDs := strings.Fields(gatewayRebindRequiredLostAcknowledgementScenarioIDs)
+	if len(lossIDs) != 10 || len(gatewayRebindLiveLostAcknowledgementExpectedTerminalDispositions) != len(lossIDs) {
+		t.Errorf("lost acknowledgement terminal map size=%d ids=%d want=10",
+			len(gatewayRebindLiveLostAcknowledgementExpectedTerminalDispositions), len(lossIDs))
+	}
+	lossSet := make(map[string]struct{}, len(lossIDs))
+	for _, id := range lossIDs {
+		if _, duplicate := lossSet[id]; duplicate {
+			t.Errorf("lost acknowledgement scenario %q is duplicated", id)
+		}
+		lossSet[id] = struct{}{}
+		if _, found := scenarios[id]; !found {
+			t.Errorf("lost acknowledgement scenario %q is absent from the closed scenario manifest", id)
+		}
+		got, found := gatewayRebindLiveLostAcknowledgementExpectedTerminalDispositions[id]
+		if !found || got != wantLoss[id] {
+			t.Errorf("lost acknowledgement scenario %q terminal disposition=%q want=%q", id, got, wantLoss[id])
+		}
+	}
+	for id, got := range gatewayRebindLiveLostAcknowledgementExpectedTerminalDispositions {
+		if _, expected := lossSet[id]; !expected {
+			t.Errorf("unexpected lost acknowledgement terminal disposition for %q=%q", id, got)
+		}
+		if got != "commit" && got != "abort" {
+			t.Errorf("lost acknowledgement scenario %q has invalid terminal disposition %q", id, got)
 		}
 	}
 }

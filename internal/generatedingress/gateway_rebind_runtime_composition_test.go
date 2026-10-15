@@ -142,17 +142,19 @@ func (d *gatewayRebindCompositionDriver) install(m *Manager) {
 	r := d.runner
 	m.runner = r
 	rebind, current := newGatewayRebindRuntimeDrivers(m)
-	handover := rebind.handover.(gatewayRebindTypedHandoverRuntime)
-	handover.stage.reads = gatewayRebindTypedHandoverRuntimeReads(d.t, r.intent, r.stage.networkID,
-		func() bool { return r.networkPresent })
-	handover.stage.reads.network.docker = func(context.Context) ([]netip.Prefix, error) {
-		_, prefixes := r.networkInventory()
-		return prefixes, nil
+	if r.stage != nil {
+		handover := rebind.handover.(gatewayRebindTypedHandoverRuntime)
+		handover.stage.reads = gatewayRebindTypedHandoverRuntimeReads(d.t, r.intent, r.stage.networkID,
+			func() bool { return r.networkPresent })
+		handover.stage.reads.network.docker = func(context.Context) ([]netip.Prefix, error) {
+			_, prefixes := r.networkInventory()
+			return prefixes, nil
+		}
+		handover.stage.reads.dockerIDs = func(context.Context) ([]string, error) { ids, _ := r.networkInventory(); return ids, nil }
+		handover.hostProbe, handover.containerProbe, handover.listenerAbsent = r.hostProbe, r.containerProbe, r.listenerAbsent
+		handover.stage.hostProbe, handover.stage.containerProbe = r.hostProbe, r.containerProbe
+		rebind.stage, rebind.handover = handover.stage, handover
 	}
-	handover.stage.reads.dockerIDs = func(context.Context) ([]string, error) { ids, _ := r.networkInventory(); return ids, nil }
-	handover.hostProbe, handover.containerProbe, handover.listenerAbsent = r.hostProbe, r.containerProbe, r.listenerAbsent
-	handover.stage.hostProbe, handover.stage.containerProbe = r.hostProbe, r.containerProbe
-	rebind.stage, rebind.handover = handover.stage, handover
 	d.managerGatewayRebindCrossStoreDriver = rebind
 	managed := current.(managedGatewayCurrentPhysicalDriver)
 	physical := managed.runtime.(managerGatewayCurrentPhysicalRuntime)
@@ -420,8 +422,6 @@ func (r *gatewayRebindCompositionRunner) Run(ctx context.Context, request runtim
 		strings.Contains(args[len(args)-1], "127.0.0.1:2019/config/") {
 		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), r.stage.stageBody...)}, nil
 	}
-	// The retained handover simulator needs the reserved stage ID even before
-	// that binding has been persisted. Its presence flags still govern all reads.
 	if r.effect.StageContainer == nil {
 		return r.readBeforeStageBinding(args)
 	}
