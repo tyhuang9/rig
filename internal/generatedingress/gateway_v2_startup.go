@@ -52,38 +52,53 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 ) {
 	claimSet, err := validateGatewayV2StartupClaims(claims)
 	if m == nil || ctx == nil || err != nil {
-		return GatewayV2StartupInspection{}, &Error{Code: DiagnosticValidationFailed}
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticErrorWithCode(
+			DiagnosticValidationFailed, gatewayStartupDiagnosticCheckpointUpgradeClaimsValidation)
 	}
 	release, err := m.lockGateway(ctx)
 	if err != nil {
-		return GatewayV2StartupInspection{}, err
+		return GatewayV2StartupInspection{}, gatewayStartupDiagnosticErrorWithCheckpoint(
+			err, gatewayStartupDiagnosticCheckpointUpgradeGatewayLock)
 	}
 	defer func() {
 		if err := release(); err != nil {
 			inspection = GatewayV2StartupInspection{}
-			resultErr = &Error{Code: DiagnosticRouteUnresolved}
+			resultErr = newGatewayStartupDiagnosticErrorWithCode(
+				DiagnosticRouteUnresolved, gatewayStartupDiagnosticCheckpointUpgradeGatewayUnlock)
 		}
 	}()
 
-	current, currentSQL, currentPresent, err := m.readOptionalGatewayCurrentSelectionLocked(ctx)
+	current, currentSQL, currentPresent, currentCheckpoint, err :=
+		m.readOptionalGatewayCurrentSelectionDiagnosticLocked(ctx)
 	if err != nil || currentSQL.Active != nil || currentSQL.Phase != "" || currentSQL.DatabaseCommittedEvent != nil ||
 		currentSQL.DatabaseCommitObserved || currentSQL.RollbackAllowed {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		if !currentCheckpoint.valid() {
+			currentCheckpoint = gatewayStartupDiagnosticCheckpointCurrentSelectionPrecondition
+		}
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(ctx, currentCheckpoint)
 	}
 	if currentPresent && current.Kind == gatewayCurrentSelectionRebind {
-		return m.inspectGatewayRebindCurrentStartupLocked(ctx, claimSet, current, currentSQL)
+		currentInspection, currentErr := m.inspectGatewayRebindCurrentStartupLocked(ctx, claimSet, current, currentSQL)
+		if currentErr != nil {
+			return GatewayV2StartupInspection{}, gatewayStartupDiagnosticErrorWithCheckpoint(
+				currentErr, gatewayStartupDiagnosticCheckpointUpgradeCurrentBinding)
+		}
+		return currentInspection, nil
 	}
 	history, err := m.scanGatewayUpgradeHistoryLockedMode(true, claimSet.activeID)
 	if err != nil {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeHistory)
 	}
 	source, err := m.store.load()
 	if err != nil {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeSourceState)
 	}
 	if currentPresent && (current.Kind != gatewayCurrentSelectionUpgrade || current.Upgrade == nil ||
 		current.UpgradeSource == nil || !reflect.DeepEqual(*current.UpgradeSource, source)) {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeCurrentBinding)
 	}
 
 	matched := make(map[string]struct{}, len(history.generations))
@@ -96,11 +111,13 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 		selection := history.generations[index]
 		if currentPresent && selection.operationID == current.Lineage.OperationID &&
 			!sameObservedGatewayV2Selection(selection, *current.Upgrade) {
-			return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+			return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+				ctx, gatewayStartupDiagnosticCheckpointUpgradeClaimHistoryBinding)
 		}
 		claim, ok := claimSet.byOperation[selection.operationID]
 		if !ok || !gatewayV2StartupClaimMatchesSelection(claim, selection, m.options.HostPort) {
-			return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+			return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+				ctx, gatewayStartupDiagnosticCheckpointUpgradeClaimHistoryBinding)
 		}
 		matched[selection.operationID] = struct{}{}
 
@@ -113,7 +130,8 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 				appaccess.GatewayProfileUpgradeUnresolved:
 				recoveryOperationID = claim.Request.OperationID
 			default:
-				return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+				return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+					ctx, gatewayStartupDiagnosticCheckpointUpgradeClaimHistoryBinding)
 			}
 		case selection.Existing && !selection.Aborted && selection.Journal.Phase == gatewayPhaseCommitted:
 			allHistoryTerminal = false
@@ -135,12 +153,14 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 				appaccess.GatewayProfileUpgradeUnresolved:
 				recoveryOperationID = claim.Request.OperationID
 			default:
-				return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+				return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+					ctx, gatewayStartupDiagnosticCheckpointUpgradeClaimHistoryBinding)
 			}
 		default:
 			allHistoryTerminal = false
 			if !gatewayV2StartupClaimIsNonterminal(claim.State) {
-				return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+				return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+					ctx, gatewayStartupDiagnosticCheckpointUpgradeClaimHistoryBinding)
 			}
 			recoveryOperationID = claim.Request.OperationID
 		}
@@ -154,7 +174,8 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 		if noArtifactClaim != nil || !allHistoryTerminal ||
 			(claim.State != appaccess.GatewayProfileUpgradePrepared &&
 				claim.State != appaccess.GatewayProfileUpgradeUnresolved) {
-			return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+			return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+				ctx, gatewayStartupDiagnosticCheckpointUpgradeClaimHistoryBinding)
 		}
 		copy := claim
 		noArtifactClaim = &copy
@@ -164,10 +185,12 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 	proofCtx, cancel := context.WithTimeout(ctx, v2ObservationTimeout)
 	defer cancel()
 	if pendingCommitted != nil && !m.proveGatewayV2StartupPending(proofCtx, source, *pendingCommitted) {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradePendingProof)
 	}
 	if lanRecoveryCommitted != nil && !m.proveGatewayV2StartupLANRecovery(proofCtx, *lanRecoveryCommitted) {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeLANBatchProof)
 	}
 	switch {
 	case committed != nil && recoveryOperationID == "":
@@ -177,8 +200,8 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 				OperationID: committed.operationID,
 			}
 		} else {
-			if !m.proveGatewayV2StartupCommitted(proofCtx, source, *committed) {
-				return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+			if checkpoint := m.proveGatewayV2StartupCommitted(proofCtx, source, *committed); checkpoint.valid() {
+				return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(ctx, checkpoint)
 			}
 			inspection = GatewayV2StartupInspection{
 				Disposition: GatewayV2StartupNormalV2,
@@ -189,11 +212,13 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 		for _, selection := range history.generations {
 			claim := claimSet.byOperation[selection.operationID]
 			if !m.proveGatewayV2StartupTerminalReceipt(proofCtx, source, selection, claim) {
-				return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+				return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+					ctx, gatewayStartupDiagnosticCheckpointUpgradeTerminalReceiptProof)
 			}
 		}
 		if noArtifactClaim != nil && !m.proveGatewayV2StartupNoArtifacts(proofCtx, source, *noArtifactClaim) {
-			return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+			return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+				ctx, gatewayStartupDiagnosticCheckpointUpgradeNoArtifactProof)
 		}
 		if recoveryOperationID != "" {
 			inspection = GatewayV2StartupInspection{
@@ -205,7 +230,8 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 		}
 	default:
 		if recoveryOperationID == "" {
-			return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+			return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+				ctx, gatewayStartupDiagnosticCheckpointUpgradeDisposition)
 		}
 		inspection = GatewayV2StartupInspection{
 			Disposition: GatewayV2StartupRecoveryOnly,
@@ -215,20 +241,27 @@ func (m *Manager) InspectGatewayV2Startup(ctx context.Context, claims []GatewayV
 
 	confirmedSource, err := m.store.load()
 	if err != nil || !reflect.DeepEqual(source, confirmedSource) || ctx.Err() != nil {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeSourceStability)
 	}
 	confirmedHistory, err := m.scanGatewayUpgradeHistoryLockedMode(true, claimSet.activeID)
 	if err != nil || !sameGatewayV2StartupHistory(history, confirmedHistory) {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeHistoryStability)
 	}
 	if currentPresent && (inspection.Disposition == GatewayV2StartupNormalV1 ||
 		inspection.OperationID != current.Lineage.OperationID) {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(
+			ctx, gatewayStartupDiagnosticCheckpointUpgradeCurrentStability)
 	}
-	confirmedCurrent, confirmedSQL, confirmedPresent, err := m.readOptionalGatewayCurrentSelectionLocked(ctx)
+	confirmedCurrent, confirmedSQL, confirmedPresent, confirmedCheckpoint, err :=
+		m.readOptionalGatewayCurrentSelectionDiagnosticLocked(ctx)
 	if err != nil || currentPresent != confirmedPresent || !reflect.DeepEqual(currentSQL, confirmedSQL) ||
 		!sameGatewayCurrentSelection(current, confirmedCurrent) || !reflect.DeepEqual(current.UpgradeSource, confirmedCurrent.UpgradeSource) {
-		return GatewayV2StartupInspection{}, gatewayV2StartupInspectionError(ctx)
+		if !confirmedCheckpoint.valid() {
+			confirmedCheckpoint = gatewayStartupDiagnosticCheckpointUpgradeCurrentStability
+		}
+		return GatewayV2StartupInspection{}, newGatewayStartupDiagnosticError(ctx, confirmedCheckpoint)
 	}
 	return inspection, nil
 }
@@ -397,18 +430,25 @@ func (m *Manager) proveGatewayV2StartupTerminalReceipt(ctx context.Context, sour
 
 func (m *Manager) proveGatewayV2StartupCommitted(ctx context.Context, source routeState,
 	selection gatewayUpgradeGenerationSelection,
-) bool {
+) gatewayStartupDiagnosticCheckpoint {
 	if selection.Store == nil || !selection.Existing || selection.Aborted ||
 		selection.Journal.Phase != gatewayPhaseCommitted {
-		return false
+		return gatewayStartupDiagnosticCheckpointUpgradeCommittedTopology
 	}
 	driver := m.gatewayV2TransferDriver
 	if driver == nil {
 		driver = managerGatewayV2TransferDriver{manager: m}
 	}
-	return driver.observeTopology(ctx, source, selection.State, selection.Journal) == gatewayTopologyExactFinalV2 &&
-		driver.proveFinalHostRoutes(ctx, selection.State, selection.Journal) &&
-		driver.selectedInterfacePreflight(selection.State.Profile) == nil
+	if driver.observeTopology(ctx, source, selection.State, selection.Journal) != gatewayTopologyExactFinalV2 {
+		return gatewayStartupDiagnosticCheckpointUpgradeCommittedTopology
+	}
+	if !driver.proveFinalHostRoutes(ctx, selection.State, selection.Journal) {
+		return gatewayStartupDiagnosticCheckpointUpgradeCommittedHostRoutes
+	}
+	if driver.selectedInterfacePreflight(selection.State.Profile) != nil {
+		return gatewayStartupDiagnosticCheckpointUpgradeCommittedSelectedInterface
+	}
+	return gatewayStartupDiagnosticCheckpointUnknown
 }
 
 // A durable LAN recovery batch is itself a startup fence. Inspection proves

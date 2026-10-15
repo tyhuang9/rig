@@ -114,7 +114,8 @@ func TestGatewayV2LANAccessStartupRejectsDuplicateAndForgedQueueIdentities(t *te
 		claim := gatewayV2LANStartupClaim(request, appaccess.AppAccessGrantPrepared, 1)
 		inspection, err := manager.InspectGatewayV2LANAccessStartup(context.Background(),
 			[]GatewayV2LANStartupClaim{claim, claim}, nil)
-		if !IsCode(err, DiagnosticValidationFailed) || !reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) {
+		if !IsCode(err, DiagnosticValidationFailed) || !reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) ||
+			GatewayStartupDiagnosticCheckpoint(err) != "lan_claims_validation" {
 			t.Fatalf("inspection=%#v err=%v", inspection, err)
 		}
 	})
@@ -129,7 +130,8 @@ func TestGatewayV2LANAccessStartupRejectsDuplicateAndForgedQueueIdentities(t *te
 			[]GatewayV2LANStartupClaim{grant}, []GatewayV2LANDisableStartupClaim{{
 				Request: disable, State: appaccess.AppAccessDisablePrepared, StateSequence: 1,
 			}})
-		if !IsCode(err, DiagnosticValidationFailed) || !reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) {
+		if !IsCode(err, DiagnosticValidationFailed) || !reflect.DeepEqual(inspection, GatewayV2LANAccessStartupInspection{}) ||
+			GatewayStartupDiagnosticCheckpoint(err) != "lan_claims_validation" {
 			t.Fatalf("inspection=%#v err=%v", inspection, err)
 		}
 	})

@@ -846,12 +846,16 @@ func liveHostdRebindStartupDiagnosticCode(stderr string) string {
 			continue
 		}
 		var record struct {
-			Message string `json:"msg"`
+			Message           string          `json:"msg"`
+			StartupCheckpoint json.RawMessage `json:"startup_checkpoint"`
 		}
 		if json.Unmarshal(line, &record) != nil {
 			continue
 		}
 		code, isPrimary, ok := liveHostdRebindKnownStartupMessage(record.Message)
+		if ok && record.Message == "gateway startup inspection failed" {
+			code = liveHostdRebindGatewayStartupDiagnosticCode(record.StartupCheckpoint)
+		}
 		if !ok {
 			continue
 		}
@@ -863,6 +867,22 @@ func liveHostdRebindStartupDiagnosticCode(stderr string) string {
 		}
 	}
 	return secondary
+}
+
+// liveHostdRebindGatewayStartupDiagnosticCode accepts the checkpoint only on
+// the exact main-gate message and only through the production closed mapping.
+// It deliberately does not examine the child error field or infer a value
+// from checkpoint syntax.
+func liveHostdRebindGatewayStartupDiagnosticCode(raw json.RawMessage) string {
+	var value string
+	if len(raw) == 0 || json.Unmarshal(raw, &value) != nil {
+		return "gateway_inspection"
+	}
+	checkpoint, ok := gatewayStartupDiagnosticCheckpointFromString(value)
+	if !ok {
+		return "gateway_inspection"
+	}
+	return string(checkpoint)
 }
 
 // liveHostdRebindKnownStartupMessage is intentionally a closed mapping of

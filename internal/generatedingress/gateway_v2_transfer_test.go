@@ -394,6 +394,7 @@ type fakeGatewayV2TransferDriver struct {
 	v1ServingAtFinalCreate  bool
 	failAt                  string
 	failed                  bool
+	failFinalHostRoutes     bool
 	failSelectedPreflightAt int
 
 	selectedPreflightCalls int
@@ -470,7 +471,7 @@ func (d *fakeGatewayV2TransferDriver) observeRecovery(_ context.Context, _ route
 func (d *fakeGatewayV2TransferDriver) proveFinalHostRoutes(context.Context, gatewayV2RouteState, gatewayMigrationJournal) bool {
 	d.checkLocked()
 	d.events = append(d.events, "prove_final_host_routes")
-	return !d.v1Running && d.finalExists && d.finalRunning && len(d.finalConfig) != 0
+	return !d.failFinalHostRoutes && !d.v1Running && d.finalExists && d.finalRunning && len(d.finalConfig) != 0
 }
 
 func (d *fakeGatewayV2TransferDriver) selectedInterfacePreflight(gatewayProfileBinding) error {

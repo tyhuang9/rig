@@ -39,6 +39,7 @@ type Error struct {
 	Code                         DiagnosticCode
 	candidateMayBeLive           bool
 	currentAttestationCheckpoint gatewayCurrentAttestationCheckpoint
+	startupCheckpoint            gatewayStartupDiagnosticCheckpoint
 }
 
 func (e *Error) Error() string { return "generated ingress: " + string(e.Code) }

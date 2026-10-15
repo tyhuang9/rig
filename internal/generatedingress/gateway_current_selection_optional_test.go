@@ -63,6 +63,33 @@ func TestOptionalGatewayCurrentSelectionUsesRealNativeAuthority(t *testing.T) {
 	}
 }
 
+func TestOptionalGatewayCurrentSelectionDiagnosticRejectsProtectedSelectionMismatch(t *testing.T) {
+	f := newGatewayRebindPredecessorFixtureWithClaim(t, false)
+	ctx := context.Background()
+	snapshot, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
+	if err != nil || snapshot.CurrentSource == nil {
+		t.Fatalf("missing fixture current source: %v", err)
+	}
+	source := *snapshot.CurrentSource
+	source.OperationID = "41414141-4141-4141-8141-414141414141"
+	snapshot.CurrentSource = &source
+	f.manager.options.RebindCurrentStateRepository = gatewayCurrentSelectionRepositoryFunc(
+		func(context.Context) (appaccess.GatewayRebindRecoverySnapshot, error) { return snapshot, nil })
+	release, err := f.manager.lockGatewayRaw(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, present, checkpoint, selectErr := f.manager.readOptionalGatewayCurrentSelectionDiagnosticLocked(ctx)
+	if releaseErr := release(); releaseErr != nil {
+		t.Fatal(releaseErr)
+	}
+	if selectErr == nil || present || checkpoint != gatewayStartupDiagnosticCheckpointCurrentProtectedSelection ||
+		selectErr.Error() != "generated ingress optional current gateway selection is unresolved" {
+		t.Fatalf("protected selection mismatch accepted: present=%t checkpoint=%q err=%v",
+			present, checkpoint.String(), selectErr)
+	}
+}
+
 func TestOptionalGatewayCurrentSelectionRequiresCompleteAbsence(t *testing.T) {
 	profile := appaccess.GatewayProfileRevision{ID: "41414141-4141-4141-8141-414141414141", RevisionNumber: 1,
 		Spec: appaccess.GatewayProfileSpec{SelectedIPv4: "192.168.40.5", InterfaceID: "test-lan", PortStart: 8100, PortEnd: 8119}}
@@ -118,8 +145,20 @@ func TestOptionalGatewayCurrentSelectionRequiresCompleteAbsence(t *testing.T) {
 }
 
 func TestOptionalGatewayCurrentSelectionRejectsChangesAndOrphans(t *testing.T) {
-	for _, failure := range []string{"first SQL error", "second SQL error", "second SQL change", "second cancellation", "orphan", "created directory", "replaced directory"} {
-		t.Run(failure, func(t *testing.T) {
+	for _, test := range []struct {
+		failure string
+		want    gatewayStartupDiagnosticCheckpoint
+	}{
+		{failure: "first SQL error", want: gatewayStartupDiagnosticCheckpointCurrentSQLFirstRead},
+		{failure: "second SQL error", want: gatewayStartupDiagnosticCheckpointCurrentSQLStability},
+		{failure: "second SQL change", want: gatewayStartupDiagnosticCheckpointCurrentSQLStability},
+		{failure: "second cancellation", want: gatewayStartupDiagnosticCheckpointCurrentProtectedStability},
+		{failure: "orphan", want: gatewayStartupDiagnosticCheckpointCurrentAbsenceProtectedPresence},
+		{failure: "created directory", want: gatewayStartupDiagnosticCheckpointCurrentProtectedStability},
+		{failure: "replaced directory", want: gatewayStartupDiagnosticCheckpointCurrentProtectedStability},
+	} {
+		t.Run(test.failure, func(t *testing.T) {
+			failure := test.failure
 			root := t.TempDir()
 			protected := filepath.Join(root, "runtime", "generated-ingress")
 			if failure == "replaced directory" || failure == "orphan" {
@@ -162,10 +201,24 @@ func TestOptionalGatewayCurrentSelectionRejectsChangesAndOrphans(t *testing.T) {
 				return value, nil
 			})
 			m := &Manager{options: Options{DataRoot: root, RebindCurrentStateRepository: repository}}
-			if _, _, _, err := m.readOptionalGatewayCurrentSelectionLocked(ctx); err == nil {
+			if _, _, _, checkpoint, err := m.readOptionalGatewayCurrentSelectionDiagnosticLocked(ctx); err == nil ||
+				checkpoint != test.want || err.Error() != "generated ingress optional current gateway selection is unresolved" {
 				t.Fatal("unstable or orphan history was treated as absence")
 			}
 		})
+	}
+}
+
+func TestOptionalGatewayCurrentSelectionDiagnosticPreservesSharedErrorContract(t *testing.T) {
+	var manager *Manager
+	_, _, _, sharedErr := manager.readOptionalGatewayCurrentSelectionLocked(context.Background())
+	_, _, _, checkpoint, diagnosticErr := manager.readOptionalGatewayCurrentSelectionDiagnosticLocked(context.Background())
+	if sharedErr == nil || diagnosticErr == nil || sharedErr.Error() != diagnosticErr.Error() ||
+		sharedErr.Error() != "generated ingress optional current gateway selection is unresolved" ||
+		errors.Unwrap(sharedErr) != nil || errors.Unwrap(diagnosticErr) != nil ||
+		checkpoint != gatewayStartupDiagnosticCheckpointCurrentSelectionPrecondition {
+		t.Fatalf("shared optional-selection error contract changed: shared=%v diagnostic=%v checkpoint=%q",
+			sharedErr, diagnosticErr, checkpoint.String())
 	}
 }
 

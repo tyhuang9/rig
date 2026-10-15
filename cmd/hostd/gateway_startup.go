@@ -91,53 +91,62 @@ func inspectGatewayStartupUsingIngressWithRunner(ctx context.Context, cfg config
 	ingress *generatedingress.Manager, runner runtimeprocess.CommandRunner,
 ) (gatewayStartup, error) {
 	if fenceCheck == nil {
-		return gatewayStartup{}, errors.New("gateway rebind fence check is required")
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticOrdinaryFence,
+			errors.New("gateway rebind fence check is required"))
 	}
 	if err := fenceCheck(ctx); err != nil {
-		return gatewayStartup{}, fmt.Errorf("inspect gateway rebind fence: %w", err)
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticOrdinaryFence,
+			fmt.Errorf("inspect gateway rebind fence: %w", err))
 	}
 	repository := appaccess.New(db)
 	snapshot, err := repository.HostingGatewayStartupSnapshot(ctx)
 	if err != nil {
-		return gatewayStartup{}, fmt.Errorf("read hosting gateway startup snapshot: %w", err)
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticStartupSnapshot,
+			fmt.Errorf("read hosting gateway startup snapshot: %w", err))
 	}
 	if !cfg.GeneratedRuntime {
 		history, err := hasProtectedGatewayUpgradeHistory(cfg.DataRoot)
 		if err != nil {
-			return gatewayStartup{}, fmt.Errorf("inspect protected gateway history: %w", err)
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticDisabledRuntimeHistory,
+				fmt.Errorf("inspect protected gateway history: %w", err))
 		}
 		if len(snapshot.Upgrades.Claims) != 0 || len(snapshot.Grants.Claims) != 0 || len(snapshot.Disables.Claims) != 0 || history {
-			return gatewayStartup{}, errors.New("generated runtime is required to reconcile existing gateway and LAN grant history")
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticDisabledRuntimeHistory,
+				errors.New("generated runtime is required to reconcile existing gateway and LAN grant history"))
 		}
 		return gatewayStartup{snapshot: snapshot}, nil
 	}
 	if ingress == nil {
 		ingress, err = newGatewayStartupIngressWithRunner(cfg, dockerExecutable, directories, fenceCheck, repository, runner)
 		if err != nil {
-			return gatewayStartup{}, err
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticStartupManager, err)
 		}
 	}
 	inspection, err := ingress.InspectGatewayV2Startup(ctx, gatewayStartupClaims(snapshot.Upgrades))
 	if err != nil {
-		return gatewayStartup{}, fmt.Errorf("inspect gateway upgrade startup: %w", err)
+		return gatewayStartup{}, gatewayStartupDiagnosticWrapIngress(gatewayStartupDiagnosticUpgradeInspection,
+			fmt.Errorf("inspect gateway upgrade startup: %w", err), err)
 	}
 	if inspection.CurrentGatewaySource.Kind != "" {
 		confirmed, readErr := repository.HostingGatewayStartupSnapshot(ctx)
 		if readErr != nil || !reflect.DeepEqual(snapshot, confirmed) || !committedGatewayStartupInspection(confirmed, inspection) {
-			return gatewayStartup{}, errors.New("current gateway authority changed during startup inspection")
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticCurrentAuthoritySnapshotRecheck,
+				errors.New("current gateway authority changed during startup inspection"))
 		}
 	}
 	result := gatewayStartup{ingress: ingress, snapshot: snapshot, inspection: inspection}
 	if inspection.Disposition == generatedingress.GatewayV2StartupNormalV1 {
 		if len(snapshot.Grants.Claims) != 0 || len(snapshot.Disables.Claims) != 0 {
-			return gatewayStartup{}, errors.New("LAN grant history exists without a committed v2 gateway")
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticV1WithLANHistory,
+				errors.New("LAN grant history exists without a committed v2 gateway"))
 		}
 		return result, nil
 	}
 	if inspection.Disposition == generatedingress.GatewayV2StartupRecoveryOnly &&
 		!committedGatewayStartupInspection(snapshot, inspection) {
 		if len(snapshot.Grants.Claims) != 0 || len(snapshot.Disables.Claims) != 0 {
-			return gatewayStartup{}, errors.New("LAN grant history exists while gateway upgrade requires recovery")
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticUpgradeRecoveryWithLANHistory,
+				errors.New("LAN grant history exists while gateway upgrade requires recovery"))
 		}
 		result.recoveryKind = controller.RecoveryGatewayUpgrade
 		result.recoveryID = inspection.OperationID
@@ -145,11 +154,13 @@ func inspectGatewayStartupUsingIngressWithRunner(ctx context.Context, cfg config
 	}
 	if inspection.Disposition != generatedingress.GatewayV2StartupNormalV2 &&
 		inspection.Disposition != generatedingress.GatewayV2StartupRecoveryOnly {
-		return gatewayStartup{}, errors.New("unknown gateway startup disposition")
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticStartupDisposition,
+			errors.New("unknown gateway startup disposition"))
 	}
 	batchPresent, err := ingress.HasGatewayV2LANRecoveryBatch(ctx)
 	if err != nil {
-		return gatewayStartup{}, fmt.Errorf("inspect protected LAN recovery batch: %w", err)
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticLANRecoveryBatchPresence,
+			fmt.Errorf("inspect protected LAN recovery batch: %w", err))
 	}
 	if batchPresent {
 		result.recoveryBatch = true
@@ -157,19 +168,21 @@ func inspectGatewayStartupUsingIngressWithRunner(ctx context.Context, cfg config
 	}
 	snapshot, err = attestHistoricalLANDisableSuccessors(ctx, repository, ingress, snapshot)
 	if err != nil {
-		return gatewayStartup{}, fmt.Errorf("attest historical LAN disable successor: %w", err)
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticHistoricalDisableSuccessor,
+			fmt.Errorf("attest historical LAN disable successor: %w", err))
 	}
 	result.snapshot = snapshot
 	accessInspection, err := ingress.InspectGatewayV2LANAccessStartup(ctx,
 		lanGrantStartupClaims(snapshot.Grants), lanDisableStartupClaims(snapshot.Disables))
 	if err != nil {
-		return gatewayStartup{}, fmt.Errorf("inspect LAN access startup: %w", err)
+		return gatewayStartup{}, gatewayStartupDiagnosticWrapIngress(gatewayStartupDiagnosticLANAccessInspection,
+			fmt.Errorf("inspect LAN access startup: %w", err), err)
 	}
 	result.accessInspection = accessInspection
 	result.recoveryKind, result.recoveryID, result.recoveryAppID, result.recoveryBatch, err =
 		selectLANAccessStartupRecovery(snapshot, inspection, accessInspection)
 	if err != nil {
-		return gatewayStartup{}, err
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticLANRecoverySelection, err)
 	}
 	return result, nil
 }

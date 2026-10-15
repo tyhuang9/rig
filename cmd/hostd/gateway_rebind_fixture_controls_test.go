@@ -12,6 +12,8 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	const secret = "token=do-not-disclose"
 	knownRuntime := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"runtime composition failed","error":"` + secret + `"}`
 	knownGateway := `{"msg":"gateway startup inspection failed","error":"/private/path ` + secret + `"}`
+	knownGatewayCheckpoint := `{"msg":"gateway startup inspection failed","startup_checkpoint":"upgrade_gateway_lock","error":"/private/path ` + secret + `"}`
+	unknownGatewayCheckpoint := `{"msg":"gateway startup inspection failed","startup_checkpoint":"forged-checkpoint","error":"/private/path ` + secret + `"}`
 	secondary := `{"msg":"owned gateway emergency stop could not be verified","error":"` + secret + `"}`
 	cases := []struct {
 		name      string
@@ -21,8 +23,19 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	}{
 		{name: "known exact message", stderr: knownRuntime, wantCode: "runtime_composition"},
 		{name: "primary precedes emergency stop", stderr: knownGateway + "\n" + secondary, wantCode: "gateway_inspection"},
+		{name: "known gateway checkpoint", stderr: knownGatewayCheckpoint, wantCode: "upgrade_gateway_lock"},
+		{name: "unknown gateway checkpoint keeps broad code", stderr: unknownGatewayCheckpoint, wantCode: "gateway_inspection"},
+		{name: "numeric gateway checkpoint keeps broad code", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":42,"error":"/private/path ` + secret + `"}`, wantCode: "gateway_inspection"},
+		{name: "object gateway checkpoint keeps broad code", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":{"value":"upgrade_gateway_lock"},"error":"/private/path ` + secret + `"}`, wantCode: "gateway_inspection"},
+		{name: "array gateway checkpoint keeps broad code", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":["upgrade_gateway_lock"],"error":"/private/path ` + secret + `"}`, wantCode: "gateway_inspection"},
+		{name: "boolean gateway checkpoint keeps broad code", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":true,"error":"/private/path ` + secret + `"}`, wantCode: "gateway_inspection"},
+		{name: "null gateway checkpoint keeps broad code", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":null,"error":"/private/path ` + secret + `"}`, wantCode: "gateway_inspection"},
+		{name: "malformed gateway checkpoint retains first primary", stderr: `{"msg":"gateway startup inspection failed","startup_checkpoint":42,"error":"/private/path ` + secret + `"}` + "\n" + knownRuntime, wantCode: "gateway_inspection"},
+		{name: "gateway checkpoint retains first primary", stderr: knownGatewayCheckpoint + "\n" + knownRuntime, wantCode: "upgrade_gateway_lock"},
 		{name: "primary follows emergency stop", stderr: secondary + "\n" + knownRuntime, wantCode: "runtime_composition"},
 		{name: "first primary is retained", stderr: knownGateway + "\n" + knownRuntime, wantCode: "gateway_inspection"},
+		{name: "checkpoint is ignored for another message", stderr: `{"msg":"runtime composition failed","startup_checkpoint":"upgrade_gateway_lock","error":"` + secret + `"}`, wantCode: "runtime_composition"},
+		{name: "raw error cannot manufacture checkpoint", stderr: `{"msg":"gateway startup inspection failed","error":"upgrade_gateway_lock ` + secret + `"}`, wantCode: "gateway_inspection"},
 		{name: "unknown message", stderr: `{"msg":"custom startup failed ` + secret + `","error":"` + secret + `"}`},
 		{name: "injected known message", stderr: `{"msg":"runtime composition failed; ` + secret + `","error":"` + secret + `"}`},
 		{name: "malformed JSON", stderr: `{"msg":"runtime composition failed","error":"` + secret},
@@ -64,6 +77,23 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		})
 	}
 
+}
+
+func TestLiveHostdRebindClosedDiagnosticCheckpointRoster(t *testing.T) {
+	const secret = "token=do-not-disclose"
+	for _, checkpoint := range gatewayStartupDiagnosticExpectedCheckpoints {
+		t.Run(string(checkpoint), func(t *testing.T) {
+			stderr := `{"msg":"gateway startup inspection failed","startup_checkpoint":"` + string(checkpoint) +
+				`","error":"/private/path ` + secret + `"}`
+			got := liveHostdRebindClosedDiagnostic(stderr)
+			if !strings.HasPrefix(got, "sha256:") || strings.Contains(got, secret) || strings.Contains(got, "/private/path") {
+				t.Fatalf("closed diagnostic exposed untrusted stderr: %q", got)
+			}
+			if want := " startup=" + string(checkpoint); !strings.HasSuffix(got, want) {
+				t.Fatalf("closed diagnostic=%q want code %q", got, checkpoint)
+			}
+		})
+	}
 }
 
 func TestLiveHostdRebindLegacyV1OwnershipControls(t *testing.T) {

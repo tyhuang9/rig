@@ -2,7 +2,9 @@
 
 Status: diagnostic and cleanup repair candidate; M3 remains incomplete.
 This branch starts from PR #160 at
-`950944edc9e028ce407060e4e726521876ae1c14`. It changes test infrastructure only.
+`950944edc9e028ce407060e4e726521876ae1c14`. Its initial revision changes test
+infrastructure. The follow-up adds closed diagnostic metadata to production
+startup inspection while preserving its admission decisions.
 
 ## Observed hosted failure
 
@@ -26,11 +28,33 @@ The immutable log, job/run metadata and parsed failures are retained under
 wrapper. PR #160 records the failed result alongside its separately scoped
 successful jobs.
 
+### First-boundary diagnostic at `12ccd60`
+
+The [first-boundary diagnostic job](https://github.com/tyhuang9/rig/actions/runs/38702499754/job/116313833550)
+completed with failure on 2026-10-15 at 08:36:58 UTC. Its prerequisite controls
+passed. The single live `boundary/a0-sql-claim` child failed before initial daemon
+assembly with `startup=gateway_inspection`, identifying the startup inspection
+stage without exposing error details. The child ran for 109.20 seconds and the
+package for 109.215 seconds. This code alone does not establish the underlying
+cause.
+
+The earlier per-case cleanup errors were absent in this observed case, and the
+independent cleanup step passed. Post Set up Go was skipped following failure.
+The dependent full matrix was skipped; neither the first boundary nor M3 is
+accepted. PR #161 separately records eleven successful scoped job observations.
+
+Raw log SHA-256:
+`e4fbf77d4edea3d0dc7554b74e28be6169a7d307ce5e433879724e84b5ae122d`.
+The immutable evidence is retained under
+`temp/m3-lan-external-db-20261015/pr161-terminal-evidence/116313833550/` in the
+workspace wrapper. Production startup validation remains required.
+
 ## Repair and verification design
 
 - Retain the stderr digest and optionally add one constant startup-stage code.
-  Only exact known structured-log message literals may select a code. Error
-  attributes, paths, tokens and arbitrary text remain hidden. Parsing has byte
+  Only exact known structured-log messages and their explicitly enumerated
+  startup checkpoints may select a code. Raw error attributes, paths, tokens
+  and arbitrary text remain hidden. Parsing has byte
   and record limits; a primary startup failure takes precedence over subsequent
   emergency cleanup errors.
 - Capture the legacy predecessor's identity before the fixture upgrades it.
@@ -45,11 +69,21 @@ successful jobs.
   30-scenario execution, deadlines, background-isolation checks and final
   cleanup gate remain required. The diagnostic subset is not full acceptance.
 
-There is no speculative production startup change. The first diagnostic run
-must provide evidence for any subsequent repair. Runtime authorization,
-immutable history and external application-owned database behavior are unchanged.
+The first diagnostic run identified the broad inspection stage but did not
+justify a behavioral repair. The follow-up distinguishes fixed startup
+checkpoint categories, including current selection, protected history, topology,
+host-route and LAN-publication proofs. Private ingress metadata preserves the
+public error contract. A private controller wrapper retains the original cause
+for error inspection; this main log gate emits a fixed checkpoint instead of
+the raw cause. Unknown metadata falls back to the broad diagnostic.
 
-## Verification record
+Validation order, cancellation, lock release and admission decisions remain
+required. Recursive recovery proofs retain category-level diagnostics, so a
+checkpoint is not guaranteed to identify an exact underlying cause. Runtime
+authorization, immutable history and external application-owned database
+behavior are unchanged.
+
+## Initial revision verification record (`12ccd60`)
 
 The unchanged baseline passed all nine local Windows control tests, with no
 failures or skips. The candidate passed the same nine parents plus
@@ -97,14 +131,69 @@ pre-existing managed resources.
 
 The local workstation has no Docker engine or race toolchain. Compilation and
 pure controls do not establish real container behavior. The repository-wide
-`make test` and browser suites were not repeated for this test-only change;
+`make test` and browser suites were not repeated for the initial test-only change;
 hosted CI provides the broader platform and race gates. The full supported
 matrix and physical second-device LAN qualification remain outstanding.
 
+## Checkpoint refinement verification
+
+The refinement passed **118 parent tests and 416 subcases per platform** on
+Windows and Linux, with exact discovery and no failures or skips:
+
+| Package | Parent tests | Subcases | Windows seconds | Linux seconds |
+| --- | ---: | ---: | ---: | ---: |
+| `cmd/hostd` | 51 | 248 | 6.000 | 7.391 |
+| `internal/generatedingress` | 67 | 168 | 166.094 | 21.219 |
+
+The selected tests cover startup and rebind authority, retained history,
+optional current selection, LAN recovery queues, transfer ordering, unlock
+failures, cancellation, checkpoint privacy and parser boundaries. The workflow
+now requires 17 fast controller controls before either live supported-hostd job.
+Its actual jq filter passed all 13 synthetic cases; shell syntax and comparison
+against the original workflow confirm the remaining matrix behavior is unchanged.
+
+Both platform test binaries were compiled using
+`go test -tags live_docker -c -o <temporary-binary> <package>`, then run with
+explicit test discovery and `-test.v=test2json -test.count=1 -test.timeout=10m`
+under the same Go environment described above. Linux binaries ran under WSL.
+All 954 recorded source files matched before and after the final runs and match
+the reviewed candidate. Windows and Linux `go build ./cmd/hostd` and
+`go vet -tags live_docker ./cmd/hostd ./internal/generatedingress` also passed.
+
+The first native ingress run failed because the new unlock test did not restore
+its injected global function after its LAN subcase. Both subcases now register
+cleanup, and the full selected suite passed on both platforms afterward. The
+first run also detected a later controller-test edit through its source-stability
+check; it is retained as failed evidence. Final controller reruns include that
+extra malformed-field ordering regression. No failed result was treated as a pass.
+
+Independent review also caught and resolved a cancellation-code change and a
+malformed-checkpoint parsing issue. The final implementation retains the earlier
+error classification and falls back to the broad diagnostic for malformed field
+types. Static code and security reviews found no remaining blocking issue.
+
+Exact command rosters, source and binary hashes, raw test logs, the failed first
+run, and final results are retained in the workspace wrapper under
+`temp/m3-lan-external-db-20261015/inspection-refinement-verification/`.
+
+| Final raw test log | SHA-256 |
+| --- | --- |
+| Windows controller | `bd04224ee64c2ac1502d81eca30debe0c40e2fbfa08dfa7475720f2cb4539eed` |
+| Linux controller | `55a1f4467f56f652500ab2a055ca94484f47fd360a17ba0aff753d82272e0a8c` |
+| Windows ingress | `51c9ca05d015ee62c8db6d53c1bd4b2f31bd562489244783d0aa96094e19c62c` |
+| Linux ingress | `a8e3fb8a6f80f398013e87d71865baf163cf97425949cc722848e7f08eeddf5a` |
+
+The repository-wide `make test`, browser suite and race checks were not repeated
+locally for this focused diagnostic change; hosted CI supplies the broader gates.
+No local Docker or controller activation was performed. The next hosted
+first-boundary result, full supported matrix and physical LAN qualification
+remain required before M3 acceptance.
+
 ## Rollback
 
-Revert this test-infrastructure commit through the PR process if needed. It
-does not change production state or data formats. Reverting restores the older
-digest-only diagnostics and cleanup behavior; it does not make the failed
-matrix an accepted result. No deployment or controller activation is part of
-this change.
+Revert the relevant diagnostic commit through the PR process if needed. No
+production state or data format changes are involved. Reverting the initial
+revision restores digest-only diagnostics and its earlier cleanup behavior;
+reverting the refinement removes checkpoint detail. Neither action makes the
+failed matrix an accepted result. No deployment or controller activation is
+part of this change.

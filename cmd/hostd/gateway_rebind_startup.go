@@ -201,35 +201,45 @@ func inspectGatewayStartupAfterPreparationWithRunner(ctx context.Context, cfg co
 	runner runtimeprocess.CommandRunner,
 ) (gatewayStartup, error) {
 	if ctx == nil || db == nil {
-		return gatewayStartup{}, errors.New("gateway startup dependencies are required")
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticStartupDependencies,
+			errors.New("gateway startup dependencies are required"))
 	}
 	if decision.disposition != gatewayRebindStartupNormal {
-		return gatewayStartup{}, errors.New("normal gateway startup requires an explicit normal rebind decision")
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticNormalRebindDecision,
+			errors.New("normal gateway startup requires an explicit normal rebind decision"))
 	}
 	prepared := decision.preparation
 	fenceCheck := rebindFenceCheck(db)
 	if err := fenceCheck(ctx); err != nil {
-		return gatewayStartup{}, fmt.Errorf("inspect gateway rebind fence after preparation: %w", err)
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticPostPrepareFence,
+			fmt.Errorf("inspect gateway rebind fence after preparation: %w", err))
 	}
 	repository := appaccess.New(db)
 	var ingress *generatedingress.Manager
 	if prepared.ingress == nil {
 		presence, err := generatedingress.InspectGatewayRebindStartupPresence(ctx, cfg.DataRoot, repository)
 		if err != nil || presence.Present {
-			return gatewayStartup{}, errors.New("gateway rebind history changed before startup admission")
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticNativeRebindPresenceRecheck,
+				errors.New("gateway rebind history changed before startup admission"))
 		}
 	} else {
 		if !cfg.GeneratedRuntime {
-			return gatewayStartup{}, errors.New("prepared gateway manager is required")
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticPreparedRuntimePrecondition,
+				errors.New("prepared gateway manager is required"))
 		}
 		current, err := prepared.ingress.InspectGatewayRebindCurrent(ctx, repository)
 		if err != nil || !reflect.DeepEqual(current, prepared.current) {
-			return gatewayStartup{}, errors.New("current gateway changed before startup admission")
+			return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticPreparedCurrentRecheck,
+				errors.New("current gateway changed before startup admission"))
 		}
 		ingress = prepared.ingress
 	}
-	return inspectGatewayStartupUsingIngressWithRunner(ctx, cfg, db, dockerExecutable, directories,
+	gate, err := inspectGatewayStartupUsingIngressWithRunner(ctx, cfg, db, dockerExecutable, directories,
 		fenceCheck, ingress, runner)
+	if err != nil {
+		return gatewayStartup{}, gatewayStartupDiagnosticWrap(gatewayStartupDiagnosticUpgradeInspection, err)
+	}
+	return gate, nil
 }
 
 func prepareGatewayRebindRecovery(ctx context.Context, presence generatedingress.GatewayRebindStartupPresence,
