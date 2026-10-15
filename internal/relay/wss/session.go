@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -33,6 +34,8 @@ type closeRequest struct {
 	done   chan error
 }
 
+var errRelayWSSWriterStopped = errors.New("relay WSS writer stopped")
+
 type session struct {
 	handler      *Handler
 	conn         socket
@@ -44,6 +47,13 @@ type session struct {
 	writerFailed chan error
 	readerDone   chan struct{}
 	writerDone   chan struct{}
+	// writerStopped prevents a request from being abandoned after the writer's
+	// terminal drain. A sender that observes it waits for writerDone before
+	// touching its encoded bytes or the terminal cause.
+	writerStopped atomic.Bool
+	// writerFailure has one writer: writeLoop. The writer publishes it before
+	// returning, and callers read it only after writerDone closes.
+	writerFailure error
 
 	controllerID         string
 	keyID                string
@@ -448,31 +458,64 @@ func (s *session) sendFrame(ctx context.Context, frame protocol.Frame) error {
 		return err
 	}
 	request := writeRequest{data: encoded, done: make(chan error, 1)}
+	if s.writerStopped.Load() {
+		return s.waitForWriterStop(ctx, encoded)
+	}
+	select {
+	case <-s.writerDone:
+		clear(encoded)
+		return s.writerStoppedError(ctx)
+	default:
+	}
 	select {
 	case s.writes <- request:
 	case <-s.writerDone:
 		clear(encoded)
-		return errors.New("relay WSS writer stopped")
+		return s.writerStoppedError(ctx)
 	case <-ctx.Done():
+		if s.writerStopped.Load() {
+			return s.waitForWriterStop(ctx, encoded)
+		}
 		clear(encoded)
 		return ctx.Err()
 	default:
+		if s.writerStopped.Load() {
+			return s.waitForWriterStop(ctx, encoded)
+		}
 		clear(encoded)
 		return errors.New("relay WSS outbound queue full")
+	}
+	if s.writerStopped.Load() {
+		return s.waitForWriterStop(ctx, encoded)
 	}
 	select {
 	case err = <-request.done:
 		return err
-	case err = <-s.writerFailed:
-		if err == nil {
-			err = errors.New("relay WSS writer stopped")
-		}
-		return err
 	case <-s.writerDone:
-		return errors.New("relay WSS writer stopped")
+		clear(encoded)
+		return s.writerStoppedError(ctx)
 	case <-ctx.Done():
+		if s.writerStopped.Load() {
+			return s.waitForWriterStop(ctx, encoded)
+		}
 		return ctx.Err()
 	}
+}
+
+func (s *session) waitForWriterStop(ctx context.Context, encoded []byte) error {
+	<-s.writerDone
+	clear(encoded)
+	return s.writerStoppedError(ctx)
+}
+
+func (s *session) writerStoppedError(ctx context.Context) error {
+	if s.writerFailure != nil {
+		return s.writerFailure
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errRelayWSSWriterStopped
 }
 
 func (s *session) withStore(ctx context.Context, call func(context.Context) error) error {
@@ -507,6 +550,11 @@ func (s *session) readLoop(ctx context.Context) {
 }
 
 func (s *session) writeLoop(ctx context.Context) {
+	var terminalErr error
+	defer func() {
+		s.writerStopped.Store(true)
+		s.drainWriteRequests(terminalErr)
+	}()
 	for {
 		select {
 		case request := <-s.writes:
@@ -514,19 +562,44 @@ func (s *session) writeLoop(ctx context.Context) {
 			err := s.conn.Write(writeCtx, websocket.MessageText, request.data)
 			cancel()
 			clear(request.data)
+			ctxErr := ctx.Err()
+			writeFailed := err != nil && ctxErr == nil
+			if writeFailed {
+				s.writerFailure = err
+				terminalErr = err
+			}
 			request.done <- err
-			if err != nil && ctx.Err() == nil {
+			if writeFailed {
 				select {
 				case s.writerFailed <- err:
 				default:
 				}
 				return
 			}
+			if err != nil {
+				terminalErr = ctxErr
+			}
 		case request := <-s.closes:
 			request.done <- s.conn.Close(request.code, request.reason)
 			return
 		case <-ctx.Done():
+			terminalErr = ctx.Err()
 			_ = s.conn.Close(websocket.StatusGoingAway, "server_shutdown")
+			return
+		}
+	}
+}
+
+func (s *session) drainWriteRequests(terminalErr error) {
+	if terminalErr == nil {
+		terminalErr = errRelayWSSWriterStopped
+	}
+	for {
+		select {
+		case request := <-s.writes:
+			clear(request.data)
+			request.done <- terminalErr
+		default:
 			return
 		}
 	}
