@@ -42,15 +42,20 @@ func gatewayRebindCommittedServingFixtureWithApprovals(t *testing.T,
 		return value, nil
 	}
 	interrupted := &gatewayRebindRecoveryFailAttestationDriver{gatewayRebindBoundedPhysicalDriver: &gatewayRebindBoundedPhysicalDriver{t: t, template: template}}
-	if _, err := f.manager.commitGatewayRebindWithDriver(ctx, f.repository, input, interrupted); err == nil {
+	_, commitErr := f.manager.commitGatewayRebindWithDriver(ctx, f.repository, input, interrupted)
+	if commitErr == nil {
 		t.Fatal("expected crash before committed-current attestation")
 	}
 	// A new process has fresh latches. The SQL fence must survive the crash.
 	f.manager = freshGatewayRebindRecoveryManager(f.manager)
 	f.manager.gatewayRebindFailStop, f.manager.gatewayRebindCommitBarrier = &atomic.Bool{}, &atomic.Bool{}
 	snapshot, err := f.repository.HostingGatewayStartupSnapshot(ctx)
-	if err != nil || snapshot.Rebind.Phase != appaccess.GatewayRebindDatabaseCommitted || f.repository.CheckGatewayRebindFence(ctx) == nil {
-		t.Fatalf("missing retained database commit: %v", err)
+	fenceErr := f.repository.CheckGatewayRebindFence(ctx)
+	if err != nil || snapshot.Rebind.Phase != appaccess.GatewayRebindDatabaseCommitted || fenceErr == nil {
+		history, historyErr := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		t.Fatalf("missing retained database commit: commit=%v phase=%s snapshot=%v fence=%v physicalCalls=%d abortCalls=%d withdrawCalls=%d checkpoints=%d intents=%d progress=%d terminals=%d history=%v",
+			commitErr, snapshot.Rebind.Phase, err, fenceErr, interrupted.commitCalls, interrupted.abortCalls,
+			interrupted.withdrawCalls, len(history.Checkpoints), len(history.IntentsV2), len(history.Progress), len(history.TerminalsV2), historyErr)
 	}
 	history, err := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil {
