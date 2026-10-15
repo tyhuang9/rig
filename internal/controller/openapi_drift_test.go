@@ -101,6 +101,7 @@ var expectedOpenAPIOperationProblemCodes = map[string][]string{
 	"listGitHubRepositories":                    {"source_access_lost", "provider_unavailable", "invalid_source", "source_too_large"},
 	"listGitHubBranches":                        {"source_access_lost", "provider_unavailable", "invalid_source", "source_too_large"},
 	"getRelayStatus":                            {"relay_unavailable"},
+	"getControllerRecovery":                     {"lan_gateway_forbidden", "invalid_lan_gateway_request", "lan_gateway_unavailable"},
 	"getLANRecoveryHead":                        {"lan_access_forbidden", "lan_access_unavailable"},
 	"startRelayEnrollment":                      {"authentication_required", "source_access_lost", "provider_unavailable", "invalid_source", "relay_unavailable"},
 	"pollRelayEnrollment":                       {"relay_unavailable"},

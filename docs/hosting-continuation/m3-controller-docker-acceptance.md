@@ -324,8 +324,28 @@ Receipts remain under `temp/m3-pr153-hosted-20261014/`. The only source delta
 after these green runs is the factory's explanatory comment; executable code is
 unchanged. Fresh CLI builds and scoped vet cover the final comment-normalized
 source. Independent bounded code/security review found no guard or scope regression.
-The repaired private HTTP journey still requires actual hosted Docker verification;
-these focused tests do not claim that outcome or complete M3 acceptance.
+These focused tests do not by themselves establish hosted Docker or M3 acceptance.
+
+### Hosted constructor repair verification
+
+At exact published source `386bad5f62686e1f5a7bd549ef367ec0fc26dad8`,
+[run 38646046781, job 116133035604](https://github.com/tyhuang9/rig/actions/runs/38646046781/job/116133035604)
+passed `TestLiveGatewayRebindControllerRecoveryCommitAndReplay` on 2026-10-14.
+Checkout used GitHub's test merge `683ce0217b847734418017be82ace76a34caee45`
+with parents `53d173503eec6b2240108718c17be236032adf9f` and `386bad5`.
+Its tree `e06eaf2f215173354999c45c85d86456cb7eab09` equals the published head's
+tree, so the tested source content is exact.
+The captured test stream contains one RUN and one PASS, no failure or skip,
+and elapsed test time 181.1 seconds. The separate
+`Require complete cross-store fixture cleanup` step also passed.
+
+The raw job log SHA-256 is
+`3630601ebfd63fb1f2455f2b640c961c28435e8f7508b6a135abd038f2c2e99e`.
+The job metadata, raw log and executable event/cleanup receipt are retained as
+`386bad5-controller-recovery.*` under `temp/m3-pr153-hosted-20261014/`.
+This verifies the repaired private authenticated HTTP recovery journey. It does
+not establish the full supported-hostd crash matrix, all platform/race gates or
+physical second-device LAN acceptance; those remain separate requirements.
 
 ## Disablement and data integrity
 

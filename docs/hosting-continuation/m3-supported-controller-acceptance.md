@@ -217,7 +217,14 @@ It changes no Go, SQL, schema, frontend or CI source relative to the first draft
 `7c20485`; the final API/diagnostic source hashes still match exactly. The older
 CLI receipt differs only in the two documented diagnostic test files, with all
 production hashes unchanged. This is source equivalence, not a new test run.
-Actual hosted verification of the repaired private journey remains required.
+The repaired prerequisite's private HTTP journey subsequently passed on exact
+parent `386bad5`, including independent cleanup:
+[job 116133035604](https://github.com/tyhuang9/rig/actions/runs/38646046781/job/116133035604).
+Its one RUN/one PASS event stream took 181.1 seconds without a failure or skip;
+raw job log SHA-256 is
+`3630601ebfd63fb1f2455f2b640c961c28435e8f7508b6a135abd038f2c2e99e`.
+This parent result verifies the constructor repair's private journey, not this
+candidate's full supported-hostd crash matrix or physical LAN qualification.
 
 The dashboard also passed its lockfile-respecting offline install and
 `pnpm --dir web build` (TypeScript build plus Vite production build). Receipt

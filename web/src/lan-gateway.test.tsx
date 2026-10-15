@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "./api";
 import { LANGatewayPanel } from "./lan-gateway";
 
@@ -15,6 +15,9 @@ function renderPanel(role = "administrator") {
 }
 
 describe("LANGatewayPanel", () => {
+  beforeEach(() => {
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({ version: 1, mode: "normal" } as never);
+  });
   afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
   it("reviews the server-issued digest before saving a desired profile", async () => {
@@ -66,12 +69,40 @@ describe("LANGatewayPanel", () => {
   it("does not issue administrator-only reads for viewers", () => {
     const profileRead = vi.spyOn(api, "lanGatewayProfile");
     const upgradeRead = vi.spyOn(api, "lanGatewayUpgrade");
+    const recoveryRead = vi.mocked(api.getControllerRecovery);
 
     renderPanel("viewer");
 
     expect(screen.getByText("LAN gateway details and controls require an administrator.")).not.toBeNull();
     expect(profileRead).not.toHaveBeenCalled();
     expect(upgradeRead).not.toHaveBeenCalled();
+    expect(recoveryRead).not.toHaveBeenCalled();
+  });
+
+  it("discovers an active gateway rebind for an administrator without opening recovery automatically", async () => {
+    vi.spyOn(api, "lanGatewayProfile").mockResolvedValue(profile as never);
+    vi.spyOn(api, "lanGatewayUpgrade").mockResolvedValue(upgrade as never);
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({
+      version: 1, mode: "normal", recovery: { kind: "gateway_rebind", operationId: "22222222-2222-4222-8222-222222222222" },
+    } as never);
+
+    renderPanel();
+
+    expect(await screen.findByText("Gateway recovery is available")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Open gateway recovery" })).not.toBeNull();
+  });
+
+  it("keeps the active gateway recovery entry available when the profile read fails", async () => {
+    vi.spyOn(api, "lanGatewayProfile").mockRejectedValue(new Error("profile unavailable"));
+    vi.spyOn(api, "lanGatewayUpgrade").mockResolvedValue(upgrade as never);
+    vi.spyOn(api, "getControllerRecovery").mockResolvedValue({
+      version: 1, mode: "normal", recovery: { kind: "gateway_rebind", operationId: "22222222-2222-4222-8222-222222222222" },
+    } as never);
+
+    renderPanel();
+
+    expect(await screen.findByText("LAN gateway profile could not be loaded.")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Open gateway recovery" })).not.toBeNull();
   });
 
   it("associates the port-pool error with both invalid port fields", async () => {

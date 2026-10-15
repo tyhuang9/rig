@@ -364,7 +364,7 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 	})
 	effectiveAutoDeploy := (cfg.ComposeRuntime || cfg.GeneratedRuntime) && cfg.GitHubConnectionsEnabled() && sources.ProviderEnabled()
 	appAccessRepository := appaccess.New(db)
-	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, GeneratedIngress: runtime.ingress, GeneratedRuntimeState: runtime.state, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, GatewayProfiles: appAccessRepository, GatewayUpgrades: appAccessRepository, AppAccess: appAccessRepository, AppGrants: appAccessRepository, AppDisables: appAccessRepository, AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
+	controllerServer := &controller.Server{Auth: a, Apps: applications, Jobs: j, Machines: m, Sources: sources, Configuration: applicationConfiguration, Deployments: deploymentRepository, DeploymentPlans: planStore, GeneratedIngress: runtime.ingress, GeneratedRuntimeState: runtime.state, RelayManagement: relayManagement, AutoDeploy: autoDeployRepository, GatewayProfiles: appAccessRepository, GatewayUpgrades: appAccessRepository, AppAccess: appAccessRepository, AppGrants: appAccessRepository, AppDisables: appAccessRepository, RecoveryDiscovery: controller.NewControllerRecoveryDiscovery(cfg.DataRoot, appAccessRepository, runtime.ingress), AutoDeployAvailable: effectiveAutoDeploy, RelayReconcile: relayManagement.Reconcile, AutoDeployReconcile: autoDeployReconcile, DockerEndpoint: cfg.DockerEndpoint, DataRoot: cfg.DataRoot, Logger: logger, BootstrapCompleted: bootstrapCompleted}
 	if runtime.ingress != nil {
 		controllerServer.GatewayUpgradeRuntime = runtime.ingress
 		controllerServer.GatewayRebinds = appAccessRepository
@@ -473,7 +473,8 @@ func runRecoveryOnlyControllerWithAssembly(cfg config.Config, logger *slog.Logge
 		RecoveryOperationID: gate.recoveryID, RecoveryAppID: gate.recoveryAppID,
 		RecoveryLANBatch: gate.recoveryBatch, RecoveryBatchHead: gate.recoveryBatchHead,
 		RecoveryBatchCount: gate.recoveryBatchCount,
-		Logger:             logger, BootstrapCompleted: bootstrapCompleted,
+		RecoverySnapshots:  upgrades, RecoveryStartupRuntime: gate.ingress,
+		Logger: logger, BootstrapCompleted: bootstrapCompleted,
 	}
 	switch gate.recoveryKind {
 	case controller.RecoveryGatewayUpgrade:

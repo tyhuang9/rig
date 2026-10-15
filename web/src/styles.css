@@ -458,6 +458,26 @@ button:disabled { cursor: wait; opacity: .62; }
 .lan-port-pool .field { max-width: none; }
 .lan-upgrade { margin-top: 22px; padding-top: 20px; border-top: 1px solid #e3e6ea; }
 .lan-upgrade > .button { margin-top: 16px; }
+.lan-rebind { margin-top: 22px; padding-top: 20px; border-top: 1px solid #e3e6ea; }
+.lan-rebind .lan-profile-form { margin-top: 14px; }
+.lan-rebind fieldset { display: grid; gap: 14px; min-width: 0; margin: 0; padding: 0; border: 0; }
+.lan-rebind legend { padding: 0; font-size: 13px; font-weight: 650; }
+.lan-rebind-roster { display: grid; gap: 10px; margin: 18px 0; }
+.lan-rebind-roster h4 { margin: 0; font-size: 14px; }
+.lan-rebind-roster ol { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.lan-rebind-roster li { display: grid; gap: 8px; min-width: 0; padding: 12px; border: 1px solid #e3e6ea; border-radius: 8px; background: #fbfcfd; }
+.lan-rebind-roster li > div { display: grid; min-width: 0; gap: 3px; }
+.lan-rebind-roster strong, .lan-rebind-roster span { overflow-wrap: anywhere; font-size: 12px; }
+.lan-rebind-roster span { color: #5f6672; }
+.lan-rebind-roster summary, .lan-rebind-identifiers summary { width: fit-content; cursor: pointer; color: #274ec9; font-size: 12px; font-weight: 650; }
+.lan-rebind-entry-details { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 9px 14px; margin: 10px 0 0; }
+.lan-rebind-entry-details > div { display: grid; min-width: 0; gap: 3px; }
+.lan-rebind-entry-details dt { color: #616975; font-size: 10px; }
+.lan-rebind-entry-details dd { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 11px; }
+.lan-rebind-identifiers { margin: 14px 0; }
+.lan-rebind-consent { display: grid; gap: 10px; margin: 18px 0; }
+.lan-rebind-consent label { display: flex; min-height: 44px; align-items: center; gap: 9px; color: #303744; font-size: 13px; line-height: 1.45; }
+.lan-rebind-consent input { flex: 0 0 auto; }
 .lan-address { display: grid; justify-items: start; gap: 8px; }
 .lan-address code { max-width: 100%; overflow-wrap: anywhere; color: #1f2937; font-size: 12px; }
 .lan-actions { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -634,8 +654,8 @@ button:disabled { cursor: wait; opacity: .62; }
   .relay-panel { padding: 16px 14px; overflow: hidden; }
   .lan-gateway-panel, .lan-access-panel { padding: 16px 14px; overflow: hidden; }
   .lan-heading, .lan-section-heading { align-items: stretch; flex-direction: column; }
-  .lan-heading .button, .lan-upgrade > .button, .lan-pending > .button, .lan-actions .button { width: 100%; }
-  .lan-port-pool, .lan-details, .lan-review-details { grid-template-columns: minmax(0, 1fr); }
+  .lan-heading .button, .lan-upgrade > .button, .lan-rebind > .button, .lan-pending > .button, .lan-actions .button { width: 100%; }
+  .lan-port-pool, .lan-details, .lan-review-details, .lan-rebind-entry-details { grid-template-columns: minmax(0, 1fr); }
   .lan-actions { display: grid; width: 100%; }
   .relay-heading, .relay-section-heading, .relay-binding-heading { align-items: stretch; flex-direction: column; }
   .relay-heading .button, .relay-binding > .button, .relay-section > .button, .relay-enrollment-actions .button { width: 100%; }
