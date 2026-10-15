@@ -49,9 +49,9 @@ jobs:
           output="$(mktemp)"
           trap 'rm -f "$output"' EXIT
           package_name='github.com/hostd/hostd/cmd/hostd'
-          test_pattern='^(TestGatewayRebindLiveRequiredManifestIsClosed|TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly|TestLiveHostdRebindDockerMutationClassifiesCopyDirection|TestAutoDeployStartObserverReportsOnlyEnabledLaunch|TestControllerRelayStartObserverReportsOnlyEnabledLaunch|TestGatewayRebindBackgroundLedgerAndDenyTransport|TestGatewayRebindBackgroundLedgerWriteFailureIsRetained|TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods|TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept|TestLiveHostdRebindClosedDiagnosticControls|TestLiveHostdRebindLegacyV1OwnershipControls|TestGatewayStartupDiagnosticClosedCheckpointContract|TestGatewayStartupDiagnosticOuterStageWrappingPreservesCause|TestGatewayStartupDiagnosticRejectsForgedOrWrappedIngressMetadata|TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths|TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult|TestLiveHostdRebindClosedDiagnosticCheckpointRoster|TestGatewayStartupDiagnosticSnapshotStageAndCauseContract|TestGatewayStartupDiagnosticUsesDirectSnapshotResult|TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster|TestLiveHostdRebindPlanSuccessorProfile|TestLiveHostdRebindNormalReplayControls|TestLiveHostdRebindTerminalReceiptBindingControls)$'
+          test_pattern='^(TestGatewayRebindLiveRequiredManifestIsClosed|TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly|TestLiveHostdRebindDockerMutationClassifiesCopyDirection|TestAutoDeployStartObserverReportsOnlyEnabledLaunch|TestControllerRelayStartObserverReportsOnlyEnabledLaunch|TestGatewayRebindBackgroundLedgerAndDenyTransport|TestGatewayRebindBackgroundLedgerWriteFailureIsRetained|TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods|TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept|TestLiveHostdRebindClosedDiagnosticControls|TestLiveHostdRebindLegacyV1OwnershipControls|TestGatewayStartupDiagnosticClosedCheckpointContract|TestGatewayStartupDiagnosticOuterStageWrappingPreservesCause|TestGatewayStartupDiagnosticRejectsForgedOrWrappedIngressMetadata|TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths|TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult|TestLiveHostdRebindClosedDiagnosticCheckpointRoster|TestGatewayStartupDiagnosticSnapshotStageAndCauseContract|TestGatewayStartupDiagnosticUsesDirectSnapshotResult|TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster|TestLiveHostdRebindPlanSuccessorProfile|TestLiveHostdRebindNormalReplayControls|TestLiveHostdRebindTerminalReceiptBindingControls|TestLiveHostdRebindChildStartupControls)$'
           go test -tags live_docker -json -v -count=1 -timeout=2m ./cmd/hostd -run "$test_pattern" | tee "$output"
-          jq -e -s --arg package_name "$package_name" --argjson test_names '["TestGatewayRebindLiveRequiredManifestIsClosed","TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly","TestLiveHostdRebindDockerMutationClassifiesCopyDirection","TestAutoDeployStartObserverReportsOnlyEnabledLaunch","TestControllerRelayStartObserverReportsOnlyEnabledLaunch","TestGatewayRebindBackgroundLedgerAndDenyTransport","TestGatewayRebindBackgroundLedgerWriteFailureIsRetained","TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods","TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept","TestLiveHostdRebindClosedDiagnosticControls","TestLiveHostdRebindLegacyV1OwnershipControls","TestGatewayStartupDiagnosticClosedCheckpointContract","TestGatewayStartupDiagnosticOuterStageWrappingPreservesCause","TestGatewayStartupDiagnosticRejectsForgedOrWrappedIngressMetadata","TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths","TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult","TestLiveHostdRebindClosedDiagnosticCheckpointRoster","TestGatewayStartupDiagnosticSnapshotStageAndCauseContract","TestGatewayStartupDiagnosticUsesDirectSnapshotResult","TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster","TestLiveHostdRebindPlanSuccessorProfile","TestLiveHostdRebindNormalReplayControls","TestLiveHostdRebindTerminalReceiptBindingControls"]' '
+          jq -e -s --arg package_name "$package_name" --argjson test_names '["TestGatewayRebindLiveRequiredManifestIsClosed","TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly","TestLiveHostdRebindDockerMutationClassifiesCopyDirection","TestAutoDeployStartObserverReportsOnlyEnabledLaunch","TestControllerRelayStartObserverReportsOnlyEnabledLaunch","TestGatewayRebindBackgroundLedgerAndDenyTransport","TestGatewayRebindBackgroundLedgerWriteFailureIsRetained","TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods","TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept","TestLiveHostdRebindClosedDiagnosticControls","TestLiveHostdRebindLegacyV1OwnershipControls","TestGatewayStartupDiagnosticClosedCheckpointContract","TestGatewayStartupDiagnosticOuterStageWrappingPreservesCause","TestGatewayStartupDiagnosticRejectsForgedOrWrappedIngressMetadata","TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths","TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult","TestLiveHostdRebindClosedDiagnosticCheckpointRoster","TestGatewayStartupDiagnosticSnapshotStageAndCauseContract","TestGatewayStartupDiagnosticUsesDirectSnapshotResult","TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster","TestLiveHostdRebindPlanSuccessorProfile","TestLiveHostdRebindNormalReplayControls","TestLiveHostdRebindTerminalReceiptBindingControls","TestLiveHostdRebindChildStartupControls"]' '
             [.[] | select(.Package == $package_name)] as $events |
             all($test_names[]; . as $name |
               ([$events[] | select(.Test == $name and .Action == "run")] | length) == 1 and
@@ -107,10 +107,14 @@ jobs:
           fi
 
   supported-hostd-rebind-crash-matrix:
-    name: Supported hostd rebind crash and recovery matrix
+    name: Supported hostd rebind crash and recovery matrix (${{ matrix.group }})
     needs: [rebind-cross-store-live, supported-hostd-startup-diagnostic]
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 130
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [partition-01, partition-02, partition-03, partition-04, partition-05, partition-06, partition-07, partition-08]
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -137,12 +141,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 scripts/check-supported-rebind-matrix.py --check-contract
+          python3 scripts/check-supported-rebind-matrix.py --self-test
           output="$(mktemp)"
           trap 'rm -f "$output"' EXIT
           package_name='github.com/hostd/hostd/cmd/hostd'
-          test_pattern='^(TestGatewayRebindLiveRequiredManifestIsClosed|TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly|TestLiveHostdRebindDockerMutationClassifiesCopyDirection|TestAutoDeployStartObserverReportsOnlyEnabledLaunch|TestControllerRelayStartObserverReportsOnlyEnabledLaunch|TestGatewayRebindBackgroundLedgerAndDenyTransport|TestGatewayRebindBackgroundLedgerWriteFailureIsRetained|TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods|TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept|TestLiveHostdRebindClosedDiagnosticControls|TestLiveHostdRebindLegacyV1OwnershipControls|TestGatewayStartupDiagnosticClosedCheckpointContract|TestGatewayStartupDiagnosticOuterStageWrappingPreservesCause|TestGatewayStartupDiagnosticRejectsForgedOrWrappedIngressMetadata|TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths|TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult|TestLiveHostdRebindClosedDiagnosticCheckpointRoster|TestGatewayStartupDiagnosticSnapshotStageAndCauseContract|TestGatewayStartupDiagnosticUsesDirectSnapshotResult|TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster|TestLiveHostdRebindPlanSuccessorProfile|TestLiveHostdRebindNormalReplayControls|TestLiveHostdRebindTerminalReceiptBindingControls)$'
+          test_pattern='^(TestGatewayRebindLiveRequiredManifestIsClosed|TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly|TestLiveHostdRebindDockerMutationClassifiesCopyDirection|TestAutoDeployStartObserverReportsOnlyEnabledLaunch|TestControllerRelayStartObserverReportsOnlyEnabledLaunch|TestGatewayRebindBackgroundLedgerAndDenyTransport|TestGatewayRebindBackgroundLedgerWriteFailureIsRetained|TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods|TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept|TestLiveHostdRebindClosedDiagnosticControls|TestLiveHostdRebindLegacyV1OwnershipControls|TestGatewayStartupDiagnosticClosedCheckpointContract|TestGatewayStartupDiagnosticOuterStageWrappingPreservesCause|TestGatewayStartupDiagnosticRejectsForgedOrWrappedIngressMetadata|TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths|TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult|TestLiveHostdRebindClosedDiagnosticCheckpointRoster|TestGatewayStartupDiagnosticSnapshotStageAndCauseContract|TestGatewayStartupDiagnosticUsesDirectSnapshotResult|TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster|TestLiveHostdRebindPlanSuccessorProfile|TestLiveHostdRebindNormalReplayControls|TestLiveHostdRebindTerminalReceiptBindingControls|TestLiveHostdRebindChildStartupControls)$'
           go test -tags live_docker -json -v -count=1 -timeout=2m ./cmd/hostd -run "$test_pattern" | tee "$output"
-          jq -e -s --arg package_name "$package_name" --argjson test_names '["TestGatewayRebindLiveRequiredManifestIsClosed","TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly","TestLiveHostdRebindDockerMutationClassifiesCopyDirection","TestAutoDeployStartObserverReportsOnlyEnabledLaunch","TestControllerRelayStartObserverReportsOnlyEnabledLaunch","TestGatewayRebindBackgroundLedgerAndDenyTransport","TestGatewayRebindBackgroundLedgerWriteFailureIsRetained","TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods","TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept","TestLiveHostdRebindClosedDiagnosticControls","TestLiveHostdRebindLegacyV1OwnershipControls","TestGatewayStartupDiagnosticClosedCheckpointContract","TestGatewayStartupDiagnosticOuterStageWrappingPreservesCause","TestGatewayStartupDiagnosticRejectsForgedOrWrappedIngressMetadata","TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths","TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult","TestLiveHostdRebindClosedDiagnosticCheckpointRoster","TestGatewayStartupDiagnosticSnapshotStageAndCauseContract","TestGatewayStartupDiagnosticUsesDirectSnapshotResult","TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster","TestLiveHostdRebindPlanSuccessorProfile","TestLiveHostdRebindNormalReplayControls","TestLiveHostdRebindTerminalReceiptBindingControls"]' '
+          jq -e -s --arg package_name "$package_name" --argjson test_names '["TestGatewayRebindLiveRequiredManifestIsClosed","TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly","TestLiveHostdRebindDockerMutationClassifiesCopyDirection","TestAutoDeployStartObserverReportsOnlyEnabledLaunch","TestControllerRelayStartObserverReportsOnlyEnabledLaunch","TestGatewayRebindBackgroundLedgerAndDenyTransport","TestGatewayRebindBackgroundLedgerWriteFailureIsRetained","TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods","TestLiveGatewayRebindBackgroundLoopbackRejectedTLSRecordsAccept","TestLiveHostdRebindClosedDiagnosticControls","TestLiveHostdRebindLegacyV1OwnershipControls","TestGatewayStartupDiagnosticClosedCheckpointContract","TestGatewayStartupDiagnosticOuterStageWrappingPreservesCause","TestGatewayStartupDiagnosticRejectsForgedOrWrappedIngressMetadata","TestGatewayStartupDiagnosticWrapsRealStartupFailurePaths","TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult","TestLiveHostdRebindClosedDiagnosticCheckpointRoster","TestGatewayStartupDiagnosticSnapshotStageAndCauseContract","TestGatewayStartupDiagnosticUsesDirectSnapshotResult","TestLiveHostdRebindClosedDiagnosticSnapshotCauseRoster","TestLiveHostdRebindPlanSuccessorProfile","TestLiveHostdRebindNormalReplayControls","TestLiveHostdRebindTerminalReceiptBindingControls","TestLiveHostdRebindChildStartupControls"]' '
             [.[] | select(.Package == $package_name)] as $events |
             all($test_names[]; . as $name |
               ([$events[] | select(.Test == $name and .Action == "run")] | length) == 1 and
@@ -150,34 +156,25 @@ jobs:
               ([$events[] | select(.Test == $name and (.Action == "fail" or .Action == "skip"))] | length) == 0)
           ' "$output" > /dev/null
 
-      - name: Run actual hostd authenticated crash matrix
-        timeout-minutes: 350
+      - name: Run exact owned hostd authenticated crash cases
+        timeout-minutes: 115
         shell: bash
         env:
           RIG_RUN_LIVE_GATEWAY_V2: "1"
           RIG_RUN_LIVE_GATEWAY_REBIND_CROSS_STORE: "1"
           RIG_RUN_LIVE_GATEWAY_REBIND_RUNTIME: "1"
           RIG_RUN_LIVE_HOSTD_GATEWAY_REBIND: "1"
+          MATRIX_GROUP: ${{ matrix.group }}
         run: |
           set -euo pipefail
-          output="$(mktemp)"
-          trap 'rm -f "$output"' EXIT
-          package_name='github.com/hostd/hostd/cmd/hostd'
-          test_name='TestLiveControllerGatewayRebindCrashMatrix'
-          go test -tags live_docker -json -v -count=1 -timeout=345m ./cmd/hostd -run "^${test_name}$" | tee "$output"
-          jq -e -s --arg package_name "$package_name" --arg test_name "$test_name" '
-            [.[] | select(.Package == $package_name)] as $events |
-            ([$events[] | select(.Test == $test_name and .Action == "run")] | length) == 1 and
-            ([$events[] | select(.Test == $test_name and .Action == "pass")] | length) == 1 and
-            ([$events[] | select(.Test == $test_name and (.Action == "fail" or .Action == "skip"))] | length) == 0 and
-            ([$events[] | select(((.Test // "") | startswith($test_name + "/boundary/")) and .Action == "run")] | length) == 33 and
-            ([$events[] | select(((.Test // "") | startswith($test_name + "/boundary/")) and .Action == "pass")] | length) == 33 and
-            ([$events[] | select(((.Test // "") | startswith($test_name + "/scenario/")) and .Action == "run")] | length) == 30 and
-            ([$events[] | select(((.Test // "") | startswith($test_name + "/scenario/")) and .Action == "pass")] | length) == 30 and
-            ([$events[] | select(.Test == ($test_name + "/scenario/recovery-background-isolation") and .Action == "run")] | length) == 1 and
-            ([$events[] | select(.Test == ($test_name + "/scenario/recovery-background-isolation") and .Action == "pass")] | length) == 1 and
-            ([$events[] | select((((.Test // "") | startswith($test_name + "/boundary/")) or ((.Test // "") | startswith($test_name + "/scenario/"))) and (.Action == "fail" or .Action == "skip"))] | length) == 0
-          ' "$output" > /dev/null
+          workdir="${RUNNER_TEMP}/supported-hostd-rebind-${MATRIX_GROUP}"
+          mkdir "$workdir"
+          mkdir -p "$workdir/cases"
+          python3 scripts/check-supported-rebind-matrix.py --check-contract
+          python3 scripts/check-supported-rebind-matrix.py --run-group "$MATRIX_GROUP" \
+            --events "$workdir/events.jsonl" --log-directory "$workdir/cases"
+          python3 scripts/check-supported-rebind-matrix.py --verify-events "$MATRIX_GROUP" \
+            --events "$workdir/events.jsonl"
 
       - name: Require independent full-hostd fixture cleanup
         if: always()
@@ -199,6 +196,31 @@ jobs:
               "$containers" "$networks" "$volumes" "$images" "$builders" "$builder_networks" "$adapters" "$children" >&2
             exit 1
           fi
+
+      - name: Upload owned crash-case failure evidence
+        if: failure()
+        timeout-minutes: 5
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: supported-hostd-rebind-${{ matrix.group }}-failure
+          path: ${{ runner.temp }}/supported-hostd-rebind-${{ matrix.group }}
+          if-no-files-found: warn
+          retention-days: 7
+
+  supported-hostd-rebind-crash-matrix-complete:
+    name: Supported hostd rebind crash and recovery matrix
+    needs: [supported-hostd-rebind-crash-matrix]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every owned partition to succeed
+        shell: bash
+        env:
+          MATRIX_RESULT: ${{ needs.supported-hostd-rebind-crash-matrix.result }}
+        run: |
+          set -euo pipefail
+          test "$MATRIX_RESULT" = success
 
   rebind-cross-store-live:
     name: Rebind cross-store boundary (${{ matrix.test }})
