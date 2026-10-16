@@ -1275,7 +1275,7 @@ func liveHostdRebindNormalReplay(fixture *liveHostdGatewayRebindFixture,
 	statusCode, body, err = liveHostdRebindHTTPRaw(fixture.ctx, fixture, http.MethodPost,
 		"/api/v1/system/lan-gateway-rebind", request)
 	if err != nil || statusCode != http.StatusOK {
-		return liveHostdRebindStatus{}, errors.New("normal rebind replay failed")
+		return liveHostdRebindStatus{}, liveHostdRebindNormalReplayFailure(statusCode, body, err)
 	}
 	var replay apicontract.LANGatewayRebindMutation
 	if json.Unmarshal(body, &replay) != nil {
@@ -1294,6 +1294,43 @@ func liveHostdRebindNormalReplay(fixture *liveHostdGatewayRebindFixture,
 	authority := *replay.SelectedCurrentAuthority
 	verified.SelectedCurrent = &authority
 	return verified, nil
+}
+
+// The retained request and response may contain authority or private state.
+// Classify only fixed public status/code pairs; never echo body or error text.
+func liveHostdRebindNormalReplayFailure(statusCode int, body []byte, transportErr error) error {
+	outcome := "problem_other"
+	if transportErr != nil {
+		switch {
+		case errors.Is(transportErr, context.Canceled):
+			outcome = "transport_canceled"
+		case errors.Is(transportErr, context.DeadlineExceeded):
+			outcome = "transport_deadline_exceeded"
+		default:
+			outcome = "transport_error"
+		}
+	} else {
+		var problem struct {
+			Code string `json:"code"`
+		}
+		if json.Unmarshal(body, &problem) == nil {
+			switch {
+			case statusCode == http.StatusServiceUnavailable && problem.Code == "lan_gateway_unavailable":
+				outcome = "gateway_unavailable"
+			case statusCode == http.StatusServiceUnavailable && problem.Code == "capability_unavailable":
+				outcome = "capability_unavailable"
+			case statusCode == http.StatusConflict && problem.Code == "lan_gateway_conflict":
+				outcome = "conflict"
+			case statusCode == http.StatusForbidden && problem.Code == "lan_gateway_approval_mismatch":
+				outcome = "approval_mismatch"
+			case statusCode == http.StatusForbidden && problem.Code == "lan_gateway_forbidden":
+				outcome = "forbidden"
+			case statusCode == http.StatusBadRequest && problem.Code == "invalid_lan_gateway_request":
+				outcome = "invalid_request"
+			}
+		}
+	}
+	return fmt.Errorf("normal rebind replay failed: status=%d outcome=%s", statusCode, outcome)
 }
 
 func liveHostdRebindValidateNormalReplayDiagnostic(status liveHostdRebindStatus, operationID string) error {
