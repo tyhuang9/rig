@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/database"
@@ -254,5 +256,85 @@ func TestLegacyNativeBatchAuthorityExtractorRoundTrip(t *testing.T) {
 	batch := seedLegacyNativePendingLANBatch(t, target, extracted)
 	if len(batch.operationIDs) != 2 || len(batch.claims) != 2 {
 		t.Fatal("native authority roundtrip did not produce the exact migrated batch")
+	}
+}
+
+func TestLegacyNativeBatchPublicCommitAuthorityExtractorRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	original := deterministicLegacyNativeBatchAuthority(t)
+	committed := original.upgradeEvents[len(original.upgradeEvents)-1]
+	committed.sequence = 2
+	original.upgrade.StateSequence = 2
+	original.upgradeEvents = []legacyNativeBatchEvent{original.upgradeEvents[0], committed}
+
+	source := legacyPairCompositionDBThrough028(t)
+	seedLegacyNativeAuthorityThrough028(t, source, original, false)
+	if err := database.Migrate(source); err != nil {
+		t.Fatal("migrate public-commit native authority source through latest:", err)
+	}
+	expected := legacyNativeBatchExtractionExpectationFor(original)
+	extracted := readLegacyNativeBatchAuthority(t, ctx, source, expected)
+	if !reflect.DeepEqual(extracted, original) {
+		t.Fatal("public-commit native authority extractor changed an immutable source value")
+	}
+
+	target := legacyPairCompositionDBThrough028(t)
+	batch := seedLegacyNativePendingLANBatch(t, target, extracted)
+	if len(batch.operationIDs) != 2 || len(batch.claims) != 2 {
+		t.Fatal("public-commit native authority roundtrip did not produce the exact migrated batch")
+	}
+}
+
+func TestLegacyNativeBatchUpgradeHistoryValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*legacyNativeBatchAuthority)
+	}{
+		{"missing initial prepared", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[0].state = string(appaccess.GatewayProfileUpgradeServing)
+		}},
+		{"approval timestamp mismatch", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[0].createdAt = value.upgrade.ApprovedAt.Add(time.Second).Format(time.RFC3339Nano)
+		}},
+		{"sequence gap", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[1].sequence = 3
+		}},
+		{"duplicate sequence", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[2].sequence = 2
+		}},
+		{"truncated event count", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents = value.upgradeEvents[:2]
+		}},
+		{"unsupported middle state", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[1].state = string(appaccess.GatewayProfileUpgradeUnresolved)
+		}},
+		{"wrong final state", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[2].state = string(appaccess.GatewayProfileUpgradeRolledBack)
+		}},
+		{"final timestamp mismatch", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[2].createdAt = value.upgrade.UpdatedAt.Add(time.Second).Format(time.RFC3339Nano)
+		}},
+		{"malformed timestamp", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[1].createdAt = "invalid"
+		}},
+		{"backwards intermediate timestamp", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[1].createdAt = value.upgrade.ApprovedAt.Add(-time.Second).Format(time.RFC3339Nano)
+		}},
+		{"gateway operation proof field", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[1].gatewayOperationID = sql.NullString{String: value.upgrade.OperationID, Valid: true}
+		}},
+		{"protected digest proof field", func(value *legacyNativeBatchAuthority) {
+			value.upgradeEvents[1].protectedStateDigest = sql.NullString{String: strings.Repeat("a", 64), Valid: true}
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := deterministicLegacyNativeBatchAuthority(t)
+			test.mutate(&value)
+			if err := validateLegacyNativeBatchAuthority(value); err == nil {
+				t.Fatal("malformed historical native upgrade history was accepted")
+			}
+		})
 	}
 }
