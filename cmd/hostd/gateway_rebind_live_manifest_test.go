@@ -185,7 +185,7 @@ var gatewayRebindLiveScenarios = []gatewayRebindLiveScenario{
 	{"selected-current-restoration", "fresh hostd restores exact committed serving before normal admission", "internal/generatedingress/gateway_rebind_committed_serving_restore.go", "restoreGatewayRebindCommittedServingLocked"},
 	{"pending-route-restart", "dedicated current route recovery retains precedence over historical rebind replay", "internal/generatedingress/gateway_rebind_cross_store_inspection.go", "GatewayCurrentRecoveryRoute"},
 	{"pending-lan-restart", "dedicated current LAN recovery retains the exact operation pin", "internal/generatedingress/gateway_rebind_cross_store_inspection.go", "GatewayCurrentRecoveryLAN"},
-	{"pending-lan-batch-restart", "dedicated current LAN batch recovery retains the exact batch head", "internal/generatedingress/gateway_rebind_cross_store_inspection.go", "GatewayCurrentRecoveryLANBatch"},
+	{"pending-lan-batch-restart", "migrated native LAN batch recovery retains the exact batch head", "internal/generatedingress/gateway_v2_lan_recovery_batch.go", "QuarantineGatewayV2LANAccessRecoveryBatch"},
 	{"competing-controller", "a second hostd cannot cross owner/effects/gateway locks while the first owns recovery", "internal/generatedingress/gateway_rebind_cross_store_commit.go", "runGatewayRebindCommitLocked"},
 	{"original-role-revocation", "revoked original approver blocks a newly requested direction before effects", "internal/generatedingress/gateway_rebind_commit_facade.go", "liveSession"},
 	{"current-role-revocation", "revoked current administrator blocks interactive reconcile before effects", "internal/controller/gateway_rebind_session.go", "bindLANGatewayRebindSessionAuthority"},

@@ -425,7 +425,12 @@ func migratedLegacyPairCompositionFixture(t *testing.T) (*sql.DB, *appaccess.Rep
 
 func legacyPairCompositionDBThrough028(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "control.db"))
+	return legacyPairCompositionDBThrough028At(t, filepath.Join(t.TempDir(), "control.db"))
+}
+
+func legacyPairCompositionDBThrough028At(t *testing.T, path string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -525,11 +530,18 @@ func legacyDisableApprovalRequestDigest(t *testing.T, owner appaccess.Allocation
 	specDigest, actorID string,
 ) string {
 	t.Helper()
+	return legacyDisableApprovalRequestDigestAtRevision(t, owner, 1, specDigest, actorID)
+}
+
+func legacyDisableApprovalRequestDigestAtRevision(t *testing.T, owner appaccess.AllocationOwner,
+	expectedRevisionNumber int64, specDigest, actorID string,
+) string {
+	t.Helper()
 	value := struct {
 		Expected int64                     `json:"expectedRevisionNumber"`
 		Owner    appaccess.AllocationOwner `json:"owner"`
 		Approval appaccess.Approval        `json:"approval"`
-	}{Expected: 1, Owner: owner, Approval: appaccess.Approval{
+	}{Expected: expectedRevisionNumber, Owner: owner, Approval: appaccess.Approval{
 		Action: appaccess.ActionDisableAppAccess, SpecDigest: specDigest, ActorID: actorID,
 	}}
 	return legacyJSONDigest(t, value)
