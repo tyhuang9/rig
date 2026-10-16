@@ -49,6 +49,11 @@ const (
 	// A full daemon normally starts far faster. This cap turns a child-internal
 	// stall into a reportable test failure without extending any child deadline.
 	liveHostdRebindStartupReadinessCap = 10 * time.Minute
+	// Claim observation and startup refusal are deliberately shorter than
+	// ordinary readiness so a stalled harness leaves its existing cleanup
+	// reserve rather than reaching the enclosing package timeout.
+	liveHostdRebindClaimObservationCap = 2 * time.Minute
+	liveHostdRebindStartupRefusalCap   = 2 * time.Minute
 	liveHostdRebindChildReapTimeout    = 20 * time.Second
 )
 
@@ -628,17 +633,33 @@ func liveHostdRebindWaitJSON(ctx context.Context, child *liveHostdRebindChild,
 
 func liveHostdRebindStartupReadinessBudget(now, deadline time.Time, hasDeadline bool) (time.Duration, error) {
 	if !hasDeadline {
-		return liveHostdRebindStartupReadinessCap, nil
+		return liveHostdRebindBoundedBudget(now, liveHostdRebindStartupReadinessCap)
 	}
-	budget := deadline.Sub(now) - liveHostdRebindStartupCleanupReserve
-	if budget <= 0 {
-		return 0, fmt.Errorf("test deadline leaves no startup readiness time after %s cleanup reserve",
-			liveHostdRebindStartupCleanupReserve)
+	return liveHostdRebindBoundedBudget(now, liveHostdRebindStartupReadinessCap, deadline)
+}
+
+// liveHostdRebindBoundedBudget preserves the fixture cleanup reserve for each
+// known enclosing deadline. Callers may pass both the Go test deadline and an
+// inherited fixture context deadline; the shortest usable budget wins.
+func liveHostdRebindBoundedBudget(now time.Time, cap time.Duration, deadlines ...time.Time) (time.Duration, error) {
+	if cap <= 0 {
+		return 0, errors.New("invalid bounded wait cap")
 	}
-	if budget < liveHostdRebindStartupReadinessCap {
-		return budget, nil
+	budget := cap
+	for _, deadline := range deadlines {
+		if deadline.IsZero() {
+			continue
+		}
+		remaining := deadline.Sub(now) - liveHostdRebindStartupCleanupReserve
+		if remaining <= 0 {
+			return 0, fmt.Errorf("deadline leaves no bounded wait time after %s cleanup reserve",
+				liveHostdRebindStartupCleanupReserve)
+		}
+		if remaining < budget {
+			budget = remaining
+		}
 	}
-	return liveHostdRebindStartupReadinessCap, nil
+	return budget, nil
 }
 
 func liveHostdRebindReadyFailure(child *liveHostdRebindChild, purpose string, cause error) error {
