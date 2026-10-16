@@ -541,22 +541,24 @@ func gatewayRebindTypedHandoverResourceInventoryMatches(intent gatewayRebindProt
 		equalStrings(value.OwnedNetworks, []string{intent.Identity.IngressNetwork})
 }
 
-func (d gatewayRebindTypedHandoverRuntime) configInventory(ctx context.Context,
-	attempt gatewayRebindPreparedAttempt, effect gatewayRebindTypedEffectProgress,
-	containerID string, finalRunning bool,
-) bool {
-	if d.manager == nil || d.manager.runner == nil || effect.FinalConfigIntent == nil || !validContainerID(containerID) {
-		return false
+func (d gatewayRebindTypedHandoverRuntime) configInventoryValue(ctx context.Context,
+	attempt gatewayRebindPreparedAttempt, effect, sourceEffect gatewayRebindTypedEffectProgress,
+	containerID string, finalRunning, permitUnacknowledgedFinalCopy bool,
+) (gatewayRebindFinalConfigInventory, bool) {
+	if d.manager == nil || d.manager.runner == nil || effect.FinalConfigIntent == nil ||
+		sourceEffect.FinalConfigIntent == nil ||
+		!reflect.DeepEqual(effect.FinalConfigIntent, sourceEffect.FinalConfigIntent) || !validContainerID(containerID) {
+		return 0, false
 	}
 	stage, err := gatewayRebindTypedStageConfigBytes(attempt.Intent)
 	if err != nil {
-		return false
+		return 0, false
 	}
 	defer clear(stage)
 	active, err := gatewayRebindTypedFinalConfigBytes(attempt.Intent, attempt.Checkpoint,
 		effect.FinalConfigIntent.RoutePlan)
 	if err != nil {
-		return false
+		return 0, false
 	}
 	defer clear(active)
 	result, err := d.manager.runner.Run(ctx, runtimeprocess.CommandRequest{
@@ -569,28 +571,78 @@ func (d gatewayRebindTypedHandoverRuntime) configInventory(ctx context.Context,
 	})
 	defer clearResult(&result)
 	if err != nil || result.StdoutTruncated || result.StderrTruncated || len(result.Stderr) != 0 || ctx.Err() != nil {
-		return false
+		return 0, false
 	}
 	sequence := uint64(0)
 	for candidate := uint64(2); candidate <= gatewayRebindProgressMaximumSequence; candidate++ {
 		if _, legal := gatewayRebindTypedEffectPhase(candidate); legal &&
-			validGatewayRebindTypedEffectProgress(effect, candidate) {
+			validGatewayRebindTypedEffectProgress(sourceEffect, candidate) {
 			if sequence != 0 {
-				return false
+				return 0, false
 			}
 			sequence = candidate
 		}
 	}
 	phase, ok := gatewayRebindTypedEffectPhase(sequence)
 	if !ok {
-		return false
+		return 0, false
 	}
 	mode := gatewayRebindFinalHandoverAutosaveMode(phase, "", effect.FinalContainer != nil, finalRunning)
+	if mode == 0 && permitUnacknowledgedFinalCopy && phase == gatewayRebindProgressFinalConfigIntent &&
+		effect.FinalContainer == nil && !finalRunning {
+		mode = gatewayRebindFinalConfigStageAutosave
+	}
 	if mode == 0 {
-		return false
+		return 0, false
 	}
 	inventory, err := gatewayRebindExactFinalConfigVolumeArchiveWithAutosave(result.Stdout, stage, active, mode)
-	return err == nil && inventory == gatewayRebindFinalConfigInventoryExactPair
+	return inventory, err == nil
+}
+
+func (d gatewayRebindTypedHandoverRuntime) configInventory(ctx context.Context,
+	attempt gatewayRebindPreparedAttempt, effect gatewayRebindTypedEffectProgress,
+	containerID string, finalRunning bool,
+) bool {
+	inventory, ok := d.configInventoryValue(ctx, attempt, effect, effect, containerID, finalRunning, false)
+	return ok && inventory == gatewayRebindFinalConfigInventoryExactPair
+}
+
+func (d gatewayRebindTypedHandoverRuntime) rollbackConfigInventory(ctx context.Context,
+	attempt gatewayRebindPreparedAttempt, effect, sourceEffect gatewayRebindTypedEffectProgress,
+	containerID string, finalRunning bool,
+) bool {
+	if sourceEffect.FinalConfigIntent != nil {
+		inventory, ok := d.configInventoryValue(ctx, attempt, effect, sourceEffect, containerID, finalRunning,
+			sourceEffect.FinalConfigCopy == nil)
+		if !ok {
+			return false
+		}
+		if sourceEffect.FinalConfigCopy != nil {
+			return inventory == gatewayRebindFinalConfigInventoryExactPair
+		}
+		return inventory == gatewayRebindFinalConfigInventoryStageOnly ||
+			inventory == gatewayRebindFinalConfigInventoryExactPair
+	}
+	if effect.StageContainer == nil || normalizeID(containerID) != effect.StageContainer.ID {
+		return false
+	}
+	expected, err := gatewayRebindTypedStageConfigBytes(attempt.Intent)
+	if err != nil {
+		return false
+	}
+	defer clear(expected)
+	inventory, err := d.stage.stageConfigInventory(ctx, effect, expected, effect.StageStartIntent != nil)
+	if err != nil {
+		return false
+	}
+	if effect.StageConfigCopy != nil {
+		return inventory == gatewayRebindStageConfigInventoryExact
+	}
+	if effect.StageConfigIntent != nil {
+		return inventory == gatewayRebindStageConfigInventoryEmpty ||
+			inventory == gatewayRebindStageConfigInventoryExact
+	}
+	return inventory == gatewayRebindStageConfigInventoryEmpty
 }
 
 func (d gatewayRebindTypedHandoverRuntime) finalRoutes(ctx context.Context,
@@ -842,6 +894,34 @@ func (d gatewayRebindTypedHandoverRuntime) stableResources(ctx context.Context,
 	first, err := d.readResources(ctx, attempt, effect, stageExpected, finalExpected)
 	if err != nil {
 		return gatewayRebindTypedHandoverPhysical{}, err
+	}
+	second, err := d.readResources(ctx, attempt, effect, stageExpected, finalExpected)
+	if err != nil || !sameGatewayRebindTypedHandoverPhysical(attempt.Intent, first, second) ||
+		ctx.Err() != nil || guard(ctx) != nil {
+		return gatewayRebindTypedHandoverPhysical{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	return second, nil
+}
+
+func (d gatewayRebindTypedHandoverRuntime) stableRollbackResources(ctx context.Context,
+	attempt gatewayRebindPreparedAttempt, effect, sourceEffect gatewayRebindTypedEffectProgress,
+	stageExpected, finalExpected bool, guard gatewayRebindTypedEffectGuard,
+) (gatewayRebindTypedHandoverPhysical, error) {
+	if guard == nil || guard(ctx) != nil {
+		return gatewayRebindTypedHandoverPhysical{}, gatewayRebindEffectBoundaryError(ctx)
+	}
+	first, err := d.readResources(ctx, attempt, effect, stageExpected, finalExpected)
+	if err != nil {
+		return gatewayRebindTypedHandoverPhysical{}, err
+	}
+	containerID, finalRunning := "", false
+	if stageExpected {
+		containerID = effect.StageContainer.ID
+	} else if finalExpected {
+		containerID, finalRunning = normalizeID(first.Final.ID), first.Final.Running
+	}
+	if containerID == "" || !d.rollbackConfigInventory(ctx, attempt, effect, sourceEffect, containerID, finalRunning) {
+		return gatewayRebindTypedHandoverPhysical{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	second, err := d.readResources(ctx, attempt, effect, stageExpected, finalExpected)
 	if err != nil || !sameGatewayRebindTypedHandoverPhysical(attempt.Intent, first, second) ||
@@ -1324,6 +1404,10 @@ func (d gatewayRebindTypedHandoverRuntime) stableRollbackPrefix(ctx context.Cont
 		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
 	}
 	canonicalFirst, firstOK := canonicalGatewayRebindTypedStageObservation(attempt.Intent, first)
+	if first.StageContainerFound && effect.StageContainer != nil &&
+		!d.rollbackConfigInventory(ctx, attempt, effect, effect, effect.StageContainer.ID, false) {
+		return gatewayRebindTypedStageObservation{}, gatewayRebindEffectBoundaryError(ctx)
+	}
 	second, err := d.stage.read(ctx, attempt.Intent)
 	canonicalSecond, secondOK := canonicalGatewayRebindTypedStageObservation(attempt.Intent, second)
 	if err != nil || !firstOK || !secondOK || !reflect.DeepEqual(canonicalFirst, canonicalSecond) ||
@@ -1368,6 +1452,7 @@ func (d gatewayRebindTypedHandoverRuntime) prepareRollback(ctx context.Context,
 	} else if last.Sequence != 1 {
 		return invalid()
 	}
+	sourceEffect := effect
 	bound := gatewayRebindTypedRollbackOwnedFromEffect(effect)
 	planned := bound
 	stage, err := d.stage.read(ctx, attempt.Intent)
@@ -1437,7 +1522,7 @@ func (d gatewayRebindTypedHandoverRuntime) prepareRollback(ctx context.Context,
 	}
 	confirmedStage := stage
 	if planned.FinalContainer != nil {
-		physical, stableErr := d.stableResources(ctx, attempt, effect, false, true, guard)
+		physical, stableErr := d.stableRollbackResources(ctx, attempt, effect, sourceEffect, false, true, guard)
 		if stableErr != nil {
 			return invalid()
 		}
@@ -1457,7 +1542,8 @@ func (d gatewayRebindTypedHandoverRuntime) prepareRollback(ctx context.Context,
 			return invalid()
 		}
 	} else if effect.FinalConfigCopy != nil && effect.FinalConfigIntent != nil && last.Sequence >= 12 {
-		physical, stableErr := d.stableResources(ctx, attempt, effect, effect.StageContainer != nil, false, guard)
+		physical, stableErr := d.stableRollbackResources(ctx, attempt, effect, sourceEffect,
+			effect.StageContainer != nil, false, guard)
 		if stableErr != nil {
 			return invalid()
 		}
@@ -1555,7 +1641,7 @@ func (d gatewayRebindTypedHandoverRuntime) rollbackState(ctx context.Context,
 ) (gatewayRebindTypedStageObservation, error) {
 	projected := gatewayRebindTypedRollbackProjection(effect, remaining)
 	if remaining.FinalContainer != nil {
-		physical, err := d.stableResources(ctx, attempt, projected, false, true, guard)
+		physical, err := d.stableRollbackResources(ctx, attempt, projected, effect, false, true, guard)
 		if err != nil {
 			return gatewayRebindTypedStageObservation{}, err
 		}

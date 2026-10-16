@@ -55,6 +55,8 @@ type gatewayRebindTypedStageRuntimeRunner struct {
 	lostCopyAcknowledgment  bool
 	afterArchive            func(*gatewayRebindTypedStageRuntimeRunner)
 	archiveOverride         []byte
+	archiveErr              error
+	archiveStdoutTruncated  bool
 }
 
 func TestGatewayRebindTypedStageRuntimeCommandsStartReplayAndCopyFinalConfig(t *testing.T) {
@@ -419,7 +421,8 @@ func (r *gatewayRebindTypedStageRuntimeRunner) Run(_ context.Context,
 		if r.afterArchive != nil {
 			r.afterArchive(r)
 		}
-		return runtimeprocess.CommandResult{Stdout: archive}, nil
+		return runtimeprocess.CommandResult{Stdout: archive,
+			StdoutTruncated: r.archiveStdoutTruncated}, r.archiveErr
 	}
 	if len(args) == 4 && args[0] == "container" && args[1] == "cp" {
 		body, err := os.ReadFile(args[2])
