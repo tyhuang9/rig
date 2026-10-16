@@ -69,8 +69,8 @@ also refuse with their expected read counts and no mutation effects.
 All three new test parents match the shared `^Test(GatewayRebind|InspectGatewayRebind)`
 selection and none of its specialized exclusions in
 `scripts/check-generated-runtime-race.sh`, so each belongs to `rebind-history`
-exactly once. No workflow change was needed. Existing hosted Linux history jobs
-175 and 177 took roughly 24 to 26 minutes in total job duration. The package
+exactly once. No workflow change was needed. The completed Linux history jobs
+in PRs #175 and #177 took roughly 24 to 26 minutes in total job duration. The package
 deadline remains 32 minutes; the added durable controls increase the risk of
 approaching the hosted job limit. No Linux race or hosted workflow run is
 claimed here.
