@@ -352,3 +352,141 @@ func TestGatewayRebindAbortedTerminalExportedWrapperRejectsMissingPredecessorInv
 		}
 	}
 }
+
+// TestGatewayRebindRollbackTerminalObserverBindsCheckpointRoutesDigest is a
+// limited observer output-contract control. It uses the observer's explicit
+// predecessor-reader seam after a real typed rollback has produced stable
+// stage absence. It does not stand in for the SQL/protected-history acceptance
+// exercised by TestGatewayRebindAbortedTerminalProofCoreIsFreshAndReadOnly.
+func TestGatewayRebindRollbackTerminalObserverBindsCheckpointRoutesDigest(t *testing.T) {
+	fixture := newGatewayRebindTypedHandoverRuntimeFixture(t, true)
+	fixture.runner.failFinalCreate = true
+	request := gatewayRebindPhysicalReconcileRequest{Attempt: fixture.attempt,
+		Mode: gatewayRebindPhysicalReconcileUndecided, SQLPhase: appaccess.GatewayRebindPrepared,
+		RollbackAllowed: true}
+	driver := managerGatewayRebindCrossStoreDriver{manager: fixture.predecessor.manager,
+		stage: fixture.stageDriver, handover: fixture.runtime}
+	physical, err := driver.reconcileSuccessorLocked(context.Background(), request, fixture.appendProgress)
+	if err != nil || physical.Disposition != appaccess.GatewayRebindDispositionAbort {
+		t.Fatalf("prepare observer contract rollback: result=%#v error=%v", physical, err)
+	}
+	history, err := fixture.predecessor.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(history.IntentsV2) != 1 {
+		t.Fatalf("read observer contract history: intents=%d error=%v", len(history.IntentsV2), err)
+	}
+	attempt, err := gatewayRebindTypedPreparedAttemptFromHistory(history.IntentsV2[0].Intent, history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	predecessor, err := fixture.runtime.predecessor(context.Background(), attempt)
+	if err != nil || !predecessor.Running || !validSHA256(predecessor.Routes) {
+		t.Fatalf("read observer contract predecessor: predecessor=%#v error=%v", predecessor, err)
+	}
+	effects := len(fixture.runner.effects)
+
+	currentFixture := newGatewayCurrentStateFixture(t)
+	currentCheckpoint, _ := gatewayRebindAttemptTypedFixture(t, currentFixture)
+	if !validGatewayRebindPredecessorCheckpoint(currentCheckpoint) || currentCheckpoint.CurrentState == nil ||
+		currentCheckpoint.UpgradeState != nil {
+		t.Fatal("current-checkpoint observer fixture is invalid")
+	}
+
+	for _, test := range []struct {
+		name       string
+		checkpoint gatewayRebindPredecessorCheckpoint
+	}{
+		{name: "gateway upgrade checkpoint", checkpoint: attempt.Checkpoint},
+		{name: "gateway rebind checkpoint", checkpoint: currentCheckpoint},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := attempt
+			candidate.Checkpoint = test.checkpoint
+			reads := 0
+			result, observeErr := fixture.runtime.observeGatewayRebindRollbackServing(context.Background(), candidate,
+				func(context.Context) (gatewayRebindTypedPredecessorObservation, error) {
+					reads++
+					return predecessor, nil
+				}, func(context.Context) error { return nil })
+			expected, digestErr := gatewayRebindTypedCheckpointRoutesDigest(test.checkpoint)
+			if observeErr != nil || digestErr != nil || result.Refuse || reads != 2 ||
+				result.Observation.PredecessorRoutesDigest != expected || expected == predecessor.Routes ||
+				!validSHA256(result.Observation.StageAbsenceDigest) || len(fixture.runner.effects) != effects {
+				t.Fatalf("purpose-bound observer result=%#v raw=%s expected=%s reads=%d effects=%d/%d errors=%v/%v",
+					result, predecessor.Routes, expected, reads, len(fixture.runner.effects), effects,
+					observeErr, digestErr)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name       string
+		checkpoint gatewayRebindPredecessorCheckpoint
+	}{
+		{name: "missing checkpoint union", checkpoint: func() gatewayRebindPredecessorCheckpoint {
+			value := attempt.Checkpoint
+			value.UpgradeState, value.CurrentState = nil, nil
+			return value
+		}()},
+		{name: "mixed checkpoint union", checkpoint: func() gatewayRebindPredecessorCheckpoint {
+			value := attempt.Checkpoint
+			value.CurrentState = currentCheckpoint.CurrentState
+			return value
+		}()},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := attempt
+			candidate.Checkpoint = test.checkpoint
+			reads := 0
+			result, observeErr := fixture.runtime.observeGatewayRebindRollbackServing(context.Background(), candidate,
+				func(context.Context) (gatewayRebindTypedPredecessorObservation, error) {
+					reads++
+					return predecessor, nil
+				}, func(context.Context) error { return nil })
+			if observeErr != nil || !result.Refuse || result.Observation != (gatewayRebindRollbackServingObservation{}) ||
+				reads != 2 || len(fixture.runner.effects) != effects {
+				t.Fatalf("invalid checkpoint union escaped refusal: result=%#v reads=%d effects=%d/%d error=%v",
+					result, reads, len(fixture.runner.effects), effects, observeErr)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name      string
+		guard     gatewayRebindTypedEffectGuard
+		wantReads int
+	}{
+		{name: "stopped predecessor", wantReads: 1},
+		{name: "raw routes changed between reads", wantReads: 2},
+		{name: "final guard refused", wantReads: 2,
+			guard: func(context.Context) error { return appaccess.ErrApprovalRequired }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			reads := 0
+			read := func(context.Context) (gatewayRebindTypedPredecessorObservation, error) {
+				reads++
+				value := predecessor
+				switch test.name {
+				case "stopped predecessor":
+					value.Running = false
+				case "raw routes changed between reads":
+					if reads == 2 {
+						value.Routes = strings.Repeat("f", 64)
+					}
+				}
+				return value, nil
+			}
+			guard := test.guard
+			if guard == nil {
+				guard = func(context.Context) error { return nil }
+			}
+			result, observeErr := fixture.runtime.observeGatewayRebindRollbackServing(context.Background(), attempt,
+				read, guard)
+			if observeErr != nil || !result.Refuse || result.Observation != (gatewayRebindRollbackServingObservation{}) ||
+				reads != test.wantReads || len(fixture.runner.effects) != effects {
+				t.Fatalf("observer refusal changed: result=%#v reads=%d effects=%d/%d error=%v",
+					result, reads, len(fixture.runner.effects), effects, observeErr)
+			}
+		})
+	}
+}
