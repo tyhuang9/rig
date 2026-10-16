@@ -212,9 +212,13 @@ func (d gatewayRebindTypedHandoverRuntime) observeGatewayRebindRollbackServing(c
 	if err != nil || !validSHA256(stageAbsenceDigest) {
 		return refuse, nil
 	}
+	predecessorRoutesDigest, err := gatewayRebindTypedCheckpointRoutesDigest(attempt.Checkpoint)
+	if err != nil || !validSHA256(predecessorRoutesDigest) {
+		return refuse, nil
+	}
 	return gatewayRebindRollbackServingObservationResult{Observation: gatewayRebindRollbackServingObservation{
 		PredecessorContainerID: predecessor.ContainerID, PredecessorObservationDigest: predecessor.Observation,
-		PredecessorRoutesDigest: predecessor.Routes, StageAbsenceDigest: stageAbsenceDigest,
+		PredecessorRoutesDigest: predecessorRoutesDigest, StageAbsenceDigest: stageAbsenceDigest,
 	}}, nil
 }
 
