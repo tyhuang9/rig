@@ -49,7 +49,7 @@ whitespace, formatting of each changed Go Git blob, clean status and unchanged
 `internal`, `db`, `go.mod` and `go.sum` checks passed.
 
 The frozen external receipt `recovery-followups-with-lan-verification/verification.json`
-records exact argument arrays, environments, source Git blobs, raw-output
+records exact argument arrays, source Git blobs, raw-output
 hashes and process results. Its SHA-256 is
 `0de3134abf7ee6641b58ce562c4468323f148327496ca3f02ed51ce4bbca08e1`.
 
