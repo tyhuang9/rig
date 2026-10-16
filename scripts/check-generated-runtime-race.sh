@@ -36,9 +36,9 @@ rebind_handover_rollback_pattern='^TestGatewayRebindFinalHandoverRollback'
 rebind_typed_pattern='^TestGatewayRebindTyped'
 rebind_withdrawal_pattern='^TestGatewayRebindTyped(Rollback|ForwardOnly)'
 rebind_completed_pattern='^TestGatewayRebindTyped(Completed|Committed|Recovery|Undurable)'
-# Keep the expensive typed handover parent trees in their own complementary
-# group. The typed-runtime fallback below retains every future non-handover
-# typed parent without extending this list.
+# Keep the complete typed Handover family in its own complementary group.
+# Withdrawal and completed groups stay unchanged; typed-runtime retains every
+# other typed-runtime parent without extending this list.
 rebind_typed_handover_pattern='^TestGatewayRebindTypedHandover'
 rebind_composition_pattern='^TestGatewayRebindConcreteComposition'
 # Keep complete startup/adoption and transferred-lifecycle parent trees in
