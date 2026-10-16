@@ -1072,7 +1072,13 @@ func (r *gatewayRebindTypedHandoverRuntimeRunner) list(args []string) (runtimepr
 func (r *gatewayRebindTypedHandoverRuntimeRunner) archive(args []string) (runtimeprocess.CommandResult, error) {
 	id := normalizeID(strings.SplitN(args[2], ":/config/", 2)[0])
 	if id == r.effect.StageContainer.ID || id == r.finalID {
-		return runtimeprocess.CommandResult{Stdout: r.stage.configArchive()}, nil
+		r.stage.archiveReads++
+		archive := r.stage.configArchive()
+		if r.stage.afterArchive != nil {
+			r.stage.afterArchive(r.stage)
+		}
+		return runtimeprocess.CommandResult{Stdout: archive,
+			StdoutTruncated: r.stage.archiveStdoutTruncated}, r.stage.archiveErr
 	}
 	if id == normalizeID(r.predecessor.V1Container.ID) {
 		return runtimeprocess.CommandResult{Stdout: gatewayRebindSingleConfigArchive(r.t,
