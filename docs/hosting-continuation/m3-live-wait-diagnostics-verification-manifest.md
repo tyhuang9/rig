@@ -40,3 +40,40 @@ The final-source Windows and WSL selector executions above cover the changed
 test harness.
 
 No command in this manifest starts Docker or uses the race detector.
+
+## Fresh combined-source verification — 2026-10-16 UTC
+
+The history-preserving local integration is
+`96d5bec473d1002672afb3bfc1799382c88f1442`, with parents
+`e790fa2fd1dfec432c39833360954505395ee0d3` (reviewed harness) and
+`20efbf1aa4358be7cfef2d83356c8241949cd48a` (published runtime safeguard).
+Its tree is `9b411900cf463897909d4b4fa2196e9eef98e633`.
+The integration needed no conflict resolution. Its entire `internal` tree
+matches the reviewed runtime parent; its entire `cmd` tree matches the reviewed
+harness parent. The `scripts` and `.github` trees also match the runtime parent.
+
+Root executed fresh checks against this combined head using the shared Go
+environment and exact workflow selector above. The actual command arguments,
+environment allowlist, exit statuses, captured stdout/stderr hashes, selected
+parents and source identity are retained in the external
+`runtime-wait-combined-verification/verification.json` receipt (SHA-256
+`bdaccee81ad84c481a20efba78aaaf95b6e18df1f07613627384d391c163ade7`).
+
+| Combined check | Actual result | Captured stdout SHA-256 |
+| --- | --- | --- |
+| Windows `go test -tags live_docker -json -count=1 -timeout=2m ./cmd/hostd -run <exact-selector>` | All 24 selected parents ran and passed once; zero fail/skip; package 12.302s; exit 0 | `0bf474810f2a88998ab3a5d91f5067e188d792fa77327a4acd75c47b0265e872` |
+| Linux cross-compile followed by actual WSL execution with the same selector and two-minute cap | All 24 selected parents ran and passed once; zero fail/skip; exit 0 | `755920c60960bb2b316f6245bbc526fd48fda0f8dab20f3035e762bee0f5befd` |
+| `pwsh -NoProfile -File scripts/check-generation.ps1` | Exit 0; controller contract test 0.644s | `01c2fcaecce7f4cdc252d31ebd2c0f142cda25fae2fa57b7b2d8127edf61eb3e` |
+| Aggregate `git diff --check` against the runtime parent | Exit 0; empty output; worktree clean | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` |
+
+The combined Linux binary SHA-256 is
+`483c9a37a4fead1f9d6762b35c91aac06905cfc86a6520032881f43f31d7a615`.
+Linux stderr contains the existing negative TLS-control handshake rejection;
+the corresponding test and package passed. It is not a production TLS result.
+This section is a documentation-only addition after the checks; tested code
+blobs are unchanged. Separate runtime fixture results remain bound to their
+recorded source and are not described as fresh combined-head executions.
+
+Fresh combined-source Docker cases, race checks and independent resource cleanup
+remain required. Neither local controls nor source-tree equality accept the
+hosted matrix, historical failure causes or M3.
