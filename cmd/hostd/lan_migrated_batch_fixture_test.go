@@ -226,9 +226,11 @@ const timeFormat = "2006-01-02T15:04:05.999999999Z07:00"
 
 func validateLegacyNativeBatchAuthority(value legacyNativeBatchAuthority) error {
 	if value.actor.id == "" || value.actor.role != "administrator" || value.machine.id == "" ||
-		len(value.applications) != 2 || len(value.access) != 2 || len(value.upgradeEvents) != 3 ||
-		value.upgrade.State != appaccess.GatewayProfileUpgradeCommitted || value.upgrade.StateSequence != 3 {
+		len(value.applications) != 2 || len(value.access) != 2 {
 		return fmt.Errorf("invalid historical native batch authority cardinality")
+	}
+	if err := validateLegacyNativeBatchUpgradeHistory(value.upgrade, value.upgradeEvents); err != nil {
+		return err
 	}
 	apps, allocations, attempts, disables, ports := map[string]bool{}, map[string]bool{}, map[string]bool{}, map[string]bool{}, map[uint16]bool{}
 	for index, access := range value.access {
@@ -256,6 +258,48 @@ func validateLegacyNativeBatchAuthority(value legacyNativeBatchAuthority) error 
 		if !apps[app.id] || app.machineID != value.machine.id || app.archivedAt.Valid {
 			return fmt.Errorf("historical native application identity is not exact")
 		}
+	}
+	return nil
+}
+
+func validateLegacyNativeBatchUpgradeHistory(claim appaccess.GatewayProfileUpgradeClaim,
+	events []legacyNativeBatchEvent,
+) error {
+	if claim.State != appaccess.GatewayProfileUpgradeCommitted ||
+		(claim.StateSequence != 2 && claim.StateSequence != 3) ||
+		int64(len(events)) != claim.StateSequence {
+		return fmt.Errorf("invalid historical native upgrade history cardinality")
+	}
+
+	var previousAt time.Time
+	for index, event := range events {
+		if event.sequence != int64(index+1) {
+			return fmt.Errorf("invalid historical native upgrade event sequence")
+		}
+		if event.gatewayOperationID.Valid || event.protectedStateDigest.Valid {
+			return fmt.Errorf("invalid historical native upgrade event protected fields")
+		}
+		createdAt, err := time.Parse(time.RFC3339Nano, event.createdAt)
+		if err != nil || (index > 0 && createdAt.Before(previousAt)) {
+			return fmt.Errorf("invalid historical native upgrade event timestamp")
+		}
+		switch {
+		case index == 0:
+			if event.state != string(appaccess.GatewayProfileUpgradePrepared) || !createdAt.Equal(claim.ApprovedAt) {
+				return fmt.Errorf("invalid historical native upgrade prepared event")
+			}
+		case claim.StateSequence == 3 && index == 1:
+			if event.state != string(appaccess.GatewayProfileUpgradeServing) {
+				return fmt.Errorf("invalid historical native upgrade intermediate event")
+			}
+		case index == len(events)-1:
+			if event.state != string(appaccess.GatewayProfileUpgradeCommitted) || !createdAt.Equal(claim.UpdatedAt) {
+				return fmt.Errorf("invalid historical native upgrade final event")
+			}
+		default:
+			return fmt.Errorf("invalid historical native upgrade history shape")
+		}
+		previousAt = createdAt
 	}
 	return nil
 }
