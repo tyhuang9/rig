@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
 import json
 import os
 import re
@@ -383,7 +384,8 @@ def posix_process_ended(process_id: int, timeout_seconds: float) -> bool:
     while True:
         try:
             status = status_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # Linux can remove the process after opening its procfs stat file.
             return True
         after_name = status.rsplit(") ", 1)
         if len(after_name) == 2 and after_name[1].startswith("Z"):
@@ -489,8 +491,29 @@ def synthetic_events(contract: dict[str, Any], group_id: str) -> list[dict[str, 
 
 
 def self_test(root: Path, contract: dict[str, Any]) -> None:
+    from unittest.mock import patch
+
     validate_contract(root, contract)
     first_group = contract["groups"][0]["id"]
+
+    for error_number in (errno.ENOENT, errno.ESRCH):
+        with patch.object(Path, "read_text", side_effect=OSError(error_number, "process exited")):
+            if not posix_process_ended(123, 0):
+                fail("self-test process disappearance was not recognized")
+    for error_number in (errno.EACCES, errno.EIO):
+        read_error = OSError(error_number, "status unavailable")
+        with patch.object(Path, "read_text", side_effect=read_error):
+            try:
+                posix_process_ended(123, 0)
+            except OSError as error:
+                if error is not read_error:
+                    raise
+            else:
+                fail("self-test unreadable process status was accepted as ended")
+    for state, expected in (("S", False), ("Z", True)):
+        with patch.object(Path, "read_text", return_value=f"123 (fixture) {state} 1"):
+            if posix_process_ended(123, 0) != expected:
+                fail(f"self-test process state {state!r} had the wrong result")
 
     omitted = copy.deepcopy(contract)
     omitted["groups"][-1]["cases"].pop()
@@ -632,7 +655,6 @@ def self_test(root: Path, contract: dict[str, Any]) -> None:
                     if actual_exit != exit_code or timed_out or not residue or not posix_process_ended(descendant_id, 5):
                         fail("self-test completed command retained a detached-output child")
                     if exit_code == 0:
-                        from unittest.mock import patch
                         with patch.dict(run_group.__globals__, run_case_command=lambda *_: (output, actual_exit, timed_out, residue)):
                             expect_contract_error("successful command with process residue", lambda: run_group(
                                 root, contract, first_group, command_events, command_logs, sys.executable, emit_output=False
