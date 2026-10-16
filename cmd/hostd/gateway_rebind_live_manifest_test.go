@@ -177,7 +177,7 @@ var gatewayRebindLiveScenarios = []gatewayRebindLiveScenario{
 	{"lost-stage-start-ack", "stage container is serving although the start success was not returned", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "serveStage"},
 	{"lost-final-config-copy-ack", "final config bytes match the intent although the copy success was not returned", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "copyFinalConfig"},
 	{"lost-final-container-create-ack", "final container exists with exact binding although create/start success was not returned", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "bindFinalContainer"},
-	{"lost-cutover-ack", "successor route is active although cutover success was not returned", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "prepareCutover"},
+	{"lost-cutover-ack", "predecessor stop completed under the durable cutover intent although its Docker success was not returned", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "serveSuccessor"},
 	{"lost-successor-serving-ack", "successor serves and predecessor is withdrawn although serving success was not returned", "internal/generatedingress/gateway_rebind_cross_store_driver.go", "serveSuccessor"},
 	{"literal-unresolved-precommit", "fixed precommit unresolved evidence permits only the validated rollback policy", "internal/generatedingress/gateway_rebind_cross_store_recovery.go", "appaccess.GatewayRebindUnresolved"},
 	{"literal-unresolved-database-committed", "an immutable database commit forces forward completion from literal unresolved", "internal/generatedingress/gateway_rebind_cross_store_recovery.go", "snapshot.DatabaseCommitObserved"},
