@@ -238,6 +238,7 @@ jobs:
           - rebind-handover-rollback
           - rebind-typed-withdrawal
           - rebind-typed-completed
+          - rebind-typed-handover
           - rebind-typed-runtime
           - rebind-composition-native
           - rebind-composition-startup

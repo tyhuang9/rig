@@ -36,6 +36,10 @@ rebind_handover_rollback_pattern='^TestGatewayRebindFinalHandoverRollback'
 rebind_typed_pattern='^TestGatewayRebindTyped'
 rebind_withdrawal_pattern='^TestGatewayRebindTyped(Rollback|ForwardOnly)'
 rebind_completed_pattern='^TestGatewayRebindTyped(Completed|Committed|Recovery|Undurable)'
+# Keep the expensive typed handover parent trees in their own complementary
+# group. The typed-runtime fallback below retains every future non-handover
+# typed parent without extending this list.
+rebind_typed_handover_pattern='^TestGatewayRebindTypedHandover'
 rebind_composition_pattern='^TestGatewayRebindConcreteComposition'
 # Keep complete startup/adoption and transferred-lifecycle parent trees in
 # complementary batches; none of these changes extends the test deadline.
@@ -110,9 +114,13 @@ case "$suite" in
     packages=(./internal/generatedingress)
     filter=(-run "$rebind_completed_pattern")
     ;;
+  rebind-typed-handover)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_typed_handover_pattern")
+    ;;
   rebind-typed-runtime)
     packages=(./internal/generatedingress)
-    filter=(-run "$rebind_typed_pattern" -skip "$rebind_withdrawal_pattern|$rebind_completed_pattern")
+    filter=(-run "$rebind_typed_pattern" -skip "$rebind_withdrawal_pattern|$rebind_completed_pattern|$rebind_typed_handover_pattern")
     ;;
   rebind-composition-native)
     packages=(./internal/generatedingress)
