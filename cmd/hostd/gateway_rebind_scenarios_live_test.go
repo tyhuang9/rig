@@ -575,7 +575,7 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 
 	testDeadline, hasTestDeadline := t.Deadline()
 	var disableSnapshot liveHostdRebindDisableSnapshot
-	if kind == "lan" || kind == "lan-batch" {
+	if kind == "lan" {
 		if _, err := liveHostdRebindClaimObservationBudget(time.Now(), fixture.ctx, testDeadline, hasTestDeadline); err != nil {
 			fail(fmt.Errorf("reserve pending LAN claim observation before requests: %w", err), liveHostdRebindDisableClaimCensus{})
 			return
@@ -598,8 +598,6 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 	}
 
 	var recoveryOperations []string
-	var secondDisableOperation string
-	var secondDisableRequest apicontract.DisableLANAppAccessRequest
 	switch kind {
 	case "route":
 		var configuration apicontract.ApplicationConfiguration
@@ -631,15 +629,9 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 		// Acceptance precedes the barrier wait. The child must have admitted a
 		// real durable deployment job that can progress without a GitHub provider.
 		liveHostdRebindAssertDeploymentStarted(t, fixture, mutation.Job.ID)
-	case "lan", "lan-batch":
+	case "lan":
 		firstID, firstRequest := liveHostdRebindDisableRequest(t, fixture, fixture.app.id)
 		recoveryOperations = append(recoveryOperations, firstID)
-		if kind == "lan-batch" {
-			// Obtain both reviews before the first true current mutation can
-			// hold the runtime lock at its post-effect lost-ack barrier.
-			secondDisableOperation, secondDisableRequest = liveHostdRebindDisableRequest(t, fixture, fixture.secondApp.id)
-			recoveryOperations = append(recoveryOperations, secondDisableOperation)
-		}
 		if err := requests.register(firstID, "first"); err != nil {
 			fail(err, liveHostdRebindDisableClaimCensus{})
 			return
@@ -653,24 +645,6 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 		t.Fatalf("unknown pending current scenario %q", kind)
 	}
 	liveHostdRebindWaitBoundary(t, fixture, child)
-	if kind == "lan-batch" {
-		if err := requests.register(secondDisableOperation, "second"); err != nil {
-			fail(err, liveHostdRebindDisableClaimCensus{})
-			return
-		}
-		go func() {
-			status, _, err := liveHostdRebindHTTP(requestContext, fixture, http.MethodPost,
-				"/api/v1/apps/"+fixture.secondApp.id+"/lan-access/disables", secondDisableRequest)
-			requests.complete(liveHostdRebindDisableRequestOutcomeFor(secondDisableOperation, "second", status, err))
-		}()
-		child.startWait()
-		census, err := liveHostdRebindWaitDisableClaimsResult(fixture.ctx, testDeadline, hasTestDeadline,
-			child.waitDone, recoveryOperations, requests, disableSnapshot)
-		if err != nil {
-			fail(err, census)
-			return
-		}
-	}
 	if err := liveHostdRebindKillAndReapError(child); err != nil {
 		fail(errors.New("reap original child before pending request join"), liveHostdRebindDisableClaimCensus{})
 		return
@@ -708,6 +682,53 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 		return
 	}
 	scenarioComplete = true
+}
+
+func liveHostdRebindMigratedPendingLANBatchScenario(t *testing.T) {
+	t.Helper()
+	fixture, batch := newLiveHostdGatewayRebindMigratedPendingLANBatchFixture(t)
+	if len(batch.operationIDs) != 2 {
+		t.Fatal("migrated pending LAN batch did not retain exactly two operations")
+	}
+	child := liveHostdRebindStartChild(t, fixture, batch.operationIDs[0], "", "pending-lan-batch-restart")
+	activeChild := child
+	complete := false
+	defer func() {
+		if !complete {
+			liveHostdRebindCleanupChild(t, activeChild)
+		}
+	}()
+
+	boundary := liveHostdRebindWaitBoundary(t, fixture, child)
+	if boundary.Boundary != "current_effect_ack_lost" {
+		t.Fatalf("migrated pending LAN batch stopped at wrong boundary %q", boundary.Boundary)
+	}
+	for _, operationID := range batch.operationIDs {
+		access := batch.claims[operationID]
+		lanTwoAppProbe(t, fixture.ctx, fixture.predecessor.IPv4, access.allocation.Port,
+			fixture.predecessor.IPv4, "/api/version", http.StatusNotFound, "")
+	}
+	beforeCrash := liveHostdRebindReadNativeBatchIdentity(t, fixture, batch)
+	if err := liveHostdRebindKillAndReapError(child); err != nil {
+		t.Fatal("reap native batch child at physical quarantine boundary:", err)
+	}
+	liveHostdRebindAssertMigratedNativeBatchSQL(t, fixture, batch)
+
+	fresh := liveHostdRebindStartChild(t, fixture, "", "", "")
+	activeChild = fresh
+	ready := liveHostdRebindWaitReady(t, fixture, fresh)
+	if !ready.RecoveryOnly || ready.RecoveryKind != "lan_disable" ||
+		ready.OperationID != beforeCrash.Items[beforeCrash.Head].OperationID {
+		t.Fatalf("fresh process lost exact migrated native batch head: recovery=%t kind=%q expected_head=%t",
+			ready.RecoveryOnly, ready.RecoveryKind, ready.OperationID == beforeCrash.Items[beforeCrash.Head].OperationID)
+	}
+	afterRestart := liveHostdRebindReadNativeBatchIdentity(t, fixture, batch)
+	liveHostdRebindAssertSameNativeBatch(t, beforeCrash, afterRestart)
+	liveHostdRebindAssertMigratedNativeBatchSQL(t, fixture, batch)
+	if err := liveHostdRebindKillAndReapError(fresh); err != nil {
+		t.Fatal("reap fresh native batch recovery child:", err)
+	}
+	complete = true
 }
 
 func liveHostdRebindAssertDeploymentStarted(t *testing.T, fixture *liveHostdGatewayRebindFixture,
@@ -1552,7 +1573,7 @@ func liveHostdRebindRunPendingLANRestart(t *testing.T) {
 	liveHostdRebindPendingCurrentScenario(t, "lan")
 }
 func liveHostdRebindRunPendingLANBatchRestart(t *testing.T) {
-	liveHostdRebindPendingCurrentScenario(t, "lan-batch")
+	liveHostdRebindMigratedPendingLANBatchScenario(t)
 }
 func liveHostdRebindRunOwnershipDrift(t *testing.T) { liveHostdRebindDriftScenario(t, "ownership") }
 func liveHostdRebindRunConfigurationDrift(t *testing.T) {
