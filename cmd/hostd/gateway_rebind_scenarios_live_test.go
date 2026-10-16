@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -542,9 +543,60 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 		t.Fatal("terminal rebind fixture entered recovery before a current operation")
 	}
 	requestContext, cancelRequests := context.WithCancel(fixture.ctx)
-	defer cancelRequests()
-	requestDone := make(chan struct{}, 2)
-	pendingRequests := 0
+	requests := liveHostdRebindNewDisableRequests()
+	activeChild := child
+	scenarioComplete := false
+	joiner := liveHostdRebindNewDisableRequestJoiner(requests, liveHostdRebindRequestJoinTimeout)
+	cleanup := liveHostdRebindPendingCurrentCleanup{
+		cancel: cancelRequests,
+		reap:   func() error { return liveHostdRebindKillAndReapError(activeChild) },
+		join:   joiner.join,
+	}
+	defer func() {
+		if scenarioComplete {
+			return
+		}
+		reapErr, joinErr := cleanup.run()
+		if reapErr != nil || joinErr != nil {
+			t.Errorf("pending current cleanup reaping=%s request_join=%s",
+				liveHostdRebindFailureCategory(reapErr), liveHostdRebindFailureCategory(joinErr))
+		}
+	}()
+	fail := func(cause error, census liveHostdRebindDisableClaimCensus) {
+		reapErr, joinErr := cleanup.run()
+		childFacts := "unavailable"
+		if reapErr == nil {
+			childFacts = liveHostdRebindClosedChildFacts(fixture, activeChild)
+		}
+		t.Fatalf("pending current %s failed: %v claims=%s requests=%s child=%s reaping=%s request_join=%s",
+			kind, cause, census, requests.summary(), childFacts,
+			liveHostdRebindFailureCategory(reapErr), liveHostdRebindFailureCategory(joinErr))
+	}
+
+	testDeadline, hasTestDeadline := t.Deadline()
+	var disableSnapshot liveHostdRebindDisableSnapshot
+	if kind == "lan" || kind == "lan-batch" {
+		if _, err := liveHostdRebindClaimObservationBudget(time.Now(), fixture.ctx, testDeadline, hasTestDeadline); err != nil {
+			fail(fmt.Errorf("reserve pending LAN claim observation before requests: %w", err), liveHostdRebindDisableClaimCensus{})
+			return
+		}
+		observerDB, err := database.Open(fixture.dataRoot)
+		if err != nil {
+			fail(errors.New("open pending LAN claim observer failed"), liveHostdRebindDisableClaimCensus{})
+			return
+		}
+		observer := appaccess.New(observerDB)
+		// The observer is opened once before either public mutation. Its snapshot
+		// method uses a read-only transaction; close it only after every snapshot
+		// call in this scenario has returned.
+		defer func() {
+			if err := observerDB.Close(); err != nil {
+				t.Error("close pending LAN claim observer")
+			}
+		}()
+		disableSnapshot = observer.AppAccessDisableStartupSnapshot
+	}
+
 	var recoveryOperations []string
 	var secondDisableOperation string
 	var secondDisableRequest apicontract.DisableLANAppAccessRequest
@@ -588,35 +640,48 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 			secondDisableOperation, secondDisableRequest = liveHostdRebindDisableRequest(t, fixture, fixture.secondApp.id)
 			recoveryOperations = append(recoveryOperations, secondDisableOperation)
 		}
+		if err := requests.register(firstID, "first"); err != nil {
+			fail(err, liveHostdRebindDisableClaimCensus{})
+			return
+		}
 		go func() {
-			defer func() { requestDone <- struct{}{} }()
-			_, _, _ = liveHostdRebindHTTP(requestContext, fixture, http.MethodPost,
+			status, _, err := liveHostdRebindHTTP(requestContext, fixture, http.MethodPost,
 				"/api/v1/apps/"+fixture.app.id+"/lan-access/disables", firstRequest)
+			requests.complete(liveHostdRebindDisableRequestOutcomeFor(firstID, "first", status, err))
 		}()
-		pendingRequests++
 	default:
 		t.Fatalf("unknown pending current scenario %q", kind)
 	}
 	liveHostdRebindWaitBoundary(t, fixture, child)
 	if kind == "lan-batch" {
+		if err := requests.register(secondDisableOperation, "second"); err != nil {
+			fail(err, liveHostdRebindDisableClaimCensus{})
+			return
+		}
 		go func() {
-			defer func() { requestDone <- struct{}{} }()
-			_, _, _ = liveHostdRebindHTTP(requestContext, fixture, http.MethodPost,
+			status, _, err := liveHostdRebindHTTP(requestContext, fixture, http.MethodPost,
 				"/api/v1/apps/"+fixture.secondApp.id+"/lan-access/disables", secondDisableRequest)
+			requests.complete(liveHostdRebindDisableRequestOutcomeFor(secondDisableOperation, "second", status, err))
 		}()
-		pendingRequests++
-		liveHostdRebindWaitDisableClaims(t, fixture, recoveryOperations)
-	}
-	liveHostdRebindKillAndReap(t, child)
-	cancelRequests()
-	for range pendingRequests {
-		select {
-		case <-requestDone:
-		case <-time.After(20 * time.Second):
-			t.Fatal("pending current request did not stop with its killed hostd")
+		child.startWait()
+		census, err := liveHostdRebindWaitDisableClaimsResult(fixture.ctx, testDeadline, hasTestDeadline,
+			child.waitDone, recoveryOperations, requests, disableSnapshot)
+		if err != nil {
+			fail(err, census)
+			return
 		}
 	}
+	if err := liveHostdRebindKillAndReapError(child); err != nil {
+		fail(errors.New("reap original child before pending request join"), liveHostdRebindDisableClaimCensus{})
+		return
+	}
+	cancelRequests()
+	if err := joiner.join(); err != nil {
+		fail(errors.New("pending current requests did not stop with their killed hostd"), liveHostdRebindDisableClaimCensus{})
+		return
+	}
 	fresh := liveHostdRebindStartChild(t, fixture, "", "", "")
+	activeChild = fresh
 	ready := liveHostdRebindWaitReady(t, fixture, fresh)
 	if kind == "route" {
 		if ready.RecoveryOnly {
@@ -630,9 +695,19 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 			!liveHostdRebindContains(recoveryOperations, ready.OperationID) {
 			t.Fatalf("pending LAN recovery lost dedicated precedence: %#v", ready)
 		}
-		liveHostdRebindWaitDisableClaims(t, fixture, recoveryOperations)
+		fresh.startWait()
+		census, err := liveHostdRebindWaitDisableClaimsResult(fixture.ctx, testDeadline, hasTestDeadline,
+			fresh.waitDone, recoveryOperations, requests, disableSnapshot)
+		if err != nil {
+			fail(err, census)
+			return
+		}
 	}
-	liveHostdRebindKillAndReap(t, fresh)
+	if err := liveHostdRebindKillAndReapError(fresh); err != nil {
+		fail(errors.New("reap fresh child after pending recovery"), liveHostdRebindDisableClaimCensus{})
+		return
+	}
+	scenarioComplete = true
 }
 
 func liveHostdRebindAssertDeploymentStarted(t *testing.T, fixture *liveHostdGatewayRebindFixture,
@@ -679,36 +754,414 @@ func liveHostdRebindDisableRequest(t *testing.T, fixture *liveHostdGatewayRebind
 	}
 }
 
-func liveHostdRebindWaitDisableClaims(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+const liveHostdRebindRequestJoinTimeout = 20 * time.Second
+
+// liveHostdRebindDisableSnapshot is the deliberately narrow polling seam. The
+// live scenario binds it once to an observer repository opened before either
+// public request; polling itself cannot reopen or migrate SQLite.
+type liveHostdRebindDisableSnapshot func(context.Context) (appaccess.AppAccessDisableStartupSnapshot, error)
+
+type liveHostdRebindDisableRequestOutcome struct {
+	operationID string
+	phase       string
+	status      int
+	response    string
+	transport   string
+}
+
+func liveHostdRebindDisableRequestOutcomeFor(operationID, phase string, status int, err error) liveHostdRebindDisableRequestOutcome {
+	outcome := liveHostdRebindDisableRequestOutcome{operationID: operationID, phase: phase, status: status}
+	if err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			outcome.transport = "canceled"
+		case errors.Is(err, context.DeadlineExceeded):
+			outcome.transport = "deadline_exceeded"
+		default:
+			outcome.transport = "transport_error"
+		}
+		return outcome
+	}
+	switch status {
+	case http.StatusOK:
+		outcome.response = "retained"
+	case http.StatusCreated:
+		outcome.response = "created"
+	default:
+		outcome.response = "unexpected_status"
+	}
+	return outcome
+}
+
+func (o liveHostdRebindDisableRequestOutcome) String() string {
+	return fmt.Sprintf("phase=%s status=%d response=%s transport=%s", o.phase, o.status, o.response, o.transport)
+}
+
+// liveHostdRebindDisableRequests retains every expected request outcome. Its
+// channel capacity covers both current LAN requests, so a request goroutine
+// cannot become the stranded sender when the first observation fails.
+type liveHostdRebindDisableRequests struct {
+	done     chan liveHostdRebindDisableRequestOutcome
+	expected map[string]string
+	outcomes map[string]liveHostdRebindDisableRequestOutcome
+}
+
+// liveHostdRebindDisableRequestJoiner keeps the single request-join deadline
+// shared by ordinary shutdown, failure reporting, and the deferred fallback.
+// A failed join therefore cannot spend another full deadline while t.Fatalf
+// unwinds the scenario defer.
+type liveHostdRebindDisableRequestJoiner struct {
+	requests *liveHostdRebindDisableRequests
+	timeout  time.Duration
+
+	attempted bool
+	err       error
+}
+
+func liveHostdRebindNewDisableRequestJoiner(requests *liveHostdRebindDisableRequests,
+	timeout time.Duration,
+) *liveHostdRebindDisableRequestJoiner {
+	return &liveHostdRebindDisableRequestJoiner{requests: requests, timeout: timeout}
+}
+
+func (j *liveHostdRebindDisableRequestJoiner) join() error {
+	if j == nil || j.requests == nil || j.timeout <= 0 {
+		return errors.New("invalid pending LAN request join")
+	}
+	if j.attempted {
+		return j.err
+	}
+	j.attempted = true
+	ctx, cancel := context.WithTimeout(context.Background(), j.timeout)
+	defer cancel()
+	j.err = j.requests.join(ctx)
+	return j.err
+}
+
+// liveHostdRebindPendingCurrentCleanup preserves the shutdown order and caches
+// both results. The failure path and its defer can call run independently
+// without a second exact-child reap or a second request-join budget.
+type liveHostdRebindPendingCurrentCleanup struct {
+	cancel context.CancelFunc
+	reap   func() error
+	join   func() error
+
+	attempted bool
+	reapErr   error
+	joinErr   error
+}
+
+func (c *liveHostdRebindPendingCurrentCleanup) run() (error, error) {
+	if c == nil || c.cancel == nil || c.reap == nil || c.join == nil {
+		return errors.New("invalid pending LAN cleanup"), errors.New("invalid pending LAN cleanup")
+	}
+	if c.attempted {
+		return c.reapErr, c.joinErr
+	}
+	c.attempted = true
+	c.cancel()
+	c.reapErr = c.reap()
+	c.joinErr = c.join()
+	return c.reapErr, c.joinErr
+}
+
+func liveHostdRebindNewDisableRequests() *liveHostdRebindDisableRequests {
+	return &liveHostdRebindDisableRequests{
+		done:     make(chan liveHostdRebindDisableRequestOutcome, 2),
+		expected: make(map[string]string), outcomes: make(map[string]liveHostdRebindDisableRequestOutcome),
+	}
+}
+
+func (r *liveHostdRebindDisableRequests) register(operationID, phase string) error {
+	if r == nil || operationID == "" || phase == "" || len(r.expected) >= cap(r.done) {
+		return errors.New("invalid pending LAN request registration")
+	}
+	if _, exists := r.expected[operationID]; exists {
+		return errors.New("duplicate pending LAN request registration")
+	}
+	r.expected[operationID] = phase
+	return nil
+}
+
+func (r *liveHostdRebindDisableRequests) complete(outcome liveHostdRebindDisableRequestOutcome) {
+	// Every scenario registers no more than the two known requests before its
+	// goroutine starts. The fixed buffer therefore accepts both completions even
+	// if cleanup has already moved on to reaping the child.
+	r.done <- outcome
+}
+
+func (r *liveHostdRebindDisableRequests) retain(outcome liveHostdRebindDisableRequestOutcome) error {
+	if r == nil || r.expected[outcome.operationID] != outcome.phase || outcome.phase == "" {
+		return errors.New("unbound pending LAN request outcome")
+	}
+	if _, exists := r.outcomes[outcome.operationID]; exists {
+		return errors.New("duplicate pending LAN request outcome")
+	}
+	r.outcomes[outcome.operationID] = outcome
+	return nil
+}
+
+func (r *liveHostdRebindDisableRequests) drain() error {
+	for {
+		select {
+		case outcome := <-r.done:
+			if err := r.retain(outcome); err != nil {
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+}
+
+func (r *liveHostdRebindDisableRequests) join(ctx context.Context) error {
+	if r == nil {
+		return errors.New("pending LAN request outcomes are missing")
+	}
+	for len(r.outcomes) < len(r.expected) {
+		if err := r.drain(); err != nil {
+			return err
+		}
+		if len(r.outcomes) == len(r.expected) {
+			break
+		}
+		select {
+		case outcome := <-r.done:
+			if err := r.retain(outcome); err != nil {
+				return err
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+func (r *liveHostdRebindDisableRequests) summary() string {
+	if r == nil || len(r.expected) == 0 {
+		return "none"
+	}
+	values := make([]string, 0, len(r.expected))
+	for operationID, phase := range r.expected {
+		outcome, ok := r.outcomes[operationID]
+		if !ok {
+			values = append(values, "phase="+phase+" outcome=pending")
+			continue
+		}
+		values = append(values, outcome.String())
+	}
+	sort.Strings(values)
+	return strings.Join(values, ",")
+}
+
+func (r *liveHostdRebindDisableRequests) incompatible(census liveHostdRebindDisableClaimCensus) *liveHostdRebindDisableRequestOutcome {
+	if r == nil {
+		return nil
+	}
+	for operationID := range r.expected {
+		outcome, exists := r.outcomes[operationID]
+		if !exists || census.pending(operationID) {
+			continue
+		}
+		if outcome.transport != "" || outcome.response == "unexpected_status" {
+			copy := outcome
+			return &copy
+		}
+	}
+	return nil
+}
+
+type liveHostdRebindDisableClaimCensus struct {
+	expected  int
+	pendingN  int
+	missing   int
+	committed int
+	invalid   int
+	duplicate int
+	foreign   int
+	counts    map[string]int
+	pendingBy map[string]bool
+}
+
+func liveHostdRebindDisableClaimCensusFor(snapshot appaccess.AppAccessDisableStartupSnapshot,
 	operationIDs []string,
-) {
-	t.Helper()
+) liveHostdRebindDisableClaimCensus {
+	census := liveHostdRebindDisableClaimCensus{expected: len(operationIDs), counts: make(map[string]int, len(operationIDs)),
+		pendingBy: make(map[string]bool, len(operationIDs))}
+	expected := make(map[string]struct{}, len(operationIDs))
+	for _, operationID := range operationIDs {
+		expected[operationID] = struct{}{}
+	}
+	states := make(map[string]appaccess.AppAccessDisableState, len(operationIDs))
+	for _, entry := range snapshot.Claims {
+		operationID := entry.Claim.OperationID
+		if _, wanted := expected[operationID]; !wanted {
+			census.foreign++
+			continue
+		}
+		census.counts[operationID]++
+		states[operationID] = entry.Claim.State
+	}
+	for _, operationID := range operationIDs {
+		count := census.counts[operationID]
+		switch {
+		case count == 0:
+			census.missing++
+		case count != 1:
+			census.duplicate++
+		case states[operationID] == appaccess.AppAccessDisableCommitted:
+			census.committed++
+		case states[operationID] == appaccess.AppAccessDisablePrepared ||
+			states[operationID] == appaccess.AppAccessDisableWithdrawing ||
+			states[operationID] == appaccess.AppAccessDisableUncertain:
+			census.pendingN++
+			census.pendingBy[operationID] = true
+		default:
+			census.invalid++
+		}
+	}
+	return census
+}
+
+func (c liveHostdRebindDisableClaimCensus) pending(operationID string) bool {
+	return c.pendingBy[operationID]
+}
+
+func (c liveHostdRebindDisableClaimCensus) complete() bool {
+	return c.expected > 0 && c.pendingN == c.expected && c.missing == 0 && c.committed == 0 &&
+		c.invalid == 0 && c.duplicate == 0
+}
+
+func (c liveHostdRebindDisableClaimCensus) strictError() error {
+	switch {
+	case c.duplicate != 0:
+		return errors.New("pending LAN claim snapshot contains duplicate required operation")
+	case c.committed != 0:
+		return errors.New("pending LAN claim snapshot contains committed required operation")
+	case c.invalid != 0:
+		return errors.New("pending LAN claim snapshot contains invalid required operation state")
+	default:
+		return nil
+	}
+}
+
+func (c liveHostdRebindDisableClaimCensus) String() string {
+	return fmt.Sprintf("expected=%d pending=%d missing=%d committed=%d invalid=%d duplicate=%d foreign=%d",
+		c.expected, c.pendingN, c.missing, c.committed, c.invalid, c.duplicate, c.foreign)
+}
+
+func liveHostdRebindClaimObservationBudget(now time.Time, parent context.Context,
+	testDeadline time.Time, hasTestDeadline bool,
+) (time.Duration, error) {
+	deadlines := make([]time.Time, 0, 2)
+	if hasTestDeadline {
+		deadlines = append(deadlines, testDeadline)
+	}
+	if parent != nil {
+		if deadline, ok := parent.Deadline(); ok {
+			deadlines = append(deadlines, deadline)
+		}
+	}
+	return liveHostdRebindBoundedBudget(now, liveHostdRebindClaimObservationCap, deadlines...)
+}
+
+// liveHostdRebindWaitDisableClaimsResult observes only the supplied
+// repository snapshot. It uses the caller's bounded context for every read,
+// retains request completions, and always obtains a fresh snapshot before an
+// incompatible completed request is classified as missing its durable claim.
+func liveHostdRebindWaitDisableClaimsResult(parent context.Context, testDeadline time.Time, hasTestDeadline bool,
+	childDone <-chan struct{}, operationIDs []string, requests *liveHostdRebindDisableRequests,
+	snapshot liveHostdRebindDisableSnapshot,
+) (liveHostdRebindDisableClaimCensus, error) {
+	var census liveHostdRebindDisableClaimCensus
+	if parent == nil || snapshot == nil || requests == nil || len(operationIDs) == 0 || len(operationIDs) != len(requests.expected) {
+		return census, errors.New("invalid pending LAN claim observation")
+	}
+	seen := make(map[string]struct{}, len(operationIDs))
+	for _, operationID := range operationIDs {
+		if operationID == "" {
+			return census, errors.New("unbound pending LAN claim observation")
+		}
+		if _, duplicate := seen[operationID]; duplicate {
+			return census, errors.New("duplicate pending LAN claim observation")
+		}
+		seen[operationID] = struct{}{}
+		if requests.expected[operationID] == "" {
+			return census, errors.New("unbound pending LAN claim observation")
+		}
+	}
+	budget, err := liveHostdRebindClaimObservationBudget(time.Now(), parent, testDeadline, hasTestDeadline)
+	if err != nil {
+		return census, fmt.Errorf("pending LAN claim observation budget: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		db, err := database.Open(fixture.dataRoot)
-		if err == nil {
-			snapshot, snapshotErr := appaccess.New(db).AppAccessDisableStartupSnapshot(context.Background())
-			closeErr := db.Close()
-			if snapshotErr == nil && closeErr == nil {
-				found := make(map[string]bool, len(operationIDs))
-				for _, claim := range snapshot.Claims {
-					found[claim.Claim.OperationID] = claim.Claim.State != appaccess.AppAccessDisableCommitted
-				}
-				complete := true
-				for _, operationID := range operationIDs {
-					complete = complete && found[operationID]
-				}
-				if complete {
-					return
-				}
+		if err := ctx.Err(); err != nil {
+			return census, fmt.Errorf("pending LAN claim observation ended: %s", liveHostdRebindFailureCategory(err))
+		}
+		if err := requests.drain(); err != nil {
+			return census, fmt.Errorf("pending LAN request outcome retention: %s", liveHostdRebindFailureCategory(err))
+		}
+		if childDone != nil {
+			select {
+			case <-childDone:
+				return census, errors.New("full hostd child exited during pending LAN claim observation")
+			default:
 			}
 		}
-		select {
-		case <-fixture.ctx.Done():
-			t.Fatal("pending LAN claims were not durably retained")
-		case <-ticker.C:
+		value, snapshotErr := snapshot(ctx)
+		if snapshotErr != nil {
+			return census, fmt.Errorf("pending LAN claim snapshot failed: %s", liveHostdRebindFailureCategory(snapshotErr))
 		}
+		census = liveHostdRebindDisableClaimCensusFor(value, operationIDs)
+		if err := ctx.Err(); err != nil {
+			return census, fmt.Errorf("pending LAN claim observation ended: %s", liveHostdRebindFailureCategory(err))
+		}
+		if childDone != nil {
+			select {
+			case <-childDone:
+				return census, errors.New("full hostd child exited during pending LAN claim observation")
+			default:
+			}
+		}
+		if err := census.strictError(); err != nil {
+			return census, err
+		}
+		if census.complete() {
+			return census, nil
+		}
+		if outcome := requests.incompatible(census); outcome != nil {
+			return census, fmt.Errorf("completed pending LAN request lacks its durable claim: %s", outcome)
+		}
+		select {
+		case outcome := <-requests.done:
+			if err := requests.retain(outcome); err != nil {
+				return census, fmt.Errorf("pending LAN request outcome retention: %s", liveHostdRebindFailureCategory(err))
+			}
+			// Loop before classification so the just-retained response/error is
+			// compared with a fresh context-bounded durable snapshot.
+		case <-childDone:
+			return census, errors.New("full hostd child exited during pending LAN claim observation")
+		case <-ticker.C:
+		case <-ctx.Done():
+			return census, fmt.Errorf("pending LAN claim observation ended: %s", liveHostdRebindFailureCategory(ctx.Err()))
+		}
+	}
+}
+
+func liveHostdRebindFailureCategory(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	default:
+		return "failed"
 	}
 }
 
@@ -739,6 +1192,19 @@ func liveHostdRebindDriftScenario(t *testing.T, kind string) {
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
 		t.Fatal("fresh drift fixture entered recovery")
 	}
+	// Open the observer before the first public mutation. The refusal path below
+	// reuses it for its bounded fence observation and never opens or migrates a
+	// database after the child has failed.
+	observerDB, err := database.Open(fixture.dataRoot)
+	if err != nil {
+		t.Fatal("open drift refusal observer")
+	}
+	defer func() {
+		if err := observerDB.Close(); err != nil {
+			t.Error("close drift refusal observer")
+		}
+	}()
+	observer := appaccess.New(observerDB)
 	successor := liveHostdRebindPlanSuccessor(t, fixture, apicontract.LANGatewayProfileSpec{
 		InterfaceID: fixture.successor.InterfaceID, SelectedIpv4: fixture.successor.IPv4,
 		PortStart: int(fixture.ports[0]), PortEnd: int(fixture.ports[2]),
@@ -780,16 +1246,24 @@ func liveHostdRebindDriftScenario(t *testing.T, kind string) {
 	case "census":
 		liveHostdRebindAttachCensusDrift(t, fixture, containerID)
 	}
-	liveHostdRebindAssertStartupRefusal(t, fixture)
-	liveHostdRebindAssertContainerRetained(t, fixture, containerID)
-	db, err := database.Open(fixture.dataRoot)
-	if err != nil {
-		t.Fatal(err)
+	refusalChild := liveHostdRebindStartChild(t, fixture, "", "", "")
+	testDeadline, hasTestDeadline := t.Deadline()
+	refusal, refusalErr := liveHostdRebindStartupRefusalResult(fixture, refusalChild, testDeadline, hasTestDeadline,
+		liveHostdRebindKillAndReapError)
+	// A closed refusal failure does not make these read-only observations pass
+	// the scenario. They record whether its exact retained container and fence
+	// can still be inspected before the final assertion reports the failure.
+	retained := liveHostdRebindContainerRetentionObservation(fixture, containerID)
+	fence := liveHostdRebindFenceObservation(fixture.ctx, observer)
+	if refusalErr != nil {
+		t.Fatalf("drifted full hostd startup refusal failed: %v result=%s retained=%s fence=%s",
+			refusalErr, refusal, retained, fence)
 	}
-	fenceErr := appaccess.New(db).CheckGatewayRebindFence(context.Background())
-	closeErr := db.Close()
-	if fenceErr == nil || closeErr != nil {
-		t.Fatalf("drift startup released the rebind fence: fence=%v close=%v", fenceErr, closeErr)
+	if retained != "retained" {
+		t.Fatalf("drift refusal mutated an exact retained container: observation=%s", retained)
+	}
+	if fence != "held" {
+		t.Fatalf("drift startup released or could not inspect the rebind fence: observation=%s", fence)
 	}
 }
 
@@ -797,12 +1271,44 @@ func liveHostdRebindAssertContainerRetained(t *testing.T, fixture *liveHostdGate
 	containerID string,
 ) {
 	t.Helper()
-	body, err := controllerJourneyDocker(fixture.ctx, fixture.docker, nil,
+	if observation := liveHostdRebindContainerRetentionObservation(fixture, containerID); observation != "retained" {
+		t.Fatalf("drift refusal mutated an exact retained container: observation=%s", observation)
+	}
+}
+
+func liveHostdRebindContainerRetentionObservation(fixture *liveHostdGatewayRebindFixture, containerID string) string {
+	if fixture == nil || containerID == "" {
+		return "unknown"
+	}
+	ctx, cancel := context.WithTimeout(fixture.ctx, liveHostdRebindChildReapTimeout)
+	defer cancel()
+	body, err := controllerJourneyDocker(ctx, fixture.docker, nil,
 		"container", "inspect", "--format", "{{.Id}}", containerID)
+	if err != nil {
+		return "unknown"
+	}
 	got := strings.TrimPrefix(strings.TrimSpace(string(body)), "sha256:")
 	want := strings.TrimPrefix(containerID, "sha256:")
-	if err != nil || got != want {
-		t.Fatalf("drift refusal mutated an exact retained container: got=%q want=%q error=%v", got, want, err)
+	if got != want {
+		return "missing"
+	}
+	return "retained"
+}
+
+func liveHostdRebindFenceObservation(parent context.Context, observer *appaccess.Repository) string {
+	if parent == nil || observer == nil {
+		return "unknown"
+	}
+	ctx, cancel := context.WithTimeout(parent, liveHostdRebindChildReapTimeout)
+	defer cancel()
+	err := observer.CheckGatewayRebindFence(ctx)
+	switch {
+	case errors.Is(err, appaccess.ErrGatewayRebindActive):
+		return "held"
+	case err == nil:
+		return "released"
+	default:
+		return "unknown"
 	}
 }
 
@@ -860,19 +1366,146 @@ func liveHostdRebindAttachCensusDrift(t *testing.T, fixture *liveHostdGatewayReb
 func liveHostdRebindAssertStartupRefusal(t *testing.T, fixture *liveHostdGatewayRebindFixture) {
 	t.Helper()
 	child := liveHostdRebindStartChild(t, fixture, "", "", "")
-	child.startWait()
-	select {
-	case <-child.waitDone:
-		if child.waitErr == nil {
-			t.Fatal("drifted full hostd reported successful startup")
+	deadline, hasDeadline := t.Deadline()
+	result, err := liveHostdRebindStartupRefusalResult(fixture, child, deadline, hasDeadline,
+		liveHostdRebindKillAndReapError)
+	if err != nil {
+		t.Fatalf("drifted full hostd startup refusal failed: %v result=%s", err, result)
+	}
+}
+
+type liveHostdRebindStartupRefusalObservation struct {
+	exit       string
+	marker     string
+	diagnostic string
+}
+
+func (r liveHostdRebindStartupRefusalObservation) String() string {
+	return fmt.Sprintf("exit=%s marker=%s stderr=%s", r.exit, r.marker, r.diagnostic)
+}
+
+func liveHostdRebindStartupRefusalBudget(now time.Time, parent context.Context,
+	testDeadline time.Time, hasTestDeadline bool,
+) (time.Duration, error) {
+	deadlines := make([]time.Time, 0, 2)
+	if hasTestDeadline {
+		deadlines = append(deadlines, testDeadline)
+	}
+	if parent != nil {
+		if deadline, ok := parent.Deadline(); ok {
+			deadlines = append(deadlines, deadline)
 		}
-	case <-time.After(2 * time.Minute):
-		liveHostdRebindKillAndReap(t, child)
-		t.Fatal("drifted full hostd did not refuse startup")
 	}
-	if _, err := os.Stat(child.manifest.ReadyMarker); !errors.Is(err, os.ErrNotExist) {
-		t.Fatal("drifted full hostd assembled an API handler")
+	return liveHostdRebindBoundedBudget(now, liveHostdRebindStartupRefusalCap, deadlines...)
+}
+
+// liveHostdRebindStartupRefusalResult closes the exact child before it reads
+// stderr or a ready marker. Its returned fields are all bounded categories or
+// the existing closed stderr digest, so a refusal failure cannot expose raw
+// child output or a marker body.
+func liveHostdRebindStartupRefusalResult(fixture *liveHostdGatewayRebindFixture,
+	child *liveHostdRebindChild, testDeadline time.Time, hasTestDeadline bool,
+	reap func(*liveHostdRebindChild) error,
+) (liveHostdRebindStartupRefusalObservation, error) {
+	result := liveHostdRebindStartupRefusalObservation{exit: "unknown", marker: "unread", diagnostic: "unread"}
+	if fixture == nil || child == nil || reap == nil {
+		return result, errors.New("invalid full hostd startup refusal control")
 	}
+	budget, budgetErr := liveHostdRebindStartupRefusalBudget(time.Now(), fixture.ctx, testDeadline, hasTestDeadline)
+	if budgetErr == nil {
+		ctx, cancel := context.WithTimeout(fixture.ctx, budget)
+		child.startWait()
+		if err := ctx.Err(); err != nil {
+			result.exit = liveHostdRebindFailureCategory(err)
+			budgetErr = err
+		} else {
+			select {
+			case <-ctx.Done():
+				result.exit = liveHostdRebindFailureCategory(ctx.Err())
+				budgetErr = ctx.Err()
+			case <-child.waitDone:
+				if err := ctx.Err(); err != nil {
+					result.exit = liveHostdRebindFailureCategory(err)
+					budgetErr = err
+				} else if child.waitErr == nil {
+					result.exit = "zero"
+				} else {
+					result.exit = "nonzero"
+				}
+			}
+		}
+		cancel()
+	}
+	if reapErr := reap(child); reapErr != nil {
+		// Wait did not complete, so child.stderr may still be receiving bytes.
+		// Do not race that buffer merely to decorate a failed reaping result.
+		return result, fmt.Errorf("full hostd startup refusal child cleanup failed: %s",
+			liveHostdRebindFailureCategory(reapErr))
+	}
+	result.diagnostic = liveHostdRebindClosedDiagnostic(child.stderr.String())
+	result.marker = liveHostdRebindClosedReadyMarkerCategory(fixture, child)
+	if budgetErr != nil {
+		return result, fmt.Errorf("full hostd startup refusal wait failed: %s", liveHostdRebindFailureCategory(budgetErr))
+	}
+	if child.waitErr == nil {
+		return result, errors.New("drifted full hostd reported successful startup")
+	}
+	if result.marker != "absent" {
+		return result, errors.New("drifted full hostd assembled an API handler")
+	}
+	return result, nil
+}
+
+func liveHostdRebindClosedChildFacts(fixture *liveHostdGatewayRebindFixture, child *liveHostdRebindChild) string {
+	if fixture == nil || child == nil || !liveHostdRebindChildWaited(child) {
+		return "unavailable"
+	}
+	exit := "nonzero"
+	if child.waitErr == nil {
+		exit = "zero"
+	}
+	return fmt.Sprintf("exit=%s marker=%s stderr=%s", exit,
+		liveHostdRebindClosedReadyMarkerCategory(fixture, child), liveHostdRebindClosedDiagnostic(child.stderr.String()))
+}
+
+func liveHostdRebindClosedReadyMarkerCategory(fixture *liveHostdGatewayRebindFixture,
+	child *liveHostdRebindChild,
+) string {
+	if fixture == nil || child == nil || child.manifest.ReadyMarker == "" {
+		return "invalid"
+	}
+	file, err := os.Open(child.manifest.ReadyMarker)
+	if errors.Is(err, os.ErrNotExist) {
+		return "absent"
+	}
+	if err != nil {
+		return "invalid"
+	}
+	body, readErr := io.ReadAll(io.LimitReader(file, 8193))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil || len(body) == 0 || len(body) > 8192 {
+		return "invalid"
+	}
+	var marker liveHostdRebindReadyMarker
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(body, &fields) != nil || json.Unmarshal(body, &marker) != nil || marker.Address != fixture.listen {
+		return "invalid"
+	}
+	for field := range fields {
+		if field != "address" && field != "recoveryOnly" && field != "recoveryKind" && field != "operationId" {
+			return "invalid"
+		}
+	}
+	if !marker.RecoveryOnly {
+		if marker.RecoveryKind != "" || marker.OperationID != "" {
+			return "invalid"
+		}
+		return "normal"
+	}
+	if marker.RecoveryKind == "" || uuid.Validate(marker.OperationID) != nil {
+		return "invalid"
+	}
+	return "recovery-only"
 }
 
 func liveHostdRebindEmergencyWithdrawalScenario(t *testing.T) {
