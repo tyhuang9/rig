@@ -101,9 +101,20 @@ func liveHostdRebindSeedBackgroundSentinels(t *testing.T,
 	if err != nil || lease.ApplicationID != applicationID || !lease.ExpiresAt.Before(time.Now().UTC()) {
 		t.Fatalf("seed fixed-past auto-deploy lease: lease=%#v error=%v", lease, err)
 	}
+	// Keep the repository's exact persisted representation. RFC3339Nano omits
+	// zero fractional seconds, whereas coordination timestamps retain them.
+	var storedToken, storedExpiry string
+	if err := db.QueryRow(`SELECT lease_token,lease_expires_at FROM github_auto_deploy_heads WHERE application_id=?`, applicationID).
+		Scan(&storedToken, &storedExpiry); err != nil {
+		t.Fatal("read seeded background lease")
+	}
+	expiresAt, parseErr := time.Parse(time.RFC3339Nano, storedExpiry)
+	if parseErr != nil || storedToken != lease.Token || !expiresAt.Equal(lease.ExpiresAt) {
+		t.Fatal("seeded background lease readback differs from claimed lease")
+	}
 	return liveHostdRebindBackgroundSentinel{
 		autoApplicationID: applicationID, autoLeaseToken: lease.Token,
-		autoLeaseExpires: lease.ExpiresAt.Format(time.RFC3339Nano), autoLeaseFence: lease.Fence,
+		autoLeaseExpires: storedExpiry, autoLeaseFence: lease.Fence,
 		relayControllerID: controllerID, relayEpoch: relayEpoch, relayFence: relayFence,
 	}
 }
@@ -156,12 +167,28 @@ func liveHostdRebindAssertBackgroundSentinelUnchanged(t *testing.T, fixture *liv
 ) {
 	t.Helper()
 	got := liveHostdRebindReadBackgroundSentinel(t, fixture, sentinel)
-	if !got.autoStatus.Enabled || got.autoStatus.LeaseFence != sentinel.autoLeaseFence ||
-		got.autoToken != sentinel.autoLeaseToken || got.autoExpiry != sentinel.autoLeaseExpires ||
-		got.relay.Epoch != sentinel.relayEpoch || got.relay.Fence != sentinel.relayFence ||
-		got.relay.State != controllerrelay.SessionDisconnected || got.keys != 0 || got.credentials != 0 || got.issues != 0 {
-		t.Fatalf("recovery process changed background sentinels: %#v", got)
+	if !liveHostdRebindBackgroundReadbackUnchanged(got, sentinel) {
+		t.Fatalf("recovery process changed background sentinels: %s", liveHostdRebindBackgroundUnchangedDiagnostic(got, sentinel))
 	}
+}
+
+func liveHostdRebindBackgroundReadbackUnchanged(got liveHostdRebindBackgroundReadback,
+	sentinel liveHostdRebindBackgroundSentinel,
+) bool {
+	return got.autoStatus.Enabled && got.autoStatus.LeaseFence == sentinel.autoLeaseFence &&
+		got.autoToken == sentinel.autoLeaseToken && got.autoExpiry == sentinel.autoLeaseExpires &&
+		got.relay.Epoch == sentinel.relayEpoch && got.relay.Fence == sentinel.relayFence &&
+		got.relay.State == controllerrelay.SessionDisconnected && got.keys == 0 && got.credentials == 0 && got.issues == 0
+}
+
+func liveHostdRebindBackgroundUnchangedDiagnostic(got liveHostdRebindBackgroundReadback,
+	sentinel liveHostdRebindBackgroundSentinel,
+) string {
+	return fmt.Sprintf("auto_enabled=%t auto_fence_matches=%t auto_token_matches=%t auto_expiry_matches=%t relay_epoch_matches=%t relay_fence_matches=%t relay_disconnected=%t keys_empty=%t credentials_empty=%t issues_empty=%t",
+		got.autoStatus.Enabled, got.autoStatus.LeaseFence == sentinel.autoLeaseFence,
+		got.autoToken == sentinel.autoLeaseToken, got.autoExpiry == sentinel.autoLeaseExpires,
+		got.relay.Epoch == sentinel.relayEpoch, got.relay.Fence == sentinel.relayFence,
+		got.relay.State == controllerrelay.SessionDisconnected, got.keys == 0, got.credentials == 0, got.issues == 0)
 }
 
 func liveHostdRebindBackgroundReadbackAdvanced(got liveHostdRebindBackgroundReadback,
