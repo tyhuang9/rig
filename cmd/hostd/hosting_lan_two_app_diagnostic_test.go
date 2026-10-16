@@ -10,6 +10,7 @@ import (
 
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
+	"github.com/hostd/hostd/internal/jobs"
 )
 
 const (
@@ -25,15 +26,16 @@ type lanTwoAppComponentStateCounts struct {
 }
 
 type lanTwoAppDeploymentFailureObservation struct {
+	JobRead, JobStatus, JobCode, RuntimeDiagnostic                              string
 	DeploymentRead, DeploymentStatus, RuntimeRead, RuntimePhase, MigrationState string
 	Components                                                                  lanTwoAppComponentStateCounts
 }
 
-func lanTwoAppLogDeploymentFailure(t *testing.T, ctx context.Context, appID, jobID string,
+func lanTwoAppLogDeploymentFailure(t *testing.T, ctx context.Context, appID, jobID string, job jobs.Job,
 	list lanTwoAppDeploymentList, get lanTwoAppRuntimeGet,
 ) {
 	t.Helper()
-	observation := lanTwoAppDeploymentFailureObservationFor(ctx, appID, jobID, list, get)
+	observation := lanTwoAppDeploymentFailureObservationFor(ctx, appID, jobID, job, list, get)
 	t.Log(lanTwoAppDeploymentFailureObservationLine(observation))
 }
 
@@ -45,22 +47,34 @@ func lanTwoAppFailureDiagnosticContext(parent context.Context) (context.Context,
 }
 
 func lanTwoAppDeploymentFailureObservationLine(observation lanTwoAppDeploymentFailureObservation) string {
-	return fmt.Sprintf("LAN deployment failure diagnostic: deployment_read=%s deployment_status=%s runtime_read=%s runtime_phase=%s migration_state=%s components=pending:%d,image_ready:%d,starting:%d,running:%d,healthy:%d,active:%d,draining:%d,stopped:%d,failed:%d,unknown:%d",
+	return fmt.Sprintf("LAN deployment failure diagnostic: job_read=%s job_status=%s job_code=%s runtime_diagnostic=%s deployment_read=%s deployment_status=%s runtime_read=%s runtime_phase=%s migration_state=%s components=pending:%d,image_ready:%d,starting:%d,running:%d,healthy:%d,active:%d,draining:%d,stopped:%d,failed:%d,unknown:%d",
+		observation.JobRead, observation.JobStatus, observation.JobCode, observation.RuntimeDiagnostic,
 		observation.DeploymentRead, observation.DeploymentStatus, observation.RuntimeRead, observation.RuntimePhase, observation.MigrationState,
 		observation.Components.Pending, observation.Components.ImageReady, observation.Components.Starting, observation.Components.Running,
 		observation.Components.Healthy, observation.Components.Active, observation.Components.Draining, observation.Components.Stopped,
 		observation.Components.Failed, observation.Components.Unknown)
 }
 
-func lanTwoAppDeploymentFailureObservationFor(parent context.Context, appID, jobID string,
+func lanTwoAppDeploymentFailureObservationFor(parent context.Context, appID, jobID string, job jobs.Job,
 	list lanTwoAppDeploymentList, get lanTwoAppRuntimeGet,
 ) lanTwoAppDeploymentFailureObservation {
 	ctx, cancel := lanTwoAppFailureDiagnosticContext(parent)
 	defer cancel()
 	observation := lanTwoAppDeploymentFailureObservation{
+		JobRead: "unavailable", JobStatus: "unavailable", JobCode: "unavailable", RuntimeDiagnostic: "unavailable",
 		DeploymentRead: "unavailable", DeploymentStatus: "unavailable", RuntimeRead: "unavailable",
 		RuntimePhase: "unavailable", MigrationState: "unavailable",
 	}
+	// The caller already fetched this job. Do not add a read, or let a crossed
+	// job contribute a plausible failure classification for this deployment.
+	if appID == "" || jobID == "" || job.ID != jobID || job.ResourceID != appID ||
+		job.Type != "deploy" || job.ResourceType != "application" {
+		observation.JobRead = "identity_mismatch"
+		return observation
+	}
+	observation.JobRead = "ok"
+	observation.JobStatus = lanTwoAppJobStatusLabel(job.Status)
+	observation.JobCode = lanTwoAppJobCodeLabel(job.ErrorCode)
 	history, err := list(ctx, appID, lanTwoAppFailureHistoryLimit)
 	if err != nil {
 		observation.DeploymentRead = "failed"
@@ -97,6 +111,7 @@ func lanTwoAppDeploymentFailureObservationFor(parent context.Context, appID, job
 		return observation
 	}
 	observation.RuntimeRead = "ok"
+	observation.RuntimeDiagnostic = lanTwoAppRuntimeDiagnosticLabel(runtimeState.DiagnosticCode)
 	observation.RuntimePhase = lanTwoAppRuntimePhaseLabel(runtimeState.Phase)
 	observation.MigrationState = lanTwoAppMigrationStateLabel(runtimeState.MigrationState)
 	for _, component := range runtimeState.Components {
@@ -124,6 +139,51 @@ func lanTwoAppDeploymentFailureObservationFor(parent context.Context, appID, job
 		}
 	}
 	return observation
+}
+
+func lanTwoAppJobStatusLabel(value string) string {
+	switch jobs.Status(value) {
+	case jobs.Queued, jobs.Assigned, jobs.Running, jobs.Waiting, jobs.WaitingUser,
+		jobs.Succeeded, jobs.Failed, jobs.Cancelled, jobs.Interrupted, jobs.NeedsAttention:
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func lanTwoAppJobCodeLabel(value string) string {
+	// Keep this closed over the durable worker's failure codes.
+	// Never print ErrorDetail, checkpoint JSON, or an unrecognized code.
+	switch value {
+	case "":
+		return "none"
+	case "validation_failed", "runtime_unavailable", "process_termination_failed",
+		"invalid_source", "source_unavailable", "source_access_lost", "provider_unavailable",
+		"source_too_large", "source_storage_full", "configuration_unavailable",
+		"configuration_review_required", "reviewed_revision_stale", "reviewed_revisions_required",
+		"build_configuration_requires_build_command", "compose_invalid", "compose_config_invalid",
+		"compose_config_timeout", "compose_config_output_truncated", "policy_rejected",
+		"apply_failed", "compose_apply_failed", "compose_apply_timeout", "compose_apply_output_truncated",
+		"health_failed", "gateway_readiness_failed", "internal_error", "executor_failed", "executor_invalid_result":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func lanTwoAppRuntimeDiagnosticLabel(value generatedruntimestate.DiagnosticCode) string {
+	switch value {
+	case "":
+		return "none"
+	case generatedruntimestate.DiagnosticInsufficientReplacementCapacity, generatedruntimestate.DiagnosticPlanReviewRequired,
+		generatedruntimestate.DiagnosticMigrationFailed, generatedruntimestate.DiagnosticStartFailed,
+		generatedruntimestate.DiagnosticHealthFailed, generatedruntimestate.DiagnosticRouteSwitchFailed,
+		generatedruntimestate.DiagnosticRuntimeUnavailable, generatedruntimestate.DiagnosticDaemonRestarted,
+		generatedruntimestate.DiagnosticCancelled, generatedruntimestate.DiagnosticInternalError:
+		return string(value)
+	default:
+		return "unknown"
+	}
 }
 
 func lanTwoAppDeploymentStatusLabel(value deployments.Status) string {
@@ -167,6 +227,7 @@ func TestLanTwoAppDeploymentFailureObservationIsAllowlisted(t *testing.T) {
 	var listContext, getContext context.Context
 	var readApp, readDeployment string
 	observation := lanTwoAppDeploymentFailureObservationFor(parent, appID, jobID,
+		jobs.Job{ID: jobID, Type: "deploy", ResourceType: "application", ResourceID: appID},
 		func(ctx context.Context, app string, limit int) ([]deployments.Deployment, error) {
 			listContext, listedApp, listedLimit = ctx, app, limit
 			if err := ctx.Err(); err != nil {
@@ -316,7 +377,8 @@ func TestLanTwoAppDeploymentFailureObservationRejectsUnreadableOrAmbiguousState(
 					return delegate(ctx, appID, deploymentID)
 				}
 			}
-			observation := lanTwoAppDeploymentFailureObservationFor(context.Background(), "application-secret", "job", test.list, get)
+			observation := lanTwoAppDeploymentFailureObservationFor(context.Background(), "application-secret", "job",
+				jobs.Job{ID: "job", Type: "deploy", ResourceType: "application", ResourceID: "application-secret"}, test.list, get)
 			if observation.DeploymentRead != test.wantDeployment || observation.RuntimeRead != test.wantRuntime || getCalls != test.wantGetCalls {
 				t.Fatalf("diagnostic observation=%#v getCalls=%d", observation, getCalls)
 			}

@@ -613,7 +613,7 @@ func lanTwoAppDeployJob(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service,
 		}
 		if job.Status == string(jobs.Failed) || job.Status == string(jobs.NeedsAttention) ||
 			job.Status == string(jobs.WaitingUser) || time.Now().After(deadline) || api.ctx.Err() != nil {
-			lanTwoAppLogDeploymentFailure(t, api.ctx, appID, mutation.Job.ID, deploymentStore.List, state.Get)
+			lanTwoAppLogDeploymentFailure(t, api.ctx, appID, mutation.Job.ID, job, deploymentStore.List, state.Get)
 			t.Fatal("generated deployment did not succeed; safe diagnostic logged")
 		}
 	}

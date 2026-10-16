@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,116 @@ import (
 )
 
 func TestLiveHostdRebindNormalReplayControls(t *testing.T) {
+	t.Run("failure outcomes are bounded and do not fall back", func(t *testing.T) {
+		const private = "private-replay-control-secret"
+		for _, testCase := range []struct {
+			name, code, outcome string
+			status              int
+			malformed           bool
+		}{
+			{name: "proof unavailable", status: 503, code: "lan_gateway_unavailable", outcome: "gateway_unavailable"},
+			{name: "capability unavailable", status: 503, code: "capability_unavailable", outcome: "capability_unavailable"},
+			{name: "conflict", status: 409, code: "lan_gateway_conflict", outcome: "conflict"},
+			{name: "approval mismatch", status: 403, code: "lan_gateway_approval_mismatch", outcome: "approval_mismatch"},
+			{name: "forbidden", status: 403, code: "lan_gateway_forbidden", outcome: "forbidden"},
+			{name: "invalid request", status: 400, code: "invalid_lan_gateway_request", outcome: "invalid_request"},
+			{name: "unknown code", status: 503, code: private, outcome: "problem_other"},
+			{name: "mismatched status", status: 409, code: "lan_gateway_unavailable", outcome: "problem_other"},
+			{name: "unexpected success status", status: 201, code: "lan_gateway_unavailable", outcome: "problem_other"},
+			{name: "malformed body", status: 503, outcome: "problem_other", malformed: true},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				operationID := "operation-failure"
+				diagnostic := liveHostdRebindTerminalControlStatus(operationID, "abort")
+				var gets, posts int
+				var mu sync.Mutex
+				fixture := liveHostdRebindTerminalControlFixture(t, func(writer http.ResponseWriter, request *http.Request) {
+					mu.Lock()
+					defer mu.Unlock()
+					if request.Method == http.MethodGet {
+						gets++
+						_ = json.NewEncoder(writer).Encode(diagnostic)
+						return
+					}
+					posts++
+					writer.WriteHeader(testCase.status)
+					if testCase.malformed {
+						_, _ = io.WriteString(writer, "invalid response "+private)
+						return
+					}
+					_ = json.NewEncoder(writer).Encode(apicontract.Problem{
+						Code: testCase.code, Detail: private, RequestID: private,
+						Errors: map[string]string{private: private}, Title: private, Type: private,
+					})
+				})
+				if err := fixture.retainCommitRequest(operationID, []byte(`{"operationId":"operation-failure","approval":"`+private+`"}`)); err != nil {
+					t.Fatal(err)
+				}
+				status, replayErr := liveHostdRebindNormalReplay(fixture, operationID)
+				mu.Lock()
+				getCount, postCount := gets, posts
+				mu.Unlock()
+				want := fmt.Sprintf("normal rebind replay failed: status=%d outcome=%s", testCase.status, testCase.outcome)
+				if replayErr == nil || replayErr.Error() != want || status.Operation != nil || status.TerminalProof != "" ||
+					status.CurrentProof != "" || getCount != 1 || postCount != 1 {
+					t.Fatal("failed replay did not produce only the bounded refusal without fallback")
+				}
+			})
+		}
+	})
+
+	t.Run("post transport failure remains a bounded refusal", func(t *testing.T) {
+		operationID := "operation-transport"
+		diagnostic := liveHostdRebindTerminalControlStatus(operationID, "abort")
+		var gets, posts int
+		var mu sync.Mutex
+		fixture := liveHostdRebindTerminalControlFixture(t, func(writer http.ResponseWriter, request *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			if request.Method == http.MethodGet {
+				gets++
+				_ = json.NewEncoder(writer).Encode(diagnostic)
+				return
+			}
+			posts++
+			connection, _, err := writer.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error("could not close the test connection")
+				return
+			}
+			_ = connection.Close()
+		})
+		if err := fixture.retainCommitRequest(operationID, []byte(`{"operationId":"operation-transport"}`)); err != nil {
+			t.Fatal(err)
+		}
+		status, replayErr := liveHostdRebindNormalReplay(fixture, operationID)
+		mu.Lock()
+		getCount, postCount := gets, posts
+		mu.Unlock()
+		if replayErr == nil || replayErr.Error() != "normal rebind replay failed: status=0 outcome=transport_error" ||
+			status.Operation != nil || status.TerminalProof != "" || status.CurrentProof != "" || getCount != 1 || postCount != 1 {
+			t.Fatal("transport failure leaked details, retried, or supplied usable replay evidence")
+		}
+	})
+
+	t.Run("transport outcomes discard private error text", func(t *testing.T) {
+		for _, testCase := range []struct {
+			name, outcome string
+			err           error
+		}{
+			{name: "canceled", err: fmt.Errorf("private URL and token: %w", context.Canceled), outcome: "transport_canceled"},
+			{name: "deadline", err: fmt.Errorf("private URL and token: %w", context.DeadlineExceeded), outcome: "transport_deadline_exceeded"},
+			{name: "other", err: errors.New("private URL and token"), outcome: "transport_error"},
+		} {
+			t.Run(testCase.name, func(t *testing.T) {
+				err := liveHostdRebindNormalReplayFailure(503, []byte(`{"code":"lan_gateway_unavailable"}`), testCase.err)
+				if err.Error() != "normal rebind replay failed: status=503 outcome="+testCase.outcome {
+					t.Fatal("transport failure leaked error text or was classified as an HTTP refusal")
+				}
+			})
+		}
+	})
+
 	t.Run("retains exact request bytes", func(t *testing.T) {
 		fixture := &liveHostdGatewayRebindFixture{}
 		operationID := "operation-retained"
