@@ -801,9 +801,10 @@ func (o liveHostdRebindDisableRequestOutcome) String() string {
 // channel capacity covers both current LAN requests, so a request goroutine
 // cannot become the stranded sender when the first observation fails.
 type liveHostdRebindDisableRequests struct {
-	done     chan liveHostdRebindDisableRequestOutcome
-	expected map[string]string
-	outcomes map[string]liveHostdRebindDisableRequestOutcome
+	done        chan liveHostdRebindDisableRequestOutcome
+	expected    map[string]string
+	outcomes    map[string]liveHostdRebindDisableRequestOutcome
+	afterRetain func(liveHostdRebindDisableRequestOutcome)
 }
 
 // liveHostdRebindDisableRequestJoiner keeps the single request-join deadline
@@ -898,6 +899,9 @@ func (r *liveHostdRebindDisableRequests) retain(outcome liveHostdRebindDisableRe
 		return errors.New("duplicate pending LAN request outcome")
 	}
 	r.outcomes[outcome.operationID] = outcome
+	if r.afterRetain != nil {
+		r.afterRetain(outcome)
+	}
 	return nil
 }
 

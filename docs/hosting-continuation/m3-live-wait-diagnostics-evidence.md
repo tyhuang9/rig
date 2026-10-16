@@ -32,19 +32,21 @@ All commands used the Windows Go 1.26.7 toolchain with
 
 | Check | Result | Receipt |
 | --- | --- | --- |
-| `go test -tags live_docker -count=1 -timeout=5m ./cmd/hostd -run '^TestLiveHostdRebindChildStartupControls$'` | PASS, 9.556s | `windows-live-wait-child-controls-final.txt` |
-| Exact 24-parent selector extracted from `.github/workflows/hosting-gateway-v2-ci.yml` | PASS, 12.571s | `windows-tagged-hostd-ci-controls-final.jsonl` |
+| Exact 24-parent selector extracted from `.github/workflows/hosting-gateway-v2-ci.yml` | PASS, 12.384s | `windows-tagged-hostd-ci-controls-final.jsonl` |
 | CGO-free Linux `cmd/hostd` test binary cross-compiled by the approved Windows Go toolchain, then executed in Ubuntu with `wsl.exe --cd /mnt/c/.../cmd/hostd --exec /mnt/c/.../hostd-linux.test -test.run <exact-selector> -test.count=1 -test.v -test.timeout=2m` | PASS | `wsl-tagged-hostd-ci-controls-final.txt` |
 | Roster validation of the same selector | 24 parents each ran and passed exactly once on Windows and WSL | `hosted-selector-roster-validation-final.txt` |
 | `pwsh -NoProfile -File scripts/check-generation.ps1` | PASS | `windows-check-generation-final.txt` |
 
 Receipts are retained outside the checkout at
 `C:\Users\huang\Documents\Projects\Rig\temp\m3-lan-external-db-20261015\live-wait-verification`.
+The immutable command, source-blob, and receipt hashes are recorded in
+`m3-live-wait-diagnostics-verification-manifest.md`.
 
 ## Remaining hosted evidence
 
 The local controls do not replace the M3 hosted Docker matrix. Before accepting
 the repair, run the affected live LAN and configuration-drift matrix cases on
 the exact integrated source, with the existing package deadlines and independent
-cleanup checks unchanged. The configuration-drift hosted result also requires
-the separately reviewed runtime guard that makes the refusal deterministic.
+cleanup checks unchanged. Fresh exact combined-source hosted
+configuration-drift execution is required; the historical timeout cause and the
+strict refusal are not established by these local controls.

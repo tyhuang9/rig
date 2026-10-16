@@ -19,6 +19,7 @@ import (
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/auth"
+	"github.com/hostd/hostd/internal/database"
 )
 
 const (
@@ -298,6 +299,43 @@ func liveHostdRebindClaimObservationControls(t *testing.T) {
 		}
 	})
 
+	t.Run("real observer remains usable across bounded reads until closed", func(t *testing.T) {
+		db, err := database.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		closed := false
+		t.Cleanup(func() {
+			if !closed {
+				_ = db.Close()
+			}
+		})
+		observer := appaccess.New(db)
+		parent, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		requests := liveHostdRebindControlRequests(t, "one", "first")
+		reads := 0
+		_, waitErr := liveHostdRebindWaitDisableClaimsResult(parent, time.Time{}, false,
+			nil, []string{"one"}, requests, func(ctx context.Context) (appaccess.AppAccessDisableStartupSnapshot, error) {
+				value, readErr := observer.AppAccessDisableStartupSnapshot(ctx)
+				reads++
+				if reads == 2 {
+					cancel()
+				}
+				return value, readErr
+			})
+		if waitErr == nil || reads != 2 {
+			t.Fatalf("real observer wait error=%v reads=%d", waitErr, reads)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		closed = true
+		if _, err := observer.AppAccessDisableStartupSnapshot(context.Background()); err == nil {
+			t.Fatal("closed observer accepted a later snapshot")
+		}
+	})
+
 	t.Run("missing and foreign claims do not satisfy the exact request", func(t *testing.T) {
 		for _, test := range []struct {
 			name     string
@@ -406,6 +444,25 @@ func liveHostdRebindClaimObservationControls(t *testing.T) {
 		}
 	})
 
+	t.Run("HTTP success cannot substitute for a missing durable claim", func(t *testing.T) {
+		for _, status := range []int{http.StatusOK, http.StatusCreated} {
+			t.Run(http.StatusText(status), func(t *testing.T) {
+				parent, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				requests := liveHostdRebindControlRequests(t, "one", "first")
+				requests.complete(liveHostdRebindDisableRequestOutcomeFor("one", "first", status, nil))
+				census, err := liveHostdRebindWaitDisableClaimsResult(parent, time.Time{}, false,
+					nil, []string{"one"}, requests, func(context.Context) (appaccess.AppAccessDisableStartupSnapshot, error) {
+						cancel()
+						return appaccess.AppAccessDisableStartupSnapshot{}, nil
+					})
+				if err == nil || census.complete() || !strings.Contains(requests.summary(), "status=") {
+					t.Fatalf("HTTP success result=%s error=%v requests=%s", census, err, requests.summary())
+				}
+			})
+		}
+	})
+
 	t.Run("read error and cancellation remain observable", func(t *testing.T) {
 		const secret = "private-snapshot-error"
 		requests := liveHostdRebindControlRequests(t, "one", "first")
@@ -503,9 +560,12 @@ func liveHostdRebindClaimObservationControls(t *testing.T) {
 		requests.complete(liveHostdRebindDisableRequestOutcomeFor("one", "first", http.StatusOK, nil))
 		joiner := liveHostdRebindNewDisableRequestJoiner(requests, 25*time.Millisecond)
 		firstJoinErr := joiner.join()
+		requests.complete(liveHostdRebindDisableRequestOutcomeFor("two", "second", http.StatusCreated, nil))
 		secondJoinErr := joiner.join()
-		if !errors.Is(firstJoinErr, context.DeadlineExceeded) || secondJoinErr != firstJoinErr || !joiner.attempted {
-			t.Fatalf("shared join first=%v second=%v attempted=%t", firstJoinErr, secondJoinErr, joiner.attempted)
+		if !errors.Is(firstJoinErr, context.DeadlineExceeded) || secondJoinErr != firstJoinErr || !joiner.attempted ||
+			len(requests.outcomes) != 1 {
+			t.Fatalf("shared join first=%v second=%v attempted=%t outcomes=%d", firstJoinErr, secondJoinErr,
+				joiner.attempted, len(requests.outcomes))
 		}
 
 		cancelled := make(chan struct{})
@@ -530,6 +590,35 @@ func liveHostdRebindClaimObservationControls(t *testing.T) {
 			secondCleanupJoin != wantJoin || reapCalls != 1 || joinCalls != 1 {
 			t.Fatalf("cleanup results=%v/%v then %v/%v calls reaped=%d joined=%d",
 				firstReap, firstCleanupJoin, secondReap, secondCleanupJoin, reapCalls, joinCalls)
+		}
+	})
+
+	t.Run("late second outcome joins after the waiter retained the first", func(t *testing.T) {
+		requests := liveHostdRebindControlRequests(t, "one", "first", "two", "second")
+		firstRetained := make(chan struct{})
+		requests.afterRetain = func(outcome liveHostdRebindDisableRequestOutcome) {
+			if outcome.operationID == "one" {
+				close(firstRetained)
+			}
+		}
+		requests.complete(liveHostdRebindDisableRequestOutcomeFor("one", "first", http.StatusOK, nil))
+		joinContext, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		joined := make(chan error, 1)
+		go func() { joined <- requests.join(joinContext) }()
+		select {
+		case <-firstRetained:
+		case <-time.After(time.Second):
+			t.Fatal("waiter did not retain the first outcome")
+		}
+		requests.complete(liveHostdRebindDisableRequestOutcomeFor("two", "second", http.StatusCreated, nil))
+		select {
+		case err := <-joined:
+			if err != nil || len(requests.outcomes) != 2 {
+				t.Fatalf("late second join error=%v outcomes=%d", err, len(requests.outcomes))
+			}
+		case <-time.After(time.Second):
+			t.Fatal("late second outcome did not release the waiter")
 		}
 	})
 
