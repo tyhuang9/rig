@@ -1261,6 +1261,21 @@ func (d gatewayRebindTypedHandoverRuntime) prepareCutover(ctx context.Context,
 	return proof, nil
 }
 
+func gatewayRebindTypedHandoverReadyToResumeCutover(observation gatewayRebindFinalHandoverObservation,
+	plan gatewayRebindFinalHandoverPlan, final gatewayRebindFinalContainerBinding,
+) bool {
+	return validGatewayRebindFinalHandoverObservationValue(observation) && plan.PredecessorInitiallyRunning &&
+		!observation.PredecessorRunning && observation.PredecessorAddress == gatewayRebindPredecessorAddressPresent &&
+		observation.PredecessorObservationDigest != plan.PredecessorObservationDigest &&
+		validSHA256(observation.PredecessorStopDigest) &&
+		observation.PredecessorStopDigest == observation.PredecessorObservationDigest &&
+		observation.PredecessorRoutesDigest == "" && observation.Stage == gatewayRebindHandoverContainerAbsent &&
+		observation.Final == gatewayRebindHandoverContainerStopped && observation.FinalID == final.ID &&
+		observation.ConfigVolumePresent && observation.DataVolumePresent && observation.IngressNetworkPresent &&
+		observation.ConfigDigest == plan.FinalConfigDigest && observation.RoutesDigest == "" &&
+		reflect.DeepEqual(observation.ApplicationNetworks, plan.ApplicationNetworks)
+}
+
 func (d gatewayRebindTypedHandoverRuntime) serveSuccessor(ctx context.Context,
 	attempt gatewayRebindPreparedAttempt, current gatewayCurrentSelection,
 	effect gatewayRebindTypedEffectProgress, mode gatewayRebindPhysicalReconcileMode,
@@ -1280,7 +1295,8 @@ func (d gatewayRebindTypedHandoverRuntime) serveSuccessor(ctx context.Context,
 	if gatewayRebindFinalHandoverSuccessorIsServing(proof, effect.HandoverIntent.Plan, *effect.FinalContainer) {
 		return proof, nil
 	}
-	if !gatewayRebindFinalHandoverReadyForCutover(proof, effect.HandoverIntent.Plan, *effect.FinalContainer) {
+	if !gatewayRebindFinalHandoverReadyForCutover(proof, effect.HandoverIntent.Plan, *effect.FinalContainer) &&
+		!gatewayRebindTypedHandoverReadyToResumeCutover(proof, effect.HandoverIntent.Plan, *effect.FinalContainer) {
 		return invalid()
 	}
 	if physical.Predecessor.Running {
@@ -1290,8 +1306,8 @@ func (d gatewayRebindTypedHandoverRuntime) serveSuccessor(ctx context.Context,
 		stopErr := d.manager.runDiscard(ctx, d.manager.options.CommandTimeout,
 			"container", "stop", "--time", "10", physical.Predecessor.ContainerID)
 		proof, physical, err = d.stable(ctx, attempt, effect, guard)
-		if err != nil || physical.Predecessor.Running || proof.Final != gatewayRebindHandoverContainerStopped ||
-			!validSHA256(proof.PredecessorStopDigest) {
+		if err != nil || physical.Predecessor.Running ||
+			!gatewayRebindTypedHandoverReadyToResumeCutover(proof, effect.HandoverIntent.Plan, *effect.FinalContainer) {
 			_ = stopErr
 			return invalid()
 		}
