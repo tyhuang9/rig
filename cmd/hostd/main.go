@@ -169,10 +169,17 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 			bootstrapCompleted, assembly.ready)
 	}
 	var workerAdmission func(context.Context) (func() error, error)
+	var workerScopedAdmission jobs.ScopedAdmission
 	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
 		workerAdmission, err = deploymentEffectsAdmission(db, ownerDirectories.WorkingDirectory)
 		if err != nil {
 			logger.Error("deployment effects admission setup failed", "error", err)
+			emergencyStop()
+			return 1
+		}
+		workerScopedAdmission, err = deploymentEffectsScopedAdmission(db, ownerDirectories.WorkingDirectory)
+		if err != nil {
+			logger.Error("scoped deployment effects admission setup failed", "error", err)
 			emergencyStop()
 			return 1
 		}
@@ -351,9 +358,9 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerRun := j.RunWorker
-	if workerAdmission != nil {
+	if workerScopedAdmission != nil {
 		workerRun = func(runContext context.Context, executor jobs.Executor) error {
-			return j.RunWorkerWithAdmission(runContext, executor, workerAdmission)
+			return j.RunWorkerWithScopedAdmission(runContext, executor, workerScopedAdmission)
 		}
 	}
 	var releaseStartupAdmission func() error

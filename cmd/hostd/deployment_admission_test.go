@@ -94,3 +94,40 @@ func TestDeploymentEffectsAdmissionContentionAndRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestDeploymentEffectsScopedAdmissionBindsAndExpiresExactScope(t *testing.T) {
+	root := t.TempDir()
+	directories, err := docker.PrepareControllerDirectories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	admit, err := deploymentEffectsScopedAdmission(db, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, cancel := context.WithCancel(context.Background())
+	admitted, release, err := admit(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leave, err := deploymenteffects.EnterScope(admitted, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leave()
+	cancel()
+	if !errors.Is(admitted.Err(), context.Canceled) {
+		t.Fatalf("admitted context error = %v", admitted.Err())
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deploymenteffects.EnterScope(admitted, directories.WorkingDirectory); !errors.Is(err, deploymenteffects.ErrScopeUnavailable) {
+		t.Fatalf("expired scope error = %v", err)
+	}
+}

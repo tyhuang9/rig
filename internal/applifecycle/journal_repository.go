@@ -177,6 +177,28 @@ func (r *Repository) AuthorizePending(ctx context.Context, claim WorkerClaim, in
 // scan uses multiple database reads, so callers must hold the shared effects
 // exclusion when using the result to admit effects.
 func (r *Repository) PendingStartExists(ctx context.Context) (bool, error) {
+	found := false
+	err := r.scanStartIntents(ctx, func(_ Operation, _ Intent, receipt *Receipt) (bool, error) {
+		if receipt != nil {
+			return false, nil
+		}
+		found = true
+		return true, nil
+	})
+	if err != nil {
+		return true, err
+	}
+	return found, nil
+}
+
+// scanStartIntents loads and validates every retained start intent and its
+// optional receipt. The scan is not an atomic authorization by itself;
+// callers hold effects exclusion and separately authorize exact pending
+// intents before issuing an effect.
+func (r *Repository) scanStartIntents(ctx context.Context, visit func(Operation, Intent, *Receipt) (bool, error)) error {
+	if visit == nil {
+		return ErrInvalidEffect
+	}
 	var afterJob, afterComponent string
 	for {
 		rows, err := r.db.QueryContext(ctx, `SELECT job_id,component_name
@@ -184,7 +206,7 @@ func (r *Repository) PendingStartExists(ctx context.Context) (bool, error) {
 			WHERE boundary='start' AND (job_id>? OR (job_id=? AND component_name>?))
 			ORDER BY job_id,component_name LIMIT 32`, afterJob, afterJob, afterComponent)
 		if err != nil {
-			return true, err
+			return err
 		}
 		type key struct{ jobID, component string }
 		batch := make([]key, 0, 32)
@@ -192,41 +214,55 @@ func (r *Repository) PendingStartExists(ctx context.Context) (bool, error) {
 			var value key
 			if err := rows.Scan(&value.jobID, &value.component); err != nil {
 				_ = rows.Close()
-				return true, err
+				return err
 			}
 			batch = append(batch, value)
 		}
 		err = rows.Err()
 		_ = rows.Close()
 		if err != nil {
-			return true, err
+			return err
 		}
 		for _, value := range batch {
 			operation, loadErr := r.Operation(ctx, value.jobID)
 			if loadErr != nil {
-				return true, loadErr
+				return loadErr
 			}
 			intent, loadErr := intentByKey(ctx, r.db, value.jobID, BoundaryStart, value.component)
 			if loadErr != nil {
-				return true, loadErr
+				return loadErr
 			}
 			spec, ok := effectSpecFor(operation, intent.Key)
 			if !ok || spec.outcome != OutcomeContainerRunning || validateIntentForOperation(operation, intent, spec) != nil {
-				return true, ErrInvalidEffect
+				return ErrInvalidEffect
 			}
 			receipt, loadErr := receiptByKey(ctx, r.db, value.jobID, BoundaryStart, value.component)
 			if errors.Is(loadErr, ErrEffectNotFound) {
-				return true, nil
+				stop, visitErr := visit(operation, intent, nil)
+				if visitErr != nil {
+					return visitErr
+				}
+				if stop {
+					return nil
+				}
+				continue
 			}
 			if loadErr != nil {
-				return true, loadErr
+				return loadErr
 			}
 			if err := validateReceiptForIntent(operation, intent, receipt, spec); err != nil {
-				return true, err
+				return err
+			}
+			stop, visitErr := visit(operation, intent, &receipt)
+			if visitErr != nil {
+				return visitErr
+			}
+			if stop {
+				return nil
 			}
 		}
 		if len(batch) < 32 {
-			return false, nil
+			return nil
 		}
 		afterJob, afterComponent = batch[len(batch)-1].jobID, batch[len(batch)-1].component
 	}

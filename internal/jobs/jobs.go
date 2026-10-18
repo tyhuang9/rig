@@ -960,11 +960,29 @@ func (s *Service) RunWorkerWithAdmission(ctx context.Context, executor Executor,
 	if acquire == nil {
 		return errors.New("deployment effects admission is required")
 	}
+	return s.runWorker(ctx, executor, func(parent context.Context) (context.Context, func() error, error) {
+		release, err := acquire(parent)
+		return parent, release, err
+	})
+}
+
+// ScopedAdmission returns the context that must be used for the admitted job.
+// Implementations bind nonforgeable lease-scoped authority while preserving
+// cancellation and deadlines from parent.
+type ScopedAdmission func(parent context.Context) (context.Context, func() error, error)
+
+// RunWorkerWithScopedAdmission carries admission-scoped authority from before
+// assignment through executor cleanup and terminal persistence. The scope is
+// invalidated by the admission release after runOne has returned.
+func (s *Service) RunWorkerWithScopedAdmission(ctx context.Context, executor Executor, acquire ScopedAdmission) error {
+	if acquire == nil {
+		return errors.New("scoped deployment effects admission is required")
+	}
 	return s.runWorker(ctx, executor, acquire)
 }
 
 func (s *Service) runWorker(ctx context.Context, executor Executor,
-	acquire func(context.Context) (func() error, error),
+	acquire ScopedAdmission,
 ) error {
 	if executor == nil {
 		return errors.New("job executor is required")
@@ -992,12 +1010,18 @@ func (s *Service) runWorker(ctx context.Context, executor Executor,
 			if !queued {
 				continue
 			}
-			release, err := acquire(ctx)
+			admittedContext, release, err := acquire(ctx)
 			if err != nil {
 				return normalizeWorkerError(ctx, err)
 			}
-			if release == nil {
-				return errors.New("deployment effects admission returned no release")
+			if admittedContext == nil || release == nil {
+				incompleteErr := errors.New("deployment effects admission returned incomplete scope")
+				if release != nil {
+					if releaseErr := release(); releaseErr != nil {
+						return fmt.Errorf("release incomplete deployment effects admission: %w", errors.Join(incompleteErr, releaseErr))
+					}
+				}
+				return incompleteErr
 			}
 			if ctx.Err() != nil {
 				if err := release(); err != nil {
@@ -1005,7 +1029,7 @@ func (s *Service) runWorker(ctx context.Context, executor Executor,
 				}
 				return nil
 			}
-			runErr := s.runOne(ctx, executor)
+			runErr := s.runOne(admittedContext, executor)
 			if releaseErr := release(); releaseErr != nil {
 				return fmt.Errorf("release deployment effects admission: %w", errors.Join(runErr, releaseErr))
 			}

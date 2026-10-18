@@ -1099,9 +1099,13 @@ type templateDockerRestartPolicy struct {
 }
 
 type templateDockerState struct {
-	Running  bool
-	ExitCode int
-	Health   *templateDockerHealth
+	Status     string
+	Running    bool
+	Paused     bool
+	Restarting bool
+	Dead       bool
+	ExitCode   int
+	Health     *templateDockerHealth
 }
 
 type templateDockerHealth struct {
