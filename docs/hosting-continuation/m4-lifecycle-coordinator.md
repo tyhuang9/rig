@@ -311,6 +311,37 @@ restoration or resource cleanup is introduced here. Final command checks must
 still verify current authority, current attempt and the original live effects
 scope when an actual effect is about to run.
 
+### Dormant deployment policy guard
+
+The shared `deploymentexecution` guard keeps the original immutable binding,
+job/application identity and positive worker attempt in a private Claim. The
+Claim is identity only: every policy check rereads the saved binding, current
+job and exact deployment through the caller's transaction. A current running
+job, matching attempt, initialized provenance and an allowed policy stage are
+required. The cancellation-request state is `waiting_external` with phase
+`cancelling`; it cannot authorize positive work.
+
+Policy checks require a private Pinned receiver created from the original live
+effects scope. It retains the original context and exact guard. Copies share
+liveness state; leaving invalidates every copy and waits for active checks before
+releasing the scope entry. Cancellation and closure are checked after successful
+dependencies. Construction and `UsesDatabase` require the exact configured
+database, binding repository, canonical validator and admission working
+directory. A SQL transaction does not expose its parent database, so the later
+Gate composition must open its own transaction on that verified database.
+
+The global positive fence is any retained lifecycle start intent without its
+valid matching `container_running` receipt, regardless of job status, current
+head or age. Canonical key paging, operation, intent and receipt reads all use
+the caller's transaction. Other unfinished lifecycle actions retain their
+existing per-application and rebind rules; they do not become a new global
+positive fence. Ordinary deployment has no same-operation exception.
+
+This unit is dormant and read-only. It does not wire production Gate consumers,
+execute Compose or generated commands, authorize cleanup, or enable lifecycle
+capability. Those concrete adapters still need mandatory current checks at each
+actual effect boundary, with SQL closed before external commands.
+
 ## Required acceptance
 
 Tests must cover stale or malformed authority; same-state revision changes;
@@ -818,6 +849,65 @@ All checks use pinned Go 1.26.7 and readonly modules. Native Linux checks run
 without race instrumentation. Live fixtures were compiled, not executed;
 Docker behavior, final command authorization and full M4 acceptance remain
 unverified. The public lifecycle capability remains disabled.
+
+### Dormant deployment policy guard: local evidence
+
+Guard commit `ca109c79f7a72225a2bbe01b5ec69db8e9d0bc52` was integrated
+locally as `e5ffb0c675784f743d5ab642448b4dd74ae84995`. Both committed trees
+are `09d96ed65593cb1342c99954373792b0f678abd8`; the coordinator documentation
+is recorded separately. The seven reviewed source/test files were unchanged
+through final Windows and native Linux verification on 2026-10-18.
+
+Windows passed 21 parents and 34 subtests: seven canonical lifecycle parents
+with two subtests and the complete guard package's 14 parents with 32 subtests.
+Native Linux passed 24 parents and 38 subtests: ten lifecycle parents with six
+subtests and the same complete guard package. The Linux selection also includes
+existing journal-barrier and pending-runtime authority tests affected by the
+private query factoring. Every selected parent was discovered and passed once;
+neither platform had a failure or skip.
+
+Real SQLite and canonical lifecycle fixtures cover legacy and completed running
+bindings, stale same-state and Stop/Start history, invalid history before drift,
+exact job/deployment identity and attempt, all accepted policy stages, and fresh
+checks after earlier success. Canonical fence tests cover transaction-local key
+pages, operations, intents and receipts; starts after terminal jobs and later
+heads; valid matching receipts; malformed/orphan authority; and exclusion of
+non-start unfinished actions from the global fence.
+
+Scope tests cover zero, copied, foreign, released and closing entries, concurrent
+Leave, outer lease release ordering, original context retention and cancellation
+after successful callbacks. Narrow doubles establish distinct unresolved/storage
+error mapping and callback cancellation. They do not claim that corrupt saved
+completion is canonically unresolved: the existing history-first contract
+classifies it as invalid. Security and QA independently accepted the frozen
+source and retained evidence.
+
+```text
+go test -json -count=1 -run '^(TestPositiveFenceValidator.*|TestApplicationLifecyclePendingStartPersistsStatusPauseAndReopenUntilReceipt|TestApplicationLifecyclePendingStartRejectsMalformedMatchingReceipt)$' ./internal/applifecycle
+go test -json -count=1 ./internal/deploymentexecution
+go vet ./internal/applifecycle ./internal/deploymentexecution
+go test -count=1 -run '^$' ./internal/applifecycle ./internal/deploymentexecution
+pwsh -NoProfile -File scripts/check-generation.ps1
+```
+
+The `-run '^$'` command is compilation evidence only. Initial exploratory
+fixture failures concerned Windows private-directory setup and immutable-row
+test setup; those direct tool observations were not saved as raw logs. Final
+numbered commands have retained raw output, exact commands, exit files and a
+source manifest. The native runner records its exact parent selection and
+source hashes before and after execution.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Seven-file source manifest | `e8099be1d9ab67d64d918ad73720c7c0f3baff970e35ced5f53e5117848b89ae` |
+| Windows lifecycle JSON | `a5e4ac3286e8826c7b5f3b6d49e69d2f02c2d99d100114cdc1d35c1df68fe5bc` |
+| Windows guard JSON | `53959cdd9214ccedd48e5e5f7ebe035a1ba9692c77eaa439ad10a5e0a2285e0b` |
+| Native Linux source freeze | `36f8e850f4613da980b8857a4f5be584a0f3a6bd4ec03f757a542ecde5bb44fd` |
+| Native Linux receipt | `8270513dbab48cae31aa98930ae55f5dff37aa6b932f6c94446e00013601a049` |
+
+All checks use Go 1.26.7 with readonly modules. Linux execution is native and
+non-race. No Docker, hosted CI, production Gate/command wiring or lifecycle
+activation is claimed by this dormant unit.
 
 ### Pre-change baseline
 
