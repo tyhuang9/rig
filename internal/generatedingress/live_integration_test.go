@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -21,15 +22,24 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
+	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -65,6 +75,254 @@ func liveGatewayAccessRepository(t *testing.T, dataRoot string) *appaccess.Repos
 		}
 	})
 	return appaccess.New(db)
+}
+
+type liveGeneratedAuthority struct {
+	db               *sql.DB
+	repository       *deployments.Repository
+	bindings         *deploymentbinding.Repository
+	jobs             *jobs.Service
+	runtime          *generatedruntimestate.Repository
+	workingDirectory string
+	actorID          string
+	scope            deploymenteffects.Scope
+	bound            map[string]*liveGeneratedBoundCandidate
+	currentByApp     map[string]*liveGeneratedBoundCandidate
+}
+
+type liveGeneratedBoundCandidate struct {
+	spec     generatedruntime.CandidateSpec
+	jobID    string
+	finished bool
+}
+
+func liveGeneratedDeployments(t *testing.T, workingDirectory string) *liveGeneratedAuthority {
+	t.Helper()
+	db, err := database.Open(t.TempDir())
+	if err != nil {
+		t.Fatal("open generated runtime authority database")
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	lifecycle := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, workingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := deployments.NewWithExecutionGuard(db, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), workingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := release(); err != nil {
+			t.Errorf("release live generated authority: %v", err)
+		}
+	})
+	authority := &liveGeneratedAuthority{
+		db: db, repository: repository, bindings: bindings, jobs: jobService,
+		runtime: generatedruntimestate.New(db), workingDirectory: workingDirectory,
+		actorID: uuid.NewString(), scope: scope, bound: make(map[string]*liveGeneratedBoundCandidate),
+		currentByApp: make(map[string]*liveGeneratedBoundCandidate),
+	}
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, authority.actorID, "generated-live-owner", "hash", stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	return authority
+}
+
+func (a *liveGeneratedAuthority) bindCandidate(t *testing.T, parent context.Context, spec generatedruntime.CandidateSpec) (context.Context, generatedruntime.CandidateSpec) {
+	t.Helper()
+	if existing := a.bound[spec.DeploymentID]; existing != nil {
+		expected, supplied := existing.spec, spec
+		expected.Network = deployments.GeneratedNetworkRequest{}
+		supplied.Network = deployments.GeneratedNetworkRequest{}
+		if !reflect.DeepEqual(expected, supplied) {
+			t.Fatal("live generated deployment identity was reused with different immutable candidate authority")
+		}
+		return deploymenteffects.WithScope(parent, a.scope), existing.spec
+	}
+	previous := a.currentByApp[spec.AppID]
+	if previous != nil {
+		a.finishCandidateAuthority(t, previous)
+	}
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := a.db.Exec(`INSERT OR IGNORE INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'draft',?,?)`, spec.AppID, spec.AppID, spec.AppID, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if spec.ConfigurationRevisionID == "" {
+		if previous != nil {
+			spec.ConfigurationRevisionID = previous.spec.ConfigurationRevisionID
+			spec.ConfigurationRevisionNumber = previous.spec.ConfigurationRevisionNumber
+		} else {
+			spec.ConfigurationRevisionID = uuid.NewString()
+		}
+	}
+	if spec.ConfigurationRevisionNumber == 0 {
+		spec.ConfigurationRevisionNumber = 1
+	}
+	if spec.DeploymentPlanRevisionNumber == 0 {
+		spec.DeploymentPlanRevisionNumber = 1
+	}
+	if _, err := a.db.Exec(`INSERT OR IGNORE INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES(?,?,?,?,?,?,0,0)`, spec.ConfigurationRevisionID, spec.AppID, spec.ConfigurationRevisionNumber, "generated-live:"+spec.ConfigurationRevisionID, a.actorID, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec(`INSERT OR IGNORE INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at) VALUES(?,?,?,?,'generated_node','live-test','1',?,'local',0,?,?,1,0,'',?,?,'accepted',?,?)`, spec.DeploymentPlanRevisionID, spec.AppID, spec.DeploymentPlanRevisionNumber, "generated-live:"+spec.DeploymentPlanRevisionID, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64), a.actorID, stamp, a.actorID, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,?,?,?)`, spec.ReleaseID, spec.AppID, stamp, strings.Repeat("4", 64), strings.Repeat("5", 64), spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber); err != nil {
+		t.Fatal(err)
+	}
+	created, err := a.jobs.CreateDeploymentWithInputTransaction(parent, jobs.DeploymentCreateRequest{
+		ApplicationID: spec.AppID, IdempotencyKey: "generated-live-" + spec.DeploymentID, RequestedBy: a.actorID,
+		Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+	}, jobs.DeploymentCreateHooks{})
+	if err != nil || !created.Created {
+		t.Fatalf("create live generated deployment job: created=%t error=%v", created.Created, err)
+	}
+	if _, err := a.db.Exec(`UPDATE jobs SET status='running',phase='running',attempt=1,started_at=?,updated_at=? WHERE id=?`, stamp, stamp, created.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,actual_configuration_revision_id,actual_configuration_revision_number,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?,'preparing','current',?,?,1,'generated_node',?,?)`, spec.DeploymentID, spec.AppID, spec.ReleaseID, created.Job.ID, spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := deploymentexecution.NewClaim(created.Binding, created.Job.ID, spec.AppID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundContext := deploymenteffects.WithScope(parent, a.scope)
+	if err := a.repository.Gate(boundContext, deployments.GateRequest{Claim: claim, DeploymentID: spec.DeploymentID}); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDeployment, createdRuntime, err := a.runtime.Begin(parent, generatedruntimestate.BeginInput{
+		DeploymentID: spec.DeploymentID, AppID: spec.AppID, ReleaseID: spec.ReleaseID,
+		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: spec.DeploymentPlanRevisionNumber,
+		ComponentNames: []string{spec.ComponentName},
+	})
+	if err != nil || !createdRuntime {
+		t.Fatalf("begin live generated runtime: created=%t error=%v", createdRuntime, err)
+	}
+	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate} {
+		runtimeDeployment, err = a.runtime.Advance(parent, spec.AppID, spec.DeploymentID, runtimeDeployment.Phase, next, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot) != spec.ActiveSlot {
+		t.Fatalf("live generated predecessor slot=%q want=%q", runtimeDeployment.PreviousActiveSlot, spec.ActiveSlot)
+	}
+	spec.Network = deployments.GeneratedNetworkRequest{
+		Claim: claim, DeploymentID: spec.DeploymentID, ReleaseID: spec.ReleaseID,
+		ConfigurationRevisionID: spec.ConfigurationRevisionID, ConfigurationRevisionNumber: spec.ConfigurationRevisionNumber,
+		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: spec.DeploymentPlanRevisionNumber,
+	}
+	bound := &liveGeneratedBoundCandidate{spec: spec, jobID: created.Job.ID}
+	a.bound[spec.DeploymentID] = bound
+	a.currentByApp[spec.AppID] = bound
+	return boundContext, spec
+}
+
+func (a *liveGeneratedAuthority) finishCandidateAuthority(t *testing.T, bound *liveGeneratedBoundCandidate) {
+	t.Helper()
+	if bound.finished {
+		return
+	}
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	spec := bound.spec
+	if _, err := a.db.Exec(`INSERT INTO generated_image_artifacts(id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,'live-test',?,1,?,'ready',?,?,?)`, spec.ArtifactID, spec.ReleaseID, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber, spec.ComponentName, spec.BuildDefinitionDigest, spec.ImageContentID, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	component, err := a.runtime.SetImageReady(context.Background(), spec.AppID, spec.DeploymentID, spec.ComponentName, spec.ArtifactID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	description, err := generatedruntime.DescribeInactiveCandidate(spec.AppID, spec.ComponentName, spec.ActiveSlot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	component, err = a.runtime.SetContainerStarting(context.Background(), spec.AppID, spec.DeploymentID, spec.ComponentName, description.ContainerName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	component, err = a.runtime.SetContainerRunning(context.Background(), spec.AppID, spec.DeploymentID, spec.ComponentName, strings.Repeat("8", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.runtime.AdvanceComponent(context.Background(), spec.AppID, spec.DeploymentID, spec.ComponentName, component.State, generatedruntimestate.ComponentHealthy); err != nil {
+		t.Fatal(err)
+	}
+	runtimeDeployment, err := a.runtime.Get(context.Background(), spec.AppID, spec.DeploymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute} {
+		runtimeDeployment, err = a.runtime.Advance(context.Background(), spec.AppID, spec.DeploymentID, runtimeDeployment.Phase, next, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	active, err := a.runtime.Active(context.Background(), spec.AppID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, switched, err := a.runtime.SwitchActive(context.Background(), spec.AppID, spec.DeploymentID, active.Generation); err != nil || !switched {
+		t.Fatalf("switch live generated authority: switched=%t error=%v", switched, err)
+	}
+	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded} {
+		runtimeDeployment, err = a.runtime.Advance(context.Background(), spec.AppID, spec.DeploymentID, runtimeDeployment.Phase, next, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := a.db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',finished_at=?,updated_at=? WHERE id=?`, stamp, stamp, bound.jobID); err != nil {
+		t.Fatal(err)
+	}
+	bound.finished = true
+}
+
+func (a *liveGeneratedAuthority) rejectCandidateAuthority(t *testing.T, rejectedDeploymentID, retainedDeploymentID string) {
+	t.Helper()
+	rejected, retained := a.bound[rejectedDeploymentID], a.bound[retainedDeploymentID]
+	if rejected == nil || retained == nil || rejected.spec.AppID != retained.spec.AppID || rejected.finished {
+		t.Fatal("live generated rejected-candidate authority is invalid")
+	}
+	runtimeDeployment, err := a.runtime.Get(context.Background(), rejected.spec.AppID, rejected.spec.DeploymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.runtime.Advance(context.Background(), rejected.spec.AppID, rejected.spec.DeploymentID, runtimeDeployment.Phase, generatedruntimestate.PhaseFailed, generatedruntimestate.DiagnosticRuntimeUnavailable); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.repository.Transition(context.Background(), rejected.spec.AppID, rejected.spec.DeploymentID, deployments.Failed, "runtime_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := a.db.Exec(`UPDATE jobs SET status='failed',phase='failed',error_code='runtime_unavailable',finished_at=?,updated_at=? WHERE id=?`, stamp, stamp, rejected.jobID); err != nil {
+		t.Fatal(err)
+	}
+	rejected.finished = true
+	if a.currentByApp[rejected.spec.AppID] == rejected {
+		a.currentByApp[rejected.spec.AppID] = retained
+	}
 }
 
 func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
@@ -109,14 +367,15 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		t.Fatal("describe other application network")
 	}
 	hostPort := freeLoopbackPort(t)
-	imageTags := []string{"rig-generated-live-test:blue", "rig-generated-live-test:green", "rig-generated-live-test:other"}
+	imageTags := []string{"rig-generated-live-test:blue", "rig-generated-live-test:green-unhealthy", "rig-generated-live-test:other", "rig-generated-live-test:green"}
 	defer cleanupLiveDocker(runner, docker, root, dockerConfig, []string{network.Name, otherNetwork.Name}, imageTags)
 
 	limits := generatedruntime.ContainerLimits{
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
-	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, generatedruntime.EngineOptions{
+	authority := liveGeneratedDeployments(t, working)
+	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
@@ -138,7 +397,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 
 	blueSpec := liveCandidateSpec("blue", appID, planID)
 	blueSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, imageTags[0], blueSpec, "blue")
-	blue := startLiveCandidate(t, ctx, engine, blueSpec)
+	blue := startLiveCandidate(t, ctx, engine, authority, blueSpec)
 	bluePresent := true
 	defer func() {
 		if bluePresent {
@@ -158,7 +417,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	// network alias must keep identical component/slot aliases isolated.
 	otherSpec := liveCandidateSpec("other", otherAppID, planID)
 	otherSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, imageTags[2], otherSpec, "other")
-	other := startLiveCandidate(t, ctx, engine, otherSpec)
+	other := startLiveCandidate(t, ctx, engine, authority, otherSpec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), other, 0) }()
 	if other.Slot != generatedruntime.SlotBlue || other.NetworkAlias != blue.NetworkAlias || other.NetworkName == blue.NetworkName {
 		t.Fatal("two-application alias-isolation fixture is invalid")
@@ -177,15 +436,13 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	defer externalTLS.Close(t)
 	assertLiveApplicationNetworkIsolation(t, ctx, runner, docker, working, dockerConfig, ingress, blue, other, hostPort, appID, "blue", otherAppID, "other", externalTLS)
 
-	greenSpec := liveCandidateSpec("green", appID, planID)
-	greenSpec.ActiveSlot = blue.Slot
-	greenSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, imageTags[1], greenSpec, "green")
-
 	// A failed inactive candidate is never committed. The engine owns its exact
 	// cleanup, while Caddy must continue serving the active blue route.
-	unhealthySpec := greenSpec
+	unhealthySpec := liveCandidateSpec("green", appID, planID)
+	unhealthySpec.ActiveSlot = blue.Slot
 	unhealthySpec.HealthProbe = "/unhealthy"
-	unhealthy := createAndStartLiveCandidate(t, ctx, engine, unhealthySpec)
+	unhealthySpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, imageTags[1], unhealthySpec, "green-unhealthy")
+	unhealthy := createAndStartLiveCandidate(t, ctx, engine, authority, unhealthySpec)
 	assertLiveOneShot(t, ctx, hostPort, appID, "/", "blue", "active slot did not serve during unhealthy replacement")
 	assertLiveOneShot(t, ctx, hostPort, otherAppID, "/", "other", "other application changed during unhealthy replacement")
 	if err := engine.WaitHealthy(ctx, unhealthy); !generatedruntime.IsCode(err, generatedruntime.DiagnosticCandidateUnhealthy) {
@@ -193,8 +450,16 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	}
 	assertLiveOneShot(t, ctx, hostPort, appID, "/", "blue", "active slot did not serve after unhealthy replacement")
 	assertLiveOneShot(t, ctx, hostPort, otherAppID, "/", "other", "other application changed after unhealthy replacement")
+	authority.rejectCandidateAuthority(t, unhealthySpec.DeploymentID, blueSpec.DeploymentID)
 
-	green := startLiveCandidate(t, ctx, engine, greenSpec)
+	greenSpec := liveCandidateSpec("green", appID, planID)
+	greenSpec.ReleaseID = "e1111111-1111-4111-8111-111111111111"
+	greenSpec.DeploymentID = "e2222222-2222-4222-8222-222222222222"
+	greenSpec.ArtifactID = "e3333333-3333-4333-8333-333333333333"
+	greenSpec.BuildDefinitionDigest = strings.Repeat("e", 64)
+	greenSpec.ActiveSlot = blue.Slot
+	greenSpec.ImageContentID = buildLiveImage(t, ctx, runner, docker, root, imageTags[3], greenSpec, "green")
+	green := startLiveCandidate(t, ctx, engine, authority, greenSpec)
 	greenPresent := true
 	defer func() {
 		if greenPresent {
@@ -251,6 +516,9 @@ func liveCandidateSpec(version, appID, planID string) generatedruntime.Candidate
 		"other": {"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"},
 	}
 	values := identities[version]
+	if namespace, err := uuid.Parse(planID); err == nil {
+		planID = uuid.NewSHA1(namespace, []byte(appID)).String()
+	}
 	return generatedruntime.CandidateSpec{
 		AppID: appID, ReleaseID: values[0], DeploymentID: values[1], ArtifactID: values[2],
 		DeploymentPlanRevisionID: planID, ComponentName: "api", Role: generatedruntime.RoleServer,
@@ -351,8 +619,9 @@ func TestLiveFixtureBuildKeepsRuntimeDockerConfigurationEmpty(t *testing.T) {
 	}
 }
 
-func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
+func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, authority *liveGeneratedAuthority, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
 	t.Helper()
+	ctx, spec = authority.bindCandidate(t, ctx, spec)
 	candidate, err := engine.CreateInactiveCandidate(ctx, spec)
 	if err != nil {
 		t.Fatalf("create candidate: runtime=%s", liveRuntimeDiagnostic(err))
@@ -363,9 +632,10 @@ func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *gene
 	return candidate
 }
 
-func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
+func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, authority *liveGeneratedAuthority, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
 	t.Helper()
-	candidate := createAndStartLiveCandidate(t, ctx, engine, spec)
+	ctx, spec = authority.bindCandidate(t, ctx, spec)
+	candidate := createAndStartLiveCandidate(t, ctx, engine, authority, spec)
 	if err := engine.WaitHealthy(ctx, candidate); err != nil {
 		t.Fatalf("wait for candidate: runtime=%s", liveRuntimeDiagnostic(err))
 	}

@@ -73,7 +73,8 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 		liveGatewayResourceExists(t, fixture.ctx, fixture.runner, fixture.docker, fixture.root, fixture.dockerConfig, "image", image.tag) {
 		t.Fatal("loopback-only fixture identities already exist")
 	}
-	engine, err := generatedruntime.NewEngine(fixture.runner, liveEnvironmentStager{}, liveCapacitySource{}, generatedruntime.EngineOptions{
+	authority := liveGeneratedDeployments(t, fixture.ingress.options.WorkingDirectory)
+	engine, err := generatedruntime.NewEngine(fixture.runner, liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable: fixture.docker, DockerConfigDirectory: fixture.dockerConfig, WorkingDirectory: fixture.ingress.options.WorkingDirectory,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond, OutputLimit: liveDockerOutputLimit,
 		Limits: generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128, TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2}, ReplacementDiskBytes: 96 << 20})
@@ -90,7 +91,7 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 	})
 	secondSpec := liveCandidateSpec("green", loopbackID, loopbackPlan)
 	secondSpec.ImageContentID = buildLiveGatewayImage(t, fixture.ctx, fixture.runner, fixture.docker, fixture.root, fixture.dockerConfig, image.tag, secondSpec, loopbackReply, "0.0.0.0")
-	second := startLiveCandidate(t, fixture.ctx, engine, secondSpec)
+	second := startLiveCandidate(t, fixture.ctx, engine, authority, secondSpec)
 	secondCandidates = append(secondCandidates, second)
 	if err := fixture.ingress.Switch(fixture.ctx, generatedruntime.RouteSwitchRequest{AppID: loopbackID, ToSlot: second.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(second)}}); err != nil {
 		failLiveIngress(t, "install loopback-only source route", err)

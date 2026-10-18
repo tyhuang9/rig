@@ -195,6 +195,8 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 	}
 	deployment = persistedDeployment
+	networkRequest := generatedNetworkRequest(claim, resolved)
+	networkCapacityRisk := generatedNetworkCapacityRisk(runtimeDeployment)
 
 	artifacts := make(map[string]generatedimage.Artifact, len(componentNames))
 	candidates := make(map[string]generatedruntime.Candidate, len(componentNames))
@@ -206,7 +208,10 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
-			if err = e.runtime.EnsureAppNetwork(ctx, deployment.AppID); err != nil {
+			if err = e.runtime.EnsureAppNetwork(ctx, networkRequest); err != nil {
+				if generatedruntime.IsGeneratedNetworkBoundaryFailure(err) {
+					return jobs.ExecutionResult{}, e.generatedNetworkRefusal(ctx, reservation, networkCapacityRisk, err)
+				}
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
@@ -227,7 +232,10 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 				}
 			}
-			if err = e.runtime.EnsureAppNetwork(ctx, deployment.AppID); err != nil {
+			if err = e.runtime.EnsureAppNetwork(ctx, networkRequest); err != nil {
+				if generatedruntime.IsGeneratedNetworkBoundaryFailure(err) {
+					return jobs.ExecutionResult{}, e.generatedNetworkRefusal(ctx, reservation, networkCapacityRisk, err)
+				}
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
@@ -253,12 +261,18 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 				}
 			}
-			if err = e.runtime.EnsureAppNetwork(ctx, deployment.AppID); err != nil {
+			if err = e.runtime.EnsureAppNetwork(ctx, networkRequest); err != nil {
+				if generatedruntime.IsGeneratedNetworkBoundaryFailure(err) {
+					return jobs.ExecutionResult{}, e.generatedNetworkRefusal(ctx, reservation, networkCapacityRisk, err)
+				}
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
-			candidates, err = e.startCandidates(ctx, job, resolved, runtimeDeployment, artifacts, reservation)
+			candidates, err = e.startCandidates(ctx, job, claim, resolved, runtimeDeployment, artifacts, reservation)
 			if err != nil {
+				if generatedruntime.IsGeneratedNetworkBoundaryFailure(err) {
+					return jobs.ExecutionResult{}, e.generatedNetworkRefusal(ctx, reservation, networkCapacityRisk || len(candidates) > 0, err)
+				}
 				if cleanupErr := e.cleanupCandidates(ctx, candidates); cleanupErr != nil {
 					err = cleanupErr
 				}
@@ -369,6 +383,36 @@ func generatedAuthorizationRefusal(ctx context.Context, cause error) error {
 		return errors.Join(refusal, cause)
 	}
 	return errors.Join(refusal, cause)
+}
+
+func generatedNetworkRequest(claim deploymentexecution.Claim, resolved resolvedDeployment) deployments.GeneratedNetworkRequest {
+	return deployments.GeneratedNetworkRequest{
+		Claim: claim, DeploymentID: resolved.deployment.ID, ReleaseID: resolved.deployment.ReleaseID,
+		ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
+		DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
+		Findings: nil,
+	}
+}
+
+func generatedNetworkCapacityRisk(deployment generatedruntimestate.Deployment) bool {
+	for _, component := range deployment.Components {
+		if component.ContainerName != "" || component.ContainerID != "" {
+			return true
+		}
+		switch component.State {
+		case generatedruntimestate.ComponentPending, generatedruntimestate.ComponentImageReady:
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+func (e *Executor) generatedNetworkRefusal(ctx context.Context, reservation generatedruntime.ReplacementReservation, retain bool, cause error) error {
+	if retain {
+		cause = errors.Join(cause, e.runtime.RetainReplacementCapacity(reservation))
+	}
+	return generatedAuthorizationRefusal(ctx, cause)
 }
 
 func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.DeploymentInput, deployment deployments.Deployment, reporter jobs.ProgressReporter) (resolvedDeployment, error) {

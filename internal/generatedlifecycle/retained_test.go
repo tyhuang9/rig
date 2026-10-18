@@ -16,6 +16,9 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
@@ -378,7 +381,27 @@ func newRetainedAdapterFixture(t *testing.T, componentCount int, action applifec
 		t.Fatal(err)
 	}
 	runner := newRetainedAdapterRunner(components, appID, deploymentID, releaseID, planID)
-	engine, err := generatedruntime.NewEngine(runner, noEnvironmentStager{}, fixedAdapterCapacity{}, generatedruntime.EngineOptions{
+	bindingValidator, err := applifecycle.NewDeploymentBindingValidator(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, bindingValidator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentRepository, err := deployments.NewWithExecutionGuard(db, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := generatedruntime.NewEngine(runner, noEnvironmentStager{}, fixedAdapterCapacity{}, deploymentRepository, generatedruntime.EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
 		HealthPollInterval: 100 * time.Millisecond, ReplacementDiskBytes: 128 << 20,

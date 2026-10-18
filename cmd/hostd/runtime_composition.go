@@ -272,7 +272,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if options.capacitySourceFactory != nil {
 			capacitySource = options.capacitySourceFactory(capacitySource)
 		}
-		engine, err := generatedruntime.NewEngine(options.runner, environment, capacitySource, generatedruntime.EngineOptions{
+		engine, err := generatedruntime.NewEngine(options.runner, environment, capacitySource, runtimeDeployments, generatedruntime.EngineOptions{
 			DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
 			DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
 		})

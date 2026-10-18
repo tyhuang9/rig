@@ -149,3 +149,71 @@ func TestReplacementReservationConsumesDistinctComponentSharesConcurrently(t *te
 		t.Fatal("released reservation accepted another component")
 	}
 }
+
+func TestReplacementReservationRetentionIsIrreversibleAcrossAliasesAndReleases(t *testing.T) {
+	gate, err := newCapacityGate(fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 100, DiskAvailableBytes: 100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := gate.acquireCount(context.Background(), capacityRequest{memory: 30, disk: 30}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := &replacementReservation{owner: gate, lease: lease, limit: 2, components: make(map[string]struct{}, 2)}
+	if ok, newlyConsumed := reservation.consume(gate, "api"); !ok || !newlyConsumed {
+		t.Fatal("first aggregate component was not consumed")
+	}
+	alias := reservation
+	if !reservation.retain(gate) || !alias.retain(gate) {
+		t.Fatal("same-owner retention was not idempotent")
+	}
+
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for _, action := range []func(){reservation.Release, alias.Release, func() { reservation.unconsume("api") }} {
+		action := action
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			action()
+		}()
+	}
+	close(start)
+	wait.Wait()
+	if ok, _ := reservation.consume(gate, "web"); ok {
+		t.Fatal("retained aggregate accepted a later component")
+	}
+	if _, err := gate.acquire(context.Background(), capacityRequest{memory: 50, disk: 1}); !IsCode(err, DiagnosticInsufficientReplacementSpace) {
+		t.Fatalf("retained aggregate did not block competitor: %v", err)
+	}
+	gate.mu.Lock()
+	reservedMemory, reservedDisk := gate.memory, gate.disk
+	gate.mu.Unlock()
+	if reservedMemory != 60 || reservedDisk != 60 {
+		t.Fatalf("retained aggregate accounting changed: memory=%d disk=%d", reservedMemory, reservedDisk)
+	}
+}
+
+func TestReplacementReservationRejectsForeignRetentionAndReleasesUnattemptedAggregate(t *testing.T) {
+	owner, err := newCapacityGate(fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 100, DiskAvailableBytes: 100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := newCapacityGate(fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 100, DiskAvailableBytes: 100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := owner.acquireCount(context.Background(), capacityRequest{memory: 30, disk: 30}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation := &replacementReservation{owner: owner, lease: lease, limit: 2, components: make(map[string]struct{}, 2)}
+	if (&Engine{capacity: foreign}).RetainReplacementCapacity(reservation) == nil {
+		t.Fatal("foreign engine retained another engine's aggregate")
+	}
+	reservation.Release()
+	if _, err := owner.acquireCount(context.Background(), capacityRequest{memory: 30, disk: 30}, 2); err != nil {
+		t.Fatalf("all-unattempted aggregate did not release: %v", err)
+	}
+}

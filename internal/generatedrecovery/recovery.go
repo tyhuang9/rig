@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
 )
 
 const (
@@ -436,12 +436,12 @@ func runtimeStateResumable(value runtimeDeployment, head activeHead) bool {
 		(value.previousDeployment == "") != (value.previousSlot == "") || (value.previousSlot != "" && value.previousSlot == value.candidateSlot) {
 		return false
 	}
-	descriptionByComponent := make(map[string]generatedruntime.CandidateDescription, len(value.components))
+	descriptionByComponent := make(map[string]generatedidentity.CandidateDescription, len(value.components))
 	for _, component := range value.components {
 		if component.slot != value.candidateSlot {
 			return false
 		}
-		description, err := generatedruntime.DescribeInactiveCandidate(value.appID, component.name, generatedruntime.Slot(value.previousSlot))
+		description, err := generatedidentity.DescribeInactiveCandidate(value.appID, component.name, generatedidentity.Slot(value.previousSlot))
 		if err != nil || string(description.Slot) != value.candidateSlot {
 			return false
 		}
@@ -504,7 +504,7 @@ func runtimeStateResumable(value runtimeDeployment, head activeHead) bool {
 	return true
 }
 
-func componentStateIdentityValid(component runtimeComponent, description generatedruntime.CandidateDescription) bool {
+func componentStateIdentityValid(component runtimeComponent, description generatedidentity.CandidateDescription) bool {
 	switch component.state {
 	case "pending":
 		return component.artifactID == "" && component.containerName == "" && component.containerID == ""

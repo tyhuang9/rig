@@ -33,14 +33,17 @@ type repositoryFixture struct {
 }
 
 type guardedRepositoryFixture struct {
-	repository *Repository
-	guard      *deploymentexecution.Guard
-	jobs       *jobs.Service
-	bindings   *deploymentbinding.Repository
-	context    context.Context
-	appID      string
-	actorID    string
-	sequence   int
+	repository       *Repository
+	guard            *deploymentexecution.Guard
+	jobs             *jobs.Service
+	bindings         *deploymentbinding.Repository
+	context          context.Context
+	scope            deploymenteffects.Scope
+	release          func() error
+	workingDirectory string
+	appID            string
+	actorID          string
+	sequence         int
 }
 
 func TestGetOrCreateByJobIsAtomicAndRejectsReplayMismatch(t *testing.T) {
@@ -178,8 +181,9 @@ func newGuardedRepositoryFixture(t *testing.T, fixture repositoryFixture) *guard
 	})
 	return &guardedRepositoryFixture{
 		repository: repository, guard: guard, jobs: jobService, bindings: bindings,
-		context: deploymenteffects.WithScope(context.Background(), scope),
-		appID:   fixture.appA, actorID: fixture.actor,
+		context: deploymenteffects.WithScope(context.Background(), scope), scope: scope, release: release,
+		workingDirectory: directories.WorkingDirectory,
+		appID:            fixture.appA, actorID: fixture.actor,
 	}
 }
 
