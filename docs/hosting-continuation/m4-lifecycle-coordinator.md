@@ -104,7 +104,7 @@ drifts, this finite model pauses rather than repeating an unjournaled effect.
 Automatic repair of such drift remains a separate recoverability limit.
 
 The storage, admission, guarded restart-recovery, worker claim/resume, router
-preparation and shared policy Gate evidence below establish their bounded
+preparation, shared policy Gate and Compose apply evidence below establish their bounded
 portions of this contract.
 Final effect consumers still require their own executable acceptance evidence.
 
@@ -1008,6 +1008,90 @@ Final command freshness, generated recovery shortcuts, cleanup authorization,
 startup completion repair and actual Docker/race acceptance remain separate
 work. This local integration does not enable lifecycle capability or activate a
 controller data root.
+
+### Compose apply and success observations: local evidence
+
+Source commit `e3fba8ea57cb6b35e796daa50dd5da88d99f7139` was integrated
+locally as `cfefb489dcedeb19911e1b6b7c3c377ce02641d5`. Both committed source
+trees are `2df5f480d63369bc01044cca79cdd7a8402b3102`. All ten reviewed
+source/test files remained unchanged through final verification on 2026-10-18.
+
+The fixed Compose adapter retains the original Claim, inspected protected
+configuration, release, configuration revision and complete finding set. It
+builds the command before the final fresh authority/policy check, then invokes
+exactly that `up` request. Only `applying` can authorize `up`; an acknowledged
+`waiting_health` deployment cannot use this path to repeat the command.
+
+The original effects scope remains pinned through the command, progress
+reporting, protected-file cleanup and completion. Separate repository-owned
+transactions revalidate current authority and exact policy before recording
+`waiting_health` and `succeeded`. Observation writes reserve the SQLite writer
+before authority reads. SQL never spans the process runner, reporter or cleanup.
+Unknown execution, lost acknowledgment, cancellation and observation failures
+retain the relevant durable state; they do not trigger Docker rollback or grant
+same-job retry permission. Original failure and cancellation causes are retained.
+
+Final checks used pinned Go 1.26.7 with readonly modules, `-p=1`,
+`-buildvcs=false` and `CGO_ENABLED=0`. Guard, deployment repository and Compose
+packages were run in full. The finite Windows selection additionally ran all ten
+parents from the changed jobs fixture and six relevant controller composition
+parents. Native Linux ran the three full packages and those ten jobs parents.
+
+| Platform and scope | Passed parents | Passed subtests | Skips / failures |
+| --- | ---: | ---: | --- |
+| Windows, three full packages | 69 | 208 | One symlink-privilege parent skip; no failures |
+| Windows, jobs/controller selection | 16 | 33 | None |
+| Native Linux through WSL | 80 | 215 | None |
+
+Every selected parent was discovered exactly once. Linux explicitly passed
+`TestPolicyRejectsSymlinkAncestor`, covering the Windows skip. Tests cover stale
+attempts, binding/provenance drift and approval revocation before `up` and at
+both observations; applying-to-succeeded refusal; actual SQL statement, CAS and
+deferred-constraint commit failures; copied/closed scopes; cancellation causes;
+and a blocked runner with an independent successful database writer.
+
+The worker regression acknowledges one `up`, injects a finalize-write failure,
+then runs actual restart recovery and another empty claim iteration. It verifies
+the same failed job/attempt and deployment linkage, with no second `up`.
+Original configuration-resume, source diagnostics, nested Compose paths, managed
+read-only bind, policy and failure classification assertions remain covered.
+Security, QA and integration review accepted the frozen source and raw evidence.
+
+```text
+go test -json -count=1 ./internal/deploymentexecution ./internal/deployments ./internal/composeruntime
+go vet ./internal/deploymentexecution ./internal/deployments ./internal/composeruntime ./internal/jobs ./cmd/hostd
+go vet -tags live_docker ./cmd/hostd
+go test -json -tags live_docker -count=1 -run '^$' ./cmd/hostd
+go build -trimpath -o <evidence>/hostd-windows-e3-verification.exe ./cmd/hostd
+pwsh -NoProfile -File scripts/check-generation.ps1
+git diff --check
+```
+
+Read-only `gofmt -l` on the ten frozen Go files returned no paths. Receipts
+retain the exact anchored jobs/controller selection, toolchain path/environment,
+raw JSON, exit codes, test discovery and source hashes. The initial Compose
+compile failure is retained: its old fake deployment fixture did not satisfy
+the new concrete guarded repository constructor and was migrated. Earlier
+focused checks are supplemental, not evidence for the later frozen source.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Ten-file source manifest | `6b73a68e9ce19dd9ac26321f2638b9bd4a15ece81614ce20b2af749540ad40dd` |
+| Reviewed complete patch | `2c50a6ec40ef24ff33d9eb1d37deb00da36ad1061159dea46d4a7797d0c4e3c9` |
+| Go 1.26.7 Windows summary | `887ffdf364abea8f0931e038049c046eb90c3a5927bce8d9ddbebf68b7a079f4` |
+| Native source/test freeze | `64efc6373f5fb51bf2ca2a9dc1afb014c16bfc648cccdfacc1a481685b704ffc` |
+| Go 1.26.7 native Linux receipt | `496e57bcab4d6ea84e91e9bb13c928f394d3fb537d550dec22ce115a2256cd8e` |
+
+Native Linux is non-race. The live Docker command above compiled the fixture
+with zero tests selected; it establishes no Docker execution. Actual Docker and
+hosted race gates remain required on the published draft head. No controller
+activation or manual deployment was performed.
+
+Compose still has no durable per-command intent/result receipt or general
+exactly-once guarantee for ambiguous `applying` state. Full Compose ownership
+and restart-policy lifecycle support remains unfinished. Generated command
+families, route/restoration/drain authority, startup repair and public lifecycle
+enablement also remain separate work. This accepted unit does not complete M4.
 
 ### Pre-change baseline
 
