@@ -36,7 +36,6 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
-	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -118,7 +117,11 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	if _, err := machineStore.EnsureLocal(); err != nil {
 		t.Fatal(err)
 	}
-	appStore, jobStore := apps.New(db), jobs.New(db)
+	appStore := apps.New(db)
+	jobStore, _, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	configuration, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -263,7 +266,7 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 
 	workerContext, stopWorker := context.WithCancel(ctx)
 	done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
-		deployments: deploymentStore.Recover, jobs: jobStore.RecoverInterrupted,
+		recoverState: jobStore.RecoverRuntimeContext,
 	}, composition.executor, jobStore.RunWorker, func(error) {})
 	if err != nil {
 		t.Fatal(err)
@@ -393,7 +396,11 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 		t.Fatal("reopen controller database:", err)
 	}
 	defer reopenedDB.Close()
-	reopenedApps, reopenedJobs := apps.New(reopenedDB), jobs.New(reopenedDB)
+	reopenedApps := apps.New(reopenedDB)
+	reopenedJobs, _, err := newDeploymentJobService(reopenedDB)
+	if err != nil {
+		t.Fatal(err)
+	}
 	reopenedConfiguration, err := appconfig.New(reopenedDB, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -432,7 +439,7 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	defer reopenedAPI.Close()
 	reopenedWorkerContext, stopReopenedWorker := context.WithCancel(ctx)
 	reopenedDone, err := prepareRuntimeWorker(reopenedWorkerContext, runtimeRecovery{
-		deployments: reopenedDeployments.Recover, jobs: reopenedJobs.RecoverInterrupted,
+		recoverState: reopenedJobs.RecoverRuntimeContext,
 	}, reopenedComposition.executor, reopenedJobs.RunWorker, func(error) {})
 	if err != nil {
 		t.Fatal(err)

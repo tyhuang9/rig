@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/generatedrecovery"
 )
 
 type repositoryFixture struct {
@@ -385,7 +389,50 @@ func TestTransitionsAndRecoveryUseExplicitAllowlistAndPreserveNeedsAttention(t *
 	if err := fixture.repository.Gate(ctx, fixture.appA, applying.ID, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.repository.Recover(ctx); err != nil {
+	beforePreparing, err := fixture.repository.Get(ctx, fixture.appA, preparing.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeApplying, err := fixture.repository.Get(ctx, fixture.appA, applying.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.repository.Recover(ctx); !errors.Is(err, generatedrecovery.ErrGuardedRecoveryRequired) {
+		t.Fatalf("standalone recovery error=%v", err)
+	}
+	afterPreparing, err := fixture.repository.Get(ctx, fixture.appA, preparing.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterApplying, err := fixture.repository.Get(ctx, fixture.appA, applying.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(beforePreparing, afterPreparing) || !reflect.DeepEqual(beforeApplying, afterApplying) {
+		t.Fatal("standalone recovery refusal changed deployment evidence")
+	}
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(fixture.repository.db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(fixture.repository.db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := fixture.repository.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	for _, pendingJob := range []string{fixture.jobB, jobID} {
+		if _, err := bindings.InsertNewTx(ctx, tx, pendingJob, fixture.repository.now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := generatedrecovery.RecoverRuntime(ctx, fixture.repository.db, fixture.repository.now().UTC(), bindings); err != nil {
 		t.Fatal(err)
 	}
 	recoveredPreparing, err := fixture.repository.Get(ctx, fixture.appA, preparing.ID)

@@ -391,7 +391,10 @@ func controllerProcessKillRunChild(t *testing.T) {
 		t.Fatal("recover accepted deployment plans")
 	}
 	deploymentStore := deployments.New(db)
-	jobStore := jobs.New(db)
+	jobStore, _, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal("reopen deployment job service")
+	}
 	machineStore := machines.New(db)
 	if _, err := machineStore.EnsureLocal(); err != nil {
 		t.Fatal("reopen controller local machine")
@@ -420,7 +423,7 @@ func controllerProcessKillRunChild(t *testing.T) {
 		executor = controllerProcessKillExecutor{delegate: executor, barrier: barrier}
 	}
 	done, err := prepareRuntimeWorker(childContext, runtimeRecovery{
-		deployments: deploymentStore.Recover, jobs: jobStore.RecoverInterrupted,
+		recoverState: jobStore.RecoverRuntimeContext,
 	}, executor, jobStore.RunWorker, func(error) {})
 	if err != nil {
 		t.Fatal("recover production deployment worker")

@@ -113,7 +113,11 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	if _, err := machineStore.EnsureLocal(); err != nil {
 		t.Fatal(err)
 	}
-	appStore, jobStore := apps.New(db), jobs.New(db)
+	appStore := apps.New(db)
+	jobStore, _, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	configuration, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -172,7 +176,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	githubSource := apicontract.GitHubSource{ConnectionID: connection.ID, InstallationID: 7, RepositoryID: 17, Branch: "main"}
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	done, err := prepareRuntimeWorker(workerCtx, runtimeRecovery{
-		deployments: deploymentStore.Recover, jobs: jobStore.RecoverInterrupted,
+		recoverState: jobStore.RecoverRuntimeContext,
 	}, composition.executor, jobStore.RunWorker, func(error) {})
 	if err != nil {
 		t.Fatal(err)

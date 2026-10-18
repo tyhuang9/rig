@@ -387,6 +387,9 @@ func diagnosticSummary(value string) string {
 	}
 }
 
+// Recover is a compatibility entry point for databases without deployment
+// recovery work. Deployment recovery requires the combined guarded transaction
+// exposed by jobs.Service.RecoverRuntimeContext.
 func (r *Repository) Recover(ctx context.Context) error {
 	_, err := generatedrecovery.RecoverDeployments(ctx, r.db, r.now().UTC())
 	return err

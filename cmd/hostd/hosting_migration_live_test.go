@@ -184,7 +184,10 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	}
 	sourceClock := time.Now().UTC()
 	appStore := apps.New(db)
-	jobStore := jobs.New(db)
+	jobStore, _, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	configuration, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -381,7 +384,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 
 	workerContext, stopWorkerContext := context.WithCancel(ctx)
 	workerDone, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
-		deployments: deploymentStore.Recover, jobs: jobStore.RecoverInterrupted,
+		recoverState: jobStore.RecoverRuntimeContext,
 	}, composition.executor, jobStore.RunWorker, func(workerErr error) { t.Errorf("migration journey worker: %v", workerErr) })
 	if err != nil {
 		t.Fatal("start migration journey worker:", err)
@@ -641,7 +644,10 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reopenedJobs := jobs.New(db)
+	reopenedJobs, _, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	reopenedDeployments := deployments.New(db)
 	recoveryRunner := &migrationJourneyRunner{}
 	reopened, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
@@ -659,7 +665,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	}
 	recoveryWorkerContext, stopRecoveryWorkerContext := context.WithCancel(ctx)
 	recoveryWorkerDone, err := prepareRuntimeWorker(recoveryWorkerContext, runtimeRecovery{
-		deployments: reopenedDeployments.Recover, jobs: reopenedJobs.RecoverInterrupted,
+		recoverState: reopenedJobs.RecoverRuntimeContext,
 	}, reopened.executor, reopenedJobs.RunWorker, func(workerErr error) { t.Errorf("migration journey recovery worker: %v", workerErr) })
 	if err != nil {
 		t.Fatal("start recovered migration journey worker:", err)

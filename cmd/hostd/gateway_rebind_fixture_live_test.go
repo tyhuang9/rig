@@ -167,7 +167,11 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 	if _, err := machineStore.EnsureLocal(); err != nil {
 		t.Fatal(err)
 	}
-	applicationStore, jobStore := apps.New(db), jobs.New(db)
+	applicationStore := apps.New(db)
+	jobStore, _, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	configurationStore, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -216,7 +220,7 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 	}
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone, err := prepareRuntimeWorker(workerCtx, runtimeRecovery{
-		deployments: deploymentStore.Recover, jobs: jobStore.RecoverInterrupted,
+		recoverState: jobStore.RecoverRuntimeContext,
 	}, composition.executor, jobStore.RunWorker, func(error) {})
 	if err != nil {
 		t.Fatal(err)

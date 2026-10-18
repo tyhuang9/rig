@@ -172,7 +172,7 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 	var calls []string
 	composition, err := prepareRuntimeComposition(ctx, fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 		dockerExecutable: fixture.dockerExecutable,
@@ -192,17 +192,12 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 		t.Fatal(err)
 	}
 	done, err := prepareRuntimeWorker(ctx, runtimeRecovery{
-		deployments: func(recoveryContext context.Context) error {
-			if recoveryContext.Err() != nil {
-				t.Fatalf("deployment recovery inherited cancellation: %v", recoveryContext.Err())
+		recoverState: func(recoveryContext context.Context) error {
+			if recoveryContext != ctx {
+				t.Fatal("runtime recovery did not receive original context")
 			}
-			assertStartupAdmissionHeld("deployment recovery")
-			calls = append(calls, "deployments_recover")
-			return nil
-		},
-		jobs: func() error {
-			assertStartupAdmissionHeld("job recovery")
-			calls = append(calls, "jobs_recover")
+			assertStartupAdmissionHeld("runtime recovery")
+			calls = append(calls, "runtime_recover")
 			return nil
 		},
 		releaseAdmission: releaseStartupAdmission,
@@ -234,7 +229,7 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 	}
 	wantRecoveryOrder := []string{
 		"compose_temp_recover", "generated_build_temp_recover", "generated_environment_temp_recover",
-		"artifact_repository_recover", "ingress_recover", "deployments_recover", "jobs_recover", "worker",
+		"artifact_repository_recover", "ingress_recover", "runtime_recover", "worker",
 	}
 	var recoveryOrder []string
 	for _, call := range calls {

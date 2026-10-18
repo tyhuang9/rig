@@ -205,7 +205,10 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		t.Fatal(err)
 	}
 	appStore := apps.New(db)
-	jobStore := jobs.New(db)
+	jobStore, _, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	configuration, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -500,7 +503,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	}
 	workerContext, stopWorker := context.WithCancel(ctx)
 	done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
-		deployments: deploymentStore.Recover, jobs: jobStore.RecoverInterrupted,
+		recoverState: jobStore.RecoverRuntimeContext,
 	}, composition.executor, jobStore.RunWorker, func(error) {})
 	if err != nil {
 		t.Fatal(err)
@@ -830,8 +833,12 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		if err != nil {
 			return restartedController{}, err
 		}
+		jobStore, _, err := newDeploymentJobService(controllerDB)
+		if err != nil {
+			return restartedController{}, err
+		}
 		value := restartedController{
-			db: controllerDB, apps: apps.New(controllerDB), jobs: jobs.New(controllerDB), deployments: deployments.New(controllerDB),
+			db: controllerDB, apps: apps.New(controllerDB), jobs: jobStore, deployments: deployments.New(controllerDB),
 			configuration: configuration, plans: plans, sources: sources,
 		}
 		value.composition, err = prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
@@ -850,7 +857,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	startRestartedController := func(value restartedController) (*httptest.Server, context.CancelFunc, <-chan struct{}, error) {
 		workerContext, stop := context.WithCancel(ctx)
 		done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
-			deployments: value.deployments.Recover, jobs: value.jobs.RecoverInterrupted,
+			recoverState: value.jobs.RecoverRuntimeContext,
 		}, value.composition.executor, value.jobs.RunWorker, func(error) {})
 		if err != nil {
 			stop()

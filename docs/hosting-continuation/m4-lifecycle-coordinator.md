@@ -103,9 +103,9 @@ A receipt cannot authorize another command. If a receipted postcondition later
 drifts, this finite model pauses rather than repeating an unjournaled effect.
 Automatic repair of such drift remains a separate recoverability limit.
 
-The storage evidence below establishes the persisted portion of this contract.
-Admission, worker recovery and all effect consumers still need their own
-executable acceptance evidence.
+The storage, admission and guarded restart-recovery evidence below establish
+their bounded portions of this contract. Worker claim/resume and final effect
+consumers still require their own executable acceptance evidence.
 
 ### Retained runtime boundary
 
@@ -199,9 +199,10 @@ a historical running binding requires the complete original graph. Every nested
 read uses the caller's transaction. Repository/validator database identity is
 checked at composition; `database/sql` cannot introspect a transaction's origin.
 
-Stale retirement, resume, claim, recovery, router and final command checks
-remain implementation work. Storage and admission do not enable lifecycle
-actions or grant permission at a runtime command boundary.
+Guarded restart recovery now preserves stale deployment evidence and retires
+stale nonterminal jobs. Resume, claim, router and final command checks remain
+separate work. Storage, admission and recovery do not enable lifecycle actions
+or grant permission at a runtime command boundary.
 
 ### Atomic ordinary deployment admission
 
@@ -223,8 +224,36 @@ release, strategy and capability preflight.
 Automatic deployment keeps its current lease, source and dispatch identity
 checks inside the binding transaction. Lifecycle refusal uses the existing
 finite, sanitized deployment-failure pause; storage failure remains distinct.
-This admission boundary does not replace the still-required claim, recovery,
-router and command-boundary authorization.
+This admission boundary does not replace recovery, claim, router or
+command-boundary authorization.
+
+### Guarded restart recovery
+
+Production startup uses one `jobs.Service.RecoverRuntimeContext` callback.
+It reuses the configured binding repository and holds startup admission until
+recovery finishes. One SQLite writer transaction reserves the writer before
+reading, collects every active deployment job, mutable deployment and selected
+runtime, and classifies all bindings before changing any recovery record.
+Direct linkage validation includes orphan runtimes and terminal jobs with
+nonterminal runtime records; provenance filtering cannot hide them.
+
+Current authority retains the existing recovery policy. Historically valid
+stale authority preserves deployment, component and runtime evidence and retires
+only a nonterminal job to `needs_attention`, once, with the fixed
+`deployment_lifecycle_stale` diagnostic. Progress, checkpoints and attempts are
+preserved. Missing or corrupt authority, unresolved lifecycle work, storage
+failure and cancellation abort the whole transaction with distinct errors.
+No binding is created or refreshed by recovery.
+
+The service wakes a worker only after committed recovery requeues current
+generated work. Startup passes its caller context, releases admission exactly
+once, preserves joined recovery/release failures, and launches no worker on
+failure or cancellation. The old standalone deployment and job recovery APIs
+refuse deployment work; the job API retains generic non-deployment interruption.
+
+Lifecycle-completion bookkeeping repair remains a required preceding startup
+hook. This unit neither implements that hook nor performs Docker commands,
+resource cleanup, route restoration or lifecycle activation.
 
 ## Required acceptance
 
@@ -316,10 +345,10 @@ Independent security and QA reviews accepted the repairs. JSON hashes:
 
 Migration copies are byte-identical at SHA-256
 `359a0b996b5aecae943fc5750a1de58fb773a6c32912a97989ce9f35437a2265`.
-Ordinary deployment bindings, startup completion repair, complete runtime and
-route coordination, and public actions remain unimplemented. These storage
-results do not establish those behaviors. The separate retained-runtime results
-below cover its internal admission and physical-boundary adapters.
+Those storage-only results do not establish ordinary deployment binding,
+startup completion repair, complete runtime/route coordination or public actions.
+The later binding, admission and restart-recovery sections record their separate
+evidence. Startup completion repair and full coordination remain unfinished.
 
 ### Retained runtime boundary: local evidence
 
@@ -560,6 +589,64 @@ bounded unit. Raw JSON SHA-256 hashes:
 These checks establish local admission behavior. They do not establish hosted
 race behavior, real Docker lifecycle effects, startup recovery acceptance,
 complete M4, or activation of a live controller.
+
+### Guarded restart recovery: local evidence
+
+Core commit `e64511bed97508f4959f6fe66dd500d8a2ea7d37` was integrated
+locally at `bbd44400032ec1d39dff68ebde2c46667d716c41`. On 2026-10-18,
+the Windows core package and its native Linux executable each passed 33 parent
+tests and 50 subtests, with no failures or skips. The Windows command was:
+
+```text
+go test -json -v -count=1 -timeout=10m ./internal/generatedrecovery
+go vet ./internal/generatedrecovery
+```
+
+After review, five focused parents and six subtests passed on both platforms.
+These test-only additions establish mixed current/stale/late-failure rollback,
+terminal stale job/event preservation, orphan runtime refusal, and cancellation
+after mutations. The cancellation trigger observes an already-failed current
+runtime inside the transaction, then verifies that cancellation restores all
+job, event, deployment, runtime and component records. The canonical validator
+also runs inside the writer reservation; deterministic barriers verify that
+concurrent desired-state authoring cannot interleave.
+
+The combined service, repository and startup selection passed 17 parents
+and six subtests per platform on Windows and native Linux. Coverage includes exactly one
+post-commit wake for a safe generated requeue, no additional wake on repeat,
+zero wakes on transaction rollback, standalone-wrapper refusal, startup context
+propagation, admission release and cross-process admission ordering. The
+service selection was `^TestRecoverRuntimeContext`; startup covered every
+`TestPrepareRuntimeWorker` case, composition ordering and the existing
+cross-process admission parent.
+
+Controller build, scoped vet, canonical `scripts/check-generation.ps1`, and
+compilation with `-tags live_docker` passed. The live tests were compiled only;
+no Docker or running-controller action was performed. Initial check failures
+were confined to tests: a before/after assertion compared a newly-created
+object with a database-defaulted object, and a converted live fixture retained
+an unused import. Both were repaired with the failed logs retained. Normal
+startup tests were not repeated after the isolated live-import removal.
+
+All final checks use Go 1.26.7 with readonly modules and `CGO_ENABLED=0`.
+Core and startup sources have before/after hash receipts; native Linux uses WSL
+without race instrumentation. Independent security and QA reviews accepted the
+finite behavioral scope. Evidence receipt SHA-256 hashes:
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Core native Linux plus Windows log audit | `eb238c83b8b072d3342e6666be2b80d68d8eba2630166435e1f4a9f08bac8c6d` |
+| Core finite review repairs, both platforms | `0dd890c8a5ad6111a40814f26030ca4eb916d808bfc7752b50871f92471a0828` |
+| Integrated Windows startup checks | `e5c7fa12fff5bb85bf501492989cd3c64286d4390c07787e315abb1817aa10eb` |
+| Integrated native Linux startup checks | `e550de2c8a4baaf23fc00a63fecfb32ce73577bde6fde2aedf5332072a4fd830` |
+| Final live-fixture compilation and canonical check | `76694b430dabf7a9b49c764556141be4c51a5c355e93b180343ebf6a3f4a9012` |
+
+These are local restart-recovery results. Worker claim/resume, final runtime
+command fencing, lifecycle-completion repair, hosted race checks, actual Docker
+lifecycle behavior and full M4 acceptance remain separate requirements.
+Broader package acceptance also awaits the remaining jobs fixture migrations
+owned by the claim/resume unit; these selected checks are not a full-package
+integration baseline.
 
 ### Pre-change baseline
 

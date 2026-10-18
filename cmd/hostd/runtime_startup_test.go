@@ -19,19 +19,15 @@ func (*startupTestExecutor) Execute(context.Context, jobs.Job, jobs.ProgressRepo
 
 func TestPrepareRuntimeWorkerRecoversInOrderBeforeStartingOneWorker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 
 	var calls []string
 	recovery := runtimeRecovery{
-		deployments: func(recoveryContext context.Context) error {
-			if recoveryContext.Err() != nil {
-				t.Fatalf("deployment recovery inherited cancelled startup context: %v", recoveryContext.Err())
+		recoverState: func(recoveryContext context.Context) error {
+			if recoveryContext != ctx {
+				t.Fatal("runtime recovery received a different startup context")
 			}
-			calls = append(calls, "deployments")
-			return nil
-		},
-		jobs: func() error {
-			calls = append(calls, "jobs")
+			calls = append(calls, "recover")
 			return nil
 		},
 	}
@@ -61,7 +57,7 @@ func TestPrepareRuntimeWorkerRecoversInOrderBeforeStartingOneWorker(t *testing.T
 	if got := runCount.Load(); got != 1 {
 		t.Fatalf("worker run count = %d, want 1", got)
 	}
-	if want := []string{"deployments", "jobs", "worker"}; !reflect.DeepEqual(calls, want) {
+	if want := []string{"recover", "worker"}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("startup calls = %v, want %v", calls, want)
 	}
 }
@@ -69,12 +65,8 @@ func TestPrepareRuntimeWorkerRecoversInOrderBeforeStartingOneWorker(t *testing.T
 func TestPrepareRuntimeWorkerDefaultOffRecoversWithoutStartingWorker(t *testing.T) {
 	var calls []string
 	recovery := runtimeRecovery{
-		deployments: func(context.Context) error {
-			calls = append(calls, "deployments")
-			return nil
-		},
-		jobs: func() error {
-			calls = append(calls, "jobs")
+		recoverState: func(context.Context) error {
+			calls = append(calls, "recover")
 			return nil
 		},
 	}
@@ -94,7 +86,7 @@ func TestPrepareRuntimeWorkerDefaultOffRecoversWithoutStartingWorker(t *testing.
 	if got := runCount.Load(); got != 0 {
 		t.Fatalf("worker run count = %d, want 0", got)
 	}
-	if want := []string{"deployments", "jobs"}; !reflect.DeepEqual(calls, want) {
+	if want := []string{"recover"}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("startup calls = %v, want %v", calls, want)
 	}
 }
@@ -105,8 +97,7 @@ func TestPrepareRuntimeWorkerRecoveryFailurePreventsWorker(t *testing.T) {
 		failAt    string
 		wantCalls []string
 	}{
-		{name: "deployment recovery", failAt: "deployments", wantCalls: []string{"deployments"}},
-		{name: "job recovery", failAt: "jobs", wantCalls: []string{"deployments", "jobs"}},
+		{name: "combined recovery", failAt: "recover", wantCalls: []string{"recover"}},
 	}
 
 	for _, test := range tests {
@@ -122,10 +113,9 @@ func TestPrepareRuntimeWorkerRecoveryFailurePreventsWorker(t *testing.T) {
 			}
 			var runCount atomic.Int32
 			done, err := prepareRuntimeWorker(context.Background(), runtimeRecovery{
-				deployments: func(context.Context) error {
-					return step("deployments")
+				recoverState: func(context.Context) error {
+					return step("recover")
 				},
-				jobs: func() error { return step("jobs") },
 			}, &startupTestExecutor{}, func(context.Context, jobs.Executor) error {
 				runCount.Add(1)
 				return nil
@@ -149,7 +139,6 @@ func TestPrepareRuntimeWorkerRecoveryFailurePreventsWorker(t *testing.T) {
 func TestPrepareRuntimeWorkerMissingDependenciesStillReleasesHeldAdmission(t *testing.T) {
 	releaseCalls := 0
 	done, err := prepareRuntimeWorker(context.Background(), runtimeRecovery{
-		jobs: func() error { return nil },
 		releaseAdmission: func() error {
 			releaseCalls++
 			return nil
@@ -167,25 +156,18 @@ func TestPrepareRuntimeWorkerReleasesHeldAdmissionAfterRecoveryBeforeWorker(t *t
 	var calls []string
 	held := true
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	defer cancel()
 	done, err := prepareRuntimeWorker(ctx, runtimeRecovery{
 		releaseAdmission: func() error {
 			calls = append(calls, "release")
 			held = false
 			return nil
 		},
-		deployments: func(context.Context) error {
+		recoverState: func(context.Context) error {
 			if !held {
-				t.Fatal("deployment recovery ran without admission")
+				t.Fatal("runtime recovery ran without admission")
 			}
-			calls = append(calls, "deployments")
-			return nil
-		},
-		jobs: func() error {
-			if !held {
-				t.Fatal("job recovery ran without admission")
-			}
-			calls = append(calls, "jobs")
+			calls = append(calls, "recover")
 			return nil
 		},
 	}, &startupTestExecutor{}, func(context.Context, jobs.Executor) error {
@@ -203,7 +185,7 @@ func TestPrepareRuntimeWorkerReleasesHeldAdmissionAfterRecoveryBeforeWorker(t *t
 	case <-time.After(time.Second):
 		t.Fatal("worker did not finish")
 	}
-	if want := []string{"deployments", "jobs", "release", "worker"}; !reflect.DeepEqual(calls, want) {
+	if want := []string{"recover", "release", "worker"}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("recovery admission order = %v, want %v", calls, want)
 	}
 }
@@ -212,13 +194,9 @@ func TestPrepareRuntimeWorkerRecoveryFailureStillReleasesHeldAdmission(t *testin
 	recoveryFailure := errors.New("injected recovery failure")
 	var calls []string
 	done, err := prepareRuntimeWorker(context.Background(), runtimeRecovery{
-		deployments: func(context.Context) error {
-			calls = append(calls, "deployments")
+		recoverState: func(context.Context) error {
+			calls = append(calls, "recover")
 			return recoveryFailure
-		},
-		jobs: func() error {
-			calls = append(calls, "jobs")
-			return nil
 		},
 		releaseAdmission: func() error {
 			calls = append(calls, "release")
@@ -231,7 +209,7 @@ func TestPrepareRuntimeWorkerRecoveryFailureStillReleasesHeldAdmission(t *testin
 	if !errors.Is(err, recoveryFailure) || done != nil {
 		t.Fatalf("recovery failure done=%v err=%v", done, err)
 	}
-	if want := []string{"deployments", "release"}; !reflect.DeepEqual(calls, want) {
+	if want := []string{"recover", "release"}; !reflect.DeepEqual(calls, want) {
 		t.Fatalf("recovery failure calls = %v, want %v", calls, want)
 	}
 }
@@ -240,8 +218,7 @@ func TestPrepareRuntimeWorkerHeldAdmissionReleaseFailureBlocksWorker(t *testing.
 	releaseFailure := errors.New("injected release failure")
 	workerCalled := false
 	done, err := prepareRuntimeWorker(context.Background(), runtimeRecovery{
-		deployments:      func(context.Context) error { return nil },
-		jobs:             func() error { return nil },
+		recoverState:     func(context.Context) error { return nil },
 		releaseAdmission: func() error { return releaseFailure },
 	}, &startupTestExecutor{}, func(context.Context, jobs.Executor) error {
 		workerCalled = true
@@ -249,5 +226,68 @@ func TestPrepareRuntimeWorkerHeldAdmissionReleaseFailureBlocksWorker(t *testing.
 	}, nil)
 	if !errors.Is(err, releaseFailure) || done != nil || workerCalled {
 		t.Fatalf("release failure done=%v err=%v worker called=%t", done, err, workerCalled)
+	}
+}
+
+func TestPrepareRuntimeWorkerCancellationReleasesAdmissionWithoutWorker(t *testing.T) {
+	for _, stage := range []string{"before_recovery", "during_recovery", "during_release"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if stage == "before_recovery" {
+				cancel()
+			}
+			var calls []string
+			done, err := prepareRuntimeWorker(ctx, runtimeRecovery{
+				recoverState: func(received context.Context) error {
+					if received != ctx {
+						t.Fatal("runtime recovery lost caller context")
+					}
+					calls = append(calls, "recover")
+					if stage == "during_recovery" {
+						cancel()
+					}
+					return nil
+				},
+				releaseAdmission: func() error {
+					calls = append(calls, "release")
+					if stage == "during_release" {
+						cancel()
+					}
+					return nil
+				},
+			}, &startupTestExecutor{}, func(context.Context, jobs.Executor) error {
+				t.Error("cancelled startup launched a worker")
+				return nil
+			}, nil)
+			if !errors.Is(err, context.Canceled) || done != nil {
+				t.Fatalf("cancelled startup done=%v err=%v", done, err)
+			}
+			want := []string{"recover", "release"}
+			if stage == "before_recovery" {
+				want = []string{"release"}
+			}
+			if !reflect.DeepEqual(calls, want) {
+				t.Fatalf("cancelled startup calls=%v want=%v", calls, want)
+			}
+		})
+	}
+}
+
+func TestPrepareRuntimeWorkerPreservesRecoveryAndReleaseFailures(t *testing.T) {
+	recoveryFailure, releaseFailure := errors.New("recovery failed"), errors.New("release failed")
+	releases := 0
+	done, err := prepareRuntimeWorker(context.Background(), runtimeRecovery{
+		recoverState: func(context.Context) error { return recoveryFailure },
+		releaseAdmission: func() error {
+			releases++
+			return releaseFailure
+		},
+	}, &startupTestExecutor{}, func(context.Context, jobs.Executor) error {
+		t.Error("failed startup launched a worker")
+		return nil
+	}, nil)
+	if !errors.Is(err, recoveryFailure) || !errors.Is(err, releaseFailure) || done != nil || releases != 1 {
+		t.Fatalf("combined failure done=%v err=%v releases=%d", done, err, releases)
 	}
 }

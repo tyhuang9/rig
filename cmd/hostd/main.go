@@ -392,8 +392,7 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 		releaseStartupAdmission = startupAdmission.Release
 	}
 	workerDone, err := prepareRuntimeWorker(ctx, runtimeRecovery{
-		deployments:      deploymentRepository.Recover,
-		jobs:             j.RecoverInterrupted,
+		recoverState:     j.RecoverRuntimeContext,
 		releaseAdmission: releaseStartupAdmission,
 	}, runtime.executor, workerRun, func(err error) {
 		logger.Error("job worker stopped", "error", err)
@@ -568,8 +567,7 @@ func runRecoveryOnlyControllerWithAssembly(cfg config.Config, logger *slog.Logge
 }
 
 type runtimeRecovery struct {
-	deployments      func(context.Context) error
-	jobs             func() error
+	recoverState     func(context.Context) error
 	releaseAdmission func() error
 }
 
@@ -604,20 +602,19 @@ func prepareRuntimeWorker(ctx context.Context, recovery runtimeRecovery, executo
 		}
 		return nil
 	}
-	if ctx == nil || recovery.deployments == nil || recovery.jobs == nil {
+	if ctx == nil || recovery.recoverState == nil {
 		return nil, errors.Join(errors.New("runtime recovery dependencies are required"), releaseAdmission())
 	}
-	recoverState := func() error {
-		if err := recovery.deployments(context.WithoutCancel(ctx)); err != nil {
-			return fmt.Errorf("recover deployments: %w", err)
+	recoverErr := ctx.Err()
+	if recoverErr == nil {
+		if err := recovery.recoverState(ctx); err != nil {
+			recoverErr = fmt.Errorf("recover runtime: %w", err)
 		}
-		if err := recovery.jobs(); err != nil {
-			return fmt.Errorf("recover jobs: %w", err)
-		}
-		return nil
 	}
-	recoverErr := recoverState()
 	releaseErr := releaseAdmission()
+	if recoverErr == nil {
+		recoverErr = ctx.Err()
+	}
 	if recoverErr != nil || releaseErr != nil {
 		return nil, errors.Join(recoverErr, releaseErr)
 	}
