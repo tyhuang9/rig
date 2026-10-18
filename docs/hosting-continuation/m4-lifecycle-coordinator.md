@@ -103,9 +103,9 @@ A receipt cannot authorize another command. If a receipted postcondition later
 drifts, this finite model pauses rather than repeating an unjournaled effect.
 Automatic repair of such drift remains a separate recoverability limit.
 
-The storage, admission, guarded restart-recovery and worker claim/resume evidence
-below establish their bounded portions of this contract. Router preparation and
-final effect consumers still require their own executable acceptance evidence.
+The storage, admission, guarded restart-recovery, worker claim/resume and router
+preparation evidence below establish their bounded portions of this contract.
+Final effect consumers still require their own executable acceptance evidence.
 
 ### Retained runtime boundary
 
@@ -200,9 +200,10 @@ read uses the caller's transaction. Repository/validator database identity is
 checked at composition; `database/sql` cannot introspect a transaction's origin.
 
 Guarded restart recovery and claim now preserve stale deployment evidence and
-retire stale nonterminal jobs; Resume refuses stale authority. Router and final
-command checks remain separate work. Storage, admission, recovery and queue
-checks do not enable lifecycle actions or grant runtime command permission.
+retire stale nonterminal jobs; Resume refuses stale authority. The router also
+checks the original binding before preparation and delegation. Final command
+checks remain separate work. These boundaries do not enable lifecycle actions
+or grant runtime command permission.
 
 ### Atomic ordinary deployment admission
 
@@ -284,6 +285,32 @@ fixtures use typed admission and an explicit binding repository; generic worker
 fixtures exercise generic jobs. These queue checks do not authorize commands
 after a later desired-state change.
 
+### Original binding at runtime preparation
+
+The runtime router reads the saved binding for the exact job, verifies both job
+and application identity, and requires an explicit current classification before
+creating a deployment record or looking up a workspace. Immediately before
+either runtime delegate, it checks that same original binding again. A later
+running revision, including Stop followed by Start, cannot refresh an old job's
+authority. Missing, invalid, unresolved, unavailable and unknown authority all
+refuse; the binding is never created or replaced during execution.
+
+Real runtime composition receives the same concrete repository used by job
+admission and recovery. Missing, unconfigured or foreign-database dependencies
+are rejected before runtime setup. Fake and disabled runtime modes retain their
+existing behavior. The original caller context and live effects-scope values are
+passed through unchanged. Cancellation is checked after successful binding
+callbacks as well as before delegation.
+
+A late refusal retains the already-created preparing deployment, job, events,
+binding and runtime evidence. Typed causes remain discoverable under the
+existing `runtime_unavailable` execution error; the worker currently records a
+non-cancellation refusal as a failed job. This differs from the earlier claim
+boundary's stale `needs_attention` retirement. No new pause disposition, route
+restoration or resource cleanup is introduced here. Final command checks must
+still verify current authority, current attempt and the original live effects
+scope when an actual effect is about to run.
+
 ## Required acceptance
 
 Tests must cover stale or malformed authority; same-state revision changes;
@@ -307,12 +334,14 @@ foundation do not prove this new behavior.
 
 ### Initial dispatch guard: local evidence
 
-The first local unit adds immutable app/revision/state snapshots, mandatory
+The first local unit added immutable app/revision/state snapshots, mandatory
 DB-backed router composition, refusal before deployment preparation, and exact
 revalidation before either runtime delegate. It preserves legacy uninitialized
 intent without creating history. Explicit context checks after successful
 callbacks close a reviewed cancellation gap; deterministic tests cancel while
 returning valid data and assert no downstream preparation or dispatch.
+The original-binding router unit below supersedes that app-only snapshot
+consumer; these earlier results remain historical evidence.
 
 Final Windows checks on 2026-10-18 passed:
 
@@ -331,10 +360,11 @@ cancellation repair. JSON SHA-256 hashes:
 - Executor: `1a5ac42fb5ccf954656deb7f3b0d98737e7e0726c5531156f9767959275da7fe`.
 - Composition: `fc7554369838578d672f635bb2248f0b91bdc8ccaf5f7d894f7e16c44fd7a069`.
 
-These results cover this local unit only. A callback check cannot eliminate a
-race after it returns. Durable operation binding, shared exclusion, the deeper
-revival consumers, and actual lifecycle effects are still required. No separate
-delivery or public capability enablement is claimed for this unit.
+These results cover this initial local unit only. A callback check cannot
+eliminate a race after it returns. Later sections record durable operation
+binding and revival checks; shared exclusion at final command boundaries and
+actual lifecycle effects remain required. No separate delivery or public
+capability enablement is claimed for this unit.
 
 ### Durable operation storage: local evidence
 
@@ -724,8 +754,70 @@ reviews found no remaining issue in this bounded scope.
 Checks use pinned Go 1.26.7 with readonly modules and `CGO_ENABLED=0`.
 Native Linux runs through WSL without race instrumentation. No Docker command,
 live-controller activation or hosted lifecycle acceptance is established by
-these results. Router preparation and final runtime command fencing remain
-required before public lifecycle activation.
+these results. The router unit below records preparation checks; final runtime
+command fencing remains required before public lifecycle activation.
+
+### Original binding at runtime preparation: local evidence
+
+Router commit `3de2ede4e04d0d92aed58b52dff7781403f89d44` and the
+cancellation follow-up `04bb94f76d1019a4a81c58bf77e195bb67e7eed9` were
+integrated locally, with final source at
+`aa170b754ea7c11b7fffe9d7e5487ec1f404146e`. On 2026-10-18, the initial
+Windows router suite passed 11 parents and 36 subtests; the finite hostd
+selection passed eight parents and 39 subtests. Native Linux then passed all
+24 parents and 82 subtests from both changed test files: router 11/36 and
+hostd 13/46. Every selected parent was discovered and passed exactly once,
+with no failures or skips.
+
+Final inspection found missing cancellation checks after successful binding
+callbacks. Four new Read/first-Check cases across Compose/generated reproduced
+the regression before repair. Six production lines restore the cancellation
+checks. The final full router package passed 12 parents and 40 subtests on both
+Windows and native Linux. The other nine source files stayed byte-identical,
+so their passed checks were retained. Security and independent source
+review accepted the finite repair.
+
+The broader combined claim/recovery/router selection passed 34 parents and
+95 subtests before the cancellation follow-up. After that follow-up was
+integrated, two composed-runtime parents and nine subtests passed, along with
+the controller build and canonical generation check. Reviewed source Git blobs
+match the integrated tree. These results are recorded separately so the earlier
+combined run is not presented as a run against the later source.
+
+```text
+go test -json -count=1 -timeout=5m ./internal/runtimeexecutor
+go vet ./internal/runtimeexecutor ./cmd/hostd
+go build -o <evidence>/hostd-windows-amd64.exe ./cmd/hostd
+go test -c -tags live_docker -o <evidence>/hostd-live-docker-windows-amd64.test.exe ./cmd/hostd
+pwsh -NoProfile -File scripts/check-generation.ps1
+```
+
+The first scoped vet and live-fixture compilation preceded the cancellation
+follow-up. Router vet, the final controller build and canonical check passed
+again after the repair. Exact finite hostd selections, commands, raw logs and
+source manifests are retained in the evidence receipts.
+
+Real canonical graph fixtures cover legacy and completed running authority,
+same-state Restart and Stop/Start drift at initial and late boundaries, corrupt
+historical authority, wrong identity, typed failures, original context values,
+and retained preparation records. Tests also exercise correct repository
+injection through the assembled controller: an unbound job refuses before
+preparation, and an accepted binding reaches normal Compose validation. Existing
+routing/provenance and disabled/fake runtime behavior remain covered.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Initial Windows router JSON | `52ea6d1cb1ced2b480726f56ed71cd5744f2e8d2151bb4f067a53b955bbf6ca4` |
+| Windows composed-runtime selection JSON | `544e296dd50ec6acf2aa5e65f6e5a86f84fdd999762a39b67936cda287cb9012` |
+| Initial native Linux receipt | `0d7b1e8cea9563f8fc81d982f4068a73751e21698612a76f2801735bb05c877b` |
+| Expected cancellation regression JSON | `87be7e2797ed8bb9a3cdf6dfb114370a9b0530c7cc5d38c70d13d4bb20929bde` |
+| Final cancellation repair, Windows/Linux receipt | `e1722719c752e6d2aa7002d410ff9534a6296b0d3dfdba7174de5e966e9f4717` |
+| Final composed integration/build/canonical receipt | `f31df0d314f8532a65cef6b493fe133405b60d8c7f6ad0b7e21592ec19732c28` |
+
+All checks use pinned Go 1.26.7 and readonly modules. Native Linux checks run
+without race instrumentation. Live fixtures were compiled, not executed;
+Docker behavior, final command authorization and full M4 acceptance remain
+unverified. The public lifecycle capability remains disabled.
 
 ### Pre-change baseline
 
