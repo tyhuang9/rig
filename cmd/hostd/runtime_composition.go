@@ -9,6 +9,7 @@ import (
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/config"
@@ -319,8 +320,12 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("runtime_router_create"); err != nil {
 			return runtimeComposition{}, err
 		}
+		desiredAuthority, err := applifecycle.NewDeploymentAuthority(applifecycle.New(dependencies.db))
+		if err != nil {
+			return runtimeComposition{}, fmt.Errorf("runtime desired lifecycle authority setup: %w", err)
+		}
 		result.executor, err = runtimeexecutor.New(dependencies.deployments, dependencies.plans, dependencies.snapshots,
-			result.compose, result.generated, fenceCheck)
+			result.compose, result.generated, desiredAuthority, fenceCheck)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("runtime strategy router setup: %w", err)
 		}

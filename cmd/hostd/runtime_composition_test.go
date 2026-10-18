@@ -101,6 +101,47 @@ func TestRuntimeCompositionEnablementAndRouterSelection(t *testing.T) {
 	}
 }
 
+type runtimeCompositionReporter struct{}
+
+func (runtimeCompositionReporter) Report(jobs.ProgressUpdate) error { return nil }
+
+func TestRuntimeCompositionRouterUsesPersistedDesiredLifecycleAuthority(t *testing.T) {
+	fixture := newRuntimeCompositionFixture(t)
+	fixture.configuration.ComposeRuntime = true
+	composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := jobs.Job{
+		ID: "22222222-2222-4222-8222-222222222222", Type: "deploy", ResourceType: "application",
+		ResourceID: "11111111-1111-4111-8111-111111111111", RequestedBy: "33333333-3333-4333-8333-333333333333",
+	}
+	_, err = composition.executor.Execute(context.Background(), job, runtimeCompositionReporter{})
+	var executionErr *jobs.ExecutionError
+	if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" {
+		t.Fatalf("missing desired lifecycle head error=%v", err)
+	}
+	if _, err := fixture.db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
+		VALUES(?,?,?,'pending','2026-10-18T01:00:00Z','2026-10-18T01:00:00Z')`, job.ResourceID, "authority-app", "Authority App"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = composition.executor.Execute(context.Background(), job, runtimeCompositionReporter{})
+	if !errors.As(err, &executionErr) || executionErr.Code != "validation_failed" {
+		t.Fatalf("legacy uninitialized desired lifecycle error=%v", err)
+	}
+	var desiredState sql.NullString
+	var revision, history int64
+	if err := fixture.db.QueryRow(`SELECT desired_state,revision_number FROM application_desired_lifecycle_heads WHERE app_id=?`, job.ResourceID).Scan(&desiredState, &revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM application_desired_lifecycle_transitions WHERE app_id=?`, job.ResourceID).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
+	if desiredState.Valid || revision != 0 || history != 0 {
+		t.Fatalf("read guard authored intent: state=%v revision=%d history=%d", desiredState, revision, history)
+	}
+}
+
 func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) {
 	fixture := newRuntimeCompositionFixture(t)
 	fixture.configuration.GeneratedRuntime = true

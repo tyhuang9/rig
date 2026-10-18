@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
@@ -55,6 +56,58 @@ func (r routerReleases) ReadyWorkspace(context.Context, string, string) (release
 	return r.release, r.err
 }
 
+type countedRouterPlans struct {
+	delegate         routerPlans
+	getCalls         int
+	getRevisionCalls int
+}
+
+func (r *countedRouterPlans) Get(ctx context.Context, appID string) (deploymentplans.DeploymentPlanRevision, error) {
+	r.getCalls++
+	return r.delegate.Get(ctx, appID)
+}
+
+func (r *countedRouterPlans) GetRevision(ctx context.Context, appID, planID string, revision int64) (deploymentplans.DeploymentPlanRevision, error) {
+	r.getRevisionCalls++
+	return r.delegate.GetRevision(ctx, appID, planID, revision)
+}
+
+type countedRouterReleases struct {
+	delegate routerReleases
+	calls    int
+}
+
+func (r *countedRouterReleases) ReadyWorkspace(ctx context.Context, appID, releaseID string) (releasesnapshot.Release, error) {
+	r.calls++
+	return r.delegate.ReadyWorkspace(ctx, appID, releaseID)
+}
+
+type routerAuthority struct {
+	snapshot       applifecycle.DeploymentAuthoritySnapshot
+	snapshotErr    error
+	revalidateErr  error
+	snapshots      int
+	revalidations  int
+	onSnapshot     func()
+	onRevalidation func()
+}
+
+func (a *routerAuthority) Snapshot(context.Context, string) (applifecycle.DeploymentAuthoritySnapshot, error) {
+	a.snapshots++
+	if a.onSnapshot != nil {
+		a.onSnapshot()
+	}
+	return a.snapshot, a.snapshotErr
+}
+
+func (a *routerAuthority) Revalidate(context.Context, applifecycle.DeploymentAuthoritySnapshot) error {
+	a.revalidations++
+	if a.onRevalidation != nil {
+		a.onRevalidation()
+	}
+	return a.revalidateErr
+}
+
 type recordingExecutor struct{ calls int }
 
 func (e *recordingExecutor) Execute(context.Context, jobs.Job, jobs.ProgressReporter) (jobs.ExecutionResult, error) {
@@ -69,13 +122,20 @@ func (noopReporter) Report(jobs.ProgressUpdate) error { return nil }
 func clearRebindFence(context.Context) error { return nil }
 
 func newRouter(deployments deploymentReader, plans planReader, releases releaseReader, compose, generated jobs.Executor) (*Router, error) {
-	return New(deployments, plans, releases, compose, generated, clearRebindFence)
+	return New(deployments, plans, releases, compose, generated, &routerAuthority{}, clearRebindFence)
 }
 
 func TestRouterRequiresRebindFenceCheck(t *testing.T) {
-	router, err := New(routerDeployments{}, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil, nil)
+	router, err := New(routerDeployments{}, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil, &routerAuthority{}, nil)
 	if err == nil || router != nil {
 		t.Fatalf("missing rebind fence router=%v error=%v", router, err)
+	}
+}
+
+func TestRouterRequiresDesiredLifecycleAuthority(t *testing.T) {
+	router, err := New(routerDeployments{}, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil, nil, clearRebindFence)
+	if err == nil || router != nil {
+		t.Fatalf("missing desired lifecycle authority router=%v error=%v", router, err)
 	}
 }
 
@@ -94,7 +154,7 @@ func TestRouterRebindFenceBlocksBeforeDeploymentAndRuntimeEffects(t *testing.T) 
 				if strategy == "generated" {
 					plans.head = generatedPlan()
 				}
-				router, err := New(deployments, plans, routerReleases{}, compose, generated, fence)
+				router, err := New(deployments, plans, routerReleases{}, compose, generated, &routerAuthority{}, fence)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -113,7 +173,7 @@ func TestRouterRebindFenceBlocksBeforeDeploymentAndRuntimeEffects(t *testing.T) 
 func TestRouterCancelledBeforeRebindFenceAndDeployment(t *testing.T) {
 	deployments := &countedRouterDeployments{}
 	checks := 0
-	router, err := New(deployments, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil,
+	router, err := New(deployments, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil, &routerAuthority{},
 		func(context.Context) error { checks++; return nil })
 	if err != nil {
 		t.Fatal(err)
@@ -129,16 +189,115 @@ func TestRouterCancelledBeforeRebindFenceAndDeployment(t *testing.T) {
 func TestRouterCancellationDuringRebindFencePreservesCancellation(t *testing.T) {
 	deployments := &countedRouterDeployments{}
 	ctx, cancel := context.WithCancel(context.Background())
-	router, err := New(deployments, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil,
+	authority := &routerAuthority{}
+	router, err := New(deployments, routerPlans{}, routerReleases{}, &recordingExecutor{}, nil, authority,
 		func(context.Context) error {
 			cancel()
-			return context.Canceled
+			return nil
 		})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := router.Execute(ctx, routerJob(""), noopReporter{}); !errors.Is(err, context.Canceled) || deployments.calls != 0 {
-		t.Fatalf("canceled during fence err=%v deployments=%d", err, deployments.calls)
+	if _, err := router.Execute(ctx, routerJob(""), noopReporter{}); !errors.Is(err, context.Canceled) ||
+		authority.snapshots != 0 || deployments.calls != 0 {
+		t.Fatalf("canceled during successful fence err=%v snapshots=%d deployments=%d", err, authority.snapshots, deployments.calls)
+	}
+}
+
+func TestRouterDesiredLifecycleAuthorityBlocksBeforeDeploymentPreparation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "stopped", err: applifecycle.ErrDeploymentNotAuthorized},
+		{name: "missing or malformed", err: applifecycle.ErrDeploymentAuthorityInvalid},
+		{name: "read failure", err: applifecycle.ErrDeploymentAuthorityUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			deployments := &countedRouterDeployments{}
+			plans := &countedRouterPlans{}
+			releases := &countedRouterReleases{}
+			compose, generated := &recordingExecutor{}, &recordingExecutor{}
+			authority := &routerAuthority{snapshotErr: test.err}
+			router, err := New(deployments, plans, releases, compose, generated, authority, clearRebindFence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = router.Execute(context.Background(), routerJob(routerReleaseID), noopReporter{})
+			var executionErr *jobs.ExecutionError
+			if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" {
+				t.Fatalf("blocked error=%v", err)
+			}
+			if authority.snapshots != 1 || authority.revalidations != 0 || deployments.calls != 0 ||
+				plans.getCalls != 0 || plans.getRevisionCalls != 0 || releases.calls != 0 ||
+				compose.calls != 0 || generated.calls != 0 {
+				t.Fatalf("snapshot=%d revalidation=%d deployment=%d plan=%d revision=%d release=%d compose=%d generated=%d",
+					authority.snapshots, authority.revalidations, deployments.calls, plans.getCalls,
+					plans.getRevisionCalls, releases.calls, compose.calls, generated.calls)
+			}
+		})
+	}
+}
+
+func TestRouterDesiredLifecycleAuthorityDriftBlocksEachDelegate(t *testing.T) {
+	for _, strategy := range []string{"compose", "generated"} {
+		t.Run(strategy, func(t *testing.T) {
+			deployments := &countedRouterDeployments{}
+			plans := &countedRouterPlans{delegate: routerPlans{head: deploymentplans.DeploymentPlanRevision{AppID: routerAppID}}}
+			if strategy == "generated" {
+				plans.delegate.head = generatedPlan()
+			}
+			releases := &countedRouterReleases{}
+			compose, generated := &recordingExecutor{}, &recordingExecutor{}
+			authority := &routerAuthority{revalidateErr: applifecycle.ErrDeploymentAuthorityChanged}
+			router, err := New(deployments, plans, releases, compose, generated, authority, clearRebindFence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = router.Execute(context.Background(), routerJob(""), noopReporter{})
+			var executionErr *jobs.ExecutionError
+			if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" {
+				t.Fatalf("drift error=%v", err)
+			}
+			if authority.snapshots != 1 || authority.revalidations != 1 || deployments.calls != 1 ||
+				plans.getCalls != 1 || plans.getRevisionCalls != 0 || releases.calls != 0 ||
+				compose.calls != 0 || generated.calls != 0 {
+				t.Fatalf("snapshot=%d revalidation=%d deployment=%d plan=%d revision=%d release=%d compose=%d generated=%d",
+					authority.snapshots, authority.revalidations, deployments.calls, plans.getCalls,
+					plans.getRevisionCalls, releases.calls, compose.calls, generated.calls)
+			}
+		})
+	}
+}
+
+func TestRouterDesiredLifecycleAuthorityPreservesCancellation(t *testing.T) {
+	for _, stage := range []string{"snapshot", "revalidation"} {
+		t.Run(stage, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			deployments := &countedRouterDeployments{}
+			compose := &recordingExecutor{}
+			authority := &routerAuthority{}
+			if stage == "snapshot" {
+				authority.onSnapshot = cancel
+			} else {
+				authority.onRevalidation = cancel
+			}
+			router, err := New(deployments, routerPlans{head: deploymentplans.DeploymentPlanRevision{AppID: routerAppID}},
+				routerReleases{}, compose, nil, authority, clearRebindFence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = router.Execute(ctx, routerJob(""), noopReporter{})
+			if !errors.Is(err, context.Canceled) || compose.calls != 0 {
+				t.Fatalf("cancellation error=%v compose=%d", err, compose.calls)
+			}
+			if stage == "snapshot" && (deployments.calls != 0 || authority.revalidations != 0) {
+				t.Fatalf("snapshot cancellation deployment=%d revalidation=%d", deployments.calls, authority.revalidations)
+			}
+			if stage == "revalidation" && (deployments.calls != 1 || authority.revalidations != 1) {
+				t.Fatalf("revalidation cancellation deployment=%d revalidation=%d", deployments.calls, authority.revalidations)
+			}
+		})
 	}
 }
 

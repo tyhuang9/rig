@@ -8,6 +8,7 @@ import (
 	"errors"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
@@ -27,28 +28,37 @@ type releaseReader interface {
 	ReadyWorkspace(context.Context, string, string) (releasesnapshot.Release, error)
 }
 
+type deploymentAuthority interface {
+	Snapshot(context.Context, string) (applifecycle.DeploymentAuthoritySnapshot, error)
+	Revalidate(context.Context, applifecycle.DeploymentAuthoritySnapshot) error
+}
+
 type Router struct {
 	deployments deploymentReader
 	plans       planReader
 	releases    releaseReader
 	compose     jobs.Executor
 	generated   jobs.Executor
+	authority   deploymentAuthority
 	rebindFence func(context.Context) error
 }
 
 var errInvalidSource = errors.New("runtime strategy provenance is invalid")
 
 func New(deploymentRepository deploymentReader, plans planReader, releases releaseReader, compose, generated jobs.Executor,
-	rebindFence func(context.Context) error,
+	authority deploymentAuthority, rebindFence func(context.Context) error,
 ) (*Router, error) {
-	if deploymentRepository == nil || plans == nil || releases == nil || (compose == nil && generated == nil) || rebindFence == nil {
+	if deploymentRepository == nil || plans == nil || releases == nil || (compose == nil && generated == nil) || authority == nil || rebindFence == nil {
 		return nil, errors.New("runtime strategy router dependencies are required")
 	}
-	return &Router{deployments: deploymentRepository, plans: plans, releases: releases, compose: compose, generated: generated, rebindFence: rebindFence}, nil
+	return &Router{
+		deployments: deploymentRepository, plans: plans, releases: releases,
+		compose: compose, generated: generated, authority: authority, rebindFence: rebindFence,
+	}, nil
 }
 
 func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
-	if r == nil || r.rebindFence == nil || ctx == nil || reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil {
+	if r == nil || r.authority == nil || r.rebindFence == nil || ctx == nil || reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "validation_failed"}
 	}
 	if err := ctx.Err(); err != nil {
@@ -63,6 +73,22 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 			return jobs.ExecutionResult{}, canceled
 		}
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
+	}
+	if canceled := ctx.Err(); canceled != nil {
+		return jobs.ExecutionResult{}, canceled
+	}
+	// This value snapshot prevents preparation under an already stopped or
+	// malformed desired head. It is not durable effect permission: complete M4
+	// execution still needs shared exclusion and per-effect journal enforcement.
+	authority, err := r.authority.Snapshot(ctx, job.ResourceID)
+	if err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return jobs.ExecutionResult{}, canceled
+		}
+		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
+	}
+	if canceled := ctx.Err(); canceled != nil {
+		return jobs.ExecutionResult{}, canceled
 	}
 	input, err := jobs.DeploymentInputFor(job)
 	if err != nil {
@@ -99,6 +125,17 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	}
 	if executor == nil {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
+	}
+	// Revalidate after all routing and workspace preparation, immediately before
+	// delegation. A same-state revision change invalidates the earlier value.
+	if err := r.authority.Revalidate(ctx, authority); err != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			return jobs.ExecutionResult{}, canceled
+		}
+		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
+	}
+	if canceled := ctx.Err(); canceled != nil {
+		return jobs.ExecutionResult{}, canceled
 	}
 	return executor.Execute(ctx, job, reporter)
 }
