@@ -640,6 +640,8 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 	}
 
 	var recoveryOperations []string
+	var routeJobID string
+	var routeBaseline liveHostdRebindPendingRouteObservation
 	switch kind {
 	case "route":
 		var configuration apicontract.ApplicationConfiguration
@@ -673,6 +675,25 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 			fail(err, liveHostdRebindDisableClaimCensus{})
 			return
 		}
+		// The durable boundary marker can win before the observer's first poll.
+		// The child is still held inside the completed publish command, so take
+		// one explicit snapshot that binds the exact state this restart resumes.
+		boundary, err := routeObserver.snapshot(fixture.ctx, mutation.Job.ID)
+		if err != nil {
+			fail(errors.New("read held pending route boundary failed"), liveHostdRebindDisableClaimCensus{})
+			return
+		}
+		routeBaseline, err = liveHostdRebindPendingRouteBoundaryBaseline(boundary,
+			liveHostdRebindPendingRouteExpectation{
+				jobID: mutation.Job.ID, planID: fixture.app.plan.RevisionID,
+				planNumber: fixture.app.plan.RevisionNumber, configurationID: configuration.RevisionID,
+				configurationNumber: configuration.RevisionNumber,
+			})
+		if err != nil {
+			fail(err, liveHostdRebindDisableClaimCensus{})
+			return
+		}
+		routeJobID = mutation.Job.ID
 	case "lan":
 		firstID, firstRequest := liveHostdRebindDisableRequest(t, fixture, fixture.app.id)
 		recoveryOperations = append(recoveryOperations, firstID)
@@ -707,6 +728,11 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 		if ready.RecoveryOnly {
 			t.Fatal("ordinary pending route was not recovered before normal admission")
 		}
+		if _, err := liveHostdRebindWaitPendingRouteConvergenceResult(fixture.ctx,
+			testDeadline, hasTestDeadline, fresh, routeJobID, routeBaseline, routeObserver.snapshot); err != nil {
+			fail(err, liveHostdRebindDisableClaimCensus{})
+			return
+		}
 		status, replayErr := liveHostdRebindNormalReplayAfterCurrentRevision(fixture,
 			historicalID, historicalProof)
 		if replayErr != nil {
@@ -714,8 +740,10 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 				liveHostdRebindDisableClaimCensus{})
 			return
 		}
+		liveHostdRebindAssertDisposition(t, status, "commit")
 		liveHostdRebindAssertDurableTerminal(t, fixture, historicalProof, historicalID, false)
-		liveHostdRebindAssertServing(t, fixture, status)
+		lanTwoAppProbeMatrix(t, fixture.ctx, fixture.successor.IPv4, fixture.ports[0], fixture.ports[1],
+			fixture.ports[2], "supported-rebind-a-v2", "supported-rebind-b-v1")
 	} else {
 		if !ready.RecoveryOnly || ready.RecoveryKind != "lan_disable" ||
 			!liveHostdRebindContains(recoveryOperations, ready.OperationID) {
