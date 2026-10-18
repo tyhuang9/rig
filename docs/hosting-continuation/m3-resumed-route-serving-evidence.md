@@ -1,5 +1,9 @@
 # M3: verify the resumed pending-route deployment before serving
 
+## Hosted acceptance cross-reference — 2026-10-18
+
+The [M3 hosted acceptance addendum](m3-hosted-acceptance-20261018.md) preserves the earlier PR #185 failure and records the repaired PR #186 pending-route result: 606.50 seconds, exact deployment resume after process restart, historical COMMIT/replay/durable proof, A=v2/B=v1 LAN matrix, child reaping and cleanup. The old failed HTTP body was not retained and is not inferred. Physical second-device qualification and manual screen-reader testing remain open.
+
 ## Failure and scope
 
 PR #185 at `395eb5bb408a4f81384ca03092a81159705f8da3` reached a later

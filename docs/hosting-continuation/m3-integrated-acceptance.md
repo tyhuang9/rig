@@ -5,6 +5,10 @@ Evidence recorded on 2026-10-15 UTC. This branch collects the already reviewed
 controller startup, operator recovery UI and LAN transport changes into one
 source revision for hosted verification.
 
+## Hosted acceptance cross-reference — 2026-10-18
+
+The [M3 hosted acceptance addendum](m3-hosted-acceptance-20261018.md) records PR #186's immutable hosted result at head `4200796e3e41450e192368976b64089c84445d90`, including the resumed pending-route case and full 63-case Docker matrix. It supplements this candidate's local and earlier hosted records; M3 remains open for physical second-device qualification and manual screen-reader testing.
+
 ## Source and scope
 
 The tested source is `82d489691b95b0c23c1ab45355478d183f9a04aa` on
