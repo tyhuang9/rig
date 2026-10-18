@@ -17,6 +17,8 @@ x-rig-problem-codes:
   invalid_source: {description: The selected GitHub source is invalid or cannot be used, statuses: [400, 422]}
   approval_required: {description: Deployment requires an administrator approval before it can continue, statuses: [409]}
   migration_approval_required: {description: Deployment migration requires approval before it can continue, statuses: [409]}
+  deployment_lifecycle_stale: {description: Deployment no longer matches the application's desired lifecycle, statuses: [409]}
+  deployment_lifecycle_unresolved: {description: Application lifecycle authority is unresolved, statuses: [409]}
   route_reconciliation_required: {description: Deployment route state must be reconciled before it can be cancelled, statuses: [409]}
   application_busy: {description: The application already has an active conflicting operation, statuses: [409]}
   reviewed_revision_stale: {description: The reviewed deployment plan or configuration changed before deployment, statuses: [409]}
@@ -316,7 +318,7 @@ paths:
     parameters: [{$ref: '#/components/parameters/JobId'}]
     post:
       operationId: resumeJob
-      x-rig-problem-codes: [approval_required, migration_approval_required]
+      x-rig-problem-codes: [approval_required, migration_approval_required, deployment_lifecycle_stale, deployment_lifecycle_unresolved]
       security: [{sessionCookie: [], csrfHeader: []}]
       responses:
         '200': {description: Paused job atomically requeued, content: {application/json: {schema: {$ref: '#/components/schemas/JobResponse'}}}}

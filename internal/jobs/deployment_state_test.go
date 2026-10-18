@@ -118,7 +118,7 @@ func TestRealDeploymentCompletionAndFailuresAreCentrallySanitized(t *testing.T) 
 func TestGatewayReadinessFailurePersistsOnlyTheSafeJobDiagnostic(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "gateway-readiness", "")
+	job, _, err := service.Create("fake", "machine", "gateway-readiness", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,17 +141,18 @@ func TestGatewayReadinessFailurePersistsOnlyTheSafeJobDiagnostic(t *testing.T) {
 }
 
 func TestWaitingUserResumeStartsANewAttemptAndPausedCancelIsTerminal(t *testing.T) {
-	service, closeDB := newTestService(t)
+	service, closeDB := newLegacyDeploymentTestService(t)
 	defer closeDB()
 	releaseID := uuid.NewString()
 	insertReadyReleaseFixture(t, service, "app", releaseID)
-	job, _, err := service.CreateWithInput(CreateRequest{
-		Type: "deploy", ResourceType: "application", ResourceID: "app",
-		RequestedBy: "owner", Input: DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationOriginal},
-	})
+	result, err := service.CreateDeploymentWithInputTransaction(context.Background(), DeploymentCreateRequest{
+		ApplicationID: "app", RequestedBy: "owner",
+		Input: DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationOriginal},
+	}, DeploymentCreateHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	job := result.Job
 	if err := service.runOne(context.Background(), pauseExecutor{}); err != nil {
 		t.Fatal(err)
 	}
@@ -163,9 +164,9 @@ func TestWaitingUserResumeStartsANewAttemptAndPausedCancelIsTerminal(t *testing.
 	if err != nil || resumed.Status != string(Queued) || resumed.PauseDisposition != "" || resumed.Attempt != 1 {
 		t.Fatalf("resumed = %#v, %v", resumed, err)
 	}
-	claimed, ok, err := service.claimNext(context.Background())
-	if err != nil || !ok || claimed.Attempt != 2 {
-		t.Fatalf("second claim = %#v, %t, %v", claimed, ok, err)
+	claimed, claim, err := service.claimNext(context.Background())
+	if err != nil || claim != claimClaimed || claimed.Attempt != 2 {
+		t.Fatalf("second claim = %#v, %v, %v", claimed, claim, err)
 	}
 	if err := service.pause(job.ID, PauseApprovalRequired); err != nil {
 		t.Fatal(err)
@@ -191,17 +192,18 @@ func TestWorkerPersistsOnlyStablePauseStates(t *testing.T) {
 	}
 	for _, testCase := range testCases {
 		t.Run(testCase.disposition, func(t *testing.T) {
-			service, closeDB := newTestService(t)
+			service, closeDB := newLegacyDeploymentTestService(t)
 			defer closeDB()
 			releaseID := uuid.NewString()
 			insertReadyReleaseFixture(t, service, "app", releaseID)
-			job, _, err := service.CreateWithInput(CreateRequest{
-				Type: "deploy", ResourceType: "application", ResourceID: "app",
-				RequestedBy: "owner", Input: DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationOriginal},
-			})
+			result, err := service.CreateDeploymentWithInputTransaction(context.Background(), DeploymentCreateRequest{
+				ApplicationID: "app", RequestedBy: "owner",
+				Input: DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationOriginal},
+			}, DeploymentCreateHooks{})
 			if err != nil {
 				t.Fatal(err)
 			}
+			job := result.Job
 			if err := service.runOne(context.Background(), pauseExecutor{disposition: testCase.disposition}); err != nil {
 				t.Fatal(err)
 			}
@@ -226,12 +228,12 @@ func TestWorkerPersistsOnlyStablePauseStates(t *testing.T) {
 
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "invalid-pause", "")
+	job, _, err := service.Create("fake", "machine", "invalid-pause", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
-		t.Fatalf("claim = %t, %v", ok, err)
+	if _, claim, err := service.claimNext(context.Background()); err != nil || claim != claimClaimed {
+		t.Fatalf("claim = %v, %v", claim, err)
 	}
 	if err := service.pause(job.ID, "untrusted-detail"); !errors.Is(err, ErrInvalidProgress) {
 		t.Fatalf("invalid pause disposition = %v", err)
@@ -241,12 +243,12 @@ func TestWorkerPersistsOnlyStablePauseStates(t *testing.T) {
 func TestCapacityPauseCanBeRetriedWithoutApproval(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "capacity-retry", "")
+	job, _, err := service.Create("fake", "machine", "capacity-retry", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
-		t.Fatalf("claim = %t, %v", ok, err)
+	if _, claim, err := service.claimNext(context.Background()); err != nil || claim != claimClaimed {
+		t.Fatalf("claim = %v, %v", claim, err)
 	}
 	if err := service.pause(job.ID, PauseInsufficientReplacementCapacity); err != nil {
 		t.Fatal(err)
@@ -260,12 +262,12 @@ func TestCapacityPauseCanBeRetriedWithoutApproval(t *testing.T) {
 func TestRouteReconciliationPauseCanBeResumedButNotCancelled(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "route-reconciliation", "")
+	job, _, err := service.Create("fake", "machine", "route-reconciliation", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
-		t.Fatalf("claim = %t, %v", ok, err)
+	if _, claim, err := service.claimNext(context.Background()); err != nil || claim != claimClaimed {
+		t.Fatalf("claim = %v, %v", claim, err)
 	}
 	if err := service.pause(job.ID, PauseRouteReconciliationRequired); err != nil {
 		t.Fatal(err)
@@ -290,7 +292,7 @@ func TestMigrationPauseRequiresExactPlanApproval(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	service := New(db)
+	service := newLegacyDeploymentTestServiceForDB(t, db)
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	appID, actorID, planID, releaseID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
@@ -315,13 +317,14 @@ func TestMigrationPauseRequiresExactPlanApproval(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,1)`, releaseID, appID, now, strings.Repeat("b", 64), strings.Repeat("e", 64), planID); err != nil {
 		t.Fatal(err)
 	}
-	job, _, err := service.CreateWithInput(CreateRequest{
-		Type: "deploy", ResourceType: "application", ResourceID: appID, RequestedBy: actorID,
+	result, err := service.CreateDeploymentWithInputTransaction(context.Background(), DeploymentCreateRequest{
+		ApplicationID: appID, RequestedBy: actorID,
 		Input: DeploymentInput{ReleaseID: releaseID, ConfigurationMode: ConfigurationOriginal},
-	})
+	}, DeploymentCreateHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	job := result.Job
 	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?, 'needs_attention','original',1,'generated_node',?,1)`, uuid.NewString(), appID, releaseID, job.ID, planID); err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +360,7 @@ func TestResumeWaitsForConcurrentApprovalRevocationAndFailsClosed(t *testing.T) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = peerDB.Close() })
-	service := New(db)
+	service := newLegacyDeploymentTestServiceForDB(t, db)
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	appID, actorID := uuid.NewString(), uuid.NewString()
@@ -367,13 +370,13 @@ func TestResumeWaitsForConcurrentApprovalRevocationAndFailsClosed(t *testing.T) 
 	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,created_at,updated_at) VALUES(?,'resume-race','Resume race',?,?)`, appID, now, now); err != nil {
 		t.Fatal(err)
 	}
-	job, _, err := service.CreateWithInput(CreateRequest{
-		Type: "deploy", ResourceType: "application", ResourceID: appID,
-		RequestedBy: actorID, Input: DeploymentInput{ConfigurationMode: ConfigurationCurrent},
-	})
+	result, err := service.CreateDeploymentWithInputTransaction(context.Background(), DeploymentCreateRequest{
+		ApplicationID: appID, RequestedBy: actorID, Input: DeploymentInput{ConfigurationMode: ConfigurationCurrent},
+	}, DeploymentCreateHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	job := result.Job
 	deploymentID, findingID, approvalID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	const fingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,job_id,status,configuration_mode,provenance_initialized) VALUES(?,?,?,'needs_attention','current',1)`, deploymentID, appID, job.ID); err != nil {
@@ -452,12 +455,12 @@ func TestRecoveryPreservesIntentionalUserPause(t *testing.T) {
 		t.Run(disposition, func(t *testing.T) {
 			service, closeDB := newTestService(t)
 			defer closeDB()
-			job, _, err := service.Create("deploy", "application", "paused-recovery", "")
+			job, _, err := service.Create("fake", "machine", "paused-recovery", "")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
-				t.Fatalf("claim = %t, %v", ok, err)
+			if _, claim, err := service.claimNext(context.Background()); err != nil || claim != claimClaimed {
+				t.Fatalf("claim = %v, %v", claim, err)
 			}
 			if err := service.pause(job.ID, disposition); err != nil {
 				t.Fatal(err)

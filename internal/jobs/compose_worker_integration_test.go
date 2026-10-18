@@ -1031,10 +1031,7 @@ func TestComposeRestartRecoveryCleansExactTempAndDoesNotDuplicateLinkage(t *test
 	if err := fixture.temporary.Recover(); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.deployments.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.jobs.RecoverInterrupted(); err != nil {
+	if err := fixture.jobs.RecoverRuntimeContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	persistedJob, err := fixture.jobs.Get(job.ID)

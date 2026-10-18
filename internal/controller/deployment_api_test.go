@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -142,11 +143,7 @@ func (f deploymentAPIFixture) request(method, path, body string) *httptest.Respo
 
 func (f deploymentAPIFixture) createDeployment(t *testing.T, appID, mode string) (jobs.Job, deployments.Deployment) {
 	t.Helper()
-	result, err := f.jobs.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{ApplicationID: appID, RequestedBy: f.userID(t), Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationMode(mode)}}, jobs.DeploymentCreateHooks{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	job := result.Job
+	job := f.createDeploymentJob(t, appID, mode)
 	deployment, _, err := f.deployments.GetOrCreateByJob(context.Background(), appID, job.ID, mode)
 	if err != nil {
 		t.Fatal(err)
@@ -155,6 +152,15 @@ func (f deploymentAPIFixture) createDeployment(t *testing.T, appID, mode string)
 		t.Fatal(err)
 	}
 	return job, deployment
+}
+
+func (f deploymentAPIFixture) createDeploymentJob(t *testing.T, appID, mode string) jobs.Job {
+	t.Helper()
+	result, err := f.jobs.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{ApplicationID: appID, RequestedBy: f.userID(t), Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationMode(mode)}}, jobs.DeploymentCreateHooks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result.Job
 }
 
 func (f deploymentAPIFixture) userID(t *testing.T) string {
@@ -177,6 +183,88 @@ func assertProblemCode(t *testing.T, w *httptest.ResponseRecorder, wantStatus in
 	}
 	if problem.Code != wantCode || problem.Detail == "" || problem.RequestID == "" {
 		t.Fatalf("problem = %#v, want code %q", problem, wantCode)
+	}
+}
+
+type controllerDeploymentBindingValidator struct {
+	db              *sql.DB
+	unresolved      bool
+	historicalErr   error
+	historicalCalls int
+}
+
+func (validator *controllerDeploymentBindingValidator) ConfiguredFor(db *sql.DB) bool {
+	return validator != nil && validator.db == db
+}
+
+func (validator *controllerDeploymentBindingValidator) HistoricalBindingTx(context.Context, *sql.Tx, deploymentbinding.OperationRef) error {
+	validator.historicalCalls++
+	return validator.historicalErr
+}
+
+func (*controllerDeploymentBindingValidator) CurrentOperationTx(context.Context, *sql.Tx, deploymentbinding.OperationRef) (deploymentbinding.Completion, error) {
+	return deploymentbinding.CompletionComplete, nil
+}
+
+func (validator *controllerDeploymentBindingValidator) UnresolvedHistoryTx(context.Context, *sql.Tx, string) (bool, error) {
+	return validator.unresolved, nil
+}
+
+func (f *deploymentAPIFixture) useDeploymentBindingTestValidator(t *testing.T) *controllerDeploymentBindingValidator {
+	t.Helper()
+	validator := &controllerDeploymentBindingValidator{db: f.db}
+	bindings, err := deploymentbinding.New(f.db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(f.db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.jobs = service
+	f.server.Jobs = service
+	return validator
+}
+
+// advanceControllerSyntheticRunningHead supplies a minimal mutable head for
+// controller error-mapping tests. Canonical lifecycle graph tests remain in
+// applifecycle; this fixture's validator controls the gate outcome directly.
+func advanceControllerSyntheticRunningHead(t *testing.T, db *sql.DB, appID, actorID string) {
+	t.Helper()
+	operationID := uuid.NewString()
+	key := "controller-binding-authority-" + operationID
+	stamp := time.Date(2026, 10, 18, 12, 0, 1, 0, time.UTC).Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO jobs(
+		id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,
+		created_at,updated_at,finished_at
+	) VALUES(?,'start','application',?,'succeeded','succeeded',?,?,'{}',?,?,?)`,
+		operationID, appID, key, actorID, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO application_desired_lifecycle_transitions(
+		app_id,revision_number,expected_revision,previous_state,desired_state,job_id,action,actor_id,created_at
+	) VALUES(?,1,0,NULL,'running',?,'start',?,?)`, appID, operationID, actorID, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TRIGGER IF EXISTS application_lifecycle_operation_valid_insert`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec(`PRAGMA foreign_keys=ON`) })
+	if _, err := db.Exec(`INSERT INTO application_lifecycle_operations(
+		job_id,app_id,desired_revision,expected_revision,action,actor_id,idempotency_key,version,
+		runtime_strategy,baseline_disposition,deployment_id,active_generation,release_id,slot,
+		plan_revision_id,plan_revision_number,configuration_revision_id,configuration_revision_number,
+		configuration_format,pins_json,pins_digest,created_at
+	) VALUES(?,?,1,0,'start',?,?,1,'generated_node','stopped',?,1,?,'blue',?,1,'',0,0,'{}',?,?)`,
+		operationID, appID, actorID, key, "synthetic-deployment-"+operationID,
+		"synthetic-release-"+operationID, "synthetic-plan-"+operationID, strings.Repeat("a", 64), stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1003,7 +1091,220 @@ func TestResumeOnlyRequeuesOwnWaitingDeploymentOnComposeRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	crossApp := f.request(http.MethodPost, "/api/v1/jobs/"+missingApp.ID+"/resume", "")
-	assertProblemCode(t, crossApp, http.StatusNotFound, "job_not_found")
+	assertProblemCode(t, crossApp, http.StatusInternalServerError, "internal_error")
+	assertNoSensitiveDetail(t, crossApp.Body.String())
+}
+
+func TestResumeMapsDeploymentLifecycleAuthorityConflictsWithoutMutation(t *testing.T) {
+	t.Run("stale", func(t *testing.T) {
+		f := newDeploymentAPIFixture(t, true, false)
+		job, _ := f.createDeployment(t, f.app.ID, "current")
+		if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,pause_disposition=?,attempt=2 WHERE id=?`,
+			jobs.PauseInsufficientReplacementCapacity, jobs.PauseInsufficientReplacementCapacity, job.ID); err != nil {
+			t.Fatal(err)
+		}
+		advanceControllerSyntheticRunningHead(t, f.db, f.app.ID, f.userID(t))
+		f.useDeploymentBindingTestValidator(t)
+		before, err := f.jobs.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeEvents, err := f.jobs.Events(job.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := f.request(http.MethodPost, "/api/v1/jobs/"+job.ID+"/resume", "")
+		assertProblemCode(t, response, http.StatusConflict, "deployment_lifecycle_stale")
+		var problem apicontract.Problem
+		if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil || problem.Detail != "Deployment no longer matches the application's desired lifecycle." {
+			t.Fatalf("stale problem=%#v error=%v", problem, err)
+		}
+		after, err := f.jobs.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterEvents, err := f.jobs.Events(job.ID, 0)
+		if err != nil || !reflect.DeepEqual(after, before) || !reflect.DeepEqual(afterEvents, beforeEvents) {
+			t.Fatalf("stale resume mutated job/events before=%#v after=%#v events=%d/%d error=%v",
+				before, after, len(beforeEvents), len(afterEvents), err)
+		}
+	})
+
+	t.Run("unresolved", func(t *testing.T) {
+		f := newDeploymentAPIFixture(t, true, false)
+		advanceControllerSyntheticRunningHead(t, f.db, f.app.ID, f.userID(t))
+		if _, err := f.db.Exec(`DROP TRIGGER application_deployment_lifecycle_binding_valid_insert`); err != nil {
+			t.Fatal(err)
+		}
+		validator := f.useDeploymentBindingTestValidator(t)
+		job, _ := f.createDeployment(t, f.app.ID, "current")
+		if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,pause_disposition=?,attempt=3 WHERE id=?`,
+			jobs.PauseInsufficientReplacementCapacity, jobs.PauseInsufficientReplacementCapacity, job.ID); err != nil {
+			t.Fatal(err)
+		}
+		validator.unresolved = true
+		before, err := f.jobs.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeEvents, err := f.jobs.Events(job.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := f.request(http.MethodPost, "/api/v1/jobs/"+job.ID+"/resume", "")
+		assertProblemCode(t, response, http.StatusConflict, "deployment_lifecycle_unresolved")
+		var problem apicontract.Problem
+		if err := json.Unmarshal(response.Body.Bytes(), &problem); err != nil || problem.Detail != "Application lifecycle authority is unresolved." {
+			t.Fatalf("unresolved problem=%#v error=%v", problem, err)
+		}
+		after, err := f.jobs.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterEvents, err := f.jobs.Events(job.ID, 0)
+		if err != nil || !reflect.DeepEqual(after, before) || !reflect.DeepEqual(afterEvents, beforeEvents) {
+			t.Fatalf("unresolved resume mutated job/events before=%#v after=%#v events=%d/%d error=%v",
+				before, after, len(beforeEvents), len(afterEvents), err)
+		}
+	})
+
+	t.Run("deleted application is stale after historical validation", func(t *testing.T) {
+		f := newDeploymentAPIFixture(t, true, false)
+		job := f.createDeploymentJob(t, f.app.ID, "current")
+		if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,pause_disposition=?,attempt=4 WHERE id=?`,
+			jobs.PauseInsufficientReplacementCapacity, jobs.PauseInsufficientReplacementCapacity, job.ID); err != nil {
+			t.Fatal(err)
+		}
+		before, err := f.jobs.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeEvents, err := f.jobs.Events(job.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.db.Exec(`DELETE FROM applications WHERE id=?`, f.app.ID); err != nil {
+			t.Fatal(err)
+		}
+		response := f.request(http.MethodPost, "/api/v1/jobs/"+job.ID+"/resume", "")
+		assertProblemCode(t, response, http.StatusConflict, "deployment_lifecycle_stale")
+		after, err := f.jobs.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterEvents, err := f.jobs.Events(job.ID, 0)
+		if err != nil || !reflect.DeepEqual(after, before) || !reflect.DeepEqual(afterEvents, beforeEvents) {
+			t.Fatalf("deleted-app resume mutated job/events before=%#v after=%#v events=%d/%d error=%v",
+				before, after, len(beforeEvents), len(afterEvents), err)
+		}
+	})
+
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*testing.T, *deploymentAPIFixture)
+	}{
+		{
+			name: "archived current application remains hidden",
+			mutate: func(t *testing.T, f *deploymentAPIFixture) {
+				if _, err := f.db.Exec(`UPDATE applications SET archived_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), f.app.ID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "archived stale application remains hidden",
+			mutate: func(t *testing.T, f *deploymentAPIFixture) {
+				advanceControllerSyntheticRunningHead(t, f.db, f.app.ID, f.userID(t))
+				if _, err := f.db.Exec(`UPDATE applications SET archived_at=? WHERE id=?`, time.Now().UTC().Format(time.RFC3339Nano), f.app.ID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "current application with missing source remains hidden",
+			mutate: func(t *testing.T, f *deploymentAPIFixture) {
+				if _, err := f.db.Exec(`DELETE FROM application_sources WHERE application_id=?`, f.app.ID); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			f := newDeploymentAPIFixture(t, true, false)
+			job := f.createDeploymentJob(t, f.app.ID, "current")
+			if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,pause_disposition=?,attempt=5 WHERE id=?`,
+				jobs.PauseInsufficientReplacementCapacity, jobs.PauseInsufficientReplacementCapacity, job.ID); err != nil {
+				t.Fatal(err)
+			}
+			before, err := f.jobs.Get(job.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			beforeEvents, err := f.jobs.Events(job.ID, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testCase.mutate(t, &f)
+			response := f.request(http.MethodPost, "/api/v1/jobs/"+job.ID+"/resume", "")
+			assertProblemCode(t, response, http.StatusNotFound, "job_not_found")
+			after, err := f.jobs.Get(job.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			afterEvents, err := f.jobs.Events(job.ID, 0)
+			if err != nil || !reflect.DeepEqual(after, before) || !reflect.DeepEqual(afterEvents, beforeEvents) {
+				t.Fatalf("hidden-app resume mutated job/events before=%#v after=%#v events=%d/%d error=%v",
+					before, after, len(beforeEvents), len(afterEvents), err)
+			}
+		})
+	}
+
+	t.Run("corrupt historical authority with deleted application is internal", func(t *testing.T) {
+		f := newDeploymentAPIFixture(t, true, false)
+		advanceControllerSyntheticRunningHead(t, f.db, f.app.ID, f.userID(t))
+		if _, err := f.db.Exec(`DROP TRIGGER application_deployment_lifecycle_binding_valid_insert`); err != nil {
+			t.Fatal(err)
+		}
+		validator := f.useDeploymentBindingTestValidator(t)
+		job := f.createDeploymentJob(t, f.app.ID, "current")
+		if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase=?,pause_disposition=?,attempt=6 WHERE id=?`,
+			jobs.PauseInsufficientReplacementCapacity, jobs.PauseInsufficientReplacementCapacity, job.ID); err != nil {
+			t.Fatal(err)
+		}
+		before, err := f.jobs.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		beforeEvents, err := f.jobs.Events(job.ID, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.db.Exec(`PRAGMA foreign_keys=OFF`); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _, _ = f.db.Exec(`PRAGMA foreign_keys=ON`) })
+		if _, err := f.db.Exec(`DELETE FROM applications WHERE id=?`, f.app.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.db.Exec(`PRAGMA foreign_keys=ON`); err != nil {
+			t.Fatal(err)
+		}
+		validator.historicalErr = deploymentbinding.ErrInvalidBinding
+		response := f.request(http.MethodPost, "/api/v1/jobs/"+job.ID+"/resume", "")
+		assertProblemCode(t, response, http.StatusInternalServerError, "internal_error")
+		if validator.historicalCalls != 1 {
+			t.Fatalf("historical validation calls=%d, want 1", validator.historicalCalls)
+		}
+		after, err := f.jobs.Get(job.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		afterEvents, err := f.jobs.Events(job.ID, 0)
+		if err != nil || !reflect.DeepEqual(after, before) || !reflect.DeepEqual(afterEvents, beforeEvents) {
+			t.Fatalf("corrupt deleted-app resume mutated job/events before=%#v after=%#v events=%d/%d error=%v",
+				before, after, len(beforeEvents), len(afterEvents), err)
+		}
+	})
 }
 
 func TestResumeUsesPinnedDeploymentStrategy(t *testing.T) {

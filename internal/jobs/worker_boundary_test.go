@@ -347,13 +347,13 @@ func TestClaimNextIsFIFOAndPersistsSingleAssignment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimed, ok, err := service.claimNext(context.Background())
-	if err != nil || !ok || claimed.ID != first.ID || claimed.Attempt != 1 || claimed.Status != string(Assigned) {
-		t.Fatalf("first claim = %#v, %t, %v", claimed, ok, err)
+	claimed, claim, err := service.claimNext(context.Background())
+	if err != nil || claim != claimClaimed || claimed.ID != first.ID || claimed.Attempt != 1 || claimed.Status != string(Assigned) {
+		t.Fatalf("first claim = %#v, %v, %v", claimed, claim, err)
 	}
-	claimed, ok, err = service.claimNext(context.Background())
-	if err != nil || !ok || claimed.ID != second.ID || claimed.Attempt != 1 {
-		t.Fatalf("second claim = %#v, %t, %v", claimed, ok, err)
+	claimed, claim, err = service.claimNext(context.Background())
+	if err != nil || claim != claimClaimed || claimed.ID != second.ID || claimed.Attempt != 1 {
+		t.Fatalf("second claim = %#v, %v, %v", claimed, claim, err)
 	}
 	for _, id := range []string{first.ID, second.ID} {
 		events, err := service.Events(id, 0)
@@ -370,8 +370,8 @@ func TestClaimNextIsFIFOAndPersistsSingleAssignment(t *testing.T) {
 			t.Fatalf("job %s assignment events = %#v", id, events)
 		}
 	}
-	if _, ok, err := service.claimNext(context.Background()); err != nil || ok {
-		t.Fatalf("empty claim = %t, %v", ok, err)
+	if _, claim, err := service.claimNext(context.Background()); err != nil || claim != claimNone {
+		t.Fatalf("empty claim = %v, %v", claim, err)
 	}
 }
 
@@ -385,9 +385,9 @@ func TestClaimNextContentionAssignsOneJobOnce(t *testing.T) {
 	const claimers = 8
 	start := make(chan struct{})
 	results := make(chan struct {
-		job Job
-		ok  bool
-		err error
+		job         Job
+		disposition claimDisposition
+		err         error
 	}, claimers)
 	var group sync.WaitGroup
 	for range claimers {
@@ -395,12 +395,12 @@ func TestClaimNextContentionAssignsOneJobOnce(t *testing.T) {
 		go func() {
 			defer group.Done()
 			<-start
-			claimed, ok, err := service.claimNext(context.Background())
+			claimed, disposition, err := service.claimNext(context.Background())
 			results <- struct {
-				job Job
-				ok  bool
-				err error
-			}{claimed, ok, err}
+				job         Job
+				disposition claimDisposition
+				err         error
+			}{claimed, disposition, err}
 		}()
 	}
 	close(start)
@@ -411,7 +411,7 @@ func TestClaimNextContentionAssignsOneJobOnce(t *testing.T) {
 		if result.err != nil {
 			t.Fatal(result.err)
 		}
-		if result.ok {
+		if result.disposition == claimClaimed {
 			assigned++
 			if result.job.ID != job.ID || result.job.Attempt != 1 {
 				t.Fatalf("claimed job = %#v", result.job)
@@ -604,7 +604,7 @@ func (e blockingExecutor) Execute(ctx context.Context, _ Job, reporter ProgressR
 func TestCancelCancelsActiveExecutorAndPreventsTerminalOverwrite(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "cancel", "")
+	job, _, err := service.Create("fake", "machine", "cancel", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,7 +662,7 @@ func TestActiveCancellationHoldsApplicationUntilExecutorCleanupAcrossServices(t 
 	defer peerDB.Close()
 	service := New(db)
 	peer := New(peerDB)
-	job, _, err := service.Create("deploy", "application", "same-app", "request-one")
+	job, _, err := service.Create("restart", "application", "same-app", "request-one")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,10 +688,10 @@ func TestActiveCancellationHoldsApplicationUntilExecutorCleanupAcrossServices(t 
 	if err != nil || countEvents(events, "cancellation_requested") != 1 || countEvents(events, "job_cancelled") != 0 {
 		t.Fatalf("cancellation events before cleanup = %#v, %v", events, err)
 	}
-	if _, _, err := peer.Create("deploy", "application", "same-app", "request-two"); !errors.Is(err, ErrApplicationBusy) {
+	if _, _, err := peer.Create("restart", "application", "same-app", "request-two"); !errors.Is(err, ErrApplicationBusy) {
 		t.Fatalf("replacement during cleanup error=%v, want %v", err, ErrApplicationBusy)
 	}
-	if _, _, err := peer.Create("deploy", "application", "same-app", ""); !errors.Is(err, ErrApplicationBusy) {
+	if _, _, err := peer.Create("restart", "application", "same-app", ""); !errors.Is(err, ErrApplicationBusy) {
 		t.Fatalf("non-idempotent replacement during cleanup error=%v, want %v", err, ErrApplicationBusy)
 	}
 	close(release)
@@ -711,7 +711,7 @@ func TestActiveCancellationHoldsApplicationUntilExecutorCleanupAcrossServices(t 
 	if err != nil || countEvents(events, "job_cancelled") != 1 {
 		t.Fatalf("final cancellation events = %#v, %v", events, err)
 	}
-	if _, created, err := peer.Create("deploy", "application", "same-app", "request-two"); err != nil || !created {
+	if _, created, err := peer.Create("restart", "application", "same-app", "request-two"); err != nil || !created {
 		t.Fatalf("replacement after cleanup = %t, %v", created, err)
 	}
 	stop()
@@ -735,7 +735,7 @@ func (e mustNotExecuteExecutor) Execute(context.Context, Job, ProgressReporter) 
 func TestCancellationBetweenClaimAndRegistrationFinalizesWithoutExecuting(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "claim-race", "")
+	job, _, err := service.Create("fake", "machine", "claim-race", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,7 +795,7 @@ func TestCancellationBetweenClaimAndRegistrationFinalizesWithoutExecuting(t *tes
 func TestCancellationAfterAssignmentVerificationFinalizesWithoutExecuting(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "verified-race", "")
+	job, _, err := service.Create("restart", "application", "verified-race", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -851,7 +851,7 @@ func TestCancellationAfterAssignmentVerificationFinalizesWithoutExecuting(t *tes
 		t.Fatal("worker did not stop")
 	}
 	service.beforeExecute = nil
-	replacement, created, err := service.Create("deploy", "application", "verified-race", "replacement")
+	replacement, created, err := service.Create("restart", "application", "verified-race", "replacement")
 	if err != nil || !created {
 		t.Fatalf("replacement create = %#v, %t, %v", replacement, created, err)
 	}
@@ -881,7 +881,7 @@ func (e successAfterCancellationExecutor) Execute(_ context.Context, _ Job, repo
 func TestConcreteSuccessWinsAfterCancellationRequest(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "success-after-cancel", "")
+	job, _, err := service.Create("fake", "machine", "success-after-cancel", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -950,7 +950,7 @@ func TestPeerCancellationWatcherDeliversRequestToLocalExecutor(t *testing.T) {
 	defer peerDB.Close()
 	service := New(db)
 	peer := New(peerDB)
-	job, _, err := service.Create("deploy", "application", "peer-cancel", "")
+	job, _, err := service.Create("fake", "machine", "peer-cancel", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1013,7 +1013,7 @@ func (secretExecutionErrorExecutor) Execute(context.Context, Job, ProgressReport
 func TestUnknownExecutorFailureIsRedacted(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "failure", "")
+	job, _, err := service.Create("fake", "machine", "failure", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1043,7 +1043,7 @@ func TestUnknownExecutorFailureIsRedacted(t *testing.T) {
 func TestExecutionErrorDetailsAreNeverPersisted(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "typed-failure", "")
+	job, _, err := service.Create("fake", "machine", "typed-failure", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1085,7 +1085,7 @@ func (maliciousFailureExecutor) Execute(_ context.Context, _ Job, reporter Progr
 func TestFailureUsesLastDurableProgressAndCheckpoint(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "malicious-failure", "")
+	job, _, err := service.Create("fake", "machine", "malicious-failure", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1113,8 +1113,8 @@ func TestReporterUsesBoundedSafeEventsAndMonotonicProgress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
-		t.Fatalf("claim = %t, %v", ok, err)
+	if _, claim, err := service.claimNext(context.Background()); err != nil || claim != claimClaimed {
+		t.Fatalf("claim = %v, %v", claim, err)
 	}
 	reporter := reporter{service: service, jobID: job.ID}
 	if err := reporter.Report(ProgressUpdate{Status: Running, Phase: "running", Progress: 20, Checkpoint: `{"secret":"runtime-token"}`, Code: "phase_started", Message: "secret runtime token"}); err != nil {
@@ -1175,8 +1175,8 @@ func TestExportedJobMutatorsUseConstrainedPublicData(t *testing.T) {
 	if err := service.Update(job.ID, Running, "running", 20, `{"secret":"ignored"}`); !errors.Is(err, ErrJobTerminal) {
 		t.Fatalf("queued update bypass = %v", err)
 	}
-	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
-		t.Fatalf("claim = %t, %v", ok, err)
+	if _, claim, err := service.claimNext(context.Background()); err != nil || claim != claimClaimed {
+		t.Fatalf("claim = %v, %v", claim, err)
 	}
 	if err := service.Update(job.ID, Running, "running", 20, `{"secret":"ignored"}`); err != nil {
 		t.Fatalf("constrained update = %v", err)
@@ -1199,7 +1199,7 @@ func (panicExecutor) Execute(context.Context, Job, ProgressReporter) (ExecutionR
 func TestExecutorPanicBecomesGenericSafeFailure(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "panic", "")
+	job, _, err := service.Create("fake", "machine", "panic", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1243,7 +1243,7 @@ func (e successOnShutdownExecutor) Execute(ctx context.Context, _ Job, reporter 
 func TestConcreteSuccessWinsAgainstParentShutdownWithCanonicalResult(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "success-shutdown", "")
+	job, _, err := service.Create("fake", "machine", "success-shutdown", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1302,7 +1302,7 @@ func testParentShutdownLeavesActiveJob(t *testing.T, executor shutdownFailureExe
 	t.Helper()
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "shutdown-nonterminal", "")
+	job, _, err := service.Create("fake", "machine", "shutdown-nonterminal", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1341,7 +1341,7 @@ func testParentShutdownLeavesActiveJob(t *testing.T, executor shutdownFailureExe
 func TestWorkerShutdownLeavesActiveJobForRecovery(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "shutdown", "")
+	job, _, err := service.Create("fake", "machine", "shutdown", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1379,7 +1379,7 @@ func TestWorkerShutdownLeavesActiveJobForRecovery(t *testing.T) {
 func TestFakeExecutorPhaseParityAndInterruptedRecovery(t *testing.T) {
 	service, closeDB := newTestService(t)
 	defer closeDB()
-	job, _, err := service.Create("deploy", "application", "fake", "")
+	job, _, err := service.Create("fake", "machine", "fake", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1424,8 +1424,8 @@ func TestFakeExecutorPhaseParityAndInterruptedRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := service.claimNext(context.Background()); err != nil || !ok {
-		t.Fatalf("claim for recovery = %t, %v", ok, err)
+	if _, claim, err := service.claimNext(context.Background()); err != nil || claim != claimClaimed {
+		t.Fatalf("claim for recovery = %v, %v", claim, err)
 	}
 	if err := service.RecoverInterrupted(); err != nil {
 		t.Fatal(err)
