@@ -10,8 +10,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
-	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/generatedrecovery"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
@@ -22,15 +23,12 @@ func TestRepositoryRecoveryPreservesGeneratedAndKeepsComposeBehavior(t *testing.
 	fixture := newRecoveryFixture(t, false)
 	composeDeploymentID, composeJobID := fixture.seedComposeDeployment(t)
 
-	if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	result := fixture.recover(t, fixture.now.Add(time.Minute))
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
 	assertRuntime(t, fixture.db, fixture.deploymentID, "preflight", "not_required", "")
 	assertMainDeployment(t, fixture.db, composeDeploymentID, "failed", "daemon_restarted")
-
-	if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-		t.Fatal(err)
+	if result.Deployments.PreservedGenerated != 1 || result.Deployments.FailedOther != 1 || result.Jobs.RequeuedGenerated != 1 || result.Jobs.Interrupted != 1 {
+		t.Fatalf("recovery = %#v", result)
 	}
 	assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
 	assertRequeueReset(t, fixture.db, fixture.jobID)
@@ -40,11 +38,9 @@ func TestRepositoryRecoveryPreservesGeneratedAndKeepsComposeBehavior(t *testing.
 	// Startup recovery can be retried after a partial daemon initialization.
 	// The already requeued generated job remains eligible and gets no duplicate
 	// recovery event.
-	if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-		t.Fatal(err)
+	result = fixture.recover(t, fixture.now.Add(2*time.Minute))
+	if result.Jobs.RequeuedGenerated != 0 || result.Jobs.Interrupted != 0 {
+		t.Fatalf("repeat recovery = %#v", result)
 	}
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
 	assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
@@ -104,13 +100,9 @@ func TestRecoveryRequeuesSafeGeneratedContinuationPoints(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRecoveryFixture(t, test.migration)
 			test.prepare(t, fixture)
-			deploymentResult, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute))
-			if err != nil || deploymentResult.PreservedGenerated != 1 || deploymentResult.FailedGenerated != 0 {
-				t.Fatalf("deployment recovery = %#v err=%v", deploymentResult, err)
-			}
-			jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(2*time.Minute))
-			if err != nil || jobResult.RequeuedGenerated != 1 || jobResult.Interrupted != 0 {
-				t.Fatalf("job recovery = %#v err=%v", jobResult, err)
+			result := fixture.recover(t, fixture.now.Add(time.Minute))
+			if result.Deployments.PreservedGenerated != 1 || result.Deployments.FailedGenerated != 0 || result.Jobs.RequeuedGenerated != 1 || result.Jobs.Interrupted != 0 {
+				t.Fatalf("recovery = %#v", result)
 			}
 			assertRuntime(t, fixture.db, fixture.deploymentID, test.phase, test.migrationState, "")
 			assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
@@ -126,13 +118,9 @@ func TestRecoveryPreservesExplicitRouteReconciliationPause(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deploymentResult, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute))
-	if err != nil || deploymentResult.PreservedGenerated != 1 || deploymentResult.FailedGenerated != 0 {
-		t.Fatalf("deployment recovery = %#v err=%v", deploymentResult, err)
-	}
-	jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(2*time.Minute))
-	if err != nil || jobResult.RequeuedGenerated != 0 || jobResult.Interrupted != 0 {
-		t.Fatalf("job recovery = %#v err=%v", jobResult, err)
+	result := fixture.recover(t, fixture.now.Add(time.Minute))
+	if result.Deployments.PreservedGenerated != 1 || result.Deployments.FailedGenerated != 0 || result.Jobs.RequeuedGenerated != 0 || result.Jobs.Interrupted != 0 {
+		t.Fatalf("recovery = %#v", result)
 	}
 	assertRuntime(t, fixture.db, fixture.deploymentID, "switching_route", "not_required", "")
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
@@ -154,13 +142,9 @@ func TestRecoveryPreservesExplicitRouteReconciliationPauseWhileDraining(t *testi
 		t.Fatal(err)
 	}
 
-	deploymentResult, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute))
-	if err != nil || deploymentResult.PreservedGenerated != 1 || deploymentResult.FailedGenerated != 0 {
-		t.Fatalf("deployment recovery = %#v err=%v", deploymentResult, err)
-	}
-	jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(2*time.Minute))
-	if err != nil || jobResult.RequeuedGenerated != 0 || jobResult.Interrupted != 0 {
-		t.Fatalf("job recovery = %#v err=%v", jobResult, err)
+	result := fixture.recover(t, fixture.now.Add(time.Minute))
+	if result.Deployments.PreservedGenerated != 1 || result.Deployments.FailedGenerated != 0 || result.Jobs.RequeuedGenerated != 0 || result.Jobs.Interrupted != 0 {
+		t.Fatalf("recovery = %#v", result)
 	}
 	assertRuntime(t, fixture.db, fixture.deploymentID, "draining", "not_required", "")
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
@@ -177,16 +161,12 @@ func TestRecoveryFailsClosedForUnsafeGeneratedStates(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		result, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute))
-		if err != nil || result.FailedGenerated != 1 || result.PreservedGenerated != 0 {
-			t.Fatalf("recovery = %#v err=%v", result, err)
+		result := fixture.recover(t, fixture.now.Add(time.Minute))
+		if result.Deployments.FailedGenerated != 1 || result.Deployments.PreservedGenerated != 0 || result.Jobs.Interrupted != 1 {
+			t.Fatalf("recovery = %#v", result)
 		}
 		assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "failed", "daemon_restarted")
 		assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
-		jobsResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(2*time.Minute))
-		if err != nil || jobsResult.Interrupted != 1 || jobsResult.RequeuedGenerated != 0 {
-			t.Fatalf("job recovery = %#v err=%v", jobsResult, err)
-		}
 		assertJob(t, fixture.db, fixture.jobID, "interrupted", "interrupted", "daemon_restarted", 2, fixture.inputJSON)
 	})
 
@@ -203,9 +183,7 @@ func TestRecoveryFailsClosedForUnsafeGeneratedStates(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute)); err != nil {
-			t.Fatal(err)
-		}
+		fixture.recover(t, fixture.now.Add(time.Minute))
 		assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
 		var state, diagnostic string
 		if err := fixture.db.QueryRow(`SELECT state,diagnostic_code FROM generated_runtime_components WHERE deployment_id=? AND component_name=?`, fixture.deploymentID, fixture.component).Scan(&state, &diagnostic); err != nil {
@@ -224,9 +202,7 @@ func TestRecoveryFailsClosedForUnsafeGeneratedStates(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute)); err != nil {
-			t.Fatal(err)
-		}
+		fixture.recover(t, fixture.now.Add(time.Minute))
 		assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
 		assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
 	})
@@ -241,9 +217,7 @@ func TestRecoveryFailsClosedForUnsafeGeneratedStates(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute)); err != nil {
-			t.Fatal(err)
-		}
+		fixture.recover(t, fixture.now.Add(time.Minute))
 		assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
 		assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
 	})
@@ -262,9 +236,7 @@ func TestRecoveryFailsClosedForUnsafeGeneratedStates(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute)); err != nil {
-			t.Fatal(err)
-		}
+		fixture.recover(t, fixture.now.Add(time.Minute))
 		assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
 		assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
 		assertComponent(t, fixture.db, fixture.deploymentID, fixture.component, "failed", "daemon_restarted")
@@ -293,13 +265,9 @@ func TestRecoveryResumesSwitchingAndDrainingIdempotently(t *testing.T) {
 				fixture.advance(t, generatedruntimestate.PhaseDraining)
 			}
 
-			result, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Minute))
-			if err != nil || result.PreservedGenerated != 1 || result.FailedGenerated != 0 {
-				t.Fatalf("deployment recovery = %#v err=%v", result, err)
-			}
-			jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(2*time.Minute))
-			if err != nil || jobResult.RequeuedGenerated != 1 || jobResult.Interrupted != 0 {
-				t.Fatalf("job recovery = %#v err=%v", jobResult, err)
+			result := fixture.recover(t, fixture.now.Add(time.Minute))
+			if result.Deployments.PreservedGenerated != 1 || result.Deployments.FailedGenerated != 0 || result.Jobs.RequeuedGenerated != 1 || result.Jobs.Interrupted != 0 {
+				t.Fatalf("recovery = %#v", result)
 			}
 			phase := "switching_route"
 			if test.draining {
@@ -329,13 +297,9 @@ func TestRecoveryPreservesCommittedRuntimeAwaitingDeploymentFinalization(t *test
 			}
 
 			for repeat := 0; repeat < 2; repeat++ {
-				result, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Duration(repeat+1)*time.Minute))
-				if err != nil || result.PreservedGenerated != 1 || result.FailedGenerated != 0 {
-					t.Fatalf("deployment recovery %d = %#v err=%v", repeat, result, err)
-				}
-				jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(time.Duration(repeat+2)*time.Minute))
-				if err != nil || jobResult.Interrupted != 0 || jobResult.RequeuedGenerated != 1-repeat {
-					t.Fatalf("job recovery %d = %#v err=%v", repeat, jobResult, err)
+				result := fixture.recover(t, fixture.now.Add(time.Duration(repeat+1)*time.Minute))
+				if result.Deployments.PreservedGenerated != 1 || result.Deployments.FailedGenerated != 0 || result.Jobs.Interrupted != 0 || result.Jobs.RequeuedGenerated != 1-repeat {
+					t.Fatalf("recovery %d = %#v", repeat, result)
 				}
 				assertRuntime(t, fixture.db, fixture.deploymentID, "succeeded", "not_required", "")
 				assertMainDeployment(t, fixture.db, fixture.deploymentID, mainStatus, "")
@@ -358,13 +322,9 @@ func TestRecoveryPausesUncertainCommittedRuntimeWithoutDeletingServingState(t *t
 	}
 
 	for repeat := 0; repeat < 2; repeat++ {
-		result, err := generatedrecovery.RecoverDeployments(context.Background(), fixture.db, fixture.now.Add(time.Duration(repeat+1)*time.Minute))
-		if err != nil || result.PreservedGenerated != 0 || result.PausedGenerated != 1 || result.FailedGenerated != 0 {
-			t.Fatalf("deployment recovery %d = %#v err=%v", repeat, result, err)
-		}
-		jobResult, err := generatedrecovery.RecoverJobs(context.Background(), fixture.db, fixture.now.Add(time.Duration(repeat+2)*time.Minute))
-		if err != nil || jobResult.Interrupted != 0 || jobResult.PausedGenerated != 1-repeat {
-			t.Fatalf("job recovery %d = %#v err=%v", repeat, jobResult, err)
+		result := fixture.recover(t, fixture.now.Add(time.Duration(repeat+1)*time.Minute))
+		if result.Deployments.PreservedGenerated != 0 || result.Deployments.PausedGenerated != 1 || result.Deployments.FailedGenerated != 0 || result.Jobs.Interrupted != 0 || result.Jobs.PausedGenerated != 1-repeat {
+			t.Fatalf("recovery %d = %#v", repeat, result)
 		}
 		assertRuntime(t, fixture.db, fixture.deploymentID, "succeeded", "not_required", "")
 		assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
@@ -374,6 +334,7 @@ func TestRecoveryPausesUncertainCommittedRuntimeWithoutDeletingServingState(t *t
 
 type recoveryFixture struct {
 	db           *sql.DB
+	bindings     *deploymentbinding.Repository
 	state        *generatedruntimestate.Repository
 	now          time.Time
 	actorID      string
@@ -415,8 +376,17 @@ func newRecoveryFixtureWithReviewedConfiguration(t *testing.T, migration, review
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	lifecycleRepository := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycleRepository)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fixture := &recoveryFixture{
-		db: db, state: generatedruntimestate.New(db), now: time.Date(2026, time.August, 31, 18, 0, 0, 0, time.UTC),
+		db: db, bindings: bindings, state: generatedruntimestate.New(db), now: time.Date(2026, time.August, 31, 18, 0, 0, 0, time.UTC),
 		actorID: uuid.NewString(), appID: uuid.NewString(), jobID: uuid.NewString(), deploymentID: uuid.NewString(),
 		releaseID: uuid.NewString(), planID: uuid.NewString(), component: "api", phase: generatedruntimestate.PhasePreflight,
 	}
@@ -492,7 +462,11 @@ func newRecoveryFixtureWithReviewedConfiguration(t *testing.T, migration, review
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,input_json,attempt,progress_percent,checkpoint_json,started_at,created_at,updated_at) VALUES(?,'deploy','application',?,'running','apply_runtime',?,?,2,60,'{"phase":"apply_runtime"}',?,?,?)`, fixture.jobID, fixture.appID, fixture.actorID, string(fixture.inputJSON), timestamp(fixture.now), timestamp(fixture.now), timestamp(fixture.now)); err != nil {
+	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,input_json,created_at,updated_at) VALUES(?,'deploy','application',?,'queued','queued',?,?,?,?)`, fixture.jobID, fixture.appID, fixture.actorID, string(fixture.inputJSON), timestamp(fixture.now), timestamp(fixture.now)); err != nil {
+		t.Fatal(err)
+	}
+	fixture.bindJob(t, fixture.jobID)
+	if _, err := db.Exec(`UPDATE jobs SET status='running',phase='apply_runtime',attempt=2,progress_percent=60,checkpoint_json='{"phase":"apply_runtime"}',started_at=?,updated_at=? WHERE id=?`, timestamp(fixture.now), timestamp(fixture.now), fixture.jobID); err != nil {
 		t.Fatal(err)
 	}
 	configurationID := any(nil)
@@ -569,13 +543,41 @@ func (f *recoveryFixture) seedComposeDeployment(t *testing.T) (string, string) {
 	if _, err := f.db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'draft',?,?)`, appID, appID, appID, timestamp(f.now), timestamp(f.now)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,input_json,attempt,started_at,created_at,updated_at) VALUES(?,'deploy','application',?,'running','apply_runtime',?,'{}',1,?,?,?)`, jobID, appID, f.actorID, timestamp(f.now), timestamp(f.now), timestamp(f.now)); err != nil {
+	if _, err := f.db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,input_json,created_at,updated_at) VALUES(?,'deploy','application',?,'queued','queued',?,'{}',?,?)`, jobID, appID, f.actorID, timestamp(f.now), timestamp(f.now)); err != nil {
+		t.Fatal(err)
+	}
+	f.bindJob(t, jobID)
+	if _, err := f.db.Exec(`UPDATE jobs SET status='running',phase='apply_runtime',attempt=1,started_at=?,updated_at=? WHERE id=?`, timestamp(f.now), timestamp(f.now), jobID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.db.Exec(`INSERT INTO deployments(id,app_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,started_at) VALUES(?,?,?,'applying','current',1,'compose',?)`, deploymentID, appID, jobID, timestamp(f.now)); err != nil {
 		t.Fatal(err)
 	}
 	return deploymentID, jobID
+}
+
+func (f *recoveryFixture) bindJob(t *testing.T, jobID string) {
+	t.Helper()
+	tx, err := f.db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := f.bindings.InsertNewTx(context.Background(), tx, jobID, f.now); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *recoveryFixture) recover(t *testing.T, now time.Time) generatedrecovery.RuntimeResult {
+	t.Helper()
+	result, err := generatedrecovery.RecoverRuntime(context.Background(), f.db, now, f.bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func assertMainDeployment(t *testing.T, db *sql.DB, deploymentID, wantStatus, wantDiagnostic string) {
