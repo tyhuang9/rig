@@ -178,19 +178,30 @@ versioned operation anchors that represent genuine upgrade provenance, and a
 separate adoption path for gateways that have always been localhost-only. That
 path must retain real local ownership without inventing a LAN profile.
 
-### Next unit: ordinary deployment bindings
+### Ordinary deployment binding storage
 
 Each ordinary deployment needs an immutable binding to its accepted desired
 revision. A deployment queued before Stop must not gain permission from a later
-Start. The accepted design keeps bindings separate from existing job input and
+Start. The storage unit keeps bindings separate from existing job input and
 release bytes, validates historical operation evidence before current authority,
-and preserves exact replay without waking the worker.
+and supports historical binding reads independently of the current desired head.
 
-A one-time migration will bind eligible existing jobs to explicit revision-zero
-legacy authority. Runtime paths will never backfill missing bindings. Stale work
-will be retired atomically; corrupt authority will refuse execution. Acceptance,
-resume, claim, recovery, router and final command checks remain implementation
-work, with the same canonical lifecycle validator used inside caller transactions.
+Migration 040 binds eligible existing jobs to explicit revision-zero legacy
+authority once. It preserves job state and history, rejects binding replacement
+or deletion, and does not add an application foreign key that would prevent
+otherwise valid legacy application deletion. Runtime reads never backfill a
+missing binding.
+
+New binding insertion requires exact current authority in the caller's job
+creation transaction. The canonical lifecycle validator checks all present
+partial graph records before distinguishing incomplete from corrupt authority;
+a historical running binding requires the complete original graph. Every nested
+read uses the caller's transaction. Repository/validator database identity is
+checked at composition; `database/sql` cannot introspect a transaction's origin.
+
+Production acceptance, stale retirement, resume, claim, recovery, router and
+final command checks remain implementation work. This storage unit does not
+enable lifecycle actions or grant permission at a runtime command boundary.
 
 ## Required acceptance
 
@@ -435,6 +446,46 @@ tests. The controller build and canonical generation check passed at the same
 ten production-file hashes before the final test-only repairs. These checks do
 not prove live Docker traffic withdrawal, container lifecycle effects, recovery
 activation, or full M4 acceptance.
+
+### Ordinary deployment binding storage: local evidence
+
+Local commit `557b570b47c5d242a00c1426de42cf858411b61a` adds immutable
+binding storage and canonical transaction validation. On 2026-10-18, Windows
+passed all three affected packages:
+
+```text
+go test -count=1 ./internal/deploymentbinding ./internal/applifecycle ./internal/database
+go vet ./internal/deploymentbinding ./internal/applifecycle ./internal/database
+```
+
+The focused Windows JSON runs contained 13 parents and 13 children. Native
+Linux covered the full binding and lifecycle packages plus the migration
+parents: 43 parents and 119 children. Every selected named test ran and passed
+once, with no skips. These were local, non-race checks with Go 1.26.7.
+
+Coverage includes exact legacy seeding, fresh/upgrade/reopen behavior,
+UPDATE/DELETE/REPLACE refusal with recursive triggers disabled, unchanged job,
+event and release history, application deletion without binding loss, canonical
+partial and complete graph validation, caller-transaction visibility, foreign
+configuration refusal, corruption before stale classification, and real
+repository/validator composition. Security review verified both repairs:
+malformed partial records cannot become ordinary unresolved authority, and no
+fallible database operation follows a successful binding insertion.
+
+The first native migration invocation used the repository working directory,
+so its relative-path mirror check failed after schema/reopen checks passed.
+It passed from the package directory; the failed invocation is retained.
+Removing one trailing blank line from each SQL file before commit was followed
+by successful migration checks on both platforms. The canonical committed LF
+bytes of each migration have SHA-256
+`b9585f15450b009f91985f65f4ef259fdb9d5d4fde30128236713b4263c82a86`.
+Windows checkout line-ending conversion can produce a different raw-file hash.
+
+The Linux full lifecycle JSON has SHA-256
+`11566f1bb2cd657ddaa8e1d2ece7c1cda24e1f421cac48580660b52455570215`;
+the focused Windows validator JSON has SHA-256
+`4e80209570c380041d6b970bc055041744abd072d17a01e05e1737ce43a7b6a1`.
+Acceptance/revival wiring and final command fencing remain separate work.
 
 ### Pre-change baseline
 
