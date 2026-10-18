@@ -187,7 +187,10 @@ jobs:
           - appconfig
           - database
           - generatedrecovery
-          - jobs
+          - jobs-atomic
+          - jobs-admission
+          - jobs-compose
+          - jobs-remainder
           - controller-lifecycle
           - controller-remainder
     steps:
