@@ -124,6 +124,24 @@ func (p *Pinned) Leave() {
 }
 
 func (p *Pinned) CheckPolicyGateTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, policyGateStatus)
+}
+
+// CheckComposeUpTx revalidates the original execution authority at the fixed
+// Compose mutation boundary. An acknowledged waiting-health deployment can
+// never authorize another up command.
+func (p *Pinned) CheckComposeUpTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, composeUpStatus)
+}
+
+// CheckComposeObservationTx revalidates the original execution authority for
+// the two fixed post-command observations. The repository applies the exact
+// transition-specific status check in the same transaction.
+func (p *Pinned) CheckComposeObservationTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, composeObservationStatus)
+}
+
+func (p *Pinned) checkTx(tx *sql.Tx, claim Claim, deploymentID string, statusAllowed func(string) bool) error {
 	guard, ctx, done, err := p.beginCheck()
 	if err != nil {
 		return err
@@ -183,7 +201,7 @@ func (p *Pinned) CheckPolicyGateTx(tx *sql.Tx, claim Claim, deploymentID string)
 	if err := p.checkCurrent(ctx); err != nil {
 		return err
 	}
-	if !provenanceInitialized || !policyGateStatus(deploymentStatus) {
+	if !provenanceInitialized || statusAllowed == nil || !statusAllowed(deploymentStatus) {
 		return ErrStageInvalid
 	}
 	pending, err := guard.positiveFence.PendingStartExistsTx(ctx, tx)
@@ -197,6 +215,12 @@ func (p *Pinned) CheckPolicyGateTx(tx *sql.Tx, claim Claim, deploymentID string)
 		return ErrPositiveFence
 	}
 	return p.checkCurrent(ctx)
+}
+
+func composeUpStatus(status string) bool { return status == "applying" }
+
+func composeObservationStatus(status string) bool {
+	return status == "applying" || status == "waiting_health"
 }
 
 func policyGateStatus(status string) bool {
