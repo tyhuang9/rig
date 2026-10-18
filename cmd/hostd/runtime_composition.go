@@ -9,11 +9,13 @@ import (
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedexecutor"
@@ -31,13 +33,14 @@ import (
 )
 
 type runtimeCompositionDependencies struct {
-	db            *sql.DB
-	applications  *apps.Store
-	snapshots     *releasesnapshot.Materializer
-	configuration *appconfig.Store
-	deployments   *deployments.Repository
-	plans         *deploymentplans.Store
-	bindings      *deploymentbinding.Repository
+	db                      *sql.DB
+	applications            *apps.Store
+	snapshots               *releasesnapshot.Materializer
+	configuration           *appconfig.Store
+	deployments             *deployments.Repository
+	plans                   *deploymentplans.Store
+	bindings                *deploymentbinding.Repository
+	effectsWorkingDirectory string
 }
 
 type runtimeCompositionOptions struct {
@@ -52,8 +55,8 @@ type runtimeCompositionOptions struct {
 
 type runtimeComposition struct {
 	executor  jobs.Executor
-	compose   jobs.Executor
-	generated jobs.Executor
+	compose   runtimeexecutor.BoundExecutor
+	generated runtimeexecutor.BoundExecutor
 	ingress   *generatedingress.Manager
 	state     *generatedruntimestate.Repository
 }
@@ -109,6 +112,25 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 	if (configuration.ComposeRuntime || configuration.GeneratedRuntime) &&
 		(dependencies.bindings == nil || !dependencies.bindings.UsesDatabase(dependencies.db)) {
 		return runtimeComposition{}, errors.New("runtime deployment lifecycle binding repository is required")
+	}
+	var runtimeDeployments = dependencies.deployments
+	if configuration.ComposeRuntime || configuration.GeneratedRuntime {
+		if !dependencies.deployments.UsesDatabase(dependencies.db) || dependencies.effectsWorkingDirectory == "" ||
+			!filepath.IsAbs(dependencies.effectsWorkingDirectory) || filepath.Clean(dependencies.effectsWorkingDirectory) != dependencies.effectsWorkingDirectory {
+			return runtimeComposition{}, errors.New("runtime deployment execution dependencies are required")
+		}
+		positiveFence, err := applifecycle.NewPositiveFenceValidator(applifecycle.New(dependencies.db))
+		if err != nil {
+			return runtimeComposition{}, fmt.Errorf("runtime deployment positive fence setup: %w", err)
+		}
+		executionGuard, err := deploymentexecution.NewGuard(dependencies.db, dependencies.bindings, positiveFence, dependencies.effectsWorkingDirectory)
+		if err != nil {
+			return runtimeComposition{}, fmt.Errorf("runtime deployment execution guard setup: %w", err)
+		}
+		runtimeDeployments, err = deployments.NewWithExecutionGuard(dependencies.db, executionGuard)
+		if err != nil {
+			return runtimeComposition{}, fmt.Errorf("runtime deployment repository setup: %w", err)
+		}
 	}
 	if configuration.GeneratedRuntime && (options.dockerExecutable == "" || !filepath.IsAbs(options.dockerExecutable) || filepath.Clean(options.dockerExecutable) != options.dockerExecutable) {
 		return runtimeComposition{}, errors.New("generated runtime Docker executable is invalid")
@@ -282,7 +304,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("authorization_gate_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		authorization, err := generatedexecutor.NewAuthorizationGate(dependencies.deployments, dependencies.plans, engine)
+		authorization, err := generatedexecutor.NewAuthorizationGate(runtimeDeployments, dependencies.plans, engine)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated authorization setup: %w", err)
 		}
@@ -290,7 +312,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 			return runtimeComposition{}, err
 		}
 		result.generated, err = generatedexecutor.NewExecutor(
-			dependencies.applications, dependencies.snapshots, dependencies.configuration, dependencies.deployments,
+			dependencies.applications, dependencies.snapshots, dependencies.configuration, runtimeDeployments,
 			dependencies.plans, compiler, artifacts, state, engine, authorization, ingress, migrationRunner, generatedexecutor.Options{},
 		)
 		if err != nil {
@@ -307,7 +329,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 			composeDockerExecutable = options.dockerExecutable
 		}
 		result.compose, err = composeruntime.NewExecutor(
-			dependencies.applications, dependencies.snapshots, dependencies.configuration, dependencies.deployments,
+			dependencies.applications, dependencies.snapshots, dependencies.configuration, runtimeDeployments,
 			composeTemporary, options.runner, composeruntime.ExecutorOptions{
 				DockerExecutable: composeDockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
 				ConfigTimeout: configuration.ComposeConfigTimeout, ApplyTimeout: configuration.ComposeApplyTimeout, WaitTimeout: configuration.ComposeWaitTimeout,
@@ -325,7 +347,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("runtime_router_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		result.executor, err = runtimeexecutor.New(dependencies.deployments, dependencies.plans, dependencies.snapshots,
+		result.executor, err = runtimeexecutor.New(runtimeDeployments, dependencies.plans, dependencies.snapshots,
 			result.compose, result.generated, dependencies.bindings, fenceCheck)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("runtime strategy router setup: %w", err)

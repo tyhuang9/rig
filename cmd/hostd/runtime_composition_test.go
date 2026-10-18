@@ -175,6 +175,51 @@ func TestRuntimeCompositionRequiresSameDatabaseDeploymentBindingsBeforeSetup(t *
 	}
 }
 
+func TestRuntimeCompositionRequiresSameDatabaseDeploymentsAndEffectsDirectoryBeforeSetup(t *testing.T) {
+	for _, mode := range []string{"compose", "generated"} {
+		for _, dependency := range []string{"missing deployments", "unconfigured deployments", "foreign deployments", "missing effects directory"} {
+			t.Run(mode+"/"+dependency, func(t *testing.T) {
+				fixture := newRuntimeCompositionFixture(t)
+				fixture.configuration.ComposeRuntime = mode == "compose"
+				fixture.configuration.GeneratedRuntime = mode == "generated"
+				dependencies := fixture.dependencies
+				switch dependency {
+				case "missing deployments":
+					dependencies.deployments = nil
+				case "unconfigured deployments":
+					dependencies.deployments = deployments.New(nil)
+				case "foreign deployments":
+					foreignDB, err := database.Open(filepath.Join(t.TempDir(), "foreign"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = foreignDB.Close() })
+					dependencies.deployments = deployments.New(foreignDB)
+				case "missing effects directory":
+					dependencies.effectsWorkingDirectory = ""
+				}
+				steps, recovered := 0, false
+				runner := &runtimeCompositionCommandRunner{}
+				result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
+					dockerExecutable: fixture.dockerExecutable,
+					runner:           runner,
+					beforeStep: func(string) error {
+						steps++
+						return nil
+					},
+					recoverIngress: func(context.Context, *generatedingress.Manager) error {
+						recovered = true
+						return nil
+					},
+				})
+				if err == nil || result.executor != nil || steps != 0 || runner.calls != 0 || recovered {
+					t.Fatalf("composition=%#v error=%v steps=%d runner=%d recovered=%t", result, err, steps, runner.calls, recovered)
+				}
+			})
+		}
+	}
+}
+
 func TestRuntimeCompositionFakeAndDisabledDoNotRequireDeploymentBindings(t *testing.T) {
 	for _, mode := range []string{"disabled", "fake"} {
 		t.Run(mode, func(t *testing.T) {
@@ -633,11 +678,16 @@ func newRuntimeCompositionFixture(t *testing.T) runtimeCompositionFixture {
 	}
 	configuration := config.Defaults()
 	configuration.DataRoot = root
+	directories, err := docker.PrepareControllerDirectories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return runtimeCompositionFixture{
 		db: db, deploymentJobs: deploymentJobs, configuration: configuration, dockerExecutable: dockerExecutable,
 		dependencies: runtimeCompositionDependencies{
 			db: db, applications: apps.New(db), snapshots: snapshots, configuration: applicationConfiguration,
 			deployments: deployments.New(db), plans: plans, bindings: bindings,
+			effectsWorkingDirectory: directories.WorkingDirectory,
 		},
 	}
 }

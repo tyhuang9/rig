@@ -16,8 +16,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 )
 
 const (
@@ -1008,26 +1014,77 @@ func assertRepositoryParity(t *testing.T, f PolicyFinding) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	app, job, actor, machine := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+	app, actor, machine := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	statements := []struct {
 		q string
 		a []any
-	}{{`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,'owner','hash',?,?)`, []any{actor, now, now}}, {`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,'local','local','ready','x','x','x','x',?,?)`, []any{machine, now, now}}, {`INSERT INTO applications(id,slug,name,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?,'draft',?,?)`, []any{app, app, app, machine, now, now}}, {`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,created_at,updated_at) VALUES(?,'deploy','application',?,'queued','queued',?,?,?)`, []any{job, app, actor, now, now}}}
+	}{{`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,'owner','hash',?,?)`, []any{actor, now, now}}, {`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,'local','local','ready','x','x','x','x',?,?)`, []any{machine, now, now}}, {`INSERT INTO applications(id,slug,name,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?,'draft',?,?)`, []any{app, app, app, machine, now, now}}}
 	for _, s := range statements {
 		if _, err := db.Exec(s.q, s.a...); err != nil {
 			t.Fatal(err)
 		}
 	}
-	r := deployments.New(db)
-	d, err := r.Create(context.Background(), app, job, "current")
+	lifecycle := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+		ApplicationID: app, IdempotencyKey: "policy-parity", RequestedBy: actor,
+		Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+	}, jobs.DeploymentCreateHooks{})
+	if err != nil || !created.Created {
+		t.Fatalf("create bound policy job: created=%t error=%v", created.Created, err)
+	}
+	if _, err := db.Exec(`UPDATE jobs SET status='running',phase='running',attempt=1 WHERE id=?`, created.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directories, err := runtimedocker.PrepareControllerDirectories(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := deployments.NewWithExecutionGuard(db, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := r.Create(context.Background(), app, created.Job.ID, "current")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err = r.Initialize(context.Background(), app, d.ID, "", "", 0); err != nil {
 		t.Fatal(err)
 	}
-	err = r.Gate(context.Background(), app, d.ID, []deployments.Finding{{PolicyVersion: f.PolicyVersion, Capability: f.Capability, Scope: f.Scope, Fingerprint: f.Fingerprint, Disposition: f.Disposition}})
+	claim, err := deploymentexecution.NewClaim(created.Binding, created.Job.ID, app, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := release(); err != nil {
+			t.Errorf("release policy parity scope: %v", err)
+		}
+	}()
+	err = r.Gate(deploymenteffects.WithScope(context.Background(), scope), deployments.GateRequest{Claim: claim, DeploymentID: d.ID, Findings: []deployments.Finding{{PolicyVersion: f.PolicyVersion, Capability: f.Capability, Scope: f.Scope, Fingerprint: f.Fingerprint, Disposition: f.Disposition}}})
 	if !errors.Is(err, deployments.ErrApprovalRequired) {
 		t.Fatalf("repository parity=%v", err)
 	}

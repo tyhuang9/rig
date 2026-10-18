@@ -4,12 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
@@ -384,12 +389,16 @@ type fakeAuthorization struct {
 	err          error
 	deployments  *fakeDeployments
 	calls        int
+	after        func()
 	reservations []*fakeReplacementReservation
 }
 
 func (f *fakeAuthorization) Authorize(context.Context, AuthorizationRequest) (generatedruntime.ReplacementReservation, error) {
 	f.calls++
 	*f.events = append(*f.events, "authorize")
+	if f.after != nil {
+		f.after()
+	}
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -448,6 +457,7 @@ func (f *fakeReporter) Report(update jobs.ProgressUpdate) error {
 
 type executorFixture struct {
 	executor      *Executor
+	claim         deploymentexecution.Claim
 	configuration *fakeConfiguration
 	deployments   *fakeDeployments
 	state         *fakeRuntimeState
@@ -489,7 +499,133 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &executorFixture{executor: executor, configuration: configuration, deployments: deploymentsFake, state: state, compiler: compiler, artifacts: artifacts, runtime: runtime, authorization: authorization, routes: routes, migrations: migrations, reporter: &fakeReporter{}, events: &events, plan: plan}
+	return &executorFixture{executor: executor, claim: newGeneratedExecutorClaim(t), configuration: configuration, deployments: deploymentsFake, state: state, compiler: compiler, artifacts: artifacts, runtime: runtime, authorization: authorization, routes: routes, migrations: migrations, reporter: &fakeReporter{}, events: &events, plan: plan}
+}
+
+func (f *executorFixture) execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+	return f.executor.ExecuteBound(ctx, job, f.claim, reporter)
+}
+
+func TestGeneratedExecutorRejectsZeroOrMismatchedClaimBeforePreparation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*jobs.Job, *deploymentexecution.Claim)
+	}{
+		{name: "zero claim", mutate: func(_ *jobs.Job, claim *deploymentexecution.Claim) { *claim = deploymentexecution.Claim{} }},
+		{name: "job mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) { job.ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }},
+		{name: "application mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) {
+			job.ResourceID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+		}},
+		{name: "attempt mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) { job.Attempt++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			job, claim := deploymentJob(), fixture.claim
+			test.mutate(&job, &claim)
+			result, err := fixture.executor.ExecuteBound(context.Background(), job, claim, fixture.reporter)
+			var executionErr *jobs.ExecutionError
+			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "validation_failed" || !errors.Is(err, deploymentexecution.ErrInvalidClaim) {
+				t.Fatalf("result=%#v error=%v", result, err)
+			}
+			if len(fixture.reporter.phases) != 0 || len(*fixture.events) != 0 || fixture.configuration.exports != 0 ||
+				fixture.compiler.calls != 0 || fixture.authorization.calls != 0 || fixture.state.deployment.DeploymentID != "" {
+				t.Fatalf("claim refusal performed work: progress=%#v events=%#v exports=%d compiler=%d authorization=%d runtime=%#v", fixture.reporter.phases, *fixture.events, fixture.configuration.exports, fixture.compiler.calls, fixture.authorization.calls, fixture.state.deployment)
+			}
+		})
+	}
+}
+
+func TestExecutorPreservesAuthorizationRefusalAndCancellationWithoutFailureMutation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		cause  error
+		cancel bool
+	}{
+		{name: "cancelled approval", cause: deployments.ErrApprovalRequired, cancel: true},
+		{name: "cancelled rejection", cause: deployments.ErrRejectedCapability, cancel: true},
+		{name: "cancelled authority", cause: deploymentexecution.ErrAuthorityStale, cancel: true},
+		{name: "live authority refusal", cause: deploymentexecution.ErrAuthorityStale},
+		{name: "live evidence refusal", cause: deployments.ErrInvalidDeployment},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			fixture.authorization.err = test.cause
+			var ctx context.Context = context.Background()
+			if test.cancel {
+				cancelled, cancel := context.WithCancel(ctx)
+				ctx = cancelled
+				fixture.authorization.after = cancel
+			}
+			job := deploymentJob()
+			result, err := fixture.execute(ctx, job, fixture.reporter)
+			var executionErr *jobs.ExecutionError
+			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" ||
+				!errors.Is(err, test.cause) {
+				t.Fatalf("result=%#v error=%v", result, err)
+			}
+			if test.cancel && (!errors.Is(err, deploymentexecution.ErrCanceled) || !errors.Is(err, context.Canceled)) {
+				t.Fatalf("cancellation cause missing: %v", err)
+			}
+			if !test.cancel && errors.Is(err, deploymentexecution.ErrCanceled) {
+				t.Fatalf("live refusal was relabeled as cancellation: %v", err)
+			}
+			if fixture.deployments.deployment.Status != deployments.Preparing || fixture.deployments.deployment.DiagnosticCode != "" ||
+				fixture.state.deployment.Phase != generatedruntimestate.PhaseBuilding || fixture.state.deployment.DiagnosticCode != "" ||
+				len(fixture.state.deployment.Components) != 1 || fixture.state.deployment.Components[0].State != generatedruntimestate.ComponentPending ||
+				fixture.compiler.calls != 0 || fixture.authorization.calls != 1 || fixture.runtime.validateCalls != 0 || len(fixture.runtime.createdSpecs) != 0 ||
+				len(fixture.runtime.started) != 0 || fixture.runtime.adopted != 0 || fixture.runtime.stopped != 0 {
+				t.Fatalf("deployment=%#v runtime=%#v compiler=%d authorization=%d runtime calls=%#v", fixture.deployments.deployment, fixture.state.deployment, fixture.compiler.calls, fixture.authorization.calls, fixture.runtime)
+			}
+		})
+	}
+}
+
+func newGeneratedExecutorClaim(t *testing.T) deploymentexecution.Claim {
+	t.Helper()
+	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	stamp := time.Now().UTC()
+	stampText := stamp.Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, testActorID, testActorID, "hash", stampText, stampText); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'deployed',?,?)`, testAppID, testAppID, testAppID, stampText, stampText); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,attempt,requested_by,input_json,created_at,updated_at) VALUES(?,'deploy','application',?,'queued','queued',0,?,'{}',?,?)`, testJobID, testAppID, testActorID, stampText, stampText); err != nil {
+		t.Fatal(err)
+	}
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := bindings.InsertNewTx(context.Background(), tx, testJobID, stamp)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE jobs SET status='running',phase='running',attempt=1,started_at=?,updated_at=? WHERE id=?`, stampText, stampText, testJobID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := deploymentexecution.NewClaim(binding, testJobID, testAppID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claim
 }
 
 func readyArtifact(id string) generatedimage.Artifact {
@@ -533,7 +669,7 @@ func TestGeneratedExecutorRejectsReviewedRevisionDriftBeforeRuntimeSideEffects(t
 		t.Run(testCase.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, false)
 			testCase.mutate(fixture)
-			_, err := fixture.executor.Execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)
+			_, err := fixture.execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)
 			requireExecutionErrorCode(t, err, "reviewed_revision_stale")
 			if fixture.compiler.calls != 0 || len(fixture.routes.requests) != 0 || len(*fixture.events) != 0 || fixture.executor.releases.(*fakeReleases).materializeCalls != testCase.wantMaterializations {
 				t.Fatalf("side effects: compiler=%d routes=%d events=%d materializations=%d", fixture.compiler.calls, len(fixture.routes.requests), len(*fixture.events), fixture.executor.releases.(*fakeReleases).materializeCalls)
@@ -549,7 +685,7 @@ func TestGeneratedExecutorRejectsUnpinnedLatestJobBeforeRuntimeSideEffects(t *te
 	fixture := newExecutorFixture(t, false)
 	job := deploymentJob()
 	job.Input, _ = json.Marshal(jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent})
-	_, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	_, err := fixture.execute(context.Background(), job, fixture.reporter)
 	requireExecutionErrorCode(t, err, "reviewed_revisions_required")
 	if fixture.executor.releases.(*fakeReleases).materializeCalls != 0 || fixture.compiler.calls != 0 || len(*fixture.events) != 0 || fixture.deployments.deployment.Status != deployments.Failed {
 		t.Fatalf("unpinned worker made side effects: release=%d compile=%d events=%v deployment=%+v", fixture.executor.releases.(*fakeReleases).materializeCalls, fixture.compiler.calls, *fixture.events, fixture.deployments.deployment)
@@ -558,7 +694,7 @@ func TestGeneratedExecutorRejectsUnpinnedLatestJobBeforeRuntimeSideEffects(t *te
 
 func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
-	result, err := fixture.executor.Execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -585,7 +721,7 @@ func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, test.migration)
 			job := reviewedDeploymentJob()
-			if _, err := fixture.executor.Execute(context.Background(), job, fixture.reporter); err != nil {
+			if _, err := fixture.execute(context.Background(), job, fixture.reporter); err != nil {
 				t.Fatal(err)
 			}
 			if fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
@@ -602,7 +738,7 @@ func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 				fixture.state.active.DeploymentID = testArtifactID
 			}
 			builds, switches, removals := fixture.compiler.calls, len(fixture.routes.requests), fixture.runtime.stopped
-			result, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+			result, err := fixture.execute(context.Background(), job, fixture.reporter)
 			if err != nil || result.PauseDisposition != test.wantDisposition || fixture.deployments.deployment.Status != test.wantStatus {
 				t.Fatalf("finalize result=%+v err=%v deployment=%+v", result, err, fixture.deployments.deployment)
 			}
@@ -617,7 +753,7 @@ func TestGeneratedExecutorResumesReviewedLatestJobWithRecordedProvenanceAfterHea
 	fixture := newExecutorFixture(t, false)
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
 	job := reviewedDeploymentJob()
-	result, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	result, err := fixture.execute(context.Background(), job, fixture.reporter)
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseInsufficientReplacementCapacity {
 		t.Fatalf("first result=%+v err=%v", result, err)
 	}
@@ -635,7 +771,7 @@ func TestGeneratedExecutorResumesReviewedLatestJobWithRecordedProvenanceAfterHea
 	fixture.executor.plans.(*fakePlans).head = &newHead
 	fixture.configuration.currentID, fixture.configuration.currentNumber = testArtifactID, 4
 	fixture.authorization.err = nil
-	result, err = fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	result, err = fixture.execute(context.Background(), job, fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("resume result=%+v err=%v", result, err)
 	}
@@ -655,13 +791,13 @@ func TestGeneratedExecutorRejectsChangedReviewedProvenanceOnResume(t *testing.T)
 	fixture := newExecutorFixture(t, false)
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
 	job := reviewedDeploymentJob()
-	result, err := fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	result, err := fixture.execute(context.Background(), job, fixture.reporter)
 	if err != nil || result.PauseDisposition != jobs.PauseInsufficientReplacementCapacity || !fixture.deployments.deployment.ProvenanceInitialized {
 		t.Fatalf("first result=%+v err=%v deployment=%+v", result, err, fixture.deployments.deployment)
 	}
 	fixture.deployments.deployment.ActualConfigurationRevisionID = testArtifactID
 	fixture.authorization.err = nil
-	_, err = fixture.executor.Execute(context.Background(), job, fixture.reporter)
+	_, err = fixture.execute(context.Background(), job, fixture.reporter)
 	requireExecutionErrorCode(t, err, "invalid_source")
 	if fixture.deployments.deployment.Status != deployments.Failed || fixture.compiler.calls != 0 || len(fixture.routes.requests) != 0 ||
 		fixture.executor.releases.(*fakeReleases).materializeCalls != 1 || len(fixture.executor.releases.(*fakeReleases).readyWorkspaceIDs) != 0 || fixture.authorization.calls != 1 {
@@ -709,7 +845,7 @@ func TestGeneratedExecutorRepositoryFailuresPreserveDurableTerminalState(t *test
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, false)
 			test.inject(fixture)
-			_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+			_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 			requireExecutionErrorCode(t, err, "internal_error")
 			if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed {
 				t.Fatalf("runtime phase=%q want=%q", fixture.state.deployment.Phase, generatedruntimestate.PhaseFailed)
@@ -726,7 +862,7 @@ func TestGeneratedExecutorFinalAdvanceFailureRetainsRecoverableRuntimeState(t *t
 	fixture.state.advanceErrTo = generatedruntimestate.PhaseSucceeded
 	fixture.state.advanceErr = errors.New("runtime state storage unavailable")
 
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -739,7 +875,7 @@ func TestGeneratedExecutorFinalAdvanceFailureRetainsRecoverableRuntimeState(t *t
 
 	fixture.state.advanceErr = nil
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	result, err = fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err = fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded || fixture.deployments.deployment.Status != deployments.Succeeded {
 		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, fixture.state.deployment, fixture.deployments.deployment)
 	}
@@ -752,14 +888,14 @@ func TestGeneratedExecutorDistinguishesPlanStorageAndValidationFailures(t *testi
 	t.Run("application repository error", func(t *testing.T) {
 		fixture := newExecutorFixture(t, false)
 		fixture.executor.applications = &fakeApplications{err: errors.New("application storage unavailable")}
-		_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+		_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 		requireExecutionErrorCode(t, err, "internal_error")
 	})
 
 	t.Run("repository error", func(t *testing.T) {
 		fixture := newExecutorFixture(t, false)
 		fixture.executor.plans = &fakePlans{err: errors.New("plan storage unavailable")}
-		_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+		_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 		requireExecutionErrorCode(t, err, "internal_error")
 	})
 
@@ -775,7 +911,7 @@ func TestGeneratedExecutorDistinguishesPlanStorageAndValidationFailures(t *testi
 			plan := fixture.plan
 			test.mutate(&plan)
 			fixture.executor.plans = &fakePlans{revision: plan}
-			_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+			_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 			requireExecutionErrorCode(t, err, "invalid_source")
 		})
 	}
@@ -783,7 +919,7 @@ func TestGeneratedExecutorDistinguishesPlanStorageAndValidationFailures(t *testi
 
 func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen(t *testing.T) {
 	fixture := newExecutorFixture(t, true)
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +960,7 @@ func TestGeneratedExecutorPassesAcceptedTechnologyToRuntime(t *testing.T) {
 				fixture.plan.Plan.Components[0].Technology = technology
 				fixture.executor.plans = &fakePlans{revision: fixture.plan}
 			}
-			result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+			result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 			if err != nil || result.CompletionCode != "deployment_completed" {
 				t.Fatalf("result=%+v err=%v", result, err)
 			}
@@ -840,7 +976,7 @@ func TestGeneratedExecutorUsesCurrentConfigurationOnSameSourceRelease(t *testing
 	const currentConfigurationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 	fixture.configuration.currentID = currentConfigurationID
 	fixture.configuration.currentNumber = 4
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("same-source redeploy: result=%+v err=%v", result, err)
 	}
@@ -855,7 +991,7 @@ func TestGeneratedExecutorUsesCurrentConfigurationOnSameSourceRelease(t *testing
 func TestGeneratedExecutorRejectsRuntimeExportWithDifferentConfigurationPin(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	fixture.configuration.exportMismatch = true
-	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	requireExecutionErrorCode(t, err, "configuration_unavailable")
 	if len(fixture.runtime.createdSpecs) != 0 {
 		t.Fatalf("mismatched runtime configuration reached Docker: creates=%d", len(fixture.runtime.createdSpecs))
@@ -865,7 +1001,7 @@ func TestGeneratedExecutorRejectsRuntimeExportWithDifferentConfigurationPin(t *t
 func TestGeneratedExecutorWaitsBeforeMutationWhenMigrationApprovalIsMissing(t *testing.T) {
 	fixture := newExecutorFixture(t, true)
 	fixture.state.beginErr = generatedruntimestate.ErrMigrationApprovalRequired
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -880,7 +1016,7 @@ func TestGeneratedExecutorWaitsBeforeMutationWhenMigrationApprovalIsMissing(t *t
 func TestGeneratedExecutorWaitsBeforeMutationWhenCapacityAdmissionFails(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -895,7 +1031,7 @@ func TestGeneratedExecutorWaitsBeforeMutationWhenCapacityAdmissionFails(t *testi
 func TestGeneratedExecutorPreservesRuntimePolicyApprovalPause(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	fixture.authorization.err = deployments.ErrApprovalRequired
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -913,7 +1049,7 @@ func TestGeneratedExecutorMarksDriftedImageUnavailableAndRebuildsOnce(t *testing
 	fixture.compiler.artifacts = append(fixture.compiler.artifacts, second)
 	fixture.artifacts.values[second.ID] = second
 	fixture.runtime.validateErrs = []error{&generatedruntime.Error{Code: generatedruntime.DiagnosticImageDriftDetected}, nil}
-	if _, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter); err != nil {
+	if _, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter); err != nil {
 		t.Fatal(err)
 	}
 	if fixture.compiler.calls != 2 || !reflect.DeepEqual(fixture.artifacts.markedUnavailable, []string{testArtifactID}) {
@@ -933,7 +1069,7 @@ func TestGeneratedExecutorFailsClosedWhenRebuiltImageStillDrifts(t *testing.T) {
 		&generatedruntime.Error{Code: generatedruntime.DiagnosticImageDriftDetected},
 		&generatedruntime.Error{Code: generatedruntime.DiagnosticImageDriftDetected},
 	}
-	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err == nil || fixture.compiler.calls != 2 || len(fixture.runtime.createdSpecs) != 0 {
 		t.Fatalf("err=%v compile calls=%d create calls=%d", err, fixture.compiler.calls, len(fixture.runtime.createdSpecs))
 	}
@@ -947,7 +1083,7 @@ func TestGeneratedExecutorHealthFailurePreservesOldActiveHead(t *testing.T) {
 	oldDeploymentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "blue", Generation: 4}
 	fixture.runtime.healthErr = &generatedruntime.Error{Code: generatedruntime.DiagnosticCandidateUnhealthy}
-	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "health_failed" {
 		t.Fatalf("err=%v", err)
@@ -972,7 +1108,7 @@ func TestGeneratedExecutorDoesNotRerunInterruptedMigration(t *testing.T) {
 		Phase: generatedruntimestate.PhaseMigrating, MigrationState: generatedruntimestate.MigrationRunning,
 		Components: []generatedruntimestate.Component{{DeploymentID: testDeploymentID, Name: "api", Slot: "blue", ImageArtifactID: testArtifactID, State: generatedruntimestate.ComponentImageReady}},
 	}
-	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err == nil || len(fixture.migrations.requests) != 0 {
 		t.Fatalf("err=%v migration calls=%d", err, len(fixture.migrations.requests))
 	}
@@ -1000,7 +1136,7 @@ func TestGeneratedExecutorRecoveryAcquiresAndConsumesNewProcessReservation(t *te
 			ContainerName: description.ContainerName, State: generatedruntimestate.ComponentRunning,
 		}},
 	}
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1023,7 +1159,7 @@ func TestGeneratedExecutorCleansCandidateWhenActiveCASRollbackSucceeds(t *testin
 	fixture.state.failSwitchActive = true
 	fixture.routes.errs = []error{nil, nil}
 
-	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "apply_failed" {
 		t.Fatalf("err=%v", err)
@@ -1046,7 +1182,7 @@ func TestGeneratedExecutorPreservesFirstSlotWhenActiveCASFails(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	fixture.state.failSwitchActive = true
 
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -1070,7 +1206,7 @@ func TestGeneratedExecutorPreservesBothSlotsWhenActiveCASRollbackFails(t *testin
 	fixture.state.failSwitchActive = true
 	fixture.routes.errs = []error{nil, errors.New("rollback route unavailable")}
 
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -1095,7 +1231,7 @@ func TestGeneratedExecutorPreservesBothSlotsWhenActiveCASRollbackFails(t *testin
 func TestGeneratedExecutorNeverCleansNewSlotAfterActiveCAS(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	fixture.state.failAdvanceToDraining = true
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -1114,13 +1250,13 @@ func TestGeneratedExecutorReattestsRouteBeforeResumingAfterActiveCAS(t *testing.
 	fixture := newExecutorFixture(t, false)
 	fixture.state.failAdvanceToDraining = true
 
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || len(fixture.routes.requests) != 1 {
 		t.Fatalf("first result=%+v err=%v routes=%+v", result, err, fixture.routes.requests)
 	}
 
 	fixture.state.failAdvanceToDraining = false
-	result, err = fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err = fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("retry result=%+v err=%v", result, err)
 	}
@@ -1134,12 +1270,12 @@ func TestGeneratedExecutorDoesNotDrainWhenRouteReattestationFails(t *testing.T) 
 	fixture.state.failAdvanceToDraining = true
 	fixture.routes.errs = []error{nil, errors.New("route reattestation unavailable")}
 
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("first result=%+v err=%v", result, err)
 	}
 	fixture.state.failAdvanceToDraining = false
-	result, err = fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err = fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("retry result=%+v err=%v", result, err)
 	}
@@ -1154,7 +1290,7 @@ func TestGeneratedExecutorRetriesOldSlotCleanupWithoutTerminalizingDeployment(t 
 	fixture.executor.waitDrain = func(context.Context, time.Duration) error { return nil }
 	fixture.runtime.stopErrs = []error{errors.New("old slot cleanup unavailable"), nil}
 
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -1166,7 +1302,7 @@ func TestGeneratedExecutorRetriesOldSlotCleanupWithoutTerminalizingDeployment(t 
 	}
 
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	result, err = fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err = fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded || fixture.deployments.deployment.Status != deployments.Succeeded {
 		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, fixture.state.deployment, fixture.deployments.deployment)
 	}
@@ -1204,7 +1340,7 @@ func TestGeneratedExecutorStopsPreviousSlotOnlyAfterDrainCompletes(t *testing.T)
 	}
 	completed := make(chan outcome, 1)
 	go func() {
-		result, err := fixture.executor.Execute(testContext, deploymentJob(), fixture.reporter)
+		result, err := fixture.execute(testContext, deploymentJob(), fixture.reporter)
 		completed <- outcome{result: result, err: err}
 	}()
 
@@ -1251,7 +1387,7 @@ func TestGeneratedExecutorPreservesCandidateWhenFailedRouteMayBeLive(t *testing.
 	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "green", Generation: 4}
 	fixture.routes.err = candidateMayBeLiveRouteError{}
 
-	result, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -1273,7 +1409,7 @@ func TestGeneratedExecutorCleansCandidateAfterRolledBackRouteFailure(t *testing.
 	fixture := newExecutorFixture(t, false)
 	fixture.routes.err = errors.New("route rolled back")
 
-	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "apply_failed" {
 		t.Fatalf("err=%v", err)
@@ -1292,7 +1428,7 @@ func TestGeneratedExecutorPersistsGatewayReadinessFailureAndPreservesOldHead(t *
 	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "green", Generation: 4}
 	fixture.routes.err = gatewayReadinessRouteError{}
 
-	_, err := fixture.executor.Execute(context.Background(), deploymentJob(), fixture.reporter)
+	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "gateway_readiness_failed" {
 		t.Fatalf("err=%v", err)

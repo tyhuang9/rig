@@ -202,6 +202,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	deploymentStore := deployments.New(db)
+	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	migrationRunner := &migrationJourneyRunner{}
 	settings := config.Defaults()
 	settings.DataRoot = dataRoot
@@ -209,6 +210,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
+		effectsWorkingDirectory: effectsWorkingDirectory,
 	}, runtimeCompositionOptions{
 		dockerExecutable: docker,
 		migrationRunnerFactory: func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
@@ -385,7 +387,9 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	workerContext, stopWorkerContext := context.WithCancel(ctx)
 	workerDone, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
 		recoverState: jobStore.RecoverRuntimeContext,
-	}, composition.executor, jobStore.RunWorker, func(workerErr error) { t.Errorf("migration journey worker: %v", workerErr) })
+	}, composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
+	}, func(workerErr error) { t.Errorf("migration journey worker: %v", workerErr) })
 	if err != nil {
 		t.Fatal("start migration journey worker:", err)
 	}
@@ -649,10 +653,12 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	reopenedDeployments := deployments.New(db)
+	reopenedEffectsWorkingDirectory, reopenedScopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	recoveryRunner := &migrationJourneyRunner{}
 	reopened, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: apps.New(db), snapshots: reopenedSnapshots, configuration: reopenedConfiguration,
 		deployments: reopenedDeployments, plans: reopenedPlans, bindings: reopenedBindings,
+		effectsWorkingDirectory: reopenedEffectsWorkingDirectory,
 	}, runtimeCompositionOptions{
 		dockerExecutable: docker,
 		migrationRunnerFactory: func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
@@ -666,7 +672,9 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	recoveryWorkerContext, stopRecoveryWorkerContext := context.WithCancel(ctx)
 	recoveryWorkerDone, err := prepareRuntimeWorker(recoveryWorkerContext, runtimeRecovery{
 		recoverState: reopenedJobs.RecoverRuntimeContext,
-	}, reopened.executor, reopenedJobs.RunWorker, func(workerErr error) { t.Errorf("migration journey recovery worker: %v", workerErr) })
+	}, reopened.executor, func(workerContext context.Context, executor jobs.Executor) error {
+		return reopenedJobs.RunWorkerWithScopedAdmission(workerContext, executor, reopenedScopedAdmission)
+	}, func(workerErr error) { t.Errorf("migration journey recovery worker: %v", workerErr) })
 	if err != nil {
 		t.Fatal("start recovered migration journey worker:", err)
 	}
