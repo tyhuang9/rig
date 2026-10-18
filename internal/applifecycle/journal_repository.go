@@ -177,8 +177,12 @@ func (r *Repository) AuthorizePending(ctx context.Context, claim WorkerClaim, in
 // scan uses multiple database reads, so callers must hold the shared effects
 // exclusion when using the result to admit effects.
 func (r *Repository) PendingStartExists(ctx context.Context) (bool, error) {
+	return pendingStartExistsQuery(ctx, r.db)
+}
+
+func pendingStartExistsQuery(ctx context.Context, query lifecycleQuery) (bool, error) {
 	found := false
-	err := r.scanStartIntents(ctx, func(_ Operation, _ Intent, receipt *Receipt) (bool, error) {
+	err := scanStartIntentsQuery(ctx, query, func(_ Operation, _ Intent, receipt *Receipt) (bool, error) {
 		if receipt != nil {
 			return false, nil
 		}
@@ -196,12 +200,19 @@ func (r *Repository) PendingStartExists(ctx context.Context) (bool, error) {
 // callers hold effects exclusion and separately authorize exact pending
 // intents before issuing an effect.
 func (r *Repository) scanStartIntents(ctx context.Context, visit func(Operation, Intent, *Receipt) (bool, error)) error {
+	return scanStartIntentsQuery(ctx, r.db, visit)
+}
+
+func scanStartIntentsQuery(ctx context.Context, query lifecycleQuery, visit func(Operation, Intent, *Receipt) (bool, error)) error {
+	if query == nil {
+		return ErrInvalidEffect
+	}
 	if visit == nil {
 		return ErrInvalidEffect
 	}
 	var afterJob, afterComponent string
 	for {
-		rows, err := r.db.QueryContext(ctx, `SELECT job_id,component_name
+		rows, err := query.QueryContext(ctx, `SELECT job_id,component_name
 			FROM application_lifecycle_effect_intents
 			WHERE boundary='start' AND (job_id>? OR (job_id=? AND component_name>?))
 			ORDER BY job_id,component_name LIMIT 32`, afterJob, afterJob, afterComponent)
@@ -224,11 +235,11 @@ func (r *Repository) scanStartIntents(ctx context.Context, visit func(Operation,
 			return err
 		}
 		for _, value := range batch {
-			operation, loadErr := r.Operation(ctx, value.jobID)
+			operation, loadErr := operationByJob(ctx, query, value.jobID)
 			if loadErr != nil {
 				return loadErr
 			}
-			intent, loadErr := intentByKey(ctx, r.db, value.jobID, BoundaryStart, value.component)
+			intent, loadErr := intentByKey(ctx, query, value.jobID, BoundaryStart, value.component)
 			if loadErr != nil {
 				return loadErr
 			}
@@ -236,7 +247,7 @@ func (r *Repository) scanStartIntents(ctx context.Context, visit func(Operation,
 			if !ok || spec.outcome != OutcomeContainerRunning || validateIntentForOperation(operation, intent, spec) != nil {
 				return ErrInvalidEffect
 			}
-			receipt, loadErr := receiptByKey(ctx, r.db, value.jobID, BoundaryStart, value.component)
+			receipt, loadErr := receiptByKey(ctx, query, value.jobID, BoundaryStart, value.component)
 			if errors.Is(loadErr, ErrEffectNotFound) {
 				stop, visitErr := visit(operation, intent, nil)
 				if visitErr != nil {
