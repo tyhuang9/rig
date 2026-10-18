@@ -73,14 +73,14 @@
     {
       "id": "partition-06",
       "cases": [
+        "scenario/pending-route-restart",
         "boundary/r01-rollback-intent",
         "scenario/lost-cutover-ack",
         "scenario/lost-successor-serving-ack",
         "boundary/r02-rollback-completed",
         "scenario/literal-unresolved-database-committed",
         "scenario/terminal-replay",
-        "scenario/selected-current-restoration",
-        "scenario/pending-route-restart"
+        "scenario/selected-current-restoration"
       ]
     },
     {
