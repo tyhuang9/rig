@@ -31,6 +31,23 @@ func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedruntime.Capac
 			snapshot = generatedruntime.CapacitySnapshot{}
 		}
 	}()
+	// A native rebind commits its successor outside the migration-026 state.
+	// Select and attest that SQL authority before consulting legacy history so a
+	// capacity read cannot fall back to the retired predecessor.
+	selection, _, handled, err := m.gatewayCurrentSelectedStateLocked(ctx)
+	if err != nil {
+		return generatedruntime.CapacitySnapshot{}, err
+	}
+	if handled {
+		attestation, err := m.attestGatewayCurrentPhysicalLocked(ctx, selection)
+		if err != nil {
+			return generatedruntime.CapacitySnapshot{}, err
+		}
+		if attestation.Outcome != gatewayCurrentPhysicalStableServing || attestation.Resources.FinalContainer == nil {
+			return generatedruntime.CapacitySnapshot{}, &Error{Code: DiagnosticRouteUnresolved}
+		}
+		return m.snapshotFromContainer(ctx, attestation.Resources.FinalContainer.ID)
+	}
 	if _, state, journal, committed, err := m.committedV2Locked(ctx); err != nil {
 		return generatedruntime.CapacitySnapshot{}, err
 	} else if committed {

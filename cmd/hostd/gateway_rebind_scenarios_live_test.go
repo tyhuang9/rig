@@ -537,6 +537,13 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 	t.Helper()
 	fixture := newLiveHostdGatewayRebindFixture(t)
 	historicalID := liveHostdRebindCompleteHistorical(t, fixture)
+	if kind == "route" {
+		receipt := liveHostdRebindReadTerminal(t, fixture.dataRoot, historicalID)
+		if receipt.Disposition != appaccess.GatewayRebindDispositionCommit {
+			t.Fatal("pending route historical disposition is not commit")
+		}
+		t.Log("pending route historical disposition=commit")
+	}
 	markerID := uuid.NewString()
 	child := liveHostdRebindStartChild(t, fixture, markerID, "", "pending-"+kind+"-restart")
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
@@ -575,6 +582,27 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 
 	testDeadline, hasTestDeadline := t.Deadline()
 	var disableSnapshot liveHostdRebindDisableSnapshot
+	var routeObserver *liveHostdRebindPendingRouteObserver
+	if kind == "route" {
+		if _, err := liveHostdRebindPendingRouteObservationBudget(time.Now(), fixture.ctx,
+			testDeadline, hasTestDeadline); err != nil {
+			fail(fmt.Errorf("reserve pending route observation before requests: %w", err), liveHostdRebindDisableClaimCensus{})
+			return
+		}
+		observerDB, err := database.Open(fixture.dataRoot)
+		if err != nil {
+			fail(errors.New("open pending route observer failed"), liveHostdRebindDisableClaimCensus{})
+			return
+		}
+		routeObserver = liveHostdRebindNewPendingRouteObserver(observerDB, fixture.app.id)
+		// Reuse the one observer opened before the public mutations. The bounded
+		// waiter returns before cleanup closes it or terminates the exact child.
+		defer func() {
+			if err := observerDB.Close(); err != nil {
+				t.Error("close pending route observer")
+			}
+		}()
+	}
 	if kind == "lan" {
 		if _, err := liveHostdRebindClaimObservationBudget(time.Now(), fixture.ctx, testDeadline, hasTestDeadline); err != nil {
 			fail(fmt.Errorf("reserve pending LAN claim observation before requests: %w", err), liveHostdRebindDisableClaimCensus{})
@@ -626,9 +654,11 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 			t.Fatalf("enqueue local-source route replacement: status=%d error=%v body=%s",
 				requestStatus, requestErr, string(requestBody))
 		}
-		// Acceptance precedes the barrier wait. The child must have admitted a
-		// real durable deployment job that can progress without a GitHub provider.
-		liveHostdRebindAssertDeploymentStarted(t, fixture, mutation.Job.ID)
+		if _, _, err := liveHostdRebindWaitPendingRouteBoundaryResult(fixture.ctx,
+			testDeadline, hasTestDeadline, child, mutation.Job.ID, routeObserver.snapshot); err != nil {
+			fail(err, liveHostdRebindDisableClaimCensus{})
+			return
+		}
 	case "lan":
 		firstID, firstRequest := liveHostdRebindDisableRequest(t, fixture, fixture.app.id)
 		recoveryOperations = append(recoveryOperations, firstID)
@@ -644,7 +674,9 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 	default:
 		t.Fatalf("unknown pending current scenario %q", kind)
 	}
-	liveHostdRebindWaitBoundary(t, fixture, child)
+	if kind == "lan" {
+		liveHostdRebindWaitBoundary(t, fixture, child)
+	}
 	if err := liveHostdRebindKillAndReapError(child); err != nil {
 		fail(errors.New("reap original child before pending request join"), liveHostdRebindDisableClaimCensus{})
 		return
@@ -729,31 +761,6 @@ func liveHostdRebindMigratedPendingLANBatchScenario(t *testing.T) {
 		t.Fatal("reap fresh native batch recovery child:", err)
 	}
 	complete = true
-}
-
-func liveHostdRebindAssertDeploymentStarted(t *testing.T, fixture *liveHostdGatewayRebindFixture,
-	jobID string,
-) {
-	t.Helper()
-	for deadline := time.Now().Add(2 * time.Minute); ; time.Sleep(20 * time.Millisecond) {
-		db, err := database.Open(fixture.dataRoot)
-		if err == nil {
-			job, getErr := jobs.New(db).Get(jobID)
-			closeErr := db.Close()
-			if getErr == nil && closeErr == nil {
-				if job.Status == string(jobs.Failed) || job.Status == string(jobs.NeedsAttention) ||
-					job.Status == string(jobs.WaitingUser) || job.Status == string(jobs.Succeeded) {
-					t.Fatalf("route replacement reached terminal status before the publication barrier: %#v", job)
-				}
-				if job.Status != string(jobs.Queued) {
-					return
-				}
-			}
-		}
-		if time.Now().After(deadline) || fixture.ctx.Err() != nil {
-			t.Fatal("accepted route replacement did not start before barrier wait")
-		}
-	}
 }
 
 func liveHostdRebindDisableRequest(t *testing.T, fixture *liveHostdGatewayRebindFixture,
