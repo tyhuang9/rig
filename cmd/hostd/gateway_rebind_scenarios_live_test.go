@@ -385,6 +385,14 @@ func liveHostdRebindAssertQueuedWorkerSentinel(t *testing.T, fixture *liveHostdG
 
 func liveHostdRebindCompleteHistorical(t *testing.T, fixture *liveHostdGatewayRebindFixture) string {
 	t.Helper()
+	operationID, _ := liveHostdRebindCompleteHistoricalWithProof(t, fixture)
+	return operationID
+}
+
+func liveHostdRebindCompleteHistoricalWithProof(t *testing.T,
+	fixture *liveHostdGatewayRebindFixture,
+) (string, liveHostdRebindStatus) {
+	t.Helper()
 	operationID := uuid.NewString()
 	fixture.registerOperation(operationID)
 	child := liveHostdRebindStartChild(t, fixture, operationID, "", "")
@@ -406,7 +414,7 @@ func liveHostdRebindCompleteHistorical(t *testing.T, fixture *liveHostdGatewayRe
 	liveHostdRebindAssertTerminal(t, status, operationID)
 	liveHostdRebindAssertServing(t, fixture, status)
 	liveHostdRebindKillAndReap(t, child)
-	return operationID
+	return operationID, status
 }
 
 func liveHostdRebindRunTerminalReplay(t *testing.T) {
@@ -536,7 +544,13 @@ func liveHostdRebindOperationResourceCensus(t *testing.T, fixture *liveHostdGate
 func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 	t.Helper()
 	fixture := newLiveHostdGatewayRebindFixture(t)
-	historicalID := liveHostdRebindCompleteHistorical(t, fixture)
+	var historicalID string
+	var historicalProof liveHostdRebindStatus
+	if kind == "route" {
+		historicalID, historicalProof = liveHostdRebindCompleteHistoricalWithProof(t, fixture)
+	} else {
+		historicalID = liveHostdRebindCompleteHistorical(t, fixture)
+	}
 	if kind == "route" {
 		receipt := liveHostdRebindReadTerminal(t, fixture.dataRoot, historicalID)
 		if receipt.Disposition != appaccess.GatewayRebindDispositionCommit {
@@ -693,8 +707,14 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 		if ready.RecoveryOnly {
 			t.Fatal("ordinary pending route was not recovered before normal admission")
 		}
-		status := liveHostdRebindRecover(t, fixture, historicalID, ready)
-		liveHostdRebindAssertTerminal(t, status, historicalID)
+		status, replayErr := liveHostdRebindNormalReplayAfterCurrentRevision(fixture,
+			historicalID, historicalProof)
+		if replayErr != nil {
+			fail(fmt.Errorf("normal retained rebind later-current replay: %w", replayErr),
+				liveHostdRebindDisableClaimCensus{})
+			return
+		}
+		liveHostdRebindAssertDurableTerminal(t, fixture, historicalProof, historicalID, false)
 		liveHostdRebindAssertServing(t, fixture, status)
 	} else {
 		if !ready.RecoveryOnly || ready.RecoveryKind != "lan_disable" ||

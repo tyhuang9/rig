@@ -201,6 +201,229 @@ func TestLiveHostdRebindNormalReplayControls(t *testing.T) {
 		})
 	}
 
+	t.Run("later current revision reuses verified baseline", func(t *testing.T) {
+		operationID := "operation-later-current"
+		diagnostic := liveHostdRebindTerminalControlStatus(operationID, "commit")
+		verified := liveHostdRebindTerminalControlReplay(diagnostic)
+		later := verified
+		later.TerminalProof = "unavailable"
+		later.TerminalProofDigest = ""
+		later.CurrentAttestationDigest = strings.Repeat("c", 64)
+		var calls []string
+		var posted [][]byte
+		var mu sync.Mutex
+		fixture := liveHostdRebindTerminalControlFixture(t, func(writer http.ResponseWriter, requestIn *http.Request) {
+			mu.Lock()
+			calls = append(calls, requestIn.Method+" "+requestIn.URL.Path)
+			if requestIn.Method == http.MethodGet {
+				mu.Unlock()
+				_ = json.NewEncoder(writer).Encode(diagnostic)
+				return
+			}
+			body, _ := io.ReadAll(requestIn.Body)
+			posted = append(posted, body)
+			post := len(posted)
+			mu.Unlock()
+			if post == 1 {
+				_ = json.NewEncoder(writer).Encode(verified)
+				return
+			}
+			_ = json.NewEncoder(writer).Encode(later)
+		})
+		request := []byte(`{"operationId":"operation-later-current","version":1,"proposalDigest":"reviewed"}`)
+		if err := fixture.retainCommitRequest(operationID, request); err != nil {
+			t.Fatal(err)
+		}
+		baseline, err := liveHostdRebindNormalReplay(fixture, operationID)
+		if err != nil || baseline.TerminalProof != "verified" || baseline.CurrentProof != "verified" {
+			t.Fatalf("establish fully verified replay baseline: status=%#v error=%v", baseline, err)
+		}
+		advanced, err := liveHostdRebindNormalReplayAfterCurrentRevision(fixture, operationID, baseline)
+		mu.Lock()
+		recordedCalls := append([]string(nil), calls...)
+		postedBodies := make([][]byte, len(posted))
+		for index := range posted {
+			postedBodies[index] = append([]byte(nil), posted[index]...)
+		}
+		mu.Unlock()
+		if err != nil || len(recordedCalls) != 4 ||
+			recordedCalls[0] != http.MethodGet+" /api/v1/system/lan-gateway-rebind/"+operationID ||
+			recordedCalls[1] != http.MethodPost+" /api/v1/system/lan-gateway-rebind" ||
+			recordedCalls[2] != http.MethodGet+" /api/v1/system/lan-gateway-rebind/"+operationID ||
+			recordedCalls[3] != http.MethodPost+" /api/v1/system/lan-gateway-rebind" ||
+			len(postedBodies) != 2 || !bytes.Equal(postedBodies[0], request) || !bytes.Equal(postedBodies[1], request) ||
+			advanced.TerminalProof != "unavailable" || advanced.TerminalDigest != "" ||
+			advanced.CurrentProof != "verified" || advanced.CurrentDigest != later.CurrentAttestationDigest ||
+			advanced.Operation == nil || baseline.Operation == nil || *advanced.Operation != *baseline.Operation ||
+			advanced.SelectedCurrent == nil || baseline.SelectedCurrent == nil ||
+			*advanced.SelectedCurrent != *baseline.SelectedCurrent {
+			t.Fatalf("later current replay did not retain its verified baseline or exact request: status=%#v calls=%v error=%v",
+				advanced, recordedCalls, err)
+		}
+	})
+
+	t.Run("later current revision refusals are closed", func(t *testing.T) {
+		const private = "private-later-current-replay-secret"
+		operationID := "operation-later-current-refusal"
+
+		for _, testCase := range []struct {
+			name   string
+			mutate func(*liveHostdRebindStatus)
+		}{
+			{name: "terminal baseline", mutate: func(status *liveHostdRebindStatus) {
+				status.TerminalProof = "unavailable"
+				status.TerminalDigest = ""
+			}},
+			{name: "current baseline", mutate: func(status *liveHostdRebindStatus) {
+				status.CurrentProof = "unavailable"
+				status.CurrentDigest = ""
+			}},
+			{name: "abort baseline", mutate: func(status *liveHostdRebindStatus) {
+				aborted := liveHostdRebindLaterCurrentControlBaseline(operationID)
+				aborted.Operation.TerminalDisposition = "abort"
+				aborted.Operation.StoredState = string(appaccess.GatewayRebindRolledBack)
+				aborted.Operation.DatabaseCommitObserved = false
+				*status = aborted
+			}},
+			{name: "foreign authority baseline", mutate: func(status *liveHostdRebindStatus) {
+				status.SelectedCurrent.OperationID = private
+			}},
+		} {
+			t.Run("rejects "+testCase.name, func(t *testing.T) {
+				baseline := liveHostdRebindLaterCurrentControlBaseline(operationID)
+				testCase.mutate(&baseline)
+				var calls int
+				var mu sync.Mutex
+				fixture := liveHostdRebindTerminalControlFixture(t, func(writer http.ResponseWriter, _ *http.Request) {
+					mu.Lock()
+					calls++
+					mu.Unlock()
+					writer.WriteHeader(http.StatusInternalServerError)
+				})
+				status, err := liveHostdRebindNormalReplayAfterCurrentRevision(fixture, operationID, baseline)
+				mu.Lock()
+				callCount := calls
+				mu.Unlock()
+				if err == nil || err.Error() != "normal rebind later-current refusal: baseline" ||
+					strings.Contains(err.Error(), private) || callCount != 0 || status.Operation != nil ||
+					status.TerminalProof != "" || status.CurrentProof != "" {
+					t.Fatal("invalid baseline was not refused before any request with the fixed category")
+				}
+			})
+		}
+
+		for _, testCase := range []struct {
+			name, category string
+			mutate         func(*liveHostdRebindStatus, *apicontract.LANGatewayRebindMutation)
+		}{
+			{name: "created", category: "flags", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.Created = true
+			}},
+			{name: "recovery required", category: "flags", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.RecoveryRequired = true
+			}},
+			{name: "fence retained", category: "flags", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.FenceReleased = false
+			}},
+			{name: "terminal verified", category: "terminal_proof", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.TerminalProof = "verified"
+				replay.TerminalProofDigest = strings.Repeat("a", 64)
+			}},
+			{name: "terminal digest retained", category: "terminal_proof", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.TerminalProofDigest = strings.Repeat("a", 64)
+			}},
+			{name: "terminal proof unknown", category: "terminal_proof", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.TerminalProof = private
+			}},
+			{name: "current unavailable", category: "current_proof", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.CurrentProof = "unavailable"
+				replay.CurrentAttestationDigest = ""
+			}},
+			{name: "current proof unknown", category: "current_proof", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.CurrentProof = private
+			}},
+			{name: "current digest missing", category: "current_proof", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.CurrentAttestationDigest = ""
+			}},
+			{name: "current digest malformed", category: "current_proof", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.CurrentAttestationDigest = strings.Repeat("A", 64)
+			}},
+			{name: "operation id", category: "operation", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.Operation.OperationID = private
+			}},
+			{name: "operation receipt", category: "operation", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.Operation.TerminalReceiptDigest = private
+			}},
+			{name: "authority missing", category: "authority", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.SelectedCurrentAuthority = nil
+			}},
+			{name: "authority profile missing", category: "authority", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.SelectedCurrentAuthority.ProfileRevisionID = ""
+			}},
+			{name: "authority digest malformed", category: "authority", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.SelectedCurrentAuthority.ProfileSpecDigest = private
+			}},
+			{name: "authority kind unknown", category: "authority", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.SelectedCurrentAuthority.Kind = private
+			}},
+			{name: "operation sequence changed", category: "identity", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.Operation.StateSequence++
+			}},
+			{name: "operation receipt changed", category: "identity", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.Operation.TerminalReceiptDigest = strings.Repeat("9", 64)
+			}},
+			{name: "authority profile changed", category: "identity", mutate: func(_ *liveHostdRebindStatus, replay *apicontract.LANGatewayRebindMutation) {
+				replay.SelectedCurrentAuthority.ProfileRevisionID = private
+			}},
+			{name: "diagnostic operation changed", category: "identity", mutate: func(diagnostic *liveHostdRebindStatus, _ *apicontract.LANGatewayRebindMutation) {
+				diagnostic.Operation.StateSequence++
+			}},
+			{name: "diagnostic authority changed", category: "identity", mutate: func(diagnostic *liveHostdRebindStatus, _ *apicontract.LANGatewayRebindMutation) {
+				diagnostic.SelectedCurrent.ProfileRevisionID = private
+			}},
+		} {
+			t.Run("rejects "+testCase.name, func(t *testing.T) {
+				baseline := liveHostdRebindLaterCurrentControlBaseline(operationID)
+				diagnostic := liveHostdRebindTerminalControlStatus(operationID, "commit")
+				replay := liveHostdRebindLaterCurrentControlReplay(diagnostic)
+				testCase.mutate(&diagnostic, &replay)
+				requestBody := []byte(`{"operationId":"operation-later-current-refusal","approval":"` + private + `"}`)
+				var calls []string
+				var posted []byte
+				var mu sync.Mutex
+				fixture := liveHostdRebindTerminalControlFixture(t, func(writer http.ResponseWriter, requestIn *http.Request) {
+					mu.Lock()
+					calls = append(calls, requestIn.Method+" "+requestIn.URL.Path)
+					if requestIn.Method == http.MethodPost {
+						posted, _ = io.ReadAll(requestIn.Body)
+					}
+					mu.Unlock()
+					if requestIn.Method == http.MethodGet {
+						_ = json.NewEncoder(writer).Encode(diagnostic)
+						return
+					}
+					_ = json.NewEncoder(writer).Encode(replay)
+				})
+				if err := fixture.retainCommitRequest(operationID, requestBody); err != nil {
+					t.Fatal(err)
+				}
+				status, err := liveHostdRebindNormalReplayAfterCurrentRevision(fixture, operationID, baseline)
+				mu.Lock()
+				recordedCalls, captured := append([]string(nil), calls...), append([]byte(nil), posted...)
+				mu.Unlock()
+				want := "normal rebind later-current refusal: " + testCase.category
+				if err == nil || err.Error() != want || strings.Contains(err.Error(), private) ||
+					len(recordedCalls) != 2 ||
+					recordedCalls[0] != http.MethodGet+" /api/v1/system/lan-gateway-rebind/"+operationID ||
+					recordedCalls[1] != http.MethodPost+" /api/v1/system/lan-gateway-rebind" ||
+					!bytes.Equal(captured, requestBody) || status.Operation != nil ||
+					status.TerminalProof != "" || status.CurrentProof != "" {
+					t.Fatalf("invalid later-current replay was not refused exactly once with category %q", testCase.category)
+				}
+			})
+		}
+	})
+
 	t.Run("missing retained request makes no post", func(t *testing.T) {
 		operationID := "operation-missing"
 		diagnostic := liveHostdRebindTerminalControlStatus(operationID, "commit")
@@ -440,4 +663,23 @@ func liveHostdRebindTerminalControlReplay(status liveHostdRebindStatus) apicontr
 		CurrentProof: "verified", CurrentAttestationDigest: strings.Repeat("b", 64),
 		SelectedCurrentAuthority: &authority,
 	}
+}
+
+func liveHostdRebindLaterCurrentControlBaseline(operationID string) liveHostdRebindStatus {
+	status := liveHostdRebindTerminalControlStatus(operationID, "commit")
+	status.TerminalProof = "verified"
+	status.TerminalDigest = strings.Repeat("a", 64)
+	status.CurrentProof = "verified"
+	status.CurrentDigest = strings.Repeat("b", 64)
+	return status
+}
+
+func liveHostdRebindLaterCurrentControlReplay(
+	status liveHostdRebindStatus,
+) apicontract.LANGatewayRebindMutation {
+	replay := liveHostdRebindTerminalControlReplay(status)
+	replay.TerminalProof = "unavailable"
+	replay.TerminalProofDigest = ""
+	replay.CurrentAttestationDigest = strings.Repeat("c", 64)
+	return replay
 }

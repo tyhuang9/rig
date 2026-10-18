@@ -1253,37 +1253,59 @@ func liveHostdRebindPrepareRequest(t *testing.T, fixture *liveHostdGatewayRebind
 func liveHostdRebindNormalReplay(fixture *liveHostdGatewayRebindFixture,
 	operationID string,
 ) (liveHostdRebindStatus, error) {
-	if fixture == nil || fixture.ctx == nil || operationID == "" {
-		return liveHostdRebindStatus{}, errors.New("normal rebind replay is unavailable")
-	}
-	path := "/api/v1/system/lan-gateway-rebind/" + operationID
-	statusCode, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet, path, nil)
-	if err != nil || statusCode != http.StatusOK {
-		return liveHostdRebindStatus{}, errors.New("normal rebind diagnostic read failed")
-	}
-	var diagnostic liveHostdRebindStatus
-	if json.Unmarshal(body, &diagnostic) != nil {
-		return liveHostdRebindStatus{}, errors.New("normal rebind diagnostic response is invalid")
-	}
-	if err := liveHostdRebindValidateNormalReplayDiagnostic(diagnostic, operationID); err != nil {
+	diagnostic, replay, err := liveHostdRebindNormalReplayExchange(fixture, operationID)
+	if err != nil {
 		return liveHostdRebindStatus{}, err
-	}
-	request, ok := fixture.retainedCommitRequest(operationID)
-	if !ok {
-		return liveHostdRebindStatus{}, errors.New("normal rebind replay request is unavailable")
-	}
-	statusCode, body, err = liveHostdRebindHTTPRaw(fixture.ctx, fixture, http.MethodPost,
-		"/api/v1/system/lan-gateway-rebind", request)
-	if err != nil || statusCode != http.StatusOK {
-		return liveHostdRebindStatus{}, liveHostdRebindNormalReplayFailure(statusCode, body, err)
-	}
-	var replay apicontract.LANGatewayRebindMutation
-	if json.Unmarshal(body, &replay) != nil {
-		return liveHostdRebindStatus{}, errors.New("normal rebind replay response is invalid")
 	}
 	if err := liveHostdRebindValidateNormalReplay(diagnostic, replay, operationID); err != nil {
 		return liveHostdRebindStatus{}, err
 	}
+	return liveHostdRebindStatusFromReplay(diagnostic, replay), nil
+}
+
+func liveHostdRebindNormalReplayExchange(fixture *liveHostdGatewayRebindFixture,
+	operationID string,
+) (liveHostdRebindStatus, apicontract.LANGatewayRebindMutation, error) {
+	if fixture == nil || fixture.ctx == nil || operationID == "" {
+		return liveHostdRebindStatus{}, apicontract.LANGatewayRebindMutation{},
+			errors.New("normal rebind replay is unavailable")
+	}
+	path := "/api/v1/system/lan-gateway-rebind/" + operationID
+	statusCode, body, err := liveHostdRebindHTTP(fixture.ctx, fixture, http.MethodGet, path, nil)
+	if err != nil || statusCode != http.StatusOK {
+		return liveHostdRebindStatus{}, apicontract.LANGatewayRebindMutation{},
+			errors.New("normal rebind diagnostic read failed")
+	}
+	var diagnostic liveHostdRebindStatus
+	if json.Unmarshal(body, &diagnostic) != nil {
+		return liveHostdRebindStatus{}, apicontract.LANGatewayRebindMutation{},
+			errors.New("normal rebind diagnostic response is invalid")
+	}
+	if err := liveHostdRebindValidateNormalReplayDiagnostic(diagnostic, operationID); err != nil {
+		return liveHostdRebindStatus{}, apicontract.LANGatewayRebindMutation{}, err
+	}
+	request, ok := fixture.retainedCommitRequest(operationID)
+	if !ok {
+		return liveHostdRebindStatus{}, apicontract.LANGatewayRebindMutation{},
+			errors.New("normal rebind replay request is unavailable")
+	}
+	statusCode, body, err = liveHostdRebindHTTPRaw(fixture.ctx, fixture, http.MethodPost,
+		"/api/v1/system/lan-gateway-rebind", request)
+	if err != nil || statusCode != http.StatusOK {
+		return liveHostdRebindStatus{}, apicontract.LANGatewayRebindMutation{},
+			liveHostdRebindNormalReplayFailure(statusCode, body, err)
+	}
+	var replay apicontract.LANGatewayRebindMutation
+	if json.Unmarshal(body, &replay) != nil {
+		return liveHostdRebindStatus{}, apicontract.LANGatewayRebindMutation{},
+			errors.New("normal rebind replay response is invalid")
+	}
+	return diagnostic, replay, nil
+}
+
+func liveHostdRebindStatusFromReplay(diagnostic liveHostdRebindStatus,
+	replay apicontract.LANGatewayRebindMutation,
+) liveHostdRebindStatus {
 	verified := diagnostic
 	verified.TerminalProof = replay.TerminalProof
 	verified.TerminalDigest = replay.TerminalProofDigest
@@ -1293,7 +1315,86 @@ func liveHostdRebindNormalReplay(fixture *liveHostdGatewayRebindFixture,
 	verified.Operation = &operation
 	authority := *replay.SelectedCurrentAuthority
 	verified.SelectedCurrent = &authority
-	return verified, nil
+	return verified
+}
+
+// liveHostdRebindNormalReplayAfterCurrentRevision is the route-only seam for
+// replay after an ordinary current-route recovery advanced the protected
+// revision. It accepts only the production-defined superseded-terminal proof
+// paired with a newly verified current attestation and an earlier fully
+// verified committed baseline for the exact operation and authority.
+func liveHostdRebindNormalReplayAfterCurrentRevision(fixture *liveHostdGatewayRebindFixture,
+	operationID string, baseline liveHostdRebindStatus,
+) (liveHostdRebindStatus, error) {
+	if !liveHostdRebindValidNormalReplayBaseline(baseline, operationID) {
+		return liveHostdRebindStatus{}, liveHostdRebindLaterCurrentRefusal(liveHostdRebindLaterCurrentBaseline)
+	}
+	diagnostic, replay, err := liveHostdRebindNormalReplayExchange(fixture, operationID)
+	if err != nil {
+		return liveHostdRebindStatus{}, err
+	}
+	if err := liveHostdRebindValidateLaterCurrentReplay(diagnostic, replay, operationID, baseline); err != nil {
+		return liveHostdRebindStatus{}, err
+	}
+	return liveHostdRebindStatusFromReplay(diagnostic, replay), nil
+}
+
+type liveHostdRebindLaterCurrentCategory string
+
+const (
+	liveHostdRebindLaterCurrentBaseline      liveHostdRebindLaterCurrentCategory = "baseline"
+	liveHostdRebindLaterCurrentFlags         liveHostdRebindLaterCurrentCategory = "flags"
+	liveHostdRebindLaterCurrentTerminalProof liveHostdRebindLaterCurrentCategory = "terminal_proof"
+	liveHostdRebindLaterCurrentCurrentProof  liveHostdRebindLaterCurrentCategory = "current_proof"
+	liveHostdRebindLaterCurrentOperation     liveHostdRebindLaterCurrentCategory = "operation"
+	liveHostdRebindLaterCurrentAuthority     liveHostdRebindLaterCurrentCategory = "authority"
+	liveHostdRebindLaterCurrentIdentity      liveHostdRebindLaterCurrentCategory = "identity"
+)
+
+func liveHostdRebindValidNormalReplayBaseline(status liveHostdRebindStatus, operationID string) bool {
+	return status.Version == generatedingress.GatewayRebindOperationInspectionVersion &&
+		status.OperationID == operationID &&
+		status.Availability == string(generatedingress.GatewayRebindOperationAvailable) &&
+		!status.Active && status.Historical && status.TerminalProof == "verified" &&
+		liveHostdRebindValidDigest(status.TerminalDigest) && status.CurrentProof == "verified" &&
+		liveHostdRebindValidDigest(status.CurrentDigest) && status.OperationFence == "released" &&
+		status.RecoveryPolicy == "" && len(status.AllowedActions) == 0 &&
+		liveHostdRebindValidOperation(status.Operation, operationID) &&
+		status.Operation.TerminalDisposition == "commit" &&
+		liveHostdRebindValidAuthority(status.SelectedCurrent) &&
+		status.SelectedCurrent.OperationID == operationID
+}
+
+func liveHostdRebindValidateLaterCurrentReplay(diagnostic liveHostdRebindStatus,
+	replay apicontract.LANGatewayRebindMutation, operationID string, baseline liveHostdRebindStatus,
+) error {
+	if replay.Created || replay.RecoveryRequired || !replay.FenceReleased {
+		return liveHostdRebindLaterCurrentRefusal(liveHostdRebindLaterCurrentFlags)
+	}
+	if replay.TerminalProof != "unavailable" || replay.TerminalProofDigest != "" {
+		return liveHostdRebindLaterCurrentRefusal(liveHostdRebindLaterCurrentTerminalProof)
+	}
+	if replay.CurrentProof != "verified" || !liveHostdRebindValidDigest(replay.CurrentAttestationDigest) {
+		return liveHostdRebindLaterCurrentRefusal(liveHostdRebindLaterCurrentCurrentProof)
+	}
+	if !liveHostdRebindValidOperation(&replay.Operation, operationID) {
+		return liveHostdRebindLaterCurrentRefusal(liveHostdRebindLaterCurrentOperation)
+	}
+	if !liveHostdRebindValidAuthority(replay.SelectedCurrentAuthority) {
+		return liveHostdRebindLaterCurrentRefusal(liveHostdRebindLaterCurrentAuthority)
+	}
+	if diagnostic.Operation == nil || diagnostic.SelectedCurrent == nil || baseline.Operation == nil ||
+		baseline.SelectedCurrent == nil || *diagnostic.Operation != replay.Operation ||
+		*baseline.Operation != replay.Operation ||
+		*diagnostic.SelectedCurrent != *replay.SelectedCurrentAuthority ||
+		*baseline.SelectedCurrent != *replay.SelectedCurrentAuthority {
+		return liveHostdRebindLaterCurrentRefusal(liveHostdRebindLaterCurrentIdentity)
+	}
+	return nil
+}
+
+func liveHostdRebindLaterCurrentRefusal(category liveHostdRebindLaterCurrentCategory) error {
+	return errors.New("normal rebind later-current refusal: " + string(category))
 }
 
 // The retained request and response may contain authority or private state.
