@@ -57,8 +57,8 @@ func (backgroundControlResolver) ResolveHead(context.Context, autodeploy.SourceS
 
 type backgroundControlJobs struct{}
 
-func (backgroundControlJobs) CreateWithInputFinalized(jobs.CreateRequest, jobs.CreateFinalizer) (jobs.Job, bool, error) {
-	return jobs.Job{}, false, errors.New("unexpected background control job creation")
+func (backgroundControlJobs) CreateDeploymentWithInputTransaction(context.Context, jobs.DeploymentCreateRequest, jobs.DeploymentCreateHooks) (jobs.DeploymentCreateResult, error) {
+	return jobs.DeploymentCreateResult{}, errors.New("unexpected background control job creation")
 }
 
 // TestGatewayRebindBackgroundSentinelsUseRealRecoveryMethods drives the actual

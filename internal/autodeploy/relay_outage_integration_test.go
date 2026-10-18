@@ -95,10 +95,11 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 		t.Fatalf("PostgreSQL desired generation=%d sha=%q want generation=3 sha=%q err=%v", generation, desiredSHA, coordinatorThirdSHA, err)
 	}
 
-	jobService := jobs.New(db)
-	manual, created, err := jobService.CreateWithInput(jobs.CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: testApp, IdempotencyKey: "relay-outage-manual", RequestedBy: testOwner, Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent}})
-	if err != nil || !created {
-		t.Fatalf("create manual deployment created=%t err=%v", created, err)
+	jobService := newCoordinatorJobService(t, db)
+	manualResult, err := jobService.CreateDeploymentWithInputTransaction(ctx, jobs.DeploymentCreateRequest{ApplicationID: testApp, IdempotencyKey: "relay-outage-manual", RequestedBy: testOwner, Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent}}, jobs.DeploymentCreateHooks{})
+	manual := manualResult.Job
+	if err != nil || !manualResult.Created {
+		t.Fatalf("create manual deployment created=%t err=%v", manualResult.Created, err)
 	}
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	workerDone := make(chan error, 1)
@@ -172,7 +173,7 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	resolver := &relayOutageResolver{sha: coordinatorThirdSHA}
 	config := DefaultCoordinatorConfig()
 	config.MinResolveInterval = time.Nanosecond
-	coordinator, err := NewCoordinator(autoRepository, resolver, jobs.New(db), config)
+	coordinator, err := NewCoordinator(autoRepository, resolver, newCoordinatorJobService(t, db), config)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,13 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/controllerrelay"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/relay/protocol"
 )
@@ -279,6 +282,11 @@ func (repository *finalizeBarrierRepository) FinalizeResolvedHead(ctx context.Co
 
 type busyJobCreator struct{ calls int }
 
+type lifecycleRefusalJobCreator struct {
+	err   error
+	calls int
+}
+
 type scriptedDispatchPreflight struct {
 	mutex    sync.Mutex
 	results  []DispatchPreflightResult
@@ -307,9 +315,14 @@ func (preflight *scriptedDispatchPreflight) Requests() []DispatchPreflightReques
 	return append([]DispatchPreflightRequest(nil), preflight.requests...)
 }
 
-func (creator *busyJobCreator) CreateWithInputFinalized(jobs.CreateRequest, jobs.CreateFinalizer) (jobs.Job, bool, error) {
+func (creator *busyJobCreator) CreateDeploymentWithInputTransaction(context.Context, jobs.DeploymentCreateRequest, jobs.DeploymentCreateHooks) (jobs.DeploymentCreateResult, error) {
 	creator.calls++
-	return jobs.Job{}, false, jobs.ErrApplicationBusy
+	return jobs.DeploymentCreateResult{}, jobs.ErrApplicationBusy
+}
+
+func (creator *lifecycleRefusalJobCreator) CreateDeploymentWithInputTransaction(context.Context, jobs.DeploymentCreateRequest, jobs.DeploymentCreateHooks) (jobs.DeploymentCreateResult, error) {
+	creator.calls++
+	return jobs.DeploymentCreateResult{}, creator.err
 }
 
 type beforeCreateJobCreator struct {
@@ -317,11 +330,11 @@ type beforeCreateJobCreator struct {
 	before   func() error
 }
 
-func (creator *beforeCreateJobCreator) CreateWithInputFinalized(request jobs.CreateRequest, finalize jobs.CreateFinalizer) (jobs.Job, bool, error) {
+func (creator *beforeCreateJobCreator) CreateDeploymentWithInputTransaction(ctx context.Context, request jobs.DeploymentCreateRequest, hooks jobs.DeploymentCreateHooks) (jobs.DeploymentCreateResult, error) {
 	if err := creator.before(); err != nil {
-		return jobs.Job{}, false, err
+		return jobs.DeploymentCreateResult{}, err
 	}
-	return creator.delegate.CreateWithInputFinalized(request, finalize)
+	return creator.delegate.CreateDeploymentWithInputTransaction(ctx, request, hooks)
 }
 
 type sourceAccessLostLinkRepository struct{ *Repository }
@@ -360,7 +373,7 @@ func TestCoordinatorOfflineStartupUsesPersistedScopeAndCreatesSanitizedJob(t *te
 	}
 	clock := &coordinatorTestClock{now: fixture.now}
 	resolver := &coordinatorTestResolver{sha: secondSHA}
-	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, jobs.New(fixture.db), clock)
+	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), clock)
 
 	claimed, event := coordinator.processOne(context.Background())
 	if !claimed || event.Dispatched != 1 || event.Resolved != 1 {
@@ -388,7 +401,7 @@ func TestCoordinatorGeneratedPreflightPinsMaterializedRelease(t *testing.T) {
 	config.Clock = clock
 	config.MinResolveInterval = time.Nanosecond
 	config.Preflight = preflight
-	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +436,7 @@ func TestCoordinatorRestartReplaysGeneratedPreparedDispatchThroughPreflight(t *t
 	config.Clock = clock
 	config.MinResolveInterval = time.Nanosecond
 	config.Preflight = preflight
-	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -455,7 +468,7 @@ func TestCoordinatorGeneratedPlanReviewPausesBeforeCreatingJob(t *testing.T) {
 	config.Clock = clock
 	config.MinResolveInterval = time.Nanosecond
 	config.Preflight = preflight
-	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: secondSHA}, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +498,7 @@ func TestCoordinatorHeadRaceRestartsPreparedDispatchAndReresolves(t *testing.T) 
 	config.Clock = clock
 	config.MinResolveInterval = time.Nanosecond
 	config.Preflight = preflight
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -514,7 +527,7 @@ func TestCoordinatorPlanHeadRaceRollsBackJobAndRestartsDispatch(t *testing.T) {
 	clock := &coordinatorTestClock{now: fixture.now}
 	preflight := &scriptedDispatchPreflight{results: []DispatchPreflightResult{{ReleaseID: releaseID}}}
 	creator := &beforeCreateJobCreator{
-		delegate: jobs.New(fixture.db),
+		delegate: newCoordinatorJobService(t, fixture.db),
 		before: func() error {
 			_, err := fixture.db.Exec(`UPDATE deployment_plan_heads SET revision_id=NULL,revision_number=0,updated_at=NULL WHERE app_id=?`, testApp)
 			return err
@@ -550,7 +563,7 @@ func TestCoordinatorConsumesNewestACKAndCoalescesSeveralPushes(t *testing.T) {
 	commitDesired(t, fixture, status, 3, coordinatorThirdSHA, fixture.now.Add(3*time.Second))
 	clock := &coordinatorTestClock{now: fixture.now.Add(4 * time.Second)}
 	resolver := &coordinatorTestResolver{sha: coordinatorThirdSHA}
-	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, jobs.New(fixture.db), clock)
+	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), clock)
 
 	if claimed, event := coordinator.processOne(context.Background()); !claimed || event.Dispatched != 1 {
 		t.Fatalf("coalesced event=%#v claimed=%v", event, claimed)
@@ -576,7 +589,7 @@ func TestCoordinatorSequentialACKStormHonorsDurableResolveCooldown(t *testing.T)
 	config := DefaultCoordinatorConfig()
 	config.Clock = clock
 	config.MinResolveInterval = time.Minute
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -618,7 +631,7 @@ func TestCoordinatorRepeatedReadyStormHonorsPersistedCooldown(t *testing.T) {
 	config := DefaultCoordinatorConfig()
 	config.Clock = clock
 	config.MinResolveInterval = time.Minute
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -665,7 +678,7 @@ func TestCoordinatorSlowResolverCannotMutateAfterLeaseExpiry(t *testing.T) {
 	config.Clock = clock
 	config.LeaseTTL = time.Second
 	config.MinResolveInterval = time.Nanosecond
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,7 +716,7 @@ func TestCoordinatorRunReservesCooldownBeforeSlowResolve(t *testing.T) {
 	config.LeaseTTL = time.Second
 	config.MinResolveInterval = time.Minute
 	config.BatchSize = 32
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -795,7 +808,7 @@ func TestCoordinatorRunHonorsCooldownReservationAcrossRestart(t *testing.T) {
 	config.LeaseTTL = time.Second
 	config.MinResolveInterval = time.Minute
 	config.BatchSize = 32
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -887,7 +900,7 @@ func runCoordinatorExactGenerationBarrier(t *testing.T, duringResolve bool) {
 	config := DefaultCoordinatorConfig()
 	config.Clock = clock
 	config.MinResolveInterval = time.Minute
-	coordinator, err := NewCoordinator(repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -980,7 +993,7 @@ func TestCoordinatorStartupRearmsResolvedCrashWithoutStealingLiveLease(t *testin
 	config := DefaultCoordinatorConfig()
 	config.Clock = clock
 	config.MinResolveInterval = time.Minute
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1016,7 +1029,7 @@ func TestCoordinatorPreparedDispatchReplaysCreateAndLinkCrashSafely(t *testing.T
 	config.MinResolveInterval = time.Nanosecond
 	config.BatchSize = 1
 	config.Observer = recorder.Observe
-	coordinator, err := NewCoordinator(repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1027,10 +1040,19 @@ func TestCoordinatorPreparedDispatchReplaysCreateAndLinkCrashSafely(t *testing.T
 		t.Fatalf("failed link event=%#v", event)
 	}
 	prepared, err := fixture.repository.Get(context.Background(), testApp)
-	if err != nil || prepared.State != StateDispatching || prepared.PreparedDispatchSequence != 1 {
+	if err != nil || prepared.State != StateDispatching || prepared.PreparedDispatchSequence != 1 ||
+		prepared.PreparedDispatchGeneration != 0 || prepared.PreparedDispatchSHA != testSHA || prepared.ActiveJobID != "" {
 		t.Fatalf("prepared=%#v err=%v", prepared, err)
 	}
 	assertSingleCoordinatorJob(t, fixture, prepared, 0)
+	var queuedEvents int
+	if err = fixture.db.QueryRow(`SELECT COUNT(*) FROM job_events e JOIN jobs j ON j.id=e.job_id
+		WHERE j.resource_id=? AND j.idempotency_key=? AND e.code='job_queued'`, testApp, DispatchIdempotencyKey(prepared.Revision, prepared.PreparedDispatchSequence)).Scan(&queuedEvents); err != nil {
+		t.Fatal(err)
+	}
+	if queuedEvents != 0 {
+		t.Fatalf("failed link retained queued events=%d", queuedEvents)
+	}
 	coordinator.drain(context.Background())
 	event, ok = recorder.Last()
 	if !ok || event.Dispatched != 1 || event.State != StateDeploying || event.NextAction != NextActionPollJob {
@@ -1043,6 +1065,96 @@ func TestCoordinatorPreparedDispatchReplaysCreateAndLinkCrashSafely(t *testing.T
 	assertSingleCoordinatorJob(t, fixture, linked, 1)
 }
 
+func TestTypedCoordinatorJobCreationReplaysPersistedLinkAndFencesIdentity(t *testing.T) {
+	fixture := newRepositoryFixture(t)
+	status, lease, dispatch := prepareCoordinatorDispatch(t, fixture)
+	service := newCoordinatorJobService(t, fixture.db)
+	request := jobs.DeploymentCreateRequest{
+		ApplicationID: testApp, IdempotencyKey: DispatchIdempotencyKey(status.Revision, dispatch.Sequence), RequestedBy: status.SourceOwnerUserID,
+		Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+	}
+	link := func(at time.Time, candidate WorkLease, sequence, generation uint64) func(context.Context, *sql.Tx, jobs.Job, deploymentbinding.Binding) error {
+		return func(ctx context.Context, tx *sql.Tx, job jobs.Job, _ deploymentbinding.Binding) error {
+			return fixture.repository.LinkDispatchJobTx(ctx, tx, candidate, sequence, generation, job.ID, at)
+		}
+	}
+	created, err := service.CreateDeploymentWithInputTransaction(context.Background(), request, jobs.DeploymentCreateHooks{
+		FinalizeNew:    link(fixture.now.Add(time.Second), lease, dispatch.Sequence, dispatch.Generation),
+		ValidateReplay: link(fixture.now.Add(time.Second), lease, dispatch.Sequence, dispatch.Generation),
+	})
+	if err != nil || !created.Created {
+		t.Fatalf("created=%#v error=%v", created, err)
+	}
+	linked, err := fixture.repository.Get(context.Background(), testApp)
+	if err != nil || linked.State != StateDeploying || linked.ActiveJobID != created.Job.ID ||
+		linked.ActiveDispatchSequence != dispatch.Sequence || linked.ActiveGeneration != dispatch.Generation || linked.ActiveSHA != dispatch.SHA {
+		t.Fatalf("linked=%#v error=%v", linked, err)
+	}
+	events, err := service.Events(created.Job.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := service.CreateDeploymentWithInputTransaction(context.Background(), request, jobs.DeploymentCreateHooks{
+		ValidateReplay: link(fixture.now.Add(2*time.Second), lease, dispatch.Sequence, dispatch.Generation),
+	})
+	if err != nil || replayed.Created || replayed.Job.ID != created.Job.ID || !replayed.Binding.Equal(created.Binding) {
+		t.Fatalf("replayed=%#v error=%v", replayed, err)
+	}
+	afterReplay, err := fixture.repository.Get(context.Background(), testApp)
+	if err != nil || !reflect.DeepEqual(afterReplay, linked) {
+		t.Fatalf("exact replay mutated link before=%#v after=%#v error=%v", linked, afterReplay, err)
+	}
+	afterEvents, err := service.Events(created.Job.ID, 0)
+	if err != nil || !reflect.DeepEqual(afterEvents, events) {
+		t.Fatalf("exact replay mutated events before=%#v after=%#v error=%v", events, afterEvents, err)
+	}
+
+	foreign := lease
+	foreign.ApplicationID = uuid.NewString()
+	for _, test := range []struct {
+		name       string
+		lease      WorkLease
+		sequence   uint64
+		generation uint64
+		at         time.Time
+	}{
+		{name: "expired lease", lease: lease, sequence: dispatch.Sequence, generation: dispatch.Generation, at: lease.ExpiresAt},
+		{name: "foreign lease", lease: foreign, sequence: dispatch.Sequence, generation: dispatch.Generation, at: fixture.now.Add(2 * time.Second)},
+		{name: "foreign sequence", lease: lease, sequence: dispatch.Sequence + 1, generation: dispatch.Generation, at: fixture.now.Add(2 * time.Second)},
+		{name: "foreign generation", lease: lease, sequence: dispatch.Sequence, generation: dispatch.Generation + 1, at: fixture.now.Add(2 * time.Second)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, replayErr := service.CreateDeploymentWithInputTransaction(context.Background(), request, jobs.DeploymentCreateHooks{
+				ValidateReplay: link(test.at, test.lease, test.sequence, test.generation),
+			}); replayErr == nil {
+				t.Fatal("foreign replay unexpectedly succeeded")
+			}
+		})
+	}
+	if _, err = service.CreateDeploymentWithInputTransaction(context.Background(), request, jobs.DeploymentCreateHooks{
+		ValidateReplay: func(ctx context.Context, tx *sql.Tx, job jobs.Job, _ deploymentbinding.Binding) error {
+			stamp := timestamp(fixture.now.Add(2 * time.Second))
+			if _, updateErr := tx.ExecContext(ctx, `UPDATE relay_installation_bindings
+				SET state='access_lost',state_changed_at=?,updated_at=?,last_error_code='source_access_lost'
+				WHERE binding_id=? AND state='authorized'`, stamp, stamp, testBinding); updateErr != nil {
+				return updateErr
+			}
+			return fixture.repository.LinkDispatchJobTx(ctx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, fixture.now.Add(2*time.Second))
+		},
+	}); !errors.Is(err, ErrSourceAccessLost) {
+		t.Fatalf("source-identity replay error=%v", err)
+	}
+	final, err := fixture.repository.Get(context.Background(), testApp)
+	if err != nil || !reflect.DeepEqual(final, linked) {
+		t.Fatalf("refused replays mutated link before=%#v after=%#v error=%v", linked, final, err)
+	}
+	finalEvents, err := service.Events(created.Job.ID, 0)
+	if err != nil || !reflect.DeepEqual(finalEvents, events) {
+		t.Fatalf("refused replays mutated events before=%#v after=%#v error=%v", events, finalEvents, err)
+	}
+	assertSingleCoordinatorJob(t, fixture, final, 1)
+}
+
 func TestCoordinatorAccessLossDuringDispatchIsObservedWithoutOrphan(t *testing.T) {
 	fixture := newRepositoryFixture(t)
 	status, err := fixture.repository.Configure(context.Background(), ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now)
@@ -1052,7 +1164,7 @@ func TestCoordinatorAccessLossDuringDispatchIsObservedWithoutOrphan(t *testing.T
 	clock := &coordinatorTestClock{now: fixture.now}
 	repository := &sourceAccessLostLinkRepository{Repository: fixture.repository}
 	creator := &beforeCreateJobCreator{
-		delegate: jobs.New(fixture.db),
+		delegate: newCoordinatorJobService(t, fixture.db),
 		before: func() error {
 			removedAt := clock.Now().Add(time.Nanosecond)
 			decision, removeErr := controllerrelay.NewRepository(fixture.db).CommitAccessChange(context.Background(), testController, protocol.AccessChange{
@@ -1111,7 +1223,7 @@ func TestAtomicDispatchAccessLossOrderingNeverCreatesOrphan(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			request := jobs.CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: testApp, IdempotencyKey: DispatchIdempotencyKey(status.Revision, dispatch.Sequence), RequestedBy: status.SourceOwnerUserID, Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent}}
+			request := jobs.DeploymentCreateRequest{ApplicationID: testApp, IdempotencyKey: DispatchIdempotencyKey(status.Revision, dispatch.Sequence), RequestedBy: status.SourceOwnerUserID, Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent}}
 			removeAccess := func() (controllerrelay.InboxDecision, error) {
 				removedAt := fixture.now.Add(3 * time.Second)
 				return controllerrelay.NewRepository(fixture.db).CommitAccessChange(ctx, testController, protocol.AccessChange{
@@ -1119,15 +1231,15 @@ func TestAtomicDispatchAccessLossOrderingNeverCreatesOrphan(t *testing.T) {
 					InstallationID: testInstallation, RepositoryID: testRepository, ChangeCode: "repository.removed", ObservedAt: removedAt, AckRequired: true,
 				}, removedAt)
 			}
-			service := jobs.New(fixture.db)
+			service := newCoordinatorJobService(t, fixture.db)
 			if accessFirst {
 				decision, removeErr := removeAccess()
 				if removeErr != nil || decision.Kind != controllerrelay.DecisionAck {
 					t.Fatalf("access removal=%#v err=%v", decision, removeErr)
 				}
-				_, _, createErr := service.CreateWithInputFinalized(request, func(tx *sql.Tx, job jobs.Job) error {
-					return fixture.repository.LinkDispatchJobTx(ctx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, fixture.now.Add(4*time.Second))
-				})
+				_, createErr := service.CreateDeploymentWithInputTransaction(ctx, request, jobs.DeploymentCreateHooks{FinalizeNew: func(hookCtx context.Context, tx *sql.Tx, job jobs.Job, _ deploymentbinding.Binding) error {
+					return fixture.repository.LinkDispatchJobTx(hookCtx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, fixture.now.Add(4*time.Second))
+				}})
 				if createErr == nil {
 					t.Fatal("access-first dispatch unexpectedly committed")
 				}
@@ -1143,15 +1255,15 @@ func TestAtomicDispatchAccessLossOrderingNeverCreatesOrphan(t *testing.T) {
 			}
 			created := make(chan createResult, 1)
 			go func() {
-				job, _, createErr := service.CreateWithInputFinalized(request, func(tx *sql.Tx, job jobs.Job) error {
-					if linkErr := fixture.repository.LinkDispatchJobTx(ctx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, fixture.now.Add(2*time.Second)); linkErr != nil {
+				result, createErr := service.CreateDeploymentWithInputTransaction(ctx, request, jobs.DeploymentCreateHooks{FinalizeNew: func(hookCtx context.Context, tx *sql.Tx, job jobs.Job, _ deploymentbinding.Binding) error {
+					if linkErr := fixture.repository.LinkDispatchJobTx(hookCtx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, fixture.now.Add(2*time.Second)); linkErr != nil {
 						return linkErr
 					}
 					close(linked)
 					<-releaseFinalize
 					return nil
-				})
-				created <- createResult{job: job, err: createErr}
+				}})
+				created <- createResult{job: result.Job, err: createErr}
 			}()
 			<-linked
 			type accessResult struct {
@@ -1186,7 +1298,7 @@ func TestCoordinatorPushDuringActiveSchedulesExactlyOneFollowup(t *testing.T) {
 	}
 	clock := &coordinatorTestClock{now: fixture.now}
 	resolver := &coordinatorTestResolver{sha: testSHA}
-	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, jobs.New(fixture.db), clock)
+	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), clock)
 	coordinator.processOne(context.Background())
 	active, _ := fixture.repository.Get(context.Background(), testApp)
 	commitDesired(t, fixture, status, 1, coordinatorThirdSHA, fixture.now.Add(time.Second))
@@ -1219,7 +1331,7 @@ func TestCoordinatorKnownNewerSHAFollowsActiveFailureExactlyOnce(t *testing.T) {
 	}
 	clock := &coordinatorTestClock{now: fixture.now}
 	resolver := &coordinatorTestResolver{sha: testSHA}
-	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, jobs.New(fixture.db), clock)
+	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), clock)
 	coordinator.processOne(context.Background())
 	first, err := fixture.repository.Get(context.Background(), testApp)
 	if err != nil {
@@ -1254,7 +1366,7 @@ func TestCoordinatorActualNewerHeadConvergesWithoutDuplicate(t *testing.T) {
 	}
 	clock := &coordinatorTestClock{now: fixture.now}
 	resolver := &coordinatorTestResolver{sha: testSHA}
-	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, jobs.New(fixture.db), clock)
+	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), clock)
 	coordinator.processOne(context.Background())
 	active, _ := fixture.repository.Get(context.Background(), testApp)
 	releaseID := insertActualRelease(t, fixture, secondSHA, active.ActiveDispatchSequence)
@@ -1282,7 +1394,7 @@ func TestCoordinatorProviderRetryExhaustionAndNewSHAResume(t *testing.T) {
 	}
 	clock := &coordinatorTestClock{now: fixture.now}
 	resolver := &coordinatorTestResolver{err: &SourceError{Code: OutcomeProviderUnavailable}}
-	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, jobs.New(fixture.db), clock)
+	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), clock)
 	if _, event := coordinator.processOne(context.Background()); event.Retried != 1 {
 		t.Fatalf("first retry event=%#v", event)
 	}
@@ -1324,7 +1436,7 @@ func TestCoordinatorPersistenceSourceErrorRetriesWithoutInvalidSourcePause(t *te
 	}
 	clock := &coordinatorTestClock{now: fixture.now}
 	resolver := &coordinatorTestResolver{err: &SourceError{Code: OutcomePersistenceUnavailable}}
-	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, jobs.New(fixture.db), clock)
+	coordinator := newCoordinatorForTest(t, fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), clock)
 	if _, event := coordinator.processOne(context.Background()); event.Retried != 1 || event.Outcome != OutcomePersistenceUnavailable {
 		t.Fatalf("persistence retry event=%#v", event)
 	}
@@ -1433,7 +1545,7 @@ func TestCoordinatorObservesJobPauseLifecycle(t *testing.T) {
 			config.Clock = clock
 			config.MinResolveInterval = time.Nanosecond
 			config.Observer = recorder.Observe
-			coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: testSHA}, jobs.New(fixture.db), config)
+			coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: testSHA}, newCoordinatorJobService(t, fixture.db), config)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1471,7 +1583,7 @@ func TestCoordinatorObservesAccessRetryAndCooldownLifecycle(t *testing.T) {
 		config := DefaultCoordinatorConfig()
 		config.Clock = clock
 		config.Observer = recorder.Observe
-		coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{err: &SourceError{Code: OutcomeSourceAccessLost}}, jobs.New(fixture.db), config)
+		coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{err: &SourceError{Code: OutcomeSourceAccessLost}}, newCoordinatorJobService(t, fixture.db), config)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1492,7 +1604,7 @@ func TestCoordinatorObservesAccessRetryAndCooldownLifecycle(t *testing.T) {
 		config := DefaultCoordinatorConfig()
 		config.Clock = clock
 		config.Observer = recorder.Observe
-		coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{err: &SourceError{Code: OutcomeProviderUnavailable}}, jobs.New(fixture.db), config)
+		coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{err: &SourceError{Code: OutcomeProviderUnavailable}}, newCoordinatorJobService(t, fixture.db), config)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1514,7 +1626,7 @@ func TestCoordinatorObservesAccessRetryAndCooldownLifecycle(t *testing.T) {
 		config.Clock = clock
 		config.MinResolveInterval = time.Minute
 		config.Observer = recorder.Observe
-		coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: testSHA}, jobs.New(fixture.db), config)
+		coordinator, err := NewCoordinator(fixture.repository, &coordinatorTestResolver{sha: testSHA}, newCoordinatorJobService(t, fixture.db), config)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1550,7 +1662,7 @@ func TestCoordinatorReleaseFailureEmitsOneSanitizedObservation(t *testing.T) {
 	config.MinResolveInterval = time.Nanosecond
 	config.Clock = &coordinatorTestClock{now: fixture.now}
 	config.Observer = recorder.Observe
-	coordinator, err := NewCoordinator(repository, &coordinatorTestResolver{sha: testSHA}, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(repository, &coordinatorTestResolver{sha: testSHA}, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1604,7 +1716,7 @@ func TestNewCoordinatorRejectsRepositoryIncompatibleIntervals(t *testing.T) {
 	} {
 		config := DefaultCoordinatorConfig()
 		mutate(&config)
-		if _, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config); !errors.Is(err, ErrInvalid) {
+		if _, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("invalid interval config=%#v err=%v", config, err)
 		}
 	}
@@ -1621,7 +1733,7 @@ func TestCoordinatorActiveProviderFailureRetriesThenPausesWithinWindow(t *testin
 	config.Clock = clock
 	config.MinResolveInterval = time.Nanosecond
 	config.MaxRetryAttempts = 3
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1682,12 +1794,39 @@ func TestCoordinatorApplicationBusyRetriesOnceThenPauses(t *testing.T) {
 	}
 }
 
+func TestCoordinatorLifecycleRefusalPausesWithoutRetry(t *testing.T) {
+	for _, refusal := range []error{
+		deploymentbinding.ErrBindingNotFound,
+		deploymentbinding.ErrInvalidBinding,
+		deploymentbinding.ErrLifecycleUnresolved,
+	} {
+		t.Run(refusal.Error(), func(t *testing.T) {
+			fixture := newRepositoryFixture(t)
+			if _, err := fixture.repository.Configure(context.Background(), ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, Enabled: true}, fixture.now); err != nil {
+				t.Fatal(err)
+			}
+			creator := &lifecycleRefusalJobCreator{err: refusal}
+			coordinator := newCoordinatorForTest(t, fixture.repository, &coordinatorTestResolver{sha: testSHA}, creator, &coordinatorTestClock{now: fixture.now})
+			claimed, event := coordinator.processOne(context.Background())
+			if !claimed || event.Paused != 1 || event.Retried != 0 || event.Outcome != OutcomeDeploymentFailed ||
+				event.State != StatePaused || event.PauseCode != PauseDeploymentFailed || event.NextAction != NextActionResumeRequired {
+				t.Fatalf("lifecycle refusal claimed=%t event=%#v", claimed, event)
+			}
+			paused, err := fixture.repository.Get(context.Background(), testApp)
+			if err != nil || paused.State != StatePaused || paused.PauseCode != PauseDeploymentFailed ||
+				paused.ActiveJobID != "" || paused.PreparedDispatchSequence != 0 || paused.RetryAttempt != 0 || creator.calls != 1 {
+				t.Fatalf("lifecycle refusal status=%#v calls=%d err=%v", paused, creator.calls, err)
+			}
+		})
+	}
+}
+
 func TestCoordinatorWakeCoalescesAndRunCancels(t *testing.T) {
 	fixture := newRepositoryFixture(t)
 	resolver := &coordinatorTestResolver{sha: testSHA}
 	config := DefaultCoordinatorConfig()
 	config.PollInterval = time.Hour
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1725,7 +1864,7 @@ func TestCoordinatorCanceledClaimDoesNotObservePersistenceFailure(t *testing.T) 
 	config := DefaultCoordinatorConfig()
 	config.PollInterval = time.Hour
 	config.Observer = recorder.Observe
-	coordinator, err := NewCoordinator(repository, &coordinatorTestResolver{sha: testSHA}, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(repository, &coordinatorTestResolver{sha: testSHA}, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1762,7 +1901,7 @@ func TestCoordinatorLiveClaimErrorRemainsPersistenceFailure(t *testing.T) {
 		release:    release,
 		err:        context.Canceled,
 	}
-	coordinator := newCoordinatorForTest(t, repository, &coordinatorTestResolver{sha: testSHA}, jobs.New(fixture.db), &coordinatorTestClock{now: fixture.now})
+	coordinator := newCoordinatorForTest(t, repository, &coordinatorTestResolver{sha: testSHA}, newCoordinatorJobService(t, fixture.db), &coordinatorTestClock{now: fixture.now})
 	result := make(chan CoordinatorEvent, 1)
 	go func() {
 		_, event := coordinator.processOne(context.Background())
@@ -1804,7 +1943,7 @@ func TestCoordinatorRunPausesOnceWhenSourceDisconnectsBeforeReserve(t *testing.T
 	config.MinResolveInterval = time.Nanosecond
 	config.BatchSize = 32
 	config.Observer = recorder.Observe
-	coordinator, err := NewCoordinator(repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1870,7 +2009,7 @@ func TestCoordinatorRunPausesWhenSourceDisconnectsDuringResolve(t *testing.T) {
 	config.MinResolveInterval = time.Nanosecond
 	config.BatchSize = 32
 	config.Observer = recorder.Observe
-	coordinator, err := NewCoordinator(fixture.repository, resolver, jobs.New(fixture.db), config)
+	coordinator, err := NewCoordinator(fixture.repository, resolver, newCoordinatorJobService(t, fixture.db), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1919,6 +2058,23 @@ func TestCoordinatorRunPausesWhenSourceDisconnectsDuringResolve(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("coordinator did not stop")
 	}
+}
+
+func newCoordinatorJobService(t *testing.T, db *sql.DB) *jobs.Service {
+	t.Helper()
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
 }
 
 func newCoordinatorForTest(t *testing.T, repository CoordinatorRepository, resolver SourceResolver, jobService JobCreator, clock Clock) *Coordinator {
@@ -1990,6 +2146,13 @@ func assertSingleCoordinatorJob(t *testing.T, fixture *repositoryFixture, status
 	}
 	if count != expected {
 		t.Fatalf("job count=%d want=%d", count, expected)
+	}
+	var bindings int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM application_deployment_lifecycle_bindings b JOIN jobs j ON j.id=b.job_id WHERE j.resource_id=?`, testApp).Scan(&bindings); err != nil {
+		t.Fatal(err)
+	}
+	if bindings != expected {
+		t.Fatalf("binding count=%d want=%d", bindings, expected)
 	}
 	if expected == 0 {
 		return

@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/autodeploy"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/jobs"
 )
 
@@ -95,20 +97,38 @@ func (fixture *autoDeployDisconnectFixture) reserveAndFinalize(t *testing.T, app
 
 func (fixture *autoDeployDisconnectFixture) createAndLink(t *testing.T, status autodeploy.Status, lease autodeploy.WorkLease, dispatch autodeploy.PreparedDispatch, at time.Time, barrier func()) (jobs.Job, error) {
 	t.Helper()
-	job, _, err := jobs.New(fixture.db).CreateWithInputFinalized(jobs.CreateRequest{
-		Type: "deploy", ResourceType: "application", ResourceID: status.ApplicationID,
-		IdempotencyKey: autodeploy.DispatchIdempotencyKey(status.Revision, dispatch.Sequence), RequestedBy: status.SourceOwnerUserID,
-		Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
-	}, func(tx *sql.Tx, job jobs.Job) error {
-		if err := fixture.autoDeploy.LinkDispatchJobTx(context.Background(), tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, at); err != nil {
+	link := func(ctx context.Context, tx *sql.Tx, job jobs.Job, _ deploymentbinding.Binding) error {
+		if err := fixture.autoDeploy.LinkDispatchJobTx(ctx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, at); err != nil {
 			return err
 		}
 		if barrier != nil {
 			barrier()
 		}
 		return nil
-	})
-	return job, err
+	}
+	result, err := fixture.deploymentJobs(t).CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+		ApplicationID:  status.ApplicationID,
+		IdempotencyKey: autodeploy.DispatchIdempotencyKey(status.Revision, dispatch.Sequence), RequestedBy: status.SourceOwnerUserID,
+		Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+	}, jobs.DeploymentCreateHooks{FinalizeNew: link, ValidateReplay: link})
+	return result.Job, err
+}
+
+func (fixture *autoDeployDisconnectFixture) deploymentJobs(t *testing.T) *jobs.Service {
+	t.Helper()
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(fixture.db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(fixture.db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(fixture.db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
 }
 
 func TestDisconnectAfterFinalizeRollsBackSubsequentJobLink(t *testing.T) {
@@ -299,7 +319,7 @@ func TestAuthorizedResumeReconcilesGenerationZeroExactlyOnce(t *testing.T) {
 	config.Clock = autoDeployClock{now: resumedAt}
 	config.PollInterval = time.Hour
 	config.MinResolveInterval = time.Nanosecond
-	coordinator, err := autodeploy.NewCoordinator(fixture.autoDeploy, resolver, jobs.New(fixture.db), config)
+	coordinator, err := autodeploy.NewCoordinator(fixture.autoDeploy, resolver, fixture.deploymentJobs(t), config)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +366,7 @@ func TestAuthorizedResumeWithActiveJobPollsWithoutParallelResolve(t *testing.T) 
 	config.Clock = autoDeployClock{now: resumedAt}
 	config.PollInterval = time.Hour
 	config.MinResolveInterval = time.Nanosecond
-	coordinator, err := autodeploy.NewCoordinator(fixture.autoDeploy, resolver, jobs.New(fixture.db), config)
+	coordinator, err := autodeploy.NewCoordinator(fixture.autoDeploy, resolver, fixture.deploymentJobs(t), config)
 	if err != nil {
 		t.Fatal(err)
 	}

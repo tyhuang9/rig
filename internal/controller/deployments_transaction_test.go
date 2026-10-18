@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"path/filepath"
@@ -8,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/jobs"
 )
 
@@ -27,11 +30,26 @@ func TestUnpinnedDeploymentCreateRechecksPlanHeadInsideWriterTransaction(t *test
 	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,created_at,updated_at) VALUES(?,?,?,?,?)`, appID, "fixture", "Fixture", now, now); err != nil {
 		t.Fatal(err)
 	}
-	service := jobs.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
 	create := func(key string) (jobs.Job, bool, error) {
-		return service.CreateWithInputChecked(jobs.CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: appID, RequestedBy: actorID, IdempotencyKey: key, Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent}}, func(tx *sql.Tx, _ jobs.Job) error {
-			return checkUnpinnedComposeHead(tx, appID)
-		})
+		result, err := service.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+			ApplicationID: appID, RequestedBy: actorID, IdempotencyKey: key,
+			Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+		}, jobs.DeploymentCreateHooks{ValidateNew: func(ctx context.Context, tx *sql.Tx, _ jobs.Job) error {
+			return checkUnpinnedComposeHead(ctx, tx, appID)
+		}})
+		return result.Job, result.Created, err
 	}
 	legacy, created, err := create("legacy")
 	if err != nil || !created {

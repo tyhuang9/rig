@@ -37,7 +37,7 @@ func TestAuthAndProtectedAPI(t *testing.T) {
 	if _, err := m.EnsureLocal(); err != nil {
 		t.Fatal(err)
 	}
-	h := (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: jobs.New(db), Machines: m, FakeRuntime: true, DataRoot: t.TempDir(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
+	h := (&controller.Server{Auth: a, Apps: apps.New(db), Jobs: newDeploymentJobTestService(t, db), Machines: m, FakeRuntime: true, DataRoot: t.TempDir(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
 	r := httptest.NewRequest(http.MethodGet, "/api/v1/apps", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -156,7 +156,7 @@ func TestCancelAPIAndLastEventIDReplay(t *testing.T) {
 	if _, err := machineStore.EnsureLocal(); err != nil {
 		t.Fatal(err)
 	}
-	jobService := jobs.New(db)
+	jobService := newDeploymentJobTestService(t, db)
 	handler := (&controller.Server{Auth: authService, Apps: apps.New(db), Jobs: jobService, Machines: machineStore, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
 
 	job, _, err := jobService.Create("deploy", "application", "app-cancel", "cancel-api")
