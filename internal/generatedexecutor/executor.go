@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
@@ -42,8 +43,6 @@ type Executor struct {
 	options       Options
 	waitDrain     func(context.Context, time.Duration) error
 }
-
-var _ jobs.Executor = (*Executor)(nil)
 
 func NewExecutor(
 	applications applicationReader,
@@ -89,10 +88,14 @@ type resolvedDeployment struct {
 	configurationNumber int64
 }
 
-func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploymentexecution.Claim, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
 	if reporter == nil || job.Type != "deploy" || job.ResourceType != "application" ||
 		uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil || uuid.Validate(job.RequestedBy) != nil || job.Attempt < 1 {
 		return jobs.ExecutionResult{}, executionError("validation_failed")
+	}
+	if claim.JobID() == "" || claim.ApplicationID() == "" || claim.Attempt() < 1 ||
+		claim.JobID() != job.ID || claim.ApplicationID() != job.ResourceID || claim.Attempt() != job.Attempt {
+		return jobs.ExecutionResult{}, errors.Join(executionError("validation_failed"), deploymentexecution.ErrInvalidClaim)
 	}
 	input, err := jobs.DeploymentInputFor(job)
 	if err != nil {
@@ -164,19 +167,26 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	var reservation generatedruntime.ReplacementReservation
 	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
 		reservation, err = e.authorization.Authorize(ctx, AuthorizationRequest{
+			Claim: claim,
 			AppID: deployment.AppID, DeploymentID: deployment.ID, ReleaseID: deployment.ReleaseID,
 			DeploymentPlanRevisionID:     deployment.DeploymentPlanRevisionID,
 			DeploymentPlanRevisionNumber: deployment.DeploymentPlanRevisionNumber,
 			CandidateSlot:                generatedruntime.Slot(runtimeDeployment.CandidateSlot), ComponentCount: len(componentNames),
 		})
+		if err != nil && (ctx.Err() != nil || errors.Is(err, deploymentexecution.ErrCanceled) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, err)
+		}
 		if errors.Is(err, ErrInsufficientReplacementCapacity) {
 			return waitingFor(jobs.PauseInsufficientReplacementCapacity), nil
 		}
 		if errors.Is(err, deployments.ErrApprovalRequired) {
 			return waitingFor(jobs.PauseApprovalRequired), nil
 		}
-		if err != nil || reservation == nil {
-			return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+		if err != nil {
+			return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, err)
+		}
+		if reservation == nil {
+			return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, errors.New("generated replacement reservation is unavailable"))
 		}
 		defer reservation.Release()
 	}
@@ -347,6 +357,18 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 			return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 		}
 	}
+}
+
+func generatedAuthorizationRefusal(ctx context.Context, cause error) error {
+	refusal := executionError("runtime_unavailable")
+	if ctx != nil && ctx.Err() != nil || errors.Is(cause, deploymentexecution.ErrCanceled) ||
+		errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		if ctx != nil && ctx.Err() != nil {
+			return errors.Join(refusal, cause, deploymentexecution.ErrCanceled, ctx.Err())
+		}
+		return errors.Join(refusal, cause)
+	}
+	return errors.Join(refusal, cause)
 }
 
 func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.DeploymentInput, deployment deployments.Deployment, reporter jobs.ProgressReporter) (resolvedDeployment, error) {

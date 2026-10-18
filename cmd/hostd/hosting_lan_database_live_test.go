@@ -36,6 +36,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -138,11 +139,13 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	deploymentStore := deployments.New(db)
+	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	settings := config.Defaults()
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
+		effectsWorkingDirectory: effectsWorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
@@ -267,7 +270,9 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	workerContext, stopWorker := context.WithCancel(ctx)
 	done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
 		recoverState: jobStore.RecoverRuntimeContext,
-	}, composition.executor, jobStore.RunWorker, func(error) {})
+	}, composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
+	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,9 +420,11 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	reopenedDeployments := deployments.New(reopenedDB)
+	reopenedEffectsWorkingDirectory, reopenedScopedAdmission := liveDeploymentExecutionFixture(t, reopenedDB, dataRoot)
 	reopenedComposition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: reopenedDB, applications: reopenedApps, snapshots: reopenedSnapshots, configuration: reopenedConfiguration,
 		deployments: reopenedDeployments, plans: reopenedPlans, bindings: reopenedBindings,
+		effectsWorkingDirectory: reopenedEffectsWorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("reopen production runtime:", err)
@@ -440,7 +447,9 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	reopenedWorkerContext, stopReopenedWorker := context.WithCancel(ctx)
 	reopenedDone, err := prepareRuntimeWorker(reopenedWorkerContext, runtimeRecovery{
 		recoverState: reopenedJobs.RecoverRuntimeContext,
-	}, reopenedComposition.executor, reopenedJobs.RunWorker, func(error) {})
+	}, reopenedComposition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+		return reopenedJobs.RunWorkerWithScopedAdmission(workerContext, executor, reopenedScopedAdmission)
+	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
 	}

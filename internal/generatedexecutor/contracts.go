@@ -10,6 +10,7 @@ import (
 
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
@@ -87,6 +88,7 @@ type runtimeEngine interface {
 // AuthorizationRequest contains only immutable identities and aggregate
 // capacity facts. Commands and configuration must never cross this boundary.
 type AuthorizationRequest struct {
+	Claim                        deploymentexecution.Claim
 	AppID                        string
 	DeploymentID                 string
 	ReleaseID                    string

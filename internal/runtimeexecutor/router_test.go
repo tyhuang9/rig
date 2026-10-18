@@ -15,6 +15,7 @@ import (
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
@@ -121,12 +122,14 @@ type recordingExecutor struct {
 	contexts  []context.Context
 	jobs      []jobs.Job
 	reporters []jobs.ProgressReporter
+	claims    []deploymentexecution.Claim
 }
 
-func (e *recordingExecutor) Execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+func (e *recordingExecutor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploymentexecution.Claim, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
 	e.calls++
 	e.contexts = append(e.contexts, ctx)
 	e.jobs = append(e.jobs, job)
+	e.claims = append(e.claims, claim)
 	e.reporters = append(e.reporters, reporter)
 	return jobs.ExecutionResult{CompletionCode: "deployment_completed"}, nil
 }
@@ -418,7 +421,7 @@ func routerEffectSpecs(operation applifecycle.Operation) []routerEffectSpec {
 }
 
 func newBoundRouter(t *testing.T, fixture *routerBindingFixture, deploymentRepository deploymentReader,
-	plans planReader, releases releaseReader, compose, generated jobs.Executor,
+	plans planReader, releases releaseReader, compose, generated BoundExecutor,
 ) (*Router, *recordingBindings) {
 	t.Helper()
 	bindings := &recordingBindings{delegate: fixture.bindings}
@@ -449,6 +452,10 @@ func TestRouterRequiresFenceAndBindingDependencies(t *testing.T) {
 	var typedNil *recordingBindings
 	if router, err := New(dependencies, plans, releases, &recordingExecutor{}, nil, typedNil, clearRebindFence); err == nil || router != nil {
 		t.Fatalf("typed nil bindings router=%v error=%v", router, err)
+	}
+	var typedNilExecutor *recordingExecutor
+	if router, err := New(dependencies, plans, releases, typedNilExecutor, nil, fixture.bindings, clearRebindFence); err == nil || router != nil {
+		t.Fatalf("typed nil delegates router=%v error=%v", router, err)
 	}
 }
 
@@ -571,6 +578,10 @@ func TestRouterRealCurrentBindingsDelegateWithOriginalValues(t *testing.T) {
 				if _, err := router.Execute(ctx, job, reporter); err != nil {
 					t.Fatal(err)
 				}
+				expectedClaim, err := deploymentexecution.NewClaim(fixture.binding, job.ID, job.ResourceID, job.Attempt)
+				if err != nil {
+					t.Fatal(err)
+				}
 				selected := compose
 				if strategy == "generated" {
 					selected = generated
@@ -581,6 +592,7 @@ func TestRouterRealCurrentBindingsDelegateWithOriginalValues(t *testing.T) {
 				}
 				if selected.calls != 1 || nonselected.calls != 0 || bindings.reads != 1 || bindings.checks != 2 || deploymentRepository.calls != 1 ||
 					len(selected.contexts) != 1 || selected.contexts[0] != ctx || !reflect.DeepEqual(selected.jobs[0], job) || selected.reporters[0] != reporter ||
+					len(selected.claims) != 1 || !reflect.DeepEqual(selected.claims[0], expectedClaim) ||
 					len(bindings.readContexts) != 1 || bindings.readContexts[0] != ctx || len(bindings.checkContexts) != 2 ||
 					bindings.checkContexts[0] != ctx || bindings.checkContexts[1] != ctx ||
 					!bindings.checked[0].Equal(fixture.binding) || !bindings.checked[1].Equal(fixture.binding) {

@@ -331,6 +331,7 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 	runtime, err := prepareRuntimeComposition(context.Background(), cfg, runtimeCompositionDependencies{
 		db: db, applications: applications, snapshots: snapshots, configuration: applicationConfiguration,
 		deployments: deploymentRepository, plans: planStore, bindings: deploymentBindings,
+		effectsWorkingDirectory: ownerDirectories.WorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, runner: assembly.runner,
 		preinspectedIngress: gate.ingress})
 	if err != nil {

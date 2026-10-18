@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -41,9 +42,23 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
+
+func liveDeploymentExecutionFixture(t *testing.T, db *sql.DB, dataRoot string) (string, jobs.ScopedAdmission) {
+	t.Helper()
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := deploymentEffectsScopedAdmission(db, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return directories.WorkingDirectory, admission
+}
 
 const liveHostdGatewayRebindEnvironment = "RIG_RUN_LIVE_HOSTD_GATEWAY_REBIND"
 
@@ -188,11 +203,13 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 		t.Fatal(err)
 	}
 	deploymentStore := deployments.New(db)
+	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	settings := config.Defaults()
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: applicationStore, snapshots: snapshots, configuration: configurationStore,
 		deployments: deploymentStore, plans: planStore, bindings: bindingStore,
+		effectsWorkingDirectory: effectsWorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("compose supported hostd rebind baseline:", err)
@@ -221,7 +238,9 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone, err := prepareRuntimeWorker(workerCtx, runtimeRecovery{
 		recoverState: jobStore.RecoverRuntimeContext,
-	}, composition.executor, jobStore.RunWorker, func(error) {})
+	}, composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
+	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
 	}

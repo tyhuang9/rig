@@ -18,6 +18,7 @@ import (
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
@@ -27,7 +28,10 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/runtimeexecutor"
 	"github.com/hostd/hostd/internal/sourceconnections"
 	"github.com/hostd/hostd/internal/sourceinspection"
 )
@@ -135,7 +139,8 @@ func TestCapacityPausedDeploymentResumesWithRecordedPinsAndOneReplacement(t *tes
 }
 
 type capacityResumeFixture struct {
-	executor       *Executor
+	executor       jobs.Executor
+	admission      jobs.ScopedAdmission
 	db             *sql.DB
 	app            apps.Application
 	actorID        string
@@ -250,7 +255,34 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deploymentRepository := deployments.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentRepository, err := deployments.NewWithExecutionGuard(db, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
 	authorization, err := NewAuthorizationGate(deploymentRepository, plans, admissionEngine)
 	if err != nil {
 		t.Fatal(err)
@@ -273,23 +305,22 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	runtime := &capacityResumeRuntime{fakeRuntime: &fakeRuntime{events: &events}}
 	routes := &fakeRoutes{events: &events}
 	migrations := &fakeMigrations{events: &events}
-	executor, err := NewExecutor(applicationStore, materializer, configurations, deploymentRepository, plans, compiler, artifactRepository, runtimeState, runtime, authorization, routes, migrations, Options{})
+	boundExecutor, err := NewExecutor(applicationStore, materializer, configurations, deploymentRepository, plans, compiler, artifactRepository, runtimeState, runtime, authorization, routes, migrations, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	router, err := runtimeexecutor.New(deploymentRepository, plans, materializer, nil, boundExecutor, bindings, func(context.Context) error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
-	bindings, err := deploymentbinding.New(db, validator)
-	if err != nil {
-		t.Fatal(err)
+	admission := func(parent context.Context) (context.Context, func() error, error) {
+		scope, release, err := deploymenteffects.AcquireScoped(parent, directories.WorkingDirectory)
+		if err != nil {
+			return nil, nil, err
+		}
+		return deploymenteffects.WithScope(parent, scope), release, nil
 	}
-	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture := &capacityResumeFixture{executor: executor, db: db, app: app, actorID: actorID, jobs: jobService, deployments: deploymentRepository, runtimeState: runtimeState,
+	fixture := &capacityResumeFixture{executor: router, admission: admission, db: db, app: app, actorID: actorID, jobs: jobService, deployments: deploymentRepository, runtimeState: runtimeState,
 		configurations: configurations, plan: plan, configuration: configuration, release: release, capacity: capacity,
 		compiler: compiler, runtime: runtime, routes: routes, migrations: migrations}
 	return fixture
@@ -299,7 +330,7 @@ func (f *capacityResumeFixture) runUntilJob(t *testing.T, id string, status jobs
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- f.jobs.RunWorker(ctx, f.executor) }()
+	go func() { done <- f.jobs.RunWorkerWithScopedAdmission(ctx, f.executor, f.admission) }()
 	defer func() {
 		cancel()
 		select {

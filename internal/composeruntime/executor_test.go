@@ -14,7 +14,11 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
@@ -116,7 +120,9 @@ func cloneExecutionConfiguration(value appconfig.ExecutionConfiguration) appconf
 type fakeDeployments struct {
 	deployment deployments.Deployment
 	findings   []deployments.Finding
+	gate       deployments.GateRequest
 	gateErr    error
+	afterGate  func()
 	actions    []string
 }
 
@@ -151,8 +157,9 @@ func (f *fakeDeployments) Initialize(_ context.Context, _, _, releaseID, revisio
 	return f.deployment, nil
 }
 
-func (f *fakeDeployments) Gate(_ context.Context, _, _ string, findings []deployments.Finding) error {
-	f.findings = append([]deployments.Finding(nil), findings...)
+func (f *fakeDeployments) Gate(_ context.Context, request deployments.GateRequest) error {
+	f.gate = request
+	f.findings = append([]deployments.Finding(nil), request.Findings...)
 	f.actions = append(f.actions, "gate")
 	if errors.Is(f.gateErr, deployments.ErrApprovalRequired) {
 		f.deployment.Status = deployments.NeedsAttention
@@ -160,6 +167,9 @@ func (f *fakeDeployments) Gate(_ context.Context, _, _ string, findings []deploy
 		f.deployment.Status = deployments.Failed
 	} else if f.gateErr == nil {
 		f.deployment.Status = deployments.Applying
+	}
+	if f.afterGate != nil {
+		f.afterGate()
 	}
 	return f.gateErr
 }
@@ -197,6 +207,34 @@ func (r *recordingReporter) Report(update jobs.ProgressUpdate) error {
 	return nil
 }
 
+func TestExecutorRejectsZeroOrMismatchedClaimBeforePreparation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*jobs.Job, *deploymentexecution.Claim)
+	}{
+		{name: "zero claim", mutate: func(_ *jobs.Job, claim *deploymentexecution.Claim) { *claim = deploymentexecution.Claim{} }},
+		{name: "job mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) { job.ID = uuid.NewString() }},
+		{name: "application mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) { job.ResourceID = uuid.NewString() }},
+		{name: "attempt mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) { job.Attempt++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
+			job, claim := fixture.job, fixture.claim
+			test.mutate(&job, &claim)
+			result, err := fixture.executor.ExecuteBound(context.Background(), job, claim, &fixture.reporter)
+			var executionErr *jobs.ExecutionError
+			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "validation_failed" || !errors.Is(err, deploymentexecution.ErrInvalidClaim) {
+				t.Fatalf("result=%#v error=%v", result, err)
+			}
+			if len(fixture.reporter.updates) != 0 || len(fixture.deployments.actions) != 0 ||
+				fixture.releases.materializeCalls != 0 || fixture.releases.localMaterializeCalls != 0 || fixture.releases.readyCalls != 0 ||
+				fixture.configuration.currentCalls != 0 || len(fixture.configuration.revisionRequest) != 0 || len(fixture.runner.requests) != 0 {
+				t.Fatalf("claim refusal performed work: progress=%#v deployment=%#v releases=%#v configuration=%#v runner=%#v", fixture.reporter.updates, fixture.deployments.actions, fixture.releases, fixture.configuration, fixture.runner.requests)
+			}
+		})
+	}
+}
+
 func TestExecutorUsesInspectedEffectiveConfigAsSoleMutationInput(t *testing.T) {
 	fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
 	t.Setenv("HOSTD_SENTINEL_SECRET", "must-not-be-forwarded")
@@ -231,12 +269,15 @@ func TestExecutorUsesInspectedEffectiveConfigAsSoleMutationInput(t *testing.T) {
 		return runtimeprocess.CommandResult{Stdout: upStdout, Stderr: upStderr}, nil
 	}
 
-	result, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+	result, err := fixture.executor.ExecuteBound(context.Background(), fixture.job, fixture.claim, &fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
 	if fixture.deployments.deployment.Status != deployments.Succeeded || fixture.deployments.deployment.ReleaseID != fixture.releases.release.ID || fixture.deployments.deployment.ActualConfigurationRevisionID != fixture.configuration.current.RevisionID {
 		t.Fatalf("deployment=%#v", fixture.deployments.deployment)
+	}
+	if !reflect.DeepEqual(fixture.deployments.gate.Claim, fixture.claim) || fixture.deployments.gate.DeploymentID != fixture.deployments.deployment.ID {
+		t.Fatalf("gate request=%#v", fixture.deployments.gate)
 	}
 	if fixture.configuration.currentCalls != 1 || len(fixture.configuration.revisionRequest) != 0 {
 		t.Fatalf("configuration calls current=%d exact=%v", fixture.configuration.currentCalls, fixture.configuration.revisionRequest)
@@ -259,7 +300,7 @@ func TestExecutorRejectsSanitizedSecretDerivedPolicyBeforeMutation(t *testing.T)
 	configStdout := []byte(`{"services":{"web":{"cap_add":["NET_ADMIN"]}}}`)
 	fixture.runner.run = successfulRunner(runtimeprocess.CommandResult{Stdout: configStdout})
 
-	_, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+	_, err := fixture.executor.ExecuteBound(context.Background(), fixture.job, fixture.claim, &fixture.reporter)
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "policy_rejected" {
 		t.Fatalf("error=%v", err)
@@ -339,7 +380,7 @@ func TestExecutorFailureAndPauseTaxonomyCleansProtectedFiles(t *testing.T) {
 				cancel(jobs.ErrCancellationRequested)
 				executionContext = cancelledContext
 			}
-			result, err := fixture.executor.Execute(executionContext, fixture.job, &fixture.reporter)
+			result, err := fixture.executor.ExecuteBound(executionContext, fixture.job, fixture.claim, &fixture.reporter)
 			if test.wantPause {
 				if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != "approval_required" {
 					t.Fatalf("result=%#v err=%v", result, err)
@@ -372,6 +413,63 @@ func TestExecutorFailureAndPauseTaxonomyCleansProtectedFiles(t *testing.T) {
 	}
 }
 
+func TestExecutorPreservesGateRefusalAndCancellationWithoutFailureMutation(t *testing.T) {
+	cleanupFailure := errors.New("cleanup failed")
+	for _, test := range []struct {
+		name        string
+		gateErr     error
+		config      runtimeprocess.CommandResult
+		wantStatus  deployments.Status
+		cleanupFail bool
+		cancel      bool
+	}{
+		{name: "cancelled approval", gateErr: deployments.ErrApprovalRequired, config: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{"privileged":true}}}`)}, wantStatus: deployments.NeedsAttention, cancel: true},
+		{name: "cancelled rejection", gateErr: deployments.ErrRejectedCapability, config: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{"build":"https://example.invalid/repository.git"}}}`)}, wantStatus: deployments.Failed, cancel: true},
+		{name: "cancelled authority with cleanup failure", gateErr: deploymentexecution.ErrAuthorityStale, config: validModel(), wantStatus: deployments.Preparing, cleanupFail: true, cancel: true},
+		{name: "live authority refusal", gateErr: deploymentexecution.ErrAuthorityStale, config: validModel(), wantStatus: deployments.Preparing},
+		{name: "live evidence refusal with cleanup failure", gateErr: deployments.ErrInvalidDeployment, config: validModel(), wantStatus: deployments.Preparing, cleanupFail: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
+			fixture.deployments.gateErr = test.gateErr
+			var ctx context.Context = context.Background()
+			if test.cancel {
+				cancelled, cancel := context.WithCancel(ctx)
+				ctx = cancelled
+				fixture.deployments.afterGate = cancel
+			}
+			fixture.runner.run = successfulRunner(test.config)
+			if test.cleanupFail {
+				originalCleanup := fixture.executor.cleanup
+				fixture.executor.cleanup = func(files *securetemp.Files) error {
+					_ = originalCleanup(files)
+					return cleanupFailure
+				}
+			}
+
+			result, err := fixture.executor.ExecuteBound(ctx, fixture.job, fixture.claim, &fixture.reporter)
+			var executionErr *jobs.ExecutionError
+			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" ||
+				!errors.Is(err, test.gateErr) {
+				t.Fatalf("result=%#v error=%v", result, err)
+			}
+			if test.cancel && (!errors.Is(err, deploymentexecution.ErrCanceled) || !errors.Is(err, context.Canceled)) {
+				t.Fatalf("cancellation cause missing: %v", err)
+			}
+			if !test.cancel && errors.Is(err, deploymentexecution.ErrCanceled) {
+				t.Fatalf("live refusal was relabeled as cancellation: %v", err)
+			}
+			if test.cleanupFail && !errors.Is(err, cleanupFailure) {
+				t.Fatalf("cleanup cause missing: %v", err)
+			}
+			if fixture.deployments.deployment.Status != test.wantStatus || len(fixture.runner.requests) != 1 || last(fixture.deployments.actions) != "gate" {
+				t.Fatalf("deployment=%#v runner=%d actions=%v", fixture.deployments.deployment, len(fixture.runner.requests), fixture.deployments.actions)
+			}
+			assertRuntimeTempEmpty(t, fixture.dataRoot)
+		})
+	}
+}
+
 func TestExecutorParentShutdownLeavesDeploymentForRecovery(t *testing.T) {
 	fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
 	fixture.runner.run = func(_ int, _ runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -379,7 +477,7 @@ func TestExecutorParentShutdownLeavesDeploymentForRecovery(t *testing.T) {
 	}
 	executionContext, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := fixture.executor.Execute(executionContext, fixture.job, &fixture.reporter)
+	_, err := fixture.executor.ExecuteBound(executionContext, fixture.job, fixture.claim, &fixture.reporter)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("shutdown error=%v", err)
 	}
@@ -429,7 +527,7 @@ func TestExecutorPriorReleaseConfigurationModesAndResumePin(t *testing.T) {
 				}
 			}
 			fixture.runner.run = successfulRunner(validModel())
-			if _, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter); err != nil {
+			if _, err := fixture.executor.ExecuteBound(context.Background(), fixture.job, fixture.claim, &fixture.reporter); err != nil {
 				t.Fatal(err)
 			}
 			if fixture.configuration.currentCalls != test.wantCurrent || !reflect.DeepEqual(fixture.configuration.revisionRequest, nonzeroRevisionRequests(test.wantRevision)) {
@@ -464,7 +562,7 @@ func TestExecutorLatestGitHubUsesRequestedActorAndCurrentConfiguration(t *testin
 		ConfigurationRevisionNumber: 3,
 	}
 	fixture.runner.run = successfulRunner(validModel())
-	if _, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter); err != nil {
+	if _, err := fixture.executor.ExecuteBound(context.Background(), fixture.job, fixture.claim, &fixture.reporter); err != nil {
 		t.Fatal(err)
 	}
 	if fixture.releases.materializeCalls != 1 || fixture.releases.readyCalls != 0 || fixture.releases.materializeOwner != fixture.job.RequestedBy || fixture.releases.materializeApp != fixture.job.ResourceID {
@@ -483,7 +581,7 @@ func TestExecutorRejectsInvalidRequestedActorBeforeSideEffects(t *testing.T) {
 		t.Run(actor, func(t *testing.T) {
 			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
 			fixture.job.RequestedBy = actor
-			result, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+			result, err := fixture.executor.ExecuteBound(context.Background(), fixture.job, fixture.claim, &fixture.reporter)
 			var executionErr *jobs.ExecutionError
 			if !errors.As(err, &executionErr) || executionErr.Code != "validation_failed" || result != (jobs.ExecutionResult{}) {
 				t.Fatalf("result=%#v error=%v", result, err)
@@ -522,7 +620,7 @@ func TestExecutorMapsSourceAndConfigurationDiagnostics(t *testing.T) {
 				cancel(jobs.ErrCancellationRequested)
 				executionContext = cancelledContext
 			}
-			_, err := fixture.executor.Execute(executionContext, fixture.job, &fixture.reporter)
+			_, err := fixture.executor.ExecuteBound(executionContext, fixture.job, fixture.claim, &fixture.reporter)
 			var executionErr *jobs.ExecutionError
 			if !errors.As(err, &executionErr) || executionErr.Code != test.wantCode {
 				t.Fatalf("error=%v want code=%q", err, test.wantCode)
@@ -600,7 +698,7 @@ func TestExecutorLocalDirectoryDirectFileAndAmbiguousSource(t *testing.T) {
 				fixture.releases.release.ComposePath = wantCompose
 			}
 			fixture.runner.run = successfulRunner(validModel())
-			_, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+			_, err := fixture.executor.ExecuteBound(context.Background(), fixture.job, fixture.claim, &fixture.reporter)
 			if test.wantError {
 				var executionErr *jobs.ExecutionError
 				if !errors.As(err, &executionErr) || executionErr.Code != "invalid_source" || len(fixture.runner.requests) != 0 || fixture.deployments.deployment.Status != deployments.Failed {
@@ -644,7 +742,7 @@ func TestExecutorManagedWorkspaceBindIsReadOnlyForGitHubAndLocal(t *testing.T) {
 				if !readOnly {
 					fixture.deployments.gateErr = deployments.ErrRejectedCapability
 				}
-				_, executeErr := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+				_, executeErr := fixture.executor.ExecuteBound(context.Background(), fixture.job, fixture.claim, &fixture.reporter)
 				wantCapability, wantDisposition := "workspace_bind_mount", DispositionAllowed
 				if !readOnly {
 					wantCapability, wantDisposition = "writable_managed_bind", DispositionRejected
@@ -672,6 +770,7 @@ type executorFixture struct {
 	runner        *fakeRunner
 	reporter      recordingReporter
 	job           jobs.Job
+	claim         deploymentexecution.Claim
 	workspace     string
 	dataRoot      string
 }
@@ -713,6 +812,7 @@ func newExecutorFixture(t *testing.T, mode jobs.ConfigurationMode, releaseID str
 	if err != nil {
 		t.Fatal(err)
 	}
+	job, claim := newBoundComposeJob(t, applicationID, input)
 	return executorFixture{
 		executor:      executor,
 		applications:  applications,
@@ -720,18 +820,54 @@ func newExecutorFixture(t *testing.T, mode jobs.ConfigurationMode, releaseID str
 		configuration: configuration,
 		deployments:   deploymentRepository,
 		runner:        runner,
-		job: jobs.Job{
-			ID:           uuid.NewString(),
-			Type:         "deploy",
-			ResourceType: "application",
-			ResourceID:   applicationID,
-			RequestedBy:  uuid.NewString(),
-			Input:        input,
-			Attempt:      1,
-		},
+		job:           job, claim: claim,
 		workspace: workspace,
 		dataRoot:  dataRoot,
 	}
+}
+
+func newBoundComposeJob(t *testing.T, appID string, input json.RawMessage) (jobs.Job, deploymentexecution.Claim) {
+	t.Helper()
+	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	actorID := uuid.NewString()
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, actorID, "hash", stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'deployed',?,?)`, appID, appID, appID, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+		ApplicationID: appID, IdempotencyKey: "compose-executor", RequestedBy: actorID,
+		Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+	}, jobs.DeploymentCreateHooks{})
+	if err != nil || !created.Created {
+		t.Fatalf("create bound Compose job: created=%t error=%v", created.Created, err)
+	}
+	job := created.Job
+	job.Input = input
+	job.Attempt = 1
+	claim, err := deploymentexecution.NewClaim(created.Binding, job.ID, appID, job.Attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return job, claim
 }
 
 func successfulRunner(model runtimeprocess.CommandResult) func(int, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {

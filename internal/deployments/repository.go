@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/generatedrecovery"
 )
 
@@ -110,11 +111,24 @@ type Approval struct {
 }
 
 type Repository struct {
-	db  *sql.DB
-	now func() time.Time
+	db                  *sql.DB
+	executionGuard      *deploymentexecution.Guard
+	now                 func() time.Time
+	afterGatePolicyRead func()
 }
 
 func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }
+
+func NewWithExecutionGuard(db *sql.DB, guard *deploymentexecution.Guard) (*Repository, error) {
+	if db == nil || guard == nil || !guard.UsesDatabase(db) {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	return &Repository{db: db, executionGuard: guard, now: time.Now}, nil
+}
+
+func (r *Repository) UsesDatabase(db *sql.DB) bool {
+	return r != nil && db != nil && r.db == db
+}
 
 // GetOrCreateByJob atomically establishes the one-to-one durable linkage
 // between a deployment job and its deployment history row. Replays return the
@@ -542,76 +556,258 @@ func validateFindings(findings []Finding) error {
 	return nil
 }
 
-// Gate persists the evaluated findings and, in the same transaction, rechecks
-// exact active approvals before moving to applying immediately before mutation.
-func (r *Repository) Gate(ctx context.Context, appID, deploymentID string, findings []Finding) error {
-	if err := validateFindings(findings); err != nil {
+type GateRequest struct {
+	Claim        deploymentexecution.Claim
+	DeploymentID string
+	Findings     []Finding
+}
+
+// Gate persists a deployment's complete evaluated policy set and rechecks its
+// current execution authority and exact active approvals in one writer
+// transaction. Recovered applying and waiting-health deployments are checked
+// read-only.
+func (r *Repository) Gate(ctx context.Context, request GateRequest) error {
+	if r == nil || r.db == nil || r.executionGuard == nil || !r.executionGuard.UsesDatabase(r.db) {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
+	pinned, err := r.executionGuard.PinScope(ctx)
+	if err != nil {
+		return err
+	}
+	defer pinned.Leave()
+	if err := validateFindings(request.Findings); err != nil {
 		return err
 	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return gateDatabaseError(ctx, err)
 	}
 	defer tx.Rollback()
-	var status Status
-	var provenanceInitialized bool
-	if err := tx.QueryRowContext(ctx, `SELECT status,provenance_initialized FROM deployments WHERE id=? AND app_id=?`, deploymentID, appID).Scan(&status, &provenanceInitialized); errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	} else if err != nil {
+	// Acquire SQLite's single-writer reservation before authority and policy
+	// reads so every decision observes one serialized state.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET id=id WHERE 0`); err != nil {
+		return gateDatabaseError(ctx, err)
+	}
+	if err := pinned.CheckPolicyGateTx(tx, request.Claim, request.DeploymentID); err != nil {
 		return err
 	}
-	if (status != Preparing && status != NeedsAttention) || !provenanceInitialized {
-		return ErrInvalidTransition
+	if err := contextError(ctx); err != nil {
+		return err
 	}
-	now := r.now().UTC().Format(time.RFC3339Nano)
-	sorted := append([]Finding(nil), findings...)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Fingerprint < sorted[j].Fingerprint })
-	rejected := false
-	missingApproval := false
-	for _, finding := range sorted {
-		_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO deployment_policy_findings(id,deployment_id,policy_version,capability,scope,fingerprint,disposition,created_at) VALUES(?,?,?,?,?,?,?,?)`, uuid.NewString(), deploymentID, finding.PolicyVersion, finding.Capability, finding.Scope, finding.Fingerprint, finding.Disposition, now)
-		if err != nil {
+
+	appID := request.Claim.ApplicationID()
+	var status Status
+	if err := tx.QueryRowContext(ctx, `SELECT status FROM deployments WHERE id=? AND app_id=?`, request.DeploymentID, appID).Scan(&status); errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return gateDatabaseError(ctx, err)
+	}
+	persisted, err := findingsTx(ctx, tx, appID, request.DeploymentID)
+	if r.afterGatePolicyRead != nil {
+		r.afterGatePolicyRead()
+	}
+	if canceled := contextError(ctx); canceled != nil {
+		return errors.Join(canceled, err)
+	}
+	if err != nil {
+		if errors.Is(err, ErrInvalidDeployment) {
 			return err
 		}
-		if finding.Disposition == "rejected" {
-			rejected = true
+		return gateDatabaseError(ctx, err)
+	}
+	if len(persisted) != 0 && !sameFindingSet(persisted, request.Findings) {
+		return ErrInvalidDeployment
+	}
+	if (status == Applying || status == WaitingHealth) && !sameFindingSet(persisted, request.Findings) {
+		return ErrInvalidDeployment
+	}
+	if status != Preparing && status != NeedsAttention && status != Applying && status != WaitingHealth {
+		return ErrInvalidTransition
+	}
+
+	now := r.now().UTC().Format(time.RFC3339Nano)
+	if len(persisted) == 0 && len(request.Findings) != 0 {
+		if status == Applying || status == WaitingHealth {
+			return ErrInvalidDeployment
 		}
-		if finding.Disposition == "approval_required" {
+		for _, finding := range sortedFindings(request.Findings) {
+			result, err := tx.ExecContext(ctx, `INSERT INTO deployment_policy_findings(id,deployment_id,policy_version,capability,scope,fingerprint,disposition,created_at) VALUES(?,?,?,?,?,?,?,?)`, uuid.NewString(), request.DeploymentID, finding.PolicyVersion, finding.Capability, finding.Scope, finding.Fingerprint, finding.Disposition, now)
+			if err != nil {
+				return gateDatabaseError(ctx, err)
+			}
+			count, err := result.RowsAffected()
+			if err != nil {
+				return gateDatabaseError(ctx, err)
+			}
+			if count != 1 {
+				return ErrInvalidDeployment
+			}
+		}
+		persisted = append([]Finding(nil), request.Findings...)
+	}
+	rejected, missingApproval, err := evaluatePolicyTx(ctx, tx, appID, persisted)
+	if err != nil {
+		return gateDatabaseError(ctx, err)
+	}
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if status == Applying || status == WaitingHealth {
+		if err := tx.Commit(); err != nil {
+			return gateDatabaseError(ctx, err)
+		}
+		if rejected {
+			return ErrRejectedCapability
+		}
+		if missingApproval {
+			return ErrApprovalRequired
+		}
+		return nil
+	}
+	if rejected {
+		result, err := tx.ExecContext(ctx, `UPDATE deployments SET status='failed',finished_at=?,diagnostic_code='policy_rejected',failure_code='policy_rejected',failure_summary='Compose configuration requests an unsupported capability' WHERE id=? AND app_id=? AND status IN ('preparing','needs_attention')`, now, request.DeploymentID, appID)
+		if err != nil {
+			return gateDatabaseError(ctx, err)
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return gateDatabaseError(ctx, err)
+		}
+		if count != 1 {
+			return ErrInvalidTransition
+		}
+		if err := contextError(ctx); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return gateDatabaseError(ctx, err)
+		}
+		return ErrRejectedCapability
+	}
+	if missingApproval {
+		result, err := tx.ExecContext(ctx, `UPDATE deployments SET status='needs_attention',diagnostic_code='approval_required',failure_code='approval_required',failure_summary='Deployment requires administrator approval' WHERE id=? AND app_id=? AND status IN ('preparing','needs_attention')`, request.DeploymentID, appID)
+		if err != nil {
+			return gateDatabaseError(ctx, err)
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return gateDatabaseError(ctx, err)
+		}
+		if count != 1 {
+			return ErrInvalidTransition
+		}
+		if err := contextError(ctx); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return gateDatabaseError(ctx, err)
+		}
+		return ErrApprovalRequired
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE deployments SET status='applying',started_at=COALESCE(started_at,?),diagnostic_code=NULL,failure_code=NULL,failure_summary=NULL WHERE id=? AND app_id=? AND status IN ('preparing','needs_attention')`, now, request.DeploymentID, appID)
+	if err != nil {
+		return gateDatabaseError(ctx, err)
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return gateDatabaseError(ctx, err)
+	}
+	if count != 1 {
+		return ErrInvalidTransition
+	}
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return gateDatabaseError(ctx, err)
+	}
+	return nil
+}
+
+func findingsTx(ctx context.Context, tx *sql.Tx, appID, deploymentID string) ([]Finding, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT f.policy_version,f.capability,f.scope,f.fingerprint,f.disposition
+		FROM deployment_policy_findings f JOIN deployments d ON d.id=f.deployment_id
+		WHERE f.deployment_id=? AND d.app_id=? ORDER BY f.fingerprint`, deploymentID, appID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var findings []Finding
+	for rows.Next() {
+		var finding Finding
+		if err := rows.Scan(&finding.PolicyVersion, &finding.Capability, &finding.Scope, &finding.Fingerprint, &finding.Disposition); err != nil {
+			return nil, err
+		}
+		findings = append(findings, finding)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateFindings(findings); err != nil {
+		return nil, err
+	}
+	return findings, nil
+}
+
+func sortedFindings(findings []Finding) []Finding {
+	result := append([]Finding(nil), findings...)
+	sort.Slice(result, func(i, j int) bool { return result[i].Fingerprint < result[j].Fingerprint })
+	return result
+}
+
+func sameFindingSet(left, right []Finding) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	left = sortedFindings(left)
+	right = sortedFindings(right)
+	for index := range left {
+		if left[index].PolicyVersion != right[index].PolicyVersion || left[index].Capability != right[index].Capability ||
+			left[index].Scope != right[index].Scope || left[index].Fingerprint != right[index].Fingerprint ||
+			left[index].Disposition != right[index].Disposition {
+			return false
+		}
+	}
+	return true
+}
+
+func evaluatePolicyTx(ctx context.Context, tx *sql.Tx, appID string, findings []Finding) (bool, bool, error) {
+	rejected := false
+	missingApproval := false
+	for _, finding := range sortedFindings(findings) {
+		switch finding.Disposition {
+		case "rejected":
+			rejected = true
+		case "approval_required":
 			var approved int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_approvals WHERE app_id=? AND policy_version=? AND capability=? AND scope=? AND fingerprint=? AND revoked_at IS NULL`, appID, finding.PolicyVersion, finding.Capability, finding.Scope, finding.Fingerprint).Scan(&approved); err != nil {
-				return err
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM runtime_approvals
+				WHERE app_id=? AND policy_version=? AND capability=? AND scope=? AND fingerprint=? AND revoked_at IS NULL`,
+				appID, finding.PolicyVersion, finding.Capability, finding.Scope, finding.Fingerprint).Scan(&approved); err != nil {
+				return false, false, err
 			}
 			if approved != 1 {
 				missingApproval = true
 			}
 		}
 	}
-	if rejected {
-		if _, err := tx.ExecContext(ctx, `UPDATE deployments SET status='failed',finished_at=?,diagnostic_code='policy_rejected',failure_code='policy_rejected',failure_summary='Compose configuration requests an unsupported capability' WHERE id=? AND app_id=? AND status IN ('preparing','needs_attention')`, now, deploymentID, appID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		return ErrRejectedCapability
+	return rejected, missingApproval, nil
+}
+
+func contextError(ctx context.Context) error {
+	if ctx == nil {
+		return deploymentexecution.ErrInvalidConfiguration
 	}
-	if missingApproval {
-		if _, err := tx.ExecContext(ctx, `UPDATE deployments SET status='needs_attention',diagnostic_code='approval_required',failure_code='approval_required',failure_summary='Deployment requires administrator approval' WHERE id=? AND app_id=? AND status IN ('preparing','needs_attention')`, deploymentID, appID); err != nil {
-			return err
-		}
-		if err := tx.Commit(); err != nil {
-			return err
-		}
-		return ErrApprovalRequired
+	if err := ctx.Err(); err != nil {
+		return errors.Join(deploymentexecution.ErrCanceled, err)
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE deployments SET status='applying',started_at=COALESCE(started_at,?),diagnostic_code=NULL,failure_code=NULL,failure_summary=NULL WHERE id=? AND app_id=? AND status IN ('preparing','needs_attention')`, now, deploymentID, appID)
-	if err != nil {
-		return err
+	return nil
+}
+
+func gateDatabaseError(ctx context.Context, err error) error {
+	if canceled := contextError(ctx); canceled != nil {
+		return errors.Join(canceled, err)
 	}
-	if count, err := result.RowsAffected(); err != nil || count != 1 {
-		return ErrInvalidTransition
-	}
-	return tx.Commit()
+	return errors.Join(deploymentexecution.ErrUnavailable, err)
 }
 
 func (r *Repository) Grant(ctx context.Context, appID, actorID, fingerprint string) (Approval, bool, error) {

@@ -24,12 +24,17 @@ import (
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
+	"github.com/hostd/hostd/internal/runtimeexecutor"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -217,12 +222,8 @@ func TestCoordinatorJobRunsOwnerScopedGitHubComposeMaterialization(t *testing.T)
 		t.Fatal(err)
 	}
 	runner := &successfulComposeRunner{}
-	deploymentRepository := deployments.New(db)
-	executor, err := composeruntime.NewExecutor(applications, materializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{DockerExecutable: "docker-test", ConfigTimeout: 5 * time.Second, ApplyTimeout: 30 * time.Second, WaitTimeout: 10 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	jobService := newComposeDeploymentJobService(t, db)
+	jobService, bindings := newComposeDeploymentJobService(t, db)
+	executor, _, admission := newBoundComposeWorkerExecutor(t, db, dataRoot, bindings, applications, materializer, configuration, temporary, runner)
 	autoRepository := autodeploy.NewRepository(db)
 	if _, err = autoRepository.Configure(context.Background(), autodeploy.ConfigureRequest{ApplicationID: application.ID, ActorUserID: owner, Enabled: true}, now); err != nil {
 		t.Fatal(err)
@@ -237,7 +238,7 @@ func TestCoordinatorJobRunsOwnerScopedGitHubComposeMaterialization(t *testing.T)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	workerDone, coordinatorDone := make(chan error, 1), make(chan error, 1)
-	go func() { workerDone <- jobService.RunWorker(ctx, executor) }()
+	go func() { workerDone <- jobService.RunWorkerWithScopedAdmission(ctx, executor, admission) }()
 	go func() { coordinatorDone <- coordinator.Run(ctx) }()
 	t.Cleanup(func() {
 		cancel()
@@ -632,22 +633,13 @@ func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := newComposeDeploymentJobService(t, db)
-	deploymentRepository := deployments.New(db)
+	jobService, bindings := newComposeDeploymentJobService(t, db)
 	releaseUp := make(chan struct{})
 	var releaseUpOnce sync.Once
 	release := func() { releaseUpOnce.Do(func() { close(releaseUp) }) }
 	runner := &blockingComposeRunner{upStarted: make(chan struct{}), releaseUp: releaseUp}
 	runner.setConfigJSON([]byte(`{"services":{"web":{"image":"nginx","environment":{"TOKEN":"runtime-secret"}}}}`))
-	executor, err := composeruntime.NewExecutor(applicationStore, materializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
-		DockerExecutable: "docker-test",
-		ConfigTimeout:    5 * time.Second,
-		ApplyTimeout:     30 * time.Second,
-		WaitTimeout:      10 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	executor, deploymentRepository, admission := newBoundComposeWorkerExecutor(t, db, dataRoot, bindings, applicationStore, materializer, configuration, temporary, runner)
 	fixture := &composeWorkerFixture{
 		db:            db,
 		jobs:          jobService,
@@ -656,6 +648,8 @@ func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *t
 		temporary:     temporary,
 		runner:        runner,
 		executor:      executor,
+		admission:     admission,
+		bindings:      bindings,
 		app:           application,
 		actorID:       actorID,
 		dataRoot:      dataRoot,
@@ -1011,10 +1005,26 @@ func TestComposeRestartRecoveryCleansExactTempAndDoesNotDuplicateLinkage(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.deployments.Gate(context.Background(), fixture.app.ID, deployment.ID, nil); err != nil {
+	if _, err := fixture.db.Exec(`UPDATE jobs SET status='running',phase='apply_runtime',attempt=1 WHERE id=?`, job.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.db.Exec(`UPDATE jobs SET status='running',phase='apply_runtime',attempt=1 WHERE id=?`, job.ID); err != nil {
+	binding, err := fixture.bindings.Read(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := deploymentexecution.NewClaim(binding, job.ID, fixture.app.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateCtx, releaseGate, err := fixture.admission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.deployments.Gate(gateCtx, deployments.GateRequest{Claim: claim, DeploymentID: deployment.ID}); err != nil {
+		_ = releaseGate()
+		t.Fatal(err)
+	}
+	if err := releaseGate(); err != nil {
 		t.Fatal(err)
 	}
 	files, err := fixture.temporary.Create(job.ID, 1)
@@ -1056,7 +1066,9 @@ type composeWorkerFixture struct {
 	configuration *appconfig.Store
 	temporary     *securetemp.Manager
 	runner        *blockingComposeRunner
-	executor      *composeruntime.Executor
+	executor      jobs.Executor
+	admission     jobs.ScopedAdmission
+	bindings      *deploymentbinding.Repository
 	app           apps.Application
 	actorID       string
 	dataRoot      string
@@ -1101,23 +1113,14 @@ func newComposeWorkerFixture(t *testing.T, releaseUp chan struct{}) *composeWork
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := newComposeDeploymentJobService(t, db)
-	deploymentRepository := deployments.New(db)
+	jobService, bindings := newComposeDeploymentJobService(t, db)
 	runner := &blockingComposeRunner{upStarted: make(chan struct{}), releaseUp: releaseUp}
 	releaseMaterializer, err := releasesnapshot.New(db, unreachableSourceReader{}, dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor, err := composeruntime.NewExecutor(applicationStore, releaseMaterializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
-		DockerExecutable: "docker-test",
-		ConfigTimeout:    5 * time.Second,
-		ApplyTimeout:     30 * time.Second,
-		WaitTimeout:      10 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &composeWorkerFixture{db: db, jobs: jobService, deployments: deploymentRepository, configuration: configuration, temporary: temporary, runner: runner, executor: executor, app: app, actorID: actorID, dataRoot: dataRoot}
+	executor, deploymentRepository, admission := newBoundComposeWorkerExecutor(t, db, dataRoot, bindings, applicationStore, releaseMaterializer, configuration, temporary, runner)
+	return &composeWorkerFixture{db: db, jobs: jobService, deployments: deploymentRepository, configuration: configuration, temporary: temporary, runner: runner, executor: executor, admission: admission, bindings: bindings, app: app, actorID: actorID, dataRoot: dataRoot}
 }
 
 func (f *composeWorkerFixture) startWorker(t *testing.T) {
@@ -1125,7 +1128,7 @@ func (f *composeWorkerFixture) startWorker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	f.cancelWorker = cancel
 	f.workerDone = make(chan error, 1)
-	go func() { f.workerDone <- f.jobs.RunWorker(ctx, f.executor) }()
+	go func() { f.workerDone <- f.jobs.RunWorkerWithScopedAdmission(ctx, f.executor, f.admission) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -1154,7 +1157,7 @@ func (f *composeWorkerFixture) createJob(t *testing.T) jobs.Job {
 	return result.Job
 }
 
-func newComposeDeploymentJobService(t *testing.T, db *sql.DB) *jobs.Service {
+func newComposeDeploymentJobService(t *testing.T, db *sql.DB) (*jobs.Service, *deploymentbinding.Repository) {
 	t.Helper()
 	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
 	if err != nil {
@@ -1168,7 +1171,62 @@ func newComposeDeploymentJobService(t *testing.T, db *sql.DB) *jobs.Service {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return service
+	return service, bindings
+}
+
+func newBoundComposeWorkerExecutor(
+	t *testing.T,
+	db *sql.DB,
+	dataRoot string,
+	bindings *deploymentbinding.Repository,
+	applications *apps.Store,
+	releases *releasesnapshot.Materializer,
+	configuration *appconfig.Store,
+	temporary *securetemp.Manager,
+	runner runtimeprocess.CommandRunner,
+) (jobs.Executor, *deployments.Repository, jobs.ScopedAdmission) {
+	t.Helper()
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentRepository, err := deployments.NewWithExecutionGuard(db, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundExecutor, err := composeruntime.NewExecutor(applications, releases, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
+		DockerExecutable: "docker-test",
+		ConfigTimeout:    5 * time.Second,
+		ApplyTimeout:     30 * time.Second,
+		WaitTimeout:      10 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	router, err := runtimeexecutor.New(deploymentRepository, plans, releases, boundExecutor, nil, bindings, func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := func(parent context.Context) (context.Context, func() error, error) {
+		scope, release, err := deploymenteffects.AcquireScoped(parent, directories.WorkingDirectory)
+		if err != nil {
+			return nil, nil, err
+		}
+		return deploymenteffects.WithScope(parent, scope), release, nil
+	}
+	return router, deploymentRepository, admission
 }
 
 func waitForJob(t *testing.T, service *jobs.Service, id string, status jobs.Status) jobs.Job {

@@ -225,6 +225,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		t.Fatal(err)
 	}
 	deploymentStore := deployments.New(db)
+	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	settings := config.Defaults()
 	settings.DataRoot = dataRoot
 	settings.GeneratedRuntime = true
@@ -234,6 +235,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
+		effectsWorkingDirectory: effectsWorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: healthObserver})
 	if err != nil {
 		t.Fatal("compose production generated runtime:", err)
@@ -504,7 +506,9 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	workerContext, stopWorker := context.WithCancel(ctx)
 	done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
 		recoverState: jobStore.RecoverRuntimeContext,
-	}, composition.executor, jobStore.RunWorker, func(error) {})
+	}, composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
+	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -810,14 +814,15 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
 	}
 	type restartedController struct {
-		db            *sql.DB
-		apps          *apps.Store
-		jobs          *jobs.Service
-		deployments   *deployments.Repository
-		configuration *appconfig.Store
-		plans         *deploymentplans.Store
-		sources       *sourceconnections.Service
-		composition   runtimeComposition
+		db              *sql.DB
+		apps            *apps.Store
+		jobs            *jobs.Service
+		deployments     *deployments.Repository
+		configuration   *appconfig.Store
+		plans           *deploymentplans.Store
+		sources         *sourceconnections.Service
+		composition     runtimeComposition
+		scopedAdmission jobs.ScopedAdmission
 	}
 	openRestartedController := func(controllerDB *sql.DB) (restartedController, error) {
 		configuration, err := appconfig.New(controllerDB, dataRoot)
@@ -841,9 +846,12 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 			db: controllerDB, apps: apps.New(controllerDB), jobs: jobStore, deployments: deployments.New(controllerDB),
 			configuration: configuration, plans: plans, sources: sources,
 		}
+		restartedEffectsWorkingDirectory, restartedScopedAdmission := liveDeploymentExecutionFixture(t, controllerDB, dataRoot)
+		value.scopedAdmission = restartedScopedAdmission
 		value.composition, err = prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 			db: controllerDB, applications: value.apps, snapshots: snapshots, configuration: value.configuration,
 			deployments: value.deployments, plans: value.plans, bindings: bindingStore,
+			effectsWorkingDirectory: restartedEffectsWorkingDirectory,
 		}, runtimeCompositionOptions{
 			dockerExecutable: docker,
 			runner:           restartedObserver,
@@ -858,7 +866,9 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		workerContext, stop := context.WithCancel(ctx)
 		done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
 			recoverState: value.jobs.RecoverRuntimeContext,
-		}, value.composition.executor, value.jobs.RunWorker, func(error) {})
+		}, value.composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+			return value.jobs.RunWorkerWithScopedAdmission(workerContext, executor, value.scopedAdmission)
+		}, func(error) {})
 		if err != nil {
 			stop()
 			return nil, nil, nil, err

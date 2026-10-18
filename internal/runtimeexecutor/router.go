@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
@@ -34,22 +35,26 @@ type deploymentBindings interface {
 	Check(context.Context, deploymentbinding.Binding) (deploymentbinding.Classification, error)
 }
 
+type BoundExecutor interface {
+	ExecuteBound(context.Context, jobs.Job, deploymentexecution.Claim, jobs.ProgressReporter) (jobs.ExecutionResult, error)
+}
+
 type Router struct {
 	deployments deploymentReader
 	plans       planReader
 	releases    releaseReader
-	compose     jobs.Executor
-	generated   jobs.Executor
+	compose     BoundExecutor
+	generated   BoundExecutor
 	bindings    deploymentBindings
 	rebindFence func(context.Context) error
 }
 
 var errInvalidSource = errors.New("runtime strategy provenance is invalid")
 
-func New(deploymentRepository deploymentReader, plans planReader, releases releaseReader, compose, generated jobs.Executor,
+func New(deploymentRepository deploymentReader, plans planReader, releases releaseReader, compose, generated BoundExecutor,
 	bindings deploymentBindings, rebindFence func(context.Context) error,
 ) (*Router, error) {
-	if deploymentRepository == nil || plans == nil || releases == nil || (compose == nil && generated == nil) || nilDeploymentBindings(bindings) || rebindFence == nil {
+	if deploymentRepository == nil || plans == nil || releases == nil || (nilBoundExecutor(compose) && nilBoundExecutor(generated)) || nilDeploymentBindings(bindings) || rebindFence == nil {
 		return nil, errors.New("runtime strategy router dependencies are required")
 	}
 	return &Router{
@@ -59,7 +64,7 @@ func New(deploymentRepository deploymentReader, plans planReader, releases relea
 }
 
 func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
-	if r == nil || nilDeploymentBindings(r.bindings) || r.rebindFence == nil || ctx == nil || reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil {
+	if r == nil || nilDeploymentBindings(r.bindings) || r.rebindFence == nil || ctx == nil || reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil || job.Attempt < 1 {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "validation_failed"}
 	}
 	if err := ctx.Err(); err != nil {
@@ -91,6 +96,10 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	if binding.JobID() != job.ID || binding.ApplicationID() != job.ResourceID {
 		return jobs.ExecutionResult{}, deploymentBindingRefusal(ctx, deploymentbinding.ErrInvalidBinding)
 	}
+	claim, err := deploymentexecution.NewClaim(binding, job.ID, job.ResourceID, job.Attempt)
+	if err != nil {
+		return jobs.ExecutionResult{}, errors.Join(&jobs.ExecutionError{Code: "validation_failed"}, err)
+	}
 	if err := r.checkBinding(ctx, binding); err != nil {
 		return jobs.ExecutionResult{}, err
 	}
@@ -118,7 +127,7 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 			return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: code}
 		}
 	}
-	var executor jobs.Executor
+	var executor BoundExecutor
 	switch strategy {
 	case deployments.RuntimeGeneratedNode:
 		executor = r.generated
@@ -127,7 +136,7 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	default:
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "invalid_source"}
 	}
-	if executor == nil {
+	if nilBoundExecutor(executor) {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
 	}
 	// Revalidate the same immutable value after all routing and workspace
@@ -139,7 +148,20 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	if canceled := ctx.Err(); canceled != nil {
 		return jobs.ExecutionResult{}, canceled
 	}
-	return executor.Execute(ctx, job, reporter)
+	return executor.ExecuteBound(ctx, job, claim, reporter)
+}
+
+func nilBoundExecutor(executor BoundExecutor) bool {
+	if executor == nil {
+		return true
+	}
+	value := reflect.ValueOf(executor)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func nilDeploymentBindings(bindings deploymentBindings) bool {

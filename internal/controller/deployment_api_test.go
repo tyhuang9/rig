@@ -27,10 +27,13 @@ import (
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
@@ -44,7 +47,9 @@ type deploymentAPIFixture struct {
 	otherUserID string
 	apps        *apps.Store
 	jobs        *jobs.Service
+	bindings    *deploymentbinding.Repository
 	deployments *deployments.Repository
+	admission   jobs.ScopedAdmission
 	plans       *deploymentplans.Store
 	server      *controller.Server
 	handler     http.Handler
@@ -96,8 +101,30 @@ func newDeploymentAPIFixtureWithRuntimes(t *testing.T, composeRuntime, generated
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := newDeploymentJobTestService(t, db)
-	deploymentStore := deployments.New(db)
+	jobService, bindings := newDeploymentJobTestServiceWithBindings(t, db)
+	directories, err := runtimedocker.PrepareControllerDirectories(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentStore, err := deployments.NewWithExecutionGuard(db, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := func(parent context.Context) (context.Context, func() error, error) {
+		scope, release, err := deploymenteffects.AcquireScoped(parent, directories.WorkingDirectory)
+		if err != nil {
+			return nil, nil, err
+		}
+		return deploymenteffects.WithScope(parent, scope), release, nil
+	}
 	planStore, err := deploymentplans.New(db, stateRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -109,10 +136,16 @@ func newDeploymentAPIFixtureWithRuntimes(t *testing.T, composeRuntime, generated
 		DataRoot: t.TempDir(), Logger: slog.New(slog.NewJSONHandler(logs, nil)),
 	}
 	handler := server.Handler()
-	return deploymentAPIFixture{db: db, auth: authService, session: session, otherUserID: otherID, apps: appStore, jobs: jobService, deployments: deploymentStore, plans: planStore, server: server, handler: handler, app: app, otherApp: otherApp, stateRoot: stateRoot, logs: logs}
+	return deploymentAPIFixture{db: db, auth: authService, session: session, otherUserID: otherID, apps: appStore, jobs: jobService, bindings: bindings, deployments: deploymentStore, admission: admission, plans: planStore, server: server, handler: handler, app: app, otherApp: otherApp, stateRoot: stateRoot, logs: logs}
 }
 
 func newDeploymentJobTestService(t *testing.T, db *sql.DB) *jobs.Service {
+	t.Helper()
+	service, _ := newDeploymentJobTestServiceWithBindings(t, db)
+	return service
+}
+
+func newDeploymentJobTestServiceWithBindings(t *testing.T, db *sql.DB) (*jobs.Service, *deploymentbinding.Repository) {
 	t.Helper()
 	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
 	if err != nil {
@@ -126,7 +159,7 @@ func newDeploymentJobTestService(t *testing.T, db *sql.DB) *jobs.Service {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return service
+	return service, bindings
 }
 
 func (f deploymentAPIFixture) request(method, path, body string) *httptest.ResponseRecorder {
@@ -152,6 +185,31 @@ func (f deploymentAPIFixture) createDeployment(t *testing.T, appID, mode string)
 		t.Fatal(err)
 	}
 	return job, deployment
+}
+
+func (f deploymentAPIFixture) gateDeployment(t *testing.T, job jobs.Job, deployment deployments.Deployment, findings []deployments.Finding) error {
+	t.Helper()
+	if _, err := f.db.Exec(`UPDATE jobs SET status='running',phase='apply_runtime',attempt=CASE WHEN attempt < 1 THEN 1 ELSE attempt END WHERE id=?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.jobs.Get(job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding, err := f.bindings.Read(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := deploymentexecution.NewClaim(binding, job.ID, job.ResourceID, current.Attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateCtx, release, err := f.admission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateErr := f.deployments.Gate(gateCtx, deployments.GateRequest{Claim: claim, DeploymentID: deployment.ID, Findings: findings})
+	return errors.Join(gateErr, release())
 }
 
 func (f deploymentAPIFixture) createDeploymentJob(t *testing.T, appID, mode string) jobs.Job {
@@ -866,7 +924,7 @@ func TestSecretDerivedPolicyNeverLeaksThroughDurableOrPublicSurfaces(t *testing.
 			Scope: finding.Scope, Fingerprint: finding.Fingerprint, Disposition: finding.Disposition,
 		}
 	}
-	if err := f.deployments.Gate(context.Background(), f.app.ID, deployment.ID, findings); !errors.Is(err, deployments.ErrRejectedCapability) {
+	if err := f.gateDeployment(t, job, deployment, findings); !errors.Is(err, deployments.ErrRejectedCapability) {
 		t.Fatalf("gate error=%v", err)
 	}
 	var adminID string
@@ -934,9 +992,9 @@ func TestLocalReleaseHistoryNeverExposesAbsoluteSourceOrWorkspacePath(t *testing
 
 func TestRuntimeApprovalLifecycleOnlyUsesStoredFinding(t *testing.T) {
 	f := newDeploymentAPIFixture(t, true, false)
-	_, deployment := f.createDeployment(t, f.app.ID, "current")
+	job, deployment := f.createDeployment(t, f.app.ID, "current")
 	fingerprint := policyFindingFingerprint("compose-runtime-v1", "privileged", "service:web")
-	if err := f.deployments.Gate(context.Background(), f.app.ID, deployment.ID, []deployments.Finding{{PolicyVersion: "compose-runtime-v1", Capability: "privileged", Scope: "service:web", Fingerprint: fingerprint, Disposition: "approval_required"}}); !errors.Is(err, deployments.ErrApprovalRequired) {
+	if err := f.gateDeployment(t, job, deployment, []deployments.Finding{{PolicyVersion: "compose-runtime-v1", Capability: "privileged", Scope: "service:web", Fingerprint: fingerprint, Disposition: "approval_required"}}); !errors.Is(err, deployments.ErrApprovalRequired) {
 		t.Fatal(err)
 	}
 	path := "/api/v1/apps/" + f.app.ID + "/runtime-approvals"
@@ -990,7 +1048,7 @@ func TestRuntimeApprovalLifecycleOnlyUsesStoredFinding(t *testing.T) {
 	// The first grant is still in use while the deployment has passed the
 	// approval gate, so revocation must fail closed. Once terminal, the exact
 	// same approval can be revoked and remains visible in history.
-	if err := f.deployments.Gate(context.Background(), f.app.ID, deployment.ID, []deployments.Finding{{PolicyVersion: "compose-runtime-v1", Capability: "privileged", Scope: "service:web", Fingerprint: fingerprint, Disposition: "approval_required"}}); err != nil {
+	if err := f.gateDeployment(t, job, deployment, []deployments.Finding{{PolicyVersion: "compose-runtime-v1", Capability: "privileged", Scope: "service:web", Fingerprint: fingerprint, Disposition: "approval_required"}}); err != nil {
 		t.Fatal(err)
 	}
 	inUse := f.request(http.MethodDelete, path+"/"+grant.Approval.ID, "")
@@ -1410,7 +1468,7 @@ func TestResumeRequiresEveryExactActiveRuntimeApproval(t *testing.T) {
 			Fingerprint: policyFindingFingerprint("compose-runtime-v1", "host-network", "service:worker"), Disposition: "approval_required",
 		},
 	}
-	if err := f.deployments.Gate(context.Background(), f.app.ID, deployment.ID, findings); !errors.Is(err, deployments.ErrApprovalRequired) {
+	if err := f.gateDeployment(t, job, deployment, findings); !errors.Is(err, deployments.ErrApprovalRequired) {
 		t.Fatalf("initial approval gate = %v", err)
 	}
 	if _, err := f.db.Exec(`UPDATE jobs SET status='waiting_user',phase='approval_required',pause_disposition='approval_required',attempt=3 WHERE id=?`, job.ID); err != nil {
