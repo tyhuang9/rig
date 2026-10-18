@@ -85,6 +85,9 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	if err != nil {
 		return jobs.ExecutionResult{}, deploymentBindingRefusal(ctx, err)
 	}
+	if canceled := ctx.Err(); canceled != nil {
+		return jobs.ExecutionResult{}, canceled
+	}
 	if binding.JobID() != job.ID || binding.ApplicationID() != job.ResourceID {
 		return jobs.ExecutionResult{}, deploymentBindingRefusal(ctx, deploymentbinding.ErrInvalidBinding)
 	}
@@ -156,6 +159,9 @@ func (r *Router) checkBinding(ctx context.Context, binding deploymentbinding.Bin
 	classification, err := r.bindings.Check(ctx, binding)
 	if err != nil {
 		return deploymentBindingRefusal(ctx, err)
+	}
+	if canceled := ctx.Err(); canceled != nil {
+		return canceled
 	}
 	switch classification {
 	case deploymentbinding.ClassificationCurrent:

@@ -74,6 +74,7 @@ type recordingBindings struct {
 	readContexts   []context.Context
 	checkContexts  []context.Context
 	checked        []deploymentbinding.Binding
+	afterRead      func()
 	beforeCheck    func(int)
 	afterCheck     func(int)
 }
@@ -81,6 +82,11 @@ type recordingBindings struct {
 func (b *recordingBindings) Read(ctx context.Context, jobID string) (deploymentbinding.Binding, error) {
 	b.reads++
 	b.readContexts = append(b.readContexts, ctx)
+	defer func() {
+		if b.afterRead != nil {
+			b.afterRead()
+		}
+	}()
 	if b.readErr != nil {
 		return deploymentbinding.Binding{}, b.readErr
 	}
@@ -784,6 +790,46 @@ func TestRouterHistoricalCorruptionWinsOverNewerHead(t *testing.T) {
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deploymentbinding.ErrInvalidBinding) || deploymentRepository.calls != 0 {
 		t.Fatalf("error=%v deployment calls=%d", err, deploymentRepository.calls)
+	}
+}
+
+func TestRouterSuccessfulBindingCancellationStopsBeforePreparation(t *testing.T) {
+	for _, stage := range []string{"read", "first_check"} {
+		for _, strategy := range []string{"compose", "generated"} {
+			t.Run(stage+"/"+strategy, func(t *testing.T) {
+				fixture := newRouterBindingFixture(t, false)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				job := fixture.job
+				if strategy == "generated" {
+					job = generatedRouterInput(job)
+				}
+				deploymentRepository := &routerDeployments{}
+				plans := &routerPlans{head: deploymentplans.DeploymentPlanRevision{AppID: fixture.appID}}
+				releases := &routerReleases{}
+				compose, generated := &recordingExecutor{}, &recordingExecutor{}
+				router, bindings := newBoundRouter(t, fixture, deploymentRepository, plans, releases, compose, generated)
+				wantChecks := 0
+				if stage == "read" {
+					bindings.afterRead = cancel
+				} else {
+					wantChecks = 1
+					bindings.afterCheck = func(check int) {
+						if check == 1 {
+							cancel()
+						}
+					}
+				}
+				result, err := router.Execute(ctx, job, noopReporter{})
+				if !errors.Is(err, context.Canceled) || !reflect.DeepEqual(result, jobs.ExecutionResult{}) ||
+					bindings.reads != 1 || bindings.checks != wantChecks || deploymentRepository.calls != 0 ||
+					plans.gets != 0 || plans.revisions != 0 || releases.calls != 0 || compose.calls != 0 || generated.calls != 0 {
+					t.Fatalf("error=%v result=%#v reads=%d checks=%d deployments=%d plans=%d/%d releases=%d delegates=%d/%d",
+						err, result, bindings.reads, bindings.checks, deploymentRepository.calls, plans.gets,
+						plans.revisions, releases.calls, compose.calls, generated.calls)
+				}
+			})
+		}
 	}
 }
 
