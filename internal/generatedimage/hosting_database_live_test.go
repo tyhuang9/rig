@@ -34,6 +34,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
 	"github.com/hostd/hostd/internal/projectanalysis"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
@@ -145,7 +146,8 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal("prepare runtime environment stager")
 	}
-	engine, err := generatedruntime.NewEngine(runtimeprocess.ExecRunner{}, stager, hostingLiveCapacity{}, generatedruntime.EngineOptions{
+	authority := liveauthority.New(t, db, filepath.Join(root, "working"))
+	engine, err := generatedruntime.NewEngine(runtimeprocess.ExecRunner{}, stager, hostingLiveCapacity{}, authority.Repository(), generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: runtimeDockerConfig,
 		WorkingDirectory: filepath.Join(root, "working"), CommandTimeout: 45 * time.Second,
 		HealthTimeout: 35 * time.Second, HealthPollInterval: 250 * time.Millisecond,
@@ -203,9 +205,16 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 			t.Error("F7 Compose containers remain after cleanup")
 		}
 	})
-	if err := engine.EnsureAppNetwork(ctx, appID); err != nil {
+	networkContext, networkSpec := authority.BindCandidate(t, ctx, generatedruntime.CandidateSpec{
+		AppID: appID, ReleaseID: uuid.NewString(), DeploymentID: uuid.NewString(), ArtifactID: uuid.NewString(),
+		DeploymentPlanRevisionID: plan.ID, DeploymentPlanRevisionNumber: plan.RevisionNumber,
+		ComponentName: "network", Role: generatedruntime.RoleServer,
+		ImageContentID: "sha256:" + strings.Repeat("6", 64), BuildDefinitionDigest: strings.Repeat("7", 64),
+	})
+	if err := engine.EnsureAppNetwork(networkContext, networkSpec.Network); err != nil {
 		t.Fatalf("create app-private bridge: %s", hostingLiveRuntimeCode(err))
 	}
+	authority.RejectCandidate(t, networkSpec.DeploymentID, "")
 
 	gateway := hostingLiveGateway(t, ctx, docker, runtimeDockerConfig, appNetwork.Name)
 	postgresPort := hostingLiveFreePort(t, gateway)
@@ -239,7 +248,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	httpsURL := fmt.Sprintf("https://%s:%d/", gateway, httpsPort)
 	hostingLivePrepareSchema(t, ctx, node, workspace, dbURL, base64.StdEncoding.EncodeToString(ca), docker, runtimeDockerConfig, fixtureRoot, composeEnv)
 	settings := hostingLiveSettings{dbURL: dbURL, httpsURL: httpsURL, ca: base64.StdEncoding.EncodeToString(ca), token: token, sentinel: sentinel}
-	revisionA := hostingLiveReplaceConfig(t, ctx, config, appID, plan, 0, settings, "runtime-A")
+	revisionA := hostingLiveReplaceConfig(t, ctx, config, appID, plan, networkSpec.ConfigurationRevisionNumber, settings, "runtime-A")
 	releaseID, artifactID := uuid.NewString(), uuid.NewString()
 	imageID, definitionDigest := hostingLiveBuildAPI(t, ctx, docker, buildDockerConfig, workspace, root, imageTag, plan, appID, releaseID, artifactID, dbURL, token, sentinel)
 	hostingLiveImageHasNoSecrets(t, ctx, docker, runtimeDockerConfig, imageID, dbURL, token, sentinel)
@@ -256,7 +265,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("prepare generated ingress")
 	}
 	blueSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
-	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, config, revisionA, settings, blueSpec, &blue)
+	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, authority, config, revisionA, settings, blueSpec, &blue)
 	hostingLiveOnlyAppNetwork(t, ctx, docker, runtimeDockerConfig, blue.ContainerID, appNetwork.Name)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(blue)}}); err != nil {
 		t.Fatal("route initial API candidate")
@@ -275,15 +284,18 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	badSpec.Environment = append([]byte(nil), badExport.Environment...)
 	badExport.Clear()
 	badSpec.EnvironmentOperationID, badSpec.EnvironmentOperationAttempt = uuid.NewString(), 1
-	bad, err = engine.CreateInactiveCandidate(ctx, badSpec)
+	badSpec.ConfigurationRevisionID, badSpec.ConfigurationRevisionNumber = badRevision.RevisionID, badRevision.RevisionNumber
+	badSpec.DeploymentPlanRevisionNumber = plan.RevisionNumber
+	badContext, badSpec := authority.BindCandidate(t, ctx, badSpec)
+	bad, err = engine.CreateInactiveCandidate(badContext, badSpec)
 	if err != nil {
 		t.Fatalf("create bad-CA candidate: %s", hostingLiveRuntimeCode(err))
 	}
 	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, runtimeDockerConfig, bad.ContainerID, settings)
-	if err := engine.StartCandidate(ctx, bad); err != nil {
+	if err := engine.StartCandidate(badContext, bad); err != nil {
 		t.Fatalf("start bad-CA candidate: %s", hostingLiveRuntimeCode(err))
 	}
-	if err := engine.WaitHealthy(ctx, bad); !generatedruntime.IsCode(err, generatedruntime.DiagnosticCandidateUnhealthy) {
+	if err := engine.WaitHealthy(badContext, bad); !generatedruntime.IsCode(err, generatedruntime.DiagnosticCandidateUnhealthy) {
 		t.Fatalf("bad-CA candidate did not fail readiness: %s", hostingLiveRuntimeCode(err))
 	}
 	badPresent, inspectErr := hostingLiveResourceExists(ctx, docker, runtimeDockerConfig, "container", bad.ContainerName)
@@ -291,12 +303,13 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("unhealthy bad-CA candidate still occupies the inactive slot")
 	}
 	bad = generatedruntime.Candidate{}
+	authority.RejectCandidate(t, badSpec.DeploymentID, blueSpec.DeploymentID)
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", false)
 	settings.ca = base64.StdEncoding.EncodeToString(ca)
 	revisionB := hostingLiveReplaceConfig(t, ctx, config, appID, plan, badRevision.RevisionNumber, settings, "runtime-B")
 	greenSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
 	greenSpec.ActiveSlot = blue.Slot
-	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, config, revisionB, settings, greenSpec, &green)
+	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, authority, config, revisionB, settings, greenSpec, &green)
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", false)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(green)}}); err != nil {
 		t.Fatal("switch to configuration-only replacement")
@@ -923,7 +936,8 @@ func hostingLiveCandidateSpec(appID string, plan deploymentplans.DeploymentPlanR
 		if component.Name == "api" {
 			return generatedruntime.CandidateSpec{
 				AppID: appID, ReleaseID: releaseID, DeploymentID: uuid.NewString(), ArtifactID: artifactID,
-				DeploymentPlanRevisionID: plan.ID, ComponentName: component.Name, Role: component.Role,
+				DeploymentPlanRevisionID: plan.ID, DeploymentPlanRevisionNumber: plan.RevisionNumber,
+				ComponentName: component.Name, Role: component.Role,
 				RootDirectory: component.RootDirectory, RunCommand: component.RunCommand,
 				InternalPort: component.InternalPort, HealthProbe: component.HealthProbe,
 				ImageContentID: imageID, BuildDefinitionDigest: definitionDigest,
@@ -933,7 +947,7 @@ func hostingLiveCandidateSpec(appID string, plan deploymentplans.DeploymentPlanR
 	return generatedruntime.CandidateSpec{}
 }
 
-func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig string, engine *generatedruntime.Engine, store *appconfig.Store, revision appconfig.Configuration, settings hostingLiveSettings, spec generatedruntime.CandidateSpec, candidate *generatedruntime.Candidate) {
+func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig string, engine *generatedruntime.Engine, authority *liveauthority.Authority, store *appconfig.Store, revision appconfig.Configuration, settings hostingLiveSettings, spec generatedruntime.CandidateSpec, candidate *generatedruntime.Candidate) {
 	t.Helper()
 	// The candidate's plan identity is part of its image contract. Build the
 	// export using the same accepted plan identity without a broad revision read.
@@ -944,18 +958,21 @@ func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig st
 	spec.Environment = append([]byte(nil), export.Environment...)
 	export.Clear()
 	spec.EnvironmentOperationID, spec.EnvironmentOperationAttempt = uuid.NewString(), 1
-	created, err := engine.CreateInactiveCandidate(ctx, spec)
+	spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber = revision.RevisionID, revision.RevisionNumber
+	boundContext, boundSpec := authority.BindCandidate(t, ctx, spec)
+	created, err := engine.CreateInactiveCandidate(boundContext, boundSpec)
 	if err != nil {
 		t.Fatalf("create exact API candidate: %s", hostingLiveRuntimeCode(err))
 	}
 	*candidate = created
 	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, dockerConfig, created.ContainerID, settings)
-	if err := engine.StartCandidate(ctx, created); err != nil {
+	if err := engine.StartCandidate(boundContext, created); err != nil {
 		t.Fatalf("start exact API candidate: %s", hostingLiveRuntimeCode(err))
 	}
-	if err := engine.WaitHealthy(ctx, created); err != nil {
+	if err := engine.WaitHealthy(boundContext, created); err != nil {
 		t.Fatalf("API candidate did not pass database readiness: %s", hostingLiveRuntimeCode(err))
 	}
+	authority.FinishCandidate(t, boundSpec.DeploymentID)
 }
 
 func hostingLiveAssertSelectedDockerEnv(t *testing.T, ctx context.Context, docker, dockerConfig, containerID string, settings hostingLiveSettings) {

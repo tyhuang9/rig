@@ -48,6 +48,21 @@ Historical failed fixture attempts remain retained and are excluded from final a
 
 Required behavior includes stale authority before create and exact-network observation; migration-approval loss; original error/cancellation preservation; scope lifetime and a database writer while the runner is blocked; actual engine/aggregate retention after first-component creation and second-component network refusal; resumed name-only/unknown candidate retention; and competing-capacity rejection after unwind. Existing source/configuration/secret/route/recovery assertions remain required.
 
+## Hosted live-caller correction
+
+The first PR #190 run at `8ff3fb0170ec60fb69400d6eea4af8e6f10c6f91` exposed two stale direct `live_docker` callers of the now-mandatory guarded engine constructor. The original local gate compiled ingress live fixtures but missed these hostd and generated-image fixtures. The [migration job](https://github.com/tyhuang9/rig/actions/runs/39175210898/job/117816344072), [restart job](https://github.com/tyhuang9/rig/actions/runs/39175210909/job/117816344283), [TLS notes job](https://github.com/tyhuang9/rig/actions/runs/39175210909/job/117816344456), and [hosting/blue-green job](https://github.com/tyhuang9/rig/actions/runs/39175210943/job/117816345757) failed during compilation, before their Docker assertions.
+
+The focused correction migrates Next cache and TLS database direct fixtures to a `live_docker`-only helper. It uses the real same-database repository, binding, original Claim, effects scope and persisted provenance. Synthetic fixture history supplies the network authority prerequisite; these direct tests do not establish full durable-controller execution. Real container, Next cache, secret isolation, TLS failure, retained blue-slot and replacement assertions remain in the callers. Production authorization has no optional fallback.
+
+Final repair verification used pinned Go 1.26.7:
+
+- `go test -json -tags=live_docker ./internal/generatedruntime/liveauthority -run '^TestAuthorityBindsConcreteScopedNetworkExecution$' -count=1`: one parent passed, no failures or skips.
+- `go test -json -tags=live_docker ./cmd/hostd ./internal/generatedimage ./internal/generatedingress ./internal/generatedruntime/liveauthority -run '^$' -count=1`: all four packages compiled; zero selected tests is intentional compile-only evidence.
+- The same four packages cross-compiled with `GOOS=linux GOARCH=amd64 go test -c -tags=live_docker`; binaries were not executed. Both Windows and Linux-target live-tag vet passed.
+- Exact repaired-parent discovery passed. Independent security reviewed the final four-file freeze. All 28 retained verification artifacts and source hashes were independently audited.
+
+Repair evidence is in `m4-lifecycle-coordinator-verification/network-live-caller-repair/`: source manifest `checkpoint-12-source-freeze-sha256.json` SHA-256 `bd61a8dcf9003c102f4fdd7f251f5fd423bb255ad38ffc922c591caef7707df6`; summary `checkpoint-14-verification-summary.json` SHA-256 `eee2b48da77c560fe2388224c1932946b0fd483bf3ab091ba6c3b201762a13f0`. Root audit SHA-256 is `6510c0fe7fb767d40ca84c4d9e8a679dae62b21e2184a0295e5a19389cc2ae44`. Earlier failed fixture attempts remain in the summary and are excluded from acceptance. This correction still requires actual hosted Docker execution.
+
 ## Limits and rollback
 
 This unit governs the application-network command family only. Image builds, migrations, other candidate commands, route/restoration/drain authority, startup completion repair and full Compose ownership/restart lifecycle remain separate work. It adds no managed database or Neon provisioning; external databases remain application-owned and use scoped runtime secrets.
