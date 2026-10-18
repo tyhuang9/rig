@@ -29,16 +29,20 @@ const (
 )
 
 type liveHostdRebindPendingRouteObservation struct {
-	observed         bool
-	jobStatus        string
-	jobPhase         string
-	jobProgress      int
-	deploymentFound  bool
-	deploymentStatus deployments.Status
-	runtimeFound     bool
-	runtimePhase     generatedruntimestate.Phase
-	componentStates  []generatedruntimestate.ComponentState
-	events           []jobs.Event
+	observed                 bool
+	jobStatus                string
+	jobPhase                 string
+	jobProgress              int
+	jobErrorCode             string
+	deploymentFound          bool
+	deploymentStatus         deployments.Status
+	deploymentDiagnosticCode string
+	runtimeFound             bool
+	runtimePhase             generatedruntimestate.Phase
+	runtimeDiagnosticCode    generatedruntimestate.DiagnosticCode
+	componentStates          []generatedruntimestate.ComponentState
+	componentDiagnosticCodes []generatedruntimestate.DiagnosticCode
+	events                   []jobs.Event
 }
 
 type liveHostdRebindPendingRouteObserver struct {
@@ -94,11 +98,13 @@ func (o *liveHostdRebindPendingRouteObserver) snapshot(ctx context.Context,
 	}
 	observation.runtimeFound = true
 	observation.runtimePhase = runtime.Phase
+	observation.runtimeDiagnosticCode = runtime.DiagnosticCode
 	for _, component := range runtime.Components {
 		if !liveHostdRebindKnownComponentState(component.State) {
 			return empty, errors.New("pending route component state is invalid")
 		}
 		observation.componentStates = append(observation.componentStates, component.State)
+		observation.componentDiagnosticCodes = append(observation.componentDiagnosticCodes, component.DiagnosticCode)
 	}
 	sort.Slice(observation.componentStates, func(left, right int) bool {
 		return observation.componentStates[left] < observation.componentStates[right]
@@ -119,6 +125,7 @@ func liveHostdRebindPendingRouteObservationFor(appID, jobID string, job jobs.Job
 	}
 	observation = liveHostdRebindPendingRouteObservation{
 		observed: true, jobStatus: job.Status, jobPhase: job.Phase, jobProgress: job.Progress,
+		jobErrorCode: job.ErrorCode,
 	}
 	for _, event := range events {
 		if event.JobID != jobID {
@@ -143,6 +150,7 @@ func liveHostdRebindPendingRouteObservationFor(appID, jobID string, job jobs.Job
 		deploymentID = value.ID
 		observation.deploymentFound = true
 		observation.deploymentStatus = value.Status
+		observation.deploymentDiagnosticCode = value.DiagnosticCode
 	}
 	return observation, deploymentID, nil
 }
@@ -261,7 +269,7 @@ func liveHostdRebindDecodeBoundary(body []byte, marker *liveHostdRebindBoundaryM
 
 func (o liveHostdRebindPendingRouteObservation) String() string {
 	if !o.observed {
-		return "job=unobserved deployment=unobserved runtime=unobserved components=[] events=[]"
+		return "job=unobserved job_error=none deployment=unobserved deployment_diagnostic=none runtime=unobserved runtime_diagnostic=none components=[] component_diagnostics=[] events=[]"
 	}
 	deployment, runtime := "absent", "absent"
 	if o.deploymentFound {
@@ -274,13 +282,21 @@ func (o liveHostdRebindPendingRouteObservation) String() string {
 	for _, state := range o.componentStates {
 		components = append(components, liveHostdRebindSafeComponentState(state))
 	}
+	componentDiagnostics := make([]string, 0, len(o.componentDiagnosticCodes))
+	for _, code := range o.componentDiagnosticCodes {
+		componentDiagnostics = append(componentDiagnostics, liveHostdRebindSafeComponentDiagnosticCode(code))
+	}
+	sort.Strings(componentDiagnostics)
 	events := make([]string, 0, len(o.events))
 	for _, event := range o.events {
 		events = append(events, liveHostdRebindSafeJobPhase(event.Phase)+"/"+liveHostdRebindSafeEventCode(event.Code))
 	}
-	return fmt.Sprintf("job=%s phase=%s progress=%d deployment=%s runtime=%s components=[%s] events=[%s]",
+	return fmt.Sprintf("job=%s phase=%s progress=%d job_error=%s deployment=%s deployment_diagnostic=%s runtime=%s runtime_diagnostic=%s components=[%s] component_diagnostics=[%s] events=[%s]",
 		liveHostdRebindSafeJobStatus(o.jobStatus), liveHostdRebindSafeJobPhase(o.jobPhase), o.jobProgress,
-		deployment, runtime, strings.Join(components, ","), strings.Join(events, ","))
+		liveHostdRebindSafeJobErrorCode(o.jobErrorCode), deployment,
+		liveHostdRebindSafeDeploymentDiagnosticCode(o.deploymentDiagnosticCode), runtime,
+		liveHostdRebindSafeRuntimeDiagnosticCode(o.runtimeDiagnosticCode), strings.Join(components, ","),
+		strings.Join(componentDiagnostics, ","), strings.Join(events, ","))
 }
 
 func liveHostdRebindPendingRouteTerminal(status string) bool {
@@ -307,6 +323,27 @@ func liveHostdRebindSafeJobStatus(value string) string {
 		return value
 	}
 	return "unknown"
+}
+
+// Keep this closed to jobs.safeExecutionFailure outputs and the worker's one
+// direct invalid-result code. Job error detail remains deliberately omitted.
+func liveHostdRebindSafeJobErrorCode(value string) string {
+	if value == "" {
+		return "none"
+	}
+	switch value {
+	case "validation_failed", "runtime_unavailable", "process_termination_failed", "invalid_source",
+		"source_unavailable", "source_access_lost", "provider_unavailable", "source_too_large",
+		"source_storage_full", "configuration_unavailable", "configuration_review_required",
+		"reviewed_revision_stale", "reviewed_revisions_required", "build_configuration_requires_build_command",
+		"compose_invalid", "compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated",
+		"policy_rejected", "apply_failed", "compose_apply_failed", "compose_apply_timeout",
+		"compose_apply_output_truncated", "health_failed", "gateway_readiness_failed", "internal_error",
+		"executor_failed", "executor_invalid_result":
+		return value
+	default:
+		return "unknown"
+	}
 }
 
 func liveHostdRebindSafeJobPhase(value string) string {
@@ -350,6 +387,26 @@ func liveHostdRebindSafeDeploymentStatus(value deployments.Status) string {
 	return "unknown"
 }
 
+// Keep this closed to deployments.knownDiagnostic. Failure summary remains
+// deliberately omitted.
+func liveHostdRebindSafeDeploymentDiagnosticCode(value string) string {
+	if value == "" {
+		return "none"
+	}
+	switch value {
+	case "daemon_restarted", "runtime_unavailable", "process_termination_failed", "compose_invalid",
+		"compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated", "policy_rejected",
+		"approval_required", "apply_failed", "compose_apply_failed", "compose_apply_timeout",
+		"compose_apply_output_truncated", "health_failed", "gateway_readiness_failed", "cancelled", "internal_error",
+		"invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "source_storage_full",
+		"provider_unavailable", "configuration_unavailable", "configuration_review_required",
+		"build_configuration_requires_build_command":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
 func liveHostdRebindKnownRuntimePhase(value generatedruntimestate.Phase) bool {
 	switch value {
 	case generatedruntimestate.PhasePreflight, generatedruntimestate.PhaseBuilding,
@@ -370,6 +427,28 @@ func liveHostdRebindSafeRuntimePhase(value generatedruntimestate.Phase) string {
 	return "unknown"
 }
 
+// Keep this closed to generatedruntimestate.knownDiagnostic.
+func liveHostdRebindSafeRuntimeDiagnosticCode(value generatedruntimestate.DiagnosticCode) string {
+	if value == "" {
+		return "none"
+	}
+	switch value {
+	case generatedruntimestate.DiagnosticInsufficientReplacementCapacity,
+		generatedruntimestate.DiagnosticPlanReviewRequired,
+		generatedruntimestate.DiagnosticMigrationFailed,
+		generatedruntimestate.DiagnosticStartFailed,
+		generatedruntimestate.DiagnosticHealthFailed,
+		generatedruntimestate.DiagnosticRouteSwitchFailed,
+		generatedruntimestate.DiagnosticRuntimeUnavailable,
+		generatedruntimestate.DiagnosticDaemonRestarted,
+		generatedruntimestate.DiagnosticCancelled,
+		generatedruntimestate.DiagnosticInternalError:
+		return string(value)
+	default:
+		return "unknown"
+	}
+}
+
 func liveHostdRebindKnownComponentState(value generatedruntimestate.ComponentState) bool {
 	switch value {
 	case generatedruntimestate.ComponentPending, generatedruntimestate.ComponentImageReady,
@@ -388,6 +467,24 @@ func liveHostdRebindSafeComponentState(value generatedruntimestate.ComponentStat
 		return string(value)
 	}
 	return "unknown"
+}
+
+// Keep this closed to generatedruntimestate.componentDiagnostic.
+func liveHostdRebindSafeComponentDiagnosticCode(value generatedruntimestate.DiagnosticCode) string {
+	if value == "" {
+		return "none"
+	}
+	switch value {
+	case generatedruntimestate.DiagnosticStartFailed,
+		generatedruntimestate.DiagnosticHealthFailed,
+		generatedruntimestate.DiagnosticRuntimeUnavailable,
+		generatedruntimestate.DiagnosticDaemonRestarted,
+		generatedruntimestate.DiagnosticCancelled,
+		generatedruntimestate.DiagnosticInternalError:
+		return string(value)
+	default:
+		return "unknown"
+	}
 }
 
 func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
@@ -469,9 +566,25 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 			t.Run(string(status), func(t *testing.T) {
 				child := startChild(t, "stall")
 				_, _, err := wait(child, time.Now().Add(time.Hour), func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) {
-					return liveHostdRebindPendingRouteObservation{observed: true, jobStatus: string(status), jobPhase: string(status), jobProgress: 80}, nil
+					return liveHostdRebindPendingRouteObservation{
+						observed: true, jobStatus: string(status), jobPhase: string(status), jobProgress: 80,
+						jobErrorCode: "apply_failed", deploymentFound: true, deploymentStatus: deployments.Failed,
+						deploymentDiagnosticCode: "process_termination_failed", runtimeFound: true,
+						runtimePhase:          generatedruntimestate.PhaseFailed,
+						runtimeDiagnosticCode: generatedruntimestate.DiagnosticStartFailed,
+						componentStates:       []generatedruntimestate.ComponentState{generatedruntimestate.ComponentFailed},
+						componentDiagnosticCodes: []generatedruntimestate.DiagnosticCode{
+							generatedruntimestate.DiagnosticInternalError,
+						},
+					}, nil
 				})
-				if err == nil || !strings.Contains(err.Error(), "before publication boundary") || strings.Contains(err.Error(), secret) {
+				diagnostic := fmt.Sprint(err)
+				if err == nil || !strings.Contains(diagnostic, "before publication boundary") ||
+					!strings.Contains(diagnostic, "job_error=apply_failed") ||
+					!strings.Contains(diagnostic, "deployment_diagnostic=process_termination_failed") ||
+					!strings.Contains(diagnostic, "runtime_diagnostic=start_failed") ||
+					!strings.Contains(diagnostic, "component_diagnostics=[internal_error]") ||
+					strings.Contains(diagnostic, secret) {
 					t.Fatalf("terminal status=%s error=%v", status, err)
 				}
 				liveHostdRebindKillAndReap(t, child)
@@ -558,18 +671,20 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 
 	t.Run("exact job binding selects only the requested records", func(t *testing.T) {
 		job := jobs.Job{ID: jobID, Type: "deploy", ResourceType: "application", ResourceID: appID,
-			Status: string(jobs.Running), Phase: "apply_runtime", Progress: 70}
+			Status: string(jobs.Running), Phase: "apply_runtime", Progress: 70, ErrorCode: "apply_failed"}
 		events := make([]jobs.Event, 0, liveHostdRebindPendingRouteEventTail+2)
 		for index := 0; index < liveHostdRebindPendingRouteEventTail+2; index++ {
 			events = append(events, jobs.Event{JobID: jobID, Phase: "apply_runtime", Code: "phase_started"})
 		}
 		observation, deploymentID, err := liveHostdRebindPendingRouteObservationFor(appID, jobID, job, events,
 			[]deployments.Deployment{
-				{ID: "foreign", AppID: appID, JobID: "foreign-job", Status: deployments.Succeeded},
-				{ID: "exact", AppID: appID, JobID: jobID, Status: deployments.Applying},
+				{ID: "foreign", AppID: appID, JobID: "foreign-job", Status: deployments.Succeeded, DiagnosticCode: "runtime_unavailable"},
+				{ID: "exact", AppID: appID, JobID: jobID, Status: deployments.Applying, DiagnosticCode: "apply_failed"},
 			})
 		if err != nil || deploymentID != "exact" || !observation.deploymentFound ||
-			observation.deploymentStatus != deployments.Applying || len(observation.events) != liveHostdRebindPendingRouteEventTail {
+			observation.jobErrorCode != "apply_failed" || observation.deploymentStatus != deployments.Applying ||
+			observation.deploymentDiagnosticCode != "apply_failed" ||
+			len(observation.events) != liveHostdRebindPendingRouteEventTail {
 			t.Fatalf("exact binding deployment=%q observation=%s error=%v", deploymentID, observation, err)
 		}
 	})
@@ -624,8 +739,12 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		if err != nil || !created {
 			t.Fatalf("create historical observer deployment: created=%t error=%v", created, err)
 		}
-		if _, err := db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',progress_percent=100,finished_at=?,updated_at=? WHERE id=?`,
-			now, now, foreignJob.ID); err != nil {
+		if _, err := db.Exec(`UPDATE jobs SET status='failed',phase='failed',progress_percent=60,error_code='runtime_unavailable',error_detail=?,finished_at=?,updated_at=? WHERE id=?`,
+			secret, now, now, foreignJob.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE deployments SET status='failed',diagnostic_code='runtime_unavailable',failure_summary=? WHERE id=?`,
+			secret, foreignDeployment.ID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -651,7 +770,7 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		runtimeStore := generatedruntimestate.New(db)
 		if _, created, err := runtimeStore.Begin(context.Background(), generatedruntimestate.BeginInput{
 			DeploymentID: exactDeployment.ID, AppID: appID, ReleaseID: releaseID,
-			DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, ComponentNames: []string{"web"},
+			DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, ComponentNames: []string{secret},
 		}); err != nil || !created {
 			t.Fatalf("begin exact observer runtime: created=%t error=%v", created, err)
 		}
@@ -662,8 +781,24 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		if err := jobStore.Update(exactJob.ID, jobs.Running, "apply_runtime", 70, ""); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := db.Exec(`UPDATE jobs SET checkpoint_json=?,error_code=?,error_detail=? WHERE id=?`,
-			`{"private":"`+secret+`"}`, secret, secret, exactJob.ID); err != nil {
+		if _, err := runtimeStore.FailComponent(context.Background(), appID, exactDeployment.ID, secret,
+			generatedruntimestate.ComponentPending, generatedruntimestate.DiagnosticInternalError); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtimeStore.Advance(context.Background(), appID, exactDeployment.ID,
+			generatedruntimestate.PhasePreflight, generatedruntimestate.PhaseFailed,
+			generatedruntimestate.DiagnosticStartFailed); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := deploymentStore.Transition(context.Background(), appID, exactDeployment.ID,
+			deployments.Failed, "process_termination_failed"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE jobs SET status='failed',phase='failed',checkpoint_json=?,error_code='apply_failed',error_detail=?,finished_at=?,updated_at=? WHERE id=?`,
+			`{"private":"`+secret+`"}`, secret, now, now, exactJob.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE deployments SET failure_summary=? WHERE id=?`, secret, exactDeployment.ID); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.Exec(`UPDATE job_events SET message=? WHERE job_id=? AND code='phase_started'`, secret, exactJob.ID); err != nil {
@@ -673,7 +808,7 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		events, eventsErr := jobStore.Events(exactJob.ID, 0)
 		privateEvent := len(events) == 2 && events[1].Message == secret
 		if err != nil || eventsErr != nil || !strings.Contains(persisted.Checkpoint, secret) ||
-			persisted.ErrorCode != secret || persisted.ErrorDetail != secret || !privateEvent {
+			persisted.ErrorCode != "apply_failed" || persisted.ErrorDetail != secret || !privateEvent {
 			t.Fatalf("private durable observer fixture was not established: job_error=%v events_error=%v private_event=%t",
 				err, eventsErr, privateEvent)
 		}
@@ -681,28 +816,127 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		observation, err := liveHostdRebindNewPendingRouteObserver(db, appID).snapshot(context.Background(), exactJob.ID)
 		diagnostic := observation.String()
 		privateDiagnostic := strings.Contains(diagnostic, secret)
-		if err != nil || observation.jobStatus != string(jobs.Running) || observation.jobPhase != "apply_runtime" ||
-			observation.jobProgress != 70 || !observation.deploymentFound || observation.deploymentStatus != deployments.Applying ||
-			!observation.runtimeFound || observation.runtimePhase != generatedruntimestate.PhasePreflight ||
-			len(observation.componentStates) != 1 || observation.componentStates[0] != generatedruntimestate.ComponentPending ||
+		if err != nil || observation.jobStatus != string(jobs.Failed) || observation.jobPhase != "failed" ||
+			observation.jobProgress != 70 || observation.jobErrorCode != "apply_failed" ||
+			!observation.deploymentFound || observation.deploymentStatus != deployments.Failed ||
+			observation.deploymentDiagnosticCode != "process_termination_failed" || !observation.runtimeFound ||
+			observation.runtimePhase != generatedruntimestate.PhaseFailed ||
+			observation.runtimeDiagnosticCode != generatedruntimestate.DiagnosticStartFailed ||
+			len(observation.componentStates) != 1 || observation.componentStates[0] != generatedruntimestate.ComponentFailed ||
+			len(observation.componentDiagnosticCodes) != 1 ||
+			observation.componentDiagnosticCodes[0] != generatedruntimestate.DiagnosticInternalError ||
 			len(observation.events) != 2 || privateDiagnostic ||
-			!strings.Contains(diagnostic, "deployment=applying runtime=preflight components=[pending]") {
+			!strings.Contains(diagnostic, "job_error=apply_failed") ||
+			!strings.Contains(diagnostic, "deployment=failed deployment_diagnostic=process_termination_failed") ||
+			!strings.Contains(diagnostic, "runtime=failed runtime_diagnostic=start_failed") ||
+			!strings.Contains(diagnostic, "components=[failed] component_diagnostics=[internal_error]") {
 			t.Fatalf("real observer state invalid: error=%v historical_deployment_selected=%t private_diagnostic=%t",
 				err, observation.deploymentStatus == foreignDeployment.Status, privateDiagnostic)
+		}
+
+		if _, err := db.Exec(`UPDATE jobs SET error_code=? WHERE id=?`, secret, exactJob.ID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE deployments SET diagnostic_code=? WHERE id=?`, secret, exactDeployment.ID); err != nil {
+			t.Fatal(err)
+		}
+		unknown, err := liveHostdRebindNewPendingRouteObserver(db, appID).snapshot(context.Background(), exactJob.ID)
+		unknownDiagnostic := unknown.String()
+		if err != nil || strings.Contains(unknownDiagnostic, secret) ||
+			!strings.Contains(unknownDiagnostic, "job_error=unknown") ||
+			!strings.Contains(unknownDiagnostic, "deployment_diagnostic=unknown") ||
+			!strings.Contains(unknownDiagnostic, "runtime_diagnostic=start_failed") ||
+			!strings.Contains(unknownDiagnostic, "component_diagnostics=[internal_error]") {
+			t.Fatalf("real observer unknown-code closure failed: error=%v private=%t diagnostic=%s",
+				err, strings.Contains(unknownDiagnostic, secret), unknownDiagnostic)
 		}
 	})
 
 	t.Run("diagnostic allowlist excludes durable private fields", func(t *testing.T) {
 		observation := liveHostdRebindPendingRouteObservation{
-			observed: true, jobStatus: secret, jobPhase: secret, jobProgress: 42,
-			deploymentFound: true, deploymentStatus: deployments.Status(secret),
+			observed: true, jobStatus: secret, jobPhase: secret, jobProgress: 42, jobErrorCode: secret,
+			deploymentFound: true, deploymentStatus: deployments.Status(secret), deploymentDiagnosticCode: secret,
 			runtimeFound: true, runtimePhase: generatedruntimestate.Phase(secret),
-			componentStates: []generatedruntimestate.ComponentState{generatedruntimestate.ComponentState(secret)},
-			events:          []jobs.Event{{Phase: secret, Code: secret, Message: secret}},
+			runtimeDiagnosticCode: generatedruntimestate.DiagnosticCode(secret),
+			componentStates:       []generatedruntimestate.ComponentState{generatedruntimestate.ComponentState(secret)},
+			componentDiagnosticCodes: []generatedruntimestate.DiagnosticCode{
+				generatedruntimestate.DiagnosticCode(secret),
+			},
+			events: []jobs.Event{{Phase: secret, Code: secret, Message: secret}},
 		}
 		diagnostic := observation.String()
 		if privateDiagnostic, closedUnknown := strings.Contains(diagnostic, secret), strings.Contains(diagnostic, "unknown"); privateDiagnostic || !closedUnknown {
 			t.Fatalf("diagnostic sanitization failed: private=%t closed_unknown=%t", privateDiagnostic, closedUnknown)
+		}
+	})
+
+	t.Run("diagnostic code allowlists are exact and closed", func(t *testing.T) {
+		domains := []struct {
+			name   string
+			values []string
+			safe   func(string) string
+		}{
+			{
+				name: "job error",
+				values: []string{
+					"validation_failed", "runtime_unavailable", "process_termination_failed", "invalid_source",
+					"source_unavailable", "source_access_lost", "provider_unavailable", "source_too_large",
+					"source_storage_full", "configuration_unavailable", "configuration_review_required",
+					"reviewed_revision_stale", "reviewed_revisions_required", "build_configuration_requires_build_command",
+					"compose_invalid", "compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated",
+					"policy_rejected", "apply_failed", "compose_apply_failed", "compose_apply_timeout",
+					"compose_apply_output_truncated", "health_failed", "gateway_readiness_failed", "internal_error",
+					"executor_failed", "executor_invalid_result",
+				},
+				safe: liveHostdRebindSafeJobErrorCode,
+			},
+			{
+				name: "deployment diagnostic",
+				values: []string{
+					"daemon_restarted", "runtime_unavailable", "process_termination_failed", "compose_invalid",
+					"compose_config_invalid", "compose_config_timeout", "compose_config_output_truncated", "policy_rejected",
+					"approval_required", "apply_failed", "compose_apply_failed", "compose_apply_timeout",
+					"compose_apply_output_truncated", "health_failed", "gateway_readiness_failed", "cancelled", "internal_error",
+					"invalid_source", "source_unavailable", "source_access_lost", "source_too_large", "source_storage_full",
+					"provider_unavailable", "configuration_unavailable", "configuration_review_required",
+					"build_configuration_requires_build_command",
+				},
+				safe: liveHostdRebindSafeDeploymentDiagnosticCode,
+			},
+			{
+				name: "runtime diagnostic",
+				values: []string{
+					"insufficient_replacement_capacity", "deployment_plan_review_required", "migration_failed", "start_failed",
+					"health_failed", "route_switch_failed", "runtime_unavailable", "daemon_restarted", "cancelled", "internal_error",
+				},
+				safe: func(value string) string {
+					return liveHostdRebindSafeRuntimeDiagnosticCode(generatedruntimestate.DiagnosticCode(value))
+				},
+			},
+			{
+				name: "component diagnostic",
+				values: []string{
+					"start_failed", "health_failed", "runtime_unavailable", "daemon_restarted", "cancelled", "internal_error",
+				},
+				safe: func(value string) string {
+					return liveHostdRebindSafeComponentDiagnosticCode(generatedruntimestate.DiagnosticCode(value))
+				},
+			},
+		}
+		for _, domain := range domains {
+			t.Run(domain.name, func(t *testing.T) {
+				if got := domain.safe(""); got != "none" {
+					t.Fatalf("empty diagnostic=%q", got)
+				}
+				for _, value := range domain.values {
+					if got := domain.safe(value); got != value {
+						t.Fatalf("known diagnostic %q=%q", value, got)
+					}
+				}
+				if got := domain.safe(secret); got != "unknown" || strings.Contains(got, secret) {
+					t.Fatalf("unknown diagnostic=%q", got)
+				}
+			})
 		}
 	})
 }

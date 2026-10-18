@@ -2,8 +2,8 @@
 
 Date: 2026-10-18
 
-Status: local harness verification complete; current-branch hosted Docker
-acceptance remains pending. The branch starts from published PR #183 at
+Status: the first hosted observer run exposed an earlier runtime failure;
+pending-route recovery acceptance remains incomplete. The branch starts from PR #183 at
 `b91cfb545128e2ae7f585c5345f1b3d8db7d84cb`.
 
 ## Observed failure
@@ -127,3 +127,73 @@ the import repair and real-database coverage addition. The reviews were static;
 the executable results above were run separately by the primary agent. Local
 Docker, local race checks, the live recovery contract and a physical second
 device were not verified by these checks. Hosted Docker CI remains necessary.
+
+## Hosted result and diagnostic-code follow-up
+
+PR #184 head `7b7784b18d2e759786e62ea59c70ca352cd10b1a` ran the bounded
+observer in [partition 06, attempt 2](https://github.com/tyhuang9/rig/actions/runs/39095790337/job/117590530917).
+The checkout tree matched that head. All 324 preflight control names and the
+first seven owned recovery cases passed. `scenario/pending-route-restart`
+failed after 282.32 seconds; independent cleanup passed. The observer captured
+an exact terminal job at progress 60, after `apply_runtime` started, with failed
+deployment, runtime and both component states. It did not observe the expected
+publication marker. The observer therefore made the earlier failure visible
+without reaching the prior package alarm. Recovery itself remains unverified.
+
+The log SHA-256 is
+`85fb95016e64d7091b2dc9c2373ac4d228a64edfcddcb518732ddac5ab2931aa`.
+Artifact `12125579815`, ZIP SHA-256
+`95f1a589574b18b037f9ff0310e23cc9ce47ed49dfa203573d6c5fb52b3f1d11`,
+contains 17 case/event/result files. It contains no database or further cause
+details. The child's nonzero exit was collected after cleanup killed and reaped
+it; this does not prove a preceding daemon crash. A missing marker also does
+not distinguish a failed delegated command from a later marker-write failure.
+For this run, the independent durable event sequence ends in failure after
+`apply_runtime` at progress 60, with no `wait_for_health` at progress 85. Executor
+ordering places route switching and the selected publish command after that
+health phase, so this run stopped before the selected command. The underlying
+runtime cause remains unknown.
+
+The follow-up adds strict, source-defined allowlists for four already-loaded
+machine-code fields: job error, deployment diagnostic, runtime diagnostic and
+anonymous component diagnostics. Empty values render as `none`; arbitrary or
+future values render as `unknown`. Private error details, failure summaries,
+checkpoints, event messages, IDs, component names and raw stderr stay excluded.
+The existing exact-identity checks and marker-first ordering remain in place.
+Production code, command hooks, time budgets and cleanup contracts are unchanged.
+
+### Follow-up verification
+
+Evidence is retained under
+`C:/Users/huang/Documents/Projects/Rig/temp/m3-lan-external-db-20261015/pending-route-code-verification`.
+The same Go version, read-only module settings and unchanged 25-parent workflow
+selector described above were used. Candidate bindings confirm that the three
+PR Go files were unchanged throughout all checks. The observer SHA-256 is
+`d13d3d6c0f052cd155f0a03ada65b2d3c6331853f4b5ea53cf69fc2a2eb3db32`;
+the scenario caller and startup registration retain their earlier hashes.
+
+| Check | Actual result |
+| --- | --- |
+| Windows workflow-selected controls | 25 parents and 304 nested names, each RUN/PASS once; zero FAIL/SKIP; package 17.398 seconds |
+| Linux binary executed under WSL from `cmd/hostd` | Identical 329-name roster, each RUN/PASS once; zero FAIL/SKIP; process wall time 17.807605 seconds |
+| Pending-route subtree on Windows | 33 named results passed; 4.66 seconds; real SQLite selection, private-field exclusion and known/unknown codes included |
+| `gofmt -l`, `git diff --check` | Empty formatter output; both exit 0 |
+| `go vet -tags live_docker ./cmd/hostd` | Exit 0 |
+| `pwsh -NoProfile -File scripts/check-generation.ps1` | Exit 0 |
+
+The complete argument vectors, raw output and source bindings are retained with
+the checks. The Linux binary SHA-256 is
+`cbad72b125cf68975ca2e0f1b30f2f72e9b7882cc86585c40fde8c4e104005da`.
+Offline `test2json` timestamps describe conversion; Linux elapsed time above
+comes from the process receipt. Evidence SHA-256 values:
+
+- Windows scope: `126588092eceff61d2c24e124cd00293e1e0d06f41a7426b8a0c074898afdfbb`;
+- Linux scope: `a90bebbd86820caa732b76f344323aa40512feecf140c78809ada50e0538c6a0`;
+- Windows output: `584316adad744a01d5f63aa5b3773bb59e506bd311e4d223c33e772a52d251b9`;
+- Linux raw output: `e499e2f1a9280e996c9aa3e980e26ac3040c24fa0dbbf538bf389d0f68608f9e`;
+- canonical output: `bb54ee941957e0205d38f0675e7ed85c31dff99ee154fa53b12fca6738504229`.
+
+Hosted execution must still establish the unchanged pending-route recovery
+contract. These checks used no local Docker or race compiler, and diagnostic
+visibility alone is not M3 acceptance. This follow-up changes only test
+diagnostics and controls; reverting it restores the preceding diagnostic format.
