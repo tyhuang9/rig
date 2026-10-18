@@ -13,14 +13,23 @@ suite="$1"
 module='github.com/hostd/hostd'
 ingress_package="$module/internal/generatedingress"
 controller_package="$module/internal/controller"
+jobs_package="$module/internal/jobs"
 controller_lifecycle_pattern='^Test(Deployment|Runtime|Latest|Reviewed|Prior|Release|Secret|Local|Resume|Generated)'
+jobs_atomic_pattern='^TestRunner(CancellationAndProgress|CompletionAndCancellation)HaveOneTerminalOutcome$'
+jobs_admission_pattern='^Test(Admitted|ScopedAdmission)'
+jobs_compose_pattern='^Test(CoordinatorJobRunsOwnerScopedGitHubComposeMaterialization|BlockingCompose|LegacyLocalSourceDraft|Compose)'
+# The exact atomic parent is excluded as an exact match. The admission and
+# Compose families retain their existing prefix semantics so future parents in
+# those families remain in their designated lanes. Deriving this union from
+# the three positive selectors keeps the catch-all partition in lockstep.
+jobs_remainder_skip_pattern="(${jobs_atomic_pattern}|${jobs_admission_pattern}|${jobs_compose_pattern})"
 heavy_packages=(
   "$module/cmd/hostd"
   "$module/internal/appaccess"
   "$module/internal/appconfig"
   "$module/internal/database"
   "$module/internal/generatedrecovery"
-  "$module/internal/jobs"
+  "$jobs_package"
 )
 designated_packages=("$ingress_package" "$controller_package" "${heavy_packages[@]}")
 
@@ -86,8 +95,21 @@ case "$suite" in
   generatedrecovery)
     packages=("$module/internal/generatedrecovery")
     ;;
-  jobs)
-    packages=("$module/internal/jobs")
+  jobs-atomic)
+    packages=("$jobs_package")
+    filters=(-run "$jobs_atomic_pattern")
+    ;;
+  jobs-admission)
+    packages=("$jobs_package")
+    filters=(-run "$jobs_admission_pattern")
+    ;;
+  jobs-compose)
+    packages=("$jobs_package")
+    filters=(-run "$jobs_compose_pattern")
+    ;;
+  jobs-remainder)
+    packages=("$jobs_package")
+    filters=(-skip "$jobs_remainder_skip_pattern")
     ;;
   controller-lifecycle)
     packages=("$controller_package")
