@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
 )
@@ -15,14 +14,9 @@ func TestRecoveryPreservesStrictReviewedCurrentInput(t *testing.T) {
 	fixture := newRecoveryFixtureWithReviewedCurrent(t, false, true)
 	fixture.advance(t, generatedruntimestate.PhaseBuilding)
 
-	if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	fixture.recover(t, fixture.now)
 	assertRuntime(t, fixture.db, fixture.deploymentID, "building", "not_required", "")
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
-	if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-		t.Fatal(err)
-	}
 	assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
 	assertRequeueReset(t, fixture.db, fixture.jobID)
 	assertEventCount(t, fixture.db, fixture.jobID, "daemon_restarted", 1)
@@ -36,12 +30,7 @@ func TestRecoveryPreservesCapacityPauseWithStrictReviewedCurrentInput(t *testing
 	}
 
 	for run := 0; run < 2; run++ {
-		if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-			t.Fatal(err)
-		}
+		fixture.recover(t, fixture.now)
 		assertRuntime(t, fixture.db, fixture.deploymentID, "building", "not_required", "")
 		assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
 		assertJob(t, fixture.db, fixture.jobID, "waiting_user", "insufficient_replacement_capacity", "", 2, fixture.inputJSON)
@@ -110,12 +99,7 @@ func TestRecoveryPreservesStrictReviewedCurrentInputAtSafeContinuationPoints(t *
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRecoveryFixtureWithReviewedCurrent(t, test.migration, true)
 			test.prepare(t, fixture)
-			if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-				t.Fatal(err)
-			}
+			fixture.recover(t, fixture.now)
 			assertRuntime(t, fixture.db, fixture.deploymentID, test.phase, test.migrationState, "")
 			assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
 			assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
@@ -156,12 +140,7 @@ func TestRecoveryPreservesReviewedCurrentZeroConfigurationAndLegacyInputs(t *tes
 			fixture.advance(t, generatedruntimestate.PhaseBuilding)
 			input := test.input(t, fixture)
 			setRecoveryInput(t, fixture, input)
-			if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-				t.Fatal(err)
-			}
-			if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-				t.Fatal(err)
-			}
+			fixture.recover(t, fixture.now)
 			assertRuntime(t, fixture.db, fixture.deploymentID, "building", "not_required", "")
 			assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, input)
 		})
@@ -185,12 +164,7 @@ func TestRecoveryPreservesRecordedReviewedPinsAfterConfigurationHeadDrift(t *tes
 	}
 	assertConfigurationHead(t, fixture, newHeadID, 2)
 
-	if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-		t.Fatal(err)
-	}
+	fixture.recover(t, fixture.now)
 	assertRuntime(t, fixture.db, fixture.deploymentID, "building", "not_required", "")
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
 	assertJob(t, fixture.db, fixture.jobID, "queued", "queued", "", 2, fixture.inputJSON)
@@ -276,14 +250,9 @@ func TestRecoveryFailsClosedForInvalidReviewedJobInputWithoutRewritingBytes(t *t
 			fixture.advance(t, generatedruntimestate.PhaseBuilding)
 			input := test.mutate(t, fixture)
 			setRecoveryInput(t, fixture, input)
-			if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-				t.Fatal(err)
-			}
+			fixture.recover(t, fixture.now)
 			assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
 			assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
-			if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-				t.Fatal(err)
-			}
 			assertJob(t, fixture.db, fixture.jobID, "interrupted", "interrupted", "daemon_restarted", 2, input)
 		})
 	}
@@ -293,14 +262,9 @@ func TestRecoveryFailsClosedForReviewedCurrentBoundToVersionOneConfiguration(t *
 	fixture := newRecoveryFixtureWithReviewedConfigurationVersion(t, false, 1)
 	fixture.advance(t, generatedruntimestate.PhaseBuilding)
 
-	if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	fixture.recover(t, fixture.now)
 	assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
-	if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-		t.Fatal(err)
-	}
 	assertJob(t, fixture.db, fixture.jobID, "interrupted", "interrupted", "daemon_restarted", 2, fixture.inputJSON)
 }
 
@@ -308,14 +272,9 @@ func TestRecoveryFailsClosedForReviewedCurrentBoundToAnotherAcceptedPlan(t *test
 	fixture := newRecoveryFixtureWithForeignReviewedConfigurationPlan(t)
 	fixture.advance(t, generatedruntimestate.PhaseBuilding)
 
-	if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	fixture.recover(t, fixture.now)
 	assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "not_required", "daemon_restarted")
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
-	if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-		t.Fatal(err)
-	}
 	assertJob(t, fixture.db, fixture.jobID, "interrupted", "interrupted", "daemon_restarted", 2, fixture.inputJSON)
 }
 
@@ -328,9 +287,7 @@ func TestRecoveryFailsClosedWhenReviewedMigrationApprovalIsMissing(t *testing.T)
 		t.Fatal(err)
 	}
 
-	if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	fixture.recover(t, fixture.now)
 	assertRuntime(t, fixture.db, fixture.deploymentID, "failed", "pending", "daemon_restarted")
 	assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
 }
@@ -380,12 +337,7 @@ func TestRecoveryPreservesReviewedCapacityPausesAtSafeContinuationPoints(t *test
 			test.prepare(t, fixture)
 			setCapacityPause(t, fixture, "insufficient_replacement_capacity")
 			for run := 0; run < 2; run++ {
-				if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-					t.Fatal(err)
-				}
-				if err := jobs.New(fixture.db).RecoverInterrupted(); err != nil {
-					t.Fatal(err)
-				}
+				fixture.recover(t, fixture.now)
 				assertRuntime(t, fixture.db, fixture.deploymentID, test.phase, test.migrationState, "")
 				assertMainDeployment(t, fixture.db, fixture.deploymentID, "applying", "")
 				assertJob(t, fixture.db, fixture.jobID, "waiting_user", "insufficient_replacement_capacity", "", 2, fixture.inputJSON)
@@ -425,9 +377,7 @@ func TestRecoveryRejectsCapacityPauseOutsideSafeContinuation(t *testing.T) {
 			fixture := newRecoveryFixtureWithReviewedCurrent(t, test.migration, true)
 			test.prepare(t, fixture)
 			setCapacityPause(t, fixture, test.pause)
-			if err := deployments.New(fixture.db).Recover(context.Background()); err != nil {
-				t.Fatal(err)
-			}
+			fixture.recover(t, fixture.now)
 			assertRuntime(t, fixture.db, fixture.deploymentID, "failed", test.migrationState, "daemon_restarted")
 			assertMainDeployment(t, fixture.db, fixture.deploymentID, "failed", "daemon_restarted")
 			assertJob(t, fixture.db, fixture.jobID, "waiting_user", "insufficient_replacement_capacity", "", 2, fixture.inputJSON)

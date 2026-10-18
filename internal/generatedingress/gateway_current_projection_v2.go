@@ -137,15 +137,25 @@ func gatewayCurrentPhysicalProbeTokenV2(state gatewayCurrentRouteStateV2) (strin
 }
 
 func gatewayCurrentPhysicalProbeTokenV2Validated(state gatewayCurrentRouteStateV2) (string, error) {
-	if state.Identity.Kind != gatewayCurrentIdentityRebind || state.Identity.Rebind == nil {
+	switch state.Identity.Kind {
+	case gatewayCurrentIdentityRebind:
+		if state.Identity.Rebind == nil {
+			return "", errors.New("unsupported generated ingress current V2 physical identity")
+		}
+		networkDigest, err := gatewayCurrentPhysicalNetworkDigest(state.Network)
+		if err != nil {
+			return "", err
+		}
+		return gatewayRebindStageConfigProbeTokenV1(state.Lineage.ProtectedIntentDigest, state.Lineage.OperationID,
+			state.Identity.Rebind.Digest, networkDigest)
+	case gatewayCurrentIdentityUpgrade:
+		if state.Identity.Upgrade == nil {
+			return "", errors.New("unsupported generated ingress current V2 physical identity")
+		}
+		return gatewayV2HostChallengeFor(state.Lineage.OperationID, state.Profile, *state.Identity.Upgrade, state.Network)
+	default:
 		return "", errors.New("unsupported generated ingress current V2 physical identity")
 	}
-	networkDigest, err := gatewayCurrentPhysicalNetworkDigest(state.Network)
-	if err != nil {
-		return "", err
-	}
-	return gatewayRebindStageConfigProbeTokenV1(state.Lineage.ProtectedIntentDigest, state.Lineage.OperationID,
-		state.Identity.Rebind.Digest, networkDigest)
 }
 
 func gatewayCurrentLANAssignmentV2(appID string, binding gatewayCurrentLANBinding) caddyV2LANAssignment {

@@ -420,8 +420,14 @@ func gatewayV2IdentityDigest(identity gatewayV2Identity) (string, error) {
 }
 
 func gatewayV2PlanDigest(state gatewayV2RouteState) (string, error) {
-	if !validGatewayProfileBinding(state.Profile) || !validGatewayV2NetworkPlan(state.Network) ||
-		!gatewayV2NetworkExcludesSelectedLAN(state.Profile, state.Network) || !validGatewayV2Identity(state.OperationID, state.Identity) {
+	return gatewayV2PlanDigestFor(state.OperationID, state.Profile, state.Identity, state.Network)
+}
+
+func gatewayV2PlanDigestFor(operationID string, profile gatewayProfileBinding,
+	identity gatewayV2Identity, network gatewayV2NetworkPlan,
+) (string, error) {
+	if !validGatewayProfileBinding(profile) || !validGatewayV2NetworkPlan(network) ||
+		!gatewayV2NetworkExcludesSelectedLAN(profile, network) || !validGatewayV2Identity(operationID, identity) {
 		return "", errors.New("invalid generated ingress v2 plan")
 	}
 	return canonicalDigest(struct {
@@ -429,7 +435,7 @@ func gatewayV2PlanDigest(state gatewayV2RouteState) (string, error) {
 		Profile  gatewayProfileBinding `json:"profile"`
 		Identity gatewayV2Identity     `json:"identity"`
 		Network  gatewayV2NetworkPlan  `json:"network"`
-	}{Version: gatewayV2PlanVersion, Profile: state.Profile, Identity: state.Identity, Network: state.Network})
+	}{Version: gatewayV2PlanVersion, Profile: profile, Identity: identity, Network: network})
 }
 
 func validGatewayProfileBinding(profile gatewayProfileBinding) bool {
