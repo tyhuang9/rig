@@ -6,9 +6,10 @@ package runtimeexecutor
 import (
 	"context"
 	"errors"
+	"reflect"
 
 	"github.com/google/uuid"
-	"github.com/hostd/hostd/internal/applifecycle"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
@@ -28,9 +29,9 @@ type releaseReader interface {
 	ReadyWorkspace(context.Context, string, string) (releasesnapshot.Release, error)
 }
 
-type deploymentAuthority interface {
-	Snapshot(context.Context, string) (applifecycle.DeploymentAuthoritySnapshot, error)
-	Revalidate(context.Context, applifecycle.DeploymentAuthoritySnapshot) error
+type deploymentBindings interface {
+	Read(context.Context, string) (deploymentbinding.Binding, error)
+	Check(context.Context, deploymentbinding.Binding) (deploymentbinding.Classification, error)
 }
 
 type Router struct {
@@ -39,26 +40,26 @@ type Router struct {
 	releases    releaseReader
 	compose     jobs.Executor
 	generated   jobs.Executor
-	authority   deploymentAuthority
+	bindings    deploymentBindings
 	rebindFence func(context.Context) error
 }
 
 var errInvalidSource = errors.New("runtime strategy provenance is invalid")
 
 func New(deploymentRepository deploymentReader, plans planReader, releases releaseReader, compose, generated jobs.Executor,
-	authority deploymentAuthority, rebindFence func(context.Context) error,
+	bindings deploymentBindings, rebindFence func(context.Context) error,
 ) (*Router, error) {
-	if deploymentRepository == nil || plans == nil || releases == nil || (compose == nil && generated == nil) || authority == nil || rebindFence == nil {
+	if deploymentRepository == nil || plans == nil || releases == nil || (compose == nil && generated == nil) || nilDeploymentBindings(bindings) || rebindFence == nil {
 		return nil, errors.New("runtime strategy router dependencies are required")
 	}
 	return &Router{
 		deployments: deploymentRepository, plans: plans, releases: releases,
-		compose: compose, generated: generated, authority: authority, rebindFence: rebindFence,
+		compose: compose, generated: generated, bindings: bindings, rebindFence: rebindFence,
 	}, nil
 }
 
 func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
-	if r == nil || r.authority == nil || r.rebindFence == nil || ctx == nil || reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil {
+	if r == nil || nilDeploymentBindings(r.bindings) || r.rebindFence == nil || ctx == nil || reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "validation_failed"}
 	}
 	if err := ctx.Err(); err != nil {
@@ -77,18 +78,18 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	if canceled := ctx.Err(); canceled != nil {
 		return jobs.ExecutionResult{}, canceled
 	}
-	// This value snapshot prevents preparation under an already stopped or
-	// malformed desired head. It is not durable effect permission: complete M4
-	// execution still needs shared exclusion and per-effect journal enforcement.
-	authority, err := r.authority.Snapshot(ctx, job.ResourceID)
+	// Read the exact immutable authority accepted with this job. This boundary
+	// refuses legacy adoption and newer desired heads; it is not durable effect
+	// permission for a later runtime command.
+	binding, err := r.bindings.Read(ctx, job.ID)
 	if err != nil {
-		if canceled := ctx.Err(); canceled != nil {
-			return jobs.ExecutionResult{}, canceled
-		}
-		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
+		return jobs.ExecutionResult{}, deploymentBindingRefusal(ctx, err)
 	}
-	if canceled := ctx.Err(); canceled != nil {
-		return jobs.ExecutionResult{}, canceled
+	if binding.JobID() != job.ID || binding.ApplicationID() != job.ResourceID {
+		return jobs.ExecutionResult{}, deploymentBindingRefusal(ctx, deploymentbinding.ErrInvalidBinding)
+	}
+	if err := r.checkBinding(ctx, binding); err != nil {
+		return jobs.ExecutionResult{}, err
 	}
 	input, err := jobs.DeploymentInputFor(job)
 	if err != nil {
@@ -126,18 +127,63 @@ func (r *Router) Execute(ctx context.Context, job jobs.Job, reporter jobs.Progre
 	if executor == nil {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
 	}
-	// Revalidate after all routing and workspace preparation, immediately before
-	// delegation. A same-state revision change invalidates the earlier value.
-	if err := r.authority.Revalidate(ctx, authority); err != nil {
-		if canceled := ctx.Err(); canceled != nil {
-			return jobs.ExecutionResult{}, canceled
-		}
-		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "runtime_unavailable"}
+	// Revalidate the same immutable value after all routing and workspace
+	// preparation, immediately before delegation. Retain any preparing row when
+	// authority changed; recovery owns interpretation of that durable evidence.
+	if err := r.checkBinding(ctx, binding); err != nil {
+		return jobs.ExecutionResult{}, err
 	}
 	if canceled := ctx.Err(); canceled != nil {
 		return jobs.ExecutionResult{}, canceled
 	}
 	return executor.Execute(ctx, job, reporter)
+}
+
+func nilDeploymentBindings(bindings deploymentBindings) bool {
+	if bindings == nil {
+		return true
+	}
+	value := reflect.ValueOf(bindings)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func (r *Router) checkBinding(ctx context.Context, binding deploymentbinding.Binding) error {
+	classification, err := r.bindings.Check(ctx, binding)
+	if err != nil {
+		return deploymentBindingRefusal(ctx, err)
+	}
+	switch classification {
+	case deploymentbinding.ClassificationCurrent:
+		return nil
+	case deploymentbinding.ClassificationStale:
+		return deploymentBindingRefusal(ctx, nil)
+	default:
+		return deploymentBindingRefusal(ctx, deploymentbinding.ErrInvalidConfiguration)
+	}
+}
+
+func deploymentBindingRefusal(ctx context.Context, cause error) error {
+	if ctx != nil {
+		if canceled := ctx.Err(); canceled != nil {
+			if cause != nil {
+				return errors.Join(cause, canceled)
+			}
+			return canceled
+		}
+	}
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, deploymentbinding.ErrCanceled) {
+		return cause
+	}
+	refusal := &jobs.ExecutionError{Code: "runtime_unavailable"}
+	if cause == nil {
+		return refusal
+	}
+	return errors.Join(refusal, cause)
 }
 
 func (r *Router) strategy(ctx context.Context, appID, releaseID string, deployment deployments.Deployment) (deployments.RuntimeStrategy, error) {

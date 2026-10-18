@@ -205,7 +205,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		t.Fatal(err)
 	}
 	appStore := apps.New(db)
-	jobStore, _, err := newDeploymentJobService(db)
+	jobStore, bindingStore, err := newDeploymentJobService(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +233,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	}
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans,
+		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: healthObserver})
 	if err != nil {
 		t.Fatal("compose production generated runtime:", err)
@@ -833,7 +833,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		if err != nil {
 			return restartedController{}, err
 		}
-		jobStore, _, err := newDeploymentJobService(controllerDB)
+		jobStore, bindingStore, err := newDeploymentJobService(controllerDB)
 		if err != nil {
 			return restartedController{}, err
 		}
@@ -843,7 +843,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		}
 		value.composition, err = prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 			db: controllerDB, applications: value.apps, snapshots: snapshots, configuration: value.configuration,
-			deployments: value.deployments, plans: value.plans,
+			deployments: value.deployments, plans: value.plans, bindings: bindingStore,
 		}, runtimeCompositionOptions{
 			dockerExecutable: docker,
 			runner:           restartedObserver,

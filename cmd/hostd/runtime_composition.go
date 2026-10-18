@@ -9,11 +9,11 @@ import (
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
-	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedexecutor"
@@ -37,6 +37,7 @@ type runtimeCompositionDependencies struct {
 	configuration *appconfig.Store
 	deployments   *deployments.Repository
 	plans         *deploymentplans.Store
+	bindings      *deploymentbinding.Repository
 }
 
 type runtimeCompositionOptions struct {
@@ -104,6 +105,10 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 	}
 	if configuration.FakeRuntime && (configuration.ComposeRuntime || configuration.GeneratedRuntime) {
 		return runtimeComposition{}, errors.New("fake runtime is mutually exclusive with real runtimes")
+	}
+	if (configuration.ComposeRuntime || configuration.GeneratedRuntime) &&
+		(dependencies.bindings == nil || !dependencies.bindings.UsesDatabase(dependencies.db)) {
+		return runtimeComposition{}, errors.New("runtime deployment lifecycle binding repository is required")
 	}
 	if configuration.GeneratedRuntime && (options.dockerExecutable == "" || !filepath.IsAbs(options.dockerExecutable) || filepath.Clean(options.dockerExecutable) != options.dockerExecutable) {
 		return runtimeComposition{}, errors.New("generated runtime Docker executable is invalid")
@@ -320,12 +325,8 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("runtime_router_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		desiredAuthority, err := applifecycle.NewDeploymentAuthority(applifecycle.New(dependencies.db))
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("runtime desired lifecycle authority setup: %w", err)
-		}
 		result.executor, err = runtimeexecutor.New(dependencies.deployments, dependencies.plans, dependencies.snapshots,
-			result.compose, result.generated, desiredAuthority, fenceCheck)
+			result.compose, result.generated, dependencies.bindings, fenceCheck)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("runtime strategy router setup: %w", err)
 		}

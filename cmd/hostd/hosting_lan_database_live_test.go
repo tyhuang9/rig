@@ -118,7 +118,7 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	appStore := apps.New(db)
-	jobStore, _, err := newDeploymentJobService(db)
+	jobStore, bindingStore, err := newDeploymentJobService(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans,
+		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
@@ -397,7 +397,7 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	}
 	defer reopenedDB.Close()
 	reopenedApps := apps.New(reopenedDB)
-	reopenedJobs, _, err := newDeploymentJobService(reopenedDB)
+	reopenedJobs, reopenedBindings, err := newDeploymentJobService(reopenedDB)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	reopenedDeployments := deployments.New(reopenedDB)
 	reopenedComposition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: reopenedDB, applications: reopenedApps, snapshots: reopenedSnapshots, configuration: reopenedConfiguration,
-		deployments: reopenedDeployments, plans: reopenedPlans,
+		deployments: reopenedDeployments, plans: reopenedPlans, bindings: reopenedBindings,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("reopen production runtime:", err)

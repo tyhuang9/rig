@@ -114,7 +114,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	appStore := apps.New(db)
-	jobStore, _, err := newDeploymentJobService(db)
+	jobStore, bindingStore, err := newDeploymentJobService(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans,
+		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
@@ -287,7 +287,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	// object that already saw the grants.
 	fresh, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans,
+		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("open fresh production ingress manager:", err)

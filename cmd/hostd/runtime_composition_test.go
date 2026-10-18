@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedingress"
@@ -23,6 +25,7 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/docker"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/runtimeexecutor"
 	"github.com/hostd/hostd/internal/sourceconnections"
@@ -101,45 +104,155 @@ func TestRuntimeCompositionEnablementAndRouterSelection(t *testing.T) {
 	}
 }
 
-type runtimeCompositionReporter struct{}
+type runtimeCompositionCommandRunner struct{ calls int }
 
-func (runtimeCompositionReporter) Report(jobs.ProgressUpdate) error { return nil }
+func (runner *runtimeCompositionCommandRunner) Run(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	runner.calls++
+	return runtimeprocess.CommandResult{}, nil
+}
 
-func TestRuntimeCompositionRouterUsesPersistedDesiredLifecycleAuthority(t *testing.T) {
+type runtimeCompositionReporter struct{ updates []jobs.ProgressUpdate }
+
+func (reporter *runtimeCompositionReporter) Report(update jobs.ProgressUpdate) error {
+	reporter.updates = append(reporter.updates, update)
+	return nil
+}
+
+func TestRuntimeCompositionRequiresSameDatabaseDeploymentBindingsBeforeSetup(t *testing.T) {
+	t.Run("same database", func(t *testing.T) {
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.ComposeRuntime = true
+		result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := result.executor.(*runtimeexecutor.Router); !ok {
+			t.Fatalf("executor=%T", result.executor)
+		}
+	})
+	for _, mode := range []string{"compose", "generated"} {
+		for _, repository := range []string{"missing", "unconfigured", "foreign"} {
+			t.Run(mode+"/"+repository, func(t *testing.T) {
+				fixture := newRuntimeCompositionFixture(t)
+				fixture.configuration.ComposeRuntime = mode == "compose"
+				fixture.configuration.GeneratedRuntime = mode == "generated"
+				dependencies := fixture.dependencies
+				switch repository {
+				case "missing":
+					dependencies.bindings = nil
+				case "unconfigured":
+					dependencies.bindings = &deploymentbinding.Repository{}
+				case "foreign":
+					foreignDB, err := database.Open(filepath.Join(t.TempDir(), "foreign"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(func() { _ = foreignDB.Close() })
+					_, dependencies.bindings, err = newDeploymentJobService(foreignDB)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				steps, recovered := 0, false
+				runner := &runtimeCompositionCommandRunner{}
+				result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
+					dockerExecutable: fixture.dockerExecutable,
+					runner:           runner,
+					beforeStep: func(string) error {
+						steps++
+						return nil
+					},
+					recoverIngress: func(context.Context, *generatedingress.Manager) error {
+						recovered = true
+						return nil
+					},
+				})
+				if err == nil || result.executor != nil || steps != 0 || runner.calls != 0 || recovered {
+					t.Fatalf("composition=%#v error=%v steps=%d runner=%d recovered=%t", result, err, steps, runner.calls, recovered)
+				}
+			})
+		}
+	}
+}
+
+func TestRuntimeCompositionFakeAndDisabledDoNotRequireDeploymentBindings(t *testing.T) {
+	for _, mode := range []string{"disabled", "fake"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newRuntimeCompositionFixture(t)
+			fixture.dependencies.bindings = nil
+			fixture.configuration.FakeRuntime = mode == "fake"
+			result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, fake := result.executor.(*jobs.FakeExecutor)
+			if fake != (mode == "fake") || (mode == "disabled" && result.executor != nil) {
+				t.Fatalf("executor=%T", result.executor)
+			}
+		})
+	}
+}
+
+func TestRuntimeCompositionRouterUsesSameDatabasePersistedBindings(t *testing.T) {
 	fixture := newRuntimeCompositionFixture(t)
 	fixture.configuration.ComposeRuntime = true
-	composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{})
+	runner := &runtimeCompositionCommandRunner{}
+	composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{runner: runner})
 	if err != nil {
 		t.Fatal(err)
 	}
-	job := jobs.Job{
-		ID: "22222222-2222-4222-8222-222222222222", Type: "deploy", ResourceType: "application",
-		ResourceID: "11111111-1111-4111-8111-111111111111", RequestedBy: "33333333-3333-4333-8333-333333333333",
-	}
-	_, err = composition.executor.Execute(context.Background(), job, runtimeCompositionReporter{})
-	var executionErr *jobs.ExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" {
-		t.Fatalf("missing desired lifecycle head error=%v", err)
-	}
-	if _, err := fixture.db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
-		VALUES(?,?,?,'pending','2026-10-18T01:00:00Z','2026-10-18T01:00:00Z')`, job.ResourceID, "authority-app", "Authority App"); err != nil {
-		t.Fatal(err)
-	}
-	_, err = composition.executor.Execute(context.Background(), job, runtimeCompositionReporter{})
-	if !errors.As(err, &executionErr) || executionErr.Code != "validation_failed" {
-		t.Fatalf("legacy uninitialized desired lifecycle error=%v", err)
-	}
-	var desiredState sql.NullString
-	var revision, history int64
-	if err := fixture.db.QueryRow(`SELECT desired_state,revision_number FROM application_desired_lifecycle_heads WHERE app_id=?`, job.ResourceID).Scan(&desiredState, &revision); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM application_desired_lifecycle_transitions WHERE app_id=?`, job.ResourceID).Scan(&history); err != nil {
-		t.Fatal(err)
-	}
-	if desiredState.Valid || revision != 0 || history != 0 {
-		t.Fatalf("read guard authored intent: state=%v revision=%d history=%d", desiredState, revision, history)
-	}
+
+	t.Run("unbound job refuses before preparation", func(t *testing.T) {
+		jobID := uuid.NewString()
+		reporter := &runtimeCompositionReporter{}
+		_, err := composition.executor.Execute(context.Background(), jobs.Job{
+			ID: jobID, Type: "deploy", ResourceType: "application", ResourceID: uuid.NewString(), RequestedBy: uuid.NewString(), Attempt: 1,
+			Input: json.RawMessage(`{"configurationMode":"current"}`),
+		}, reporter)
+		var executionErr *jobs.ExecutionError
+		if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deploymentbinding.ErrBindingNotFound) {
+			t.Fatalf("error=%v", err)
+		}
+		var deploymentsCount int
+		if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM deployments WHERE job_id=?`, jobID).Scan(&deploymentsCount); err != nil {
+			t.Fatal(err)
+		}
+		if deploymentsCount != 0 || len(reporter.updates) != 0 || runner.calls != 0 {
+			t.Fatalf("deployments=%d updates=%d runner=%d", deploymentsCount, len(reporter.updates), runner.calls)
+		}
+	})
+
+	t.Run("accepted bound job reaches compose validation", func(t *testing.T) {
+		actorID, appID := uuid.NewString(), uuid.NewString()
+		stamp := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := fixture.db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, actorID, "hash", stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'pending',?,?)`, appID, appID, appID, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+		created, err := fixture.deploymentJobs.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+			ApplicationID: appID, IdempotencyKey: "composition-bound-job", RequestedBy: actorID,
+			Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+		}, jobs.DeploymentCreateHooks{})
+		if err != nil || !created.Created {
+			t.Fatalf("created=%t error=%v", created.Created, err)
+		}
+		job := created.Job
+		job.Attempt = 1
+		reporter := &runtimeCompositionReporter{}
+		_, err = composition.executor.Execute(context.Background(), job, reporter)
+		if errors.Is(err, deploymentbinding.ErrBindingNotFound) || len(reporter.updates) == 0 || reporter.updates[0].Phase != "validate" {
+			t.Fatalf("error=%v updates=%#v", err, reporter.updates)
+		}
+		var deploymentsCount int
+		if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM deployments WHERE job_id=?`, job.ID).Scan(&deploymentsCount); err != nil {
+			t.Fatal(err)
+		}
+		if deploymentsCount != 1 || runner.calls != 0 {
+			t.Fatalf("deployments=%d runner=%d", deploymentsCount, runner.calls)
+		}
+	})
 }
 
 func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) {
@@ -483,6 +596,7 @@ func TestGeneratedRuntimeImpliesManagedIngressAndServerCapability(t *testing.T) 
 
 type runtimeCompositionFixture struct {
 	db               *sql.DB
+	deploymentJobs   *jobs.Service
 	configuration    config.Config
 	dependencies     runtimeCompositionDependencies
 	dockerExecutable string
@@ -509,6 +623,10 @@ func newRuntimeCompositionFixture(t *testing.T) runtimeCompositionFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	deploymentJobs, bindings, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dockerExecutable := filepath.Join(root, "docker-test")
 	if err := os.WriteFile(dockerExecutable, []byte("test"), 0o700); err != nil {
 		t.Fatal(err)
@@ -516,10 +634,10 @@ func newRuntimeCompositionFixture(t *testing.T) runtimeCompositionFixture {
 	configuration := config.Defaults()
 	configuration.DataRoot = root
 	return runtimeCompositionFixture{
-		db: db, configuration: configuration, dockerExecutable: dockerExecutable,
+		db: db, deploymentJobs: deploymentJobs, configuration: configuration, dockerExecutable: dockerExecutable,
 		dependencies: runtimeCompositionDependencies{
 			db: db, applications: apps.New(db), snapshots: snapshots, configuration: applicationConfiguration,
-			deployments: deployments.New(db), plans: plans,
+			deployments: deployments.New(db), plans: plans, bindings: bindings,
 		},
 	}
 }
