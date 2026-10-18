@@ -391,7 +391,10 @@ func controllerProcessKillRunChild(t *testing.T) {
 		t.Fatal("recover accepted deployment plans")
 	}
 	deploymentStore := deployments.New(db)
-	jobStore := jobs.New(db)
+	jobStore, bindingStore, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal("reopen deployment job service")
+	}
 	machineStore := machines.New(db)
 	if _, err := machineStore.EnsureLocal(); err != nil {
 		t.Fatal("reopen controller local machine")
@@ -399,6 +402,7 @@ func controllerProcessKillRunChild(t *testing.T) {
 	settings := config.Defaults()
 	settings.DataRoot = manifest.DataRoot
 	settings.GeneratedRuntime = true
+	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, manifest.DataRoot)
 	childContext, cancel := context.WithTimeout(context.Background(), 46*time.Minute)
 	defer cancel()
 	var barrier *controllerProcessKillBarrier
@@ -410,7 +414,8 @@ func controllerProcessKillRunChild(t *testing.T) {
 	}
 	composition, err := prepareRuntimeComposition(childContext, settings, runtimeCompositionDependencies{
 		db: db, applications: apps.New(db), snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans,
+		deployments: deploymentStore, plans: plans, bindings: bindingStore,
+		effectsWorkingDirectory: effectsWorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: manifest.Docker, runner: controllerProcessKillRunner{delegate: runtimeprocess.ExecRunner{}, barrier: barrier}})
 	if err != nil {
 		t.Fatal("reopen production generated composition")
@@ -420,8 +425,10 @@ func controllerProcessKillRunChild(t *testing.T) {
 		executor = controllerProcessKillExecutor{delegate: executor, barrier: barrier}
 	}
 	done, err := prepareRuntimeWorker(childContext, runtimeRecovery{
-		deployments: deploymentStore.Recover, jobs: jobStore.RecoverInterrupted,
-	}, executor, jobStore.RunWorker, func(error) {})
+		recoverState: jobStore.RecoverRuntimeContext,
+	}, executor, func(workerContext context.Context, executor jobs.Executor) error {
+		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
+	}, func(error) {})
 	if err != nil {
 		t.Fatal("recover production deployment worker")
 	}

@@ -14,7 +14,6 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/database"
-	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 )
 
@@ -37,7 +36,7 @@ func TestBrowserContractUsesLowerCamelJSON(t *testing.T) {
 	if _, err := machineStore.EnsureLocal(); err != nil {
 		t.Fatal(err)
 	}
-	jobService := jobs.New(db)
+	jobService := newDeploymentJobTestService(t, db)
 	handler := (&controller.Server{Auth: authService, Apps: apps.New(db), Jobs: jobService, Machines: machineStore, FakeRuntime: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).Handler()
 
 	me := authenticatedRequest(t, handler, session, http.MethodGet, "/api/v1/auth/me", "")

@@ -72,6 +72,7 @@ func gatewayCurrentUpgradeSelection(history gatewayRebindProtectedIntentHistory,
 	snapshot appaccess.GatewayRebindRecoverySnapshot,
 ) (gatewayCurrentSelection, error) {
 	if snapshot.CurrentSource == nil || snapshot.CurrentSource.Kind != appaccess.GatewayRebindSourceGatewayUpgrade ||
+		len(snapshot.CurrentTransfers) != 0 ||
 		!gatewayCurrentProfileMatchesAuthority(snapshot.CurrentProfile, *snapshot.CurrentSource) {
 		return gatewayCurrentSelection{}, errors.New("generated ingress SQL current upgrade authority is invalid")
 	}
@@ -240,10 +241,28 @@ func gatewayCurrentTransfersMatchState(transfers []appaccess.GatewayRebindAlloca
 func (m *Manager) selectGatewayCurrentLocked(ctx context.Context,
 	snapshot appaccess.GatewayRebindRecoverySnapshot,
 ) (gatewayCurrentSelection, error) {
+	return m.selectGatewayCurrentLockedPolicy(ctx, snapshot, false)
+}
+
+func (m *Manager) selectGatewayCurrentCurrentV2AwareLocked(ctx context.Context,
+	snapshot appaccess.GatewayRebindRecoverySnapshot,
+) (gatewayCurrentSelection, error) {
+	return m.selectGatewayCurrentLockedPolicy(ctx, snapshot, true)
+}
+
+func (m *Manager) selectGatewayCurrentLockedPolicy(ctx context.Context,
+	snapshot appaccess.GatewayRebindRecoverySnapshot, allowCurrentV2 bool,
+) (gatewayCurrentSelection, error) {
 	if m == nil || ctx == nil || ctx.Err() != nil || snapshot.CurrentSource == nil {
 		return gatewayCurrentSelection{}, errors.New("generated ingress current gateway selection input is invalid")
 	}
-	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	var history gatewayRebindProtectedIntentHistory
+	var err error
+	if allowCurrentV2 {
+		history, err = m.scanGatewayRebindProtectedIntentHistoryCurrentV2AwareLocked(nil)
+	} else {
+		history, err = m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	}
 	if err != nil {
 		return gatewayCurrentSelection{}, err
 	}
@@ -261,7 +280,13 @@ func (m *Manager) selectGatewayCurrentLocked(ctx context.Context,
 	}
 	// Repeat the complete protected scan and selected current read. This keeps
 	// external protected-file replacement from crossing the SQL-led decision.
-	confirmedHistory, scanErr := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	var confirmedHistory gatewayRebindProtectedIntentHistory
+	var scanErr error
+	if allowCurrentV2 {
+		confirmedHistory, scanErr = m.scanGatewayRebindProtectedIntentHistoryCurrentV2AwareLocked(nil)
+	} else {
+		confirmedHistory, scanErr = m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	}
 	if scanErr != nil || !sameGatewayRebindCurrentHistory(history, confirmedHistory) {
 		return gatewayCurrentSelection{}, errors.New("generated ingress current protected history changed during selection")
 	}

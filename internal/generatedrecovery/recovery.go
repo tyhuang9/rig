@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -25,11 +24,14 @@ const (
 	requeuedJobSummary        = "Generated deployment requeued because hostd restarted"
 	routeReconciliationPause  = "route_reconciliation_required"
 	replacementCapacityPause  = "insufficient_replacement_capacity"
+	deploymentLifecycleStale  = "deployment_lifecycle_stale"
+	deploymentStaleSummary    = "Deployment no longer matches the application's desired lifecycle."
 )
 
 var (
-	ErrInvalidRecovery  = errors.New("invalid generated restart recovery")
-	ErrRecoveryConflict = errors.New("generated restart recovery conflict")
+	ErrInvalidRecovery         = errors.New("invalid generated restart recovery")
+	ErrRecoveryConflict        = errors.New("generated restart recovery conflict")
+	ErrGuardedRecoveryRequired = errors.New("guarded deployment recovery required")
 )
 
 // DeploymentResult contains non-secret aggregate recovery outcomes.
@@ -38,6 +40,7 @@ type DeploymentResult struct {
 	PausedGenerated    int
 	FailedGenerated    int
 	FailedOther        int
+	RetainedStale      int
 }
 
 // JobResult contains non-secret aggregate recovery outcomes.
@@ -45,6 +48,15 @@ type JobResult struct {
 	RequeuedGenerated int
 	PausedGenerated   int
 	Interrupted       int
+	RetiredStale      int
+}
+
+// RuntimeResult contains the aggregate result of the single guarded startup
+// recovery transaction. Counts are published only after that transaction
+// commits successfully.
+type RuntimeResult struct {
+	Deployments DeploymentResult
+	Jobs        JobResult
 }
 
 type runtimeDeployment struct {
@@ -111,10 +123,9 @@ type deploymentInput struct {
 	ExpectedConfigurationRevisionNumber int64  `json:"expectedConfigurationRevisionNumber"`
 }
 
-// RecoverDeployments preserves only exact generated deployments whose durable
-// state can safely be replayed. Every other active deployment retains the
-// legacy daemon-restart failure behavior. Trigger-sensitive generated state is
-// terminalized before its main deployment row.
+// RecoverDeployments is a compatibility wrapper for callers that have no
+// deployment recovery work. Deployment work requires RecoverRuntime so its
+// authority classification and job/event writes share one transaction.
 func RecoverDeployments(ctx context.Context, db *sql.DB, now time.Time) (DeploymentResult, error) {
 	if ctx == nil || db == nil || now.IsZero() {
 		return DeploymentResult{}, ErrInvalidRecovery
@@ -124,83 +135,24 @@ func RecoverDeployments(ctx context.Context, db *sql.DB, now time.Time) (Deploym
 		return DeploymentResult{}, err
 	}
 	defer tx.Rollback()
-
-	runtimes, err := loadRuntimeDeployments(ctx, tx)
+	if err := reserveRecoveryWriter(ctx, tx); err != nil {
+		return DeploymentResult{}, err
+	}
+	census, err := loadRecoveryCensus(ctx, tx)
 	if err != nil {
 		return DeploymentResult{}, err
 	}
-	safe, err := resumableDeployments(ctx, tx, runtimes)
-	if err != nil {
-		return DeploymentResult{}, err
-	}
-	formattedNow := now.UTC().Format(time.RFC3339Nano)
-	result := DeploymentResult{PreservedGenerated: len(safe)}
-	uncertainCommitted := make(map[string]struct{})
-	for _, runtimeDeployment := range runtimes {
-		if _, preserved := safe[runtimeDeployment.deploymentID]; preserved {
-			continue
-		}
-		if runtimeDeployment.phase == "succeeded" {
-			// A committed candidate may be serving. Preserve both its runtime
-			// state and its main deployment until an operator can reconcile it.
-			uncertainCommitted[runtimeDeployment.deploymentID] = struct{}{}
-			result.PausedGenerated++
-			continue
-		}
-		if err := failRuntimeDeployment(ctx, tx, runtimeDeployment, formattedNow); err != nil {
-			return DeploymentResult{}, err
-		}
-		result.FailedGenerated++
-	}
-
-	rows, err := tx.QueryContext(ctx, `SELECT id,runtime_strategy FROM deployments WHERE status IN ('preparing','applying','waiting_health') ORDER BY id`)
-	if err != nil {
-		return DeploymentResult{}, err
-	}
-	var active []struct{ id, strategy string }
-	for rows.Next() {
-		var value struct{ id, strategy string }
-		if err := rows.Scan(&value.id, &value.strategy); err != nil {
-			rows.Close()
-			return DeploymentResult{}, err
-		}
-		active = append(active, value)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return DeploymentResult{}, err
-	}
-	if err := rows.Close(); err != nil {
-		return DeploymentResult{}, err
-	}
-	for _, deployment := range active {
-		if _, preserved := safe[deployment.id]; preserved {
-			continue
-		}
-		if _, uncertain := uncertainCommitted[deployment.id]; uncertain {
-			continue
-		}
-		updated, err := tx.ExecContext(ctx, `UPDATE deployments SET status='failed',finished_at=?,diagnostic_code=?,failure_code=?,failure_summary=? WHERE id=? AND status IN ('preparing','applying','waiting_health')`, formattedNow, diagnosticDaemonRestarted, diagnosticDaemonRestarted, restartSummary, deployment.id)
-		if err != nil {
-			return DeploymentResult{}, err
-		}
-		if changed, err := updated.RowsAffected(); err != nil || changed != 1 {
-			return DeploymentResult{}, ErrRecoveryConflict
-		}
-		if deployment.strategy != "generated_node" {
-			result.FailedOther++
-		}
+	if census.hasDeploymentWork() {
+		return DeploymentResult{}, ErrGuardedRecoveryRequired
 	}
 	if err := tx.Commit(); err != nil {
 		return DeploymentResult{}, err
 	}
-	return result, nil
+	return DeploymentResult{}, nil
 }
 
-// RecoverJobs requeues active jobs only when the same exact generated state
-// remains resumable after deployment recovery. All other active jobs preserve
-// the legacy interrupted outcome. A repeated call leaves an already requeued
-// generated job unchanged.
+// RecoverJobs retains legacy generic non-deployment interruption. It refuses
+// before mutation when any deployment recovery subject exists.
 func RecoverJobs(ctx context.Context, db *sql.DB, now time.Time) (JobResult, error) {
 	if ctx == nil || db == nil || now.IsZero() {
 		return JobResult{}, ErrInvalidRecovery
@@ -210,131 +162,19 @@ func RecoverJobs(ctx context.Context, db *sql.DB, now time.Time) (JobResult, err
 		return JobResult{}, err
 	}
 	defer tx.Rollback()
-	runtimes, err := loadRuntimeDeployments(ctx, tx)
+	if err := reserveRecoveryWriter(ctx, tx); err != nil {
+		return JobResult{}, err
+	}
+	census, err := loadRecoveryCensus(ctx, tx)
 	if err != nil {
 		return JobResult{}, err
 	}
-	safe, err := resumableDeployments(ctx, tx, runtimes)
+	if census.hasDeploymentWork() {
+		return JobResult{}, ErrGuardedRecoveryRequired
+	}
+	result, err := recoverJobsTx(ctx, tx, now.UTC().Format(time.RFC3339Nano), nil)
 	if err != nil {
 		return JobResult{}, err
-	}
-	safeJobs := make(map[string]struct{}, len(safe))
-	for _, value := range safe {
-		if value.jobStatus != "queued" {
-			safeJobs[value.jobID] = struct{}{}
-		}
-	}
-	uncertainJobs := make(map[string]struct{})
-	for _, runtimeDeployment := range runtimes {
-		if runtimeDeployment.phase != "succeeded" {
-			continue
-		}
-		if _, preserved := safe[runtimeDeployment.deploymentID]; preserved {
-			continue
-		}
-		var jobID string
-		err := tx.QueryRowContext(ctx, `SELECT d.job_id FROM deployments d JOIN jobs j ON j.id=d.job_id
-			WHERE d.id=? AND d.app_id=? AND d.status IN ('preparing','applying','waiting_health','succeeded')
-			AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=d.app_id`,
-			runtimeDeployment.deploymentID, runtimeDeployment.appID).Scan(&jobID)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return JobResult{}, err
-		}
-		uncertainJobs[jobID] = struct{}{}
-	}
-
-	rows, err := tx.QueryContext(ctx, `SELECT id,status,phase FROM jobs WHERE status IN ('assigned','running','waiting_external') ORDER BY created_at,id`)
-	if err != nil {
-		return JobResult{}, err
-	}
-	type activeJob struct{ id, status, phase string }
-	var active []activeJob
-	for rows.Next() {
-		var value activeJob
-		if err := rows.Scan(&value.id, &value.status, &value.phase); err != nil {
-			rows.Close()
-			return JobResult{}, err
-		}
-		active = append(active, value)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return JobResult{}, err
-	}
-	if err := rows.Close(); err != nil {
-		return JobResult{}, err
-	}
-
-	formattedNow := now.UTC().Format(time.RFC3339Nano)
-	result := JobResult{}
-	for _, job := range active {
-		if _, requeue := safeJobs[job.id]; requeue {
-			updated, err := tx.ExecContext(ctx, `UPDATE jobs SET status='queued',phase='queued',progress_percent=0,checkpoint_json='{}',pause_disposition=NULL,error_code=NULL,error_detail=NULL,started_at=NULL,finished_at=NULL,updated_at=? WHERE id=? AND status=? AND phase=?`, formattedNow, job.id, job.status, job.phase)
-			if err != nil {
-				return JobResult{}, err
-			}
-			if changed, err := updated.RowsAffected(); err != nil || changed != 1 {
-				return JobResult{}, ErrRecoveryConflict
-			}
-			if err := appendJobEvent(ctx, tx, formattedNow, job.id, "warn", "queued", diagnosticDaemonRestarted, requeuedJobSummary); err != nil {
-				return JobResult{}, err
-			}
-			result.RequeuedGenerated++
-			continue
-		}
-		if _, uncertain := uncertainJobs[job.id]; uncertain {
-			updated, err := tx.ExecContext(ctx, `UPDATE jobs SET status='waiting_user',phase=?,checkpoint_json=?,pause_disposition=?,error_code=NULL,error_detail=NULL,updated_at=? WHERE id=? AND status=? AND phase=?`,
-				routeReconciliationPause, `{"phase":"route_reconciliation_required"}`, routeReconciliationPause, formattedNow, job.id, job.status, job.phase)
-			if err != nil {
-				return JobResult{}, err
-			}
-			if changed, err := updated.RowsAffected(); err != nil || changed != 1 {
-				return JobResult{}, ErrRecoveryConflict
-			}
-			if err := appendJobEvent(ctx, tx, formattedNow, job.id, "warn", routeReconciliationPause, diagnosticDaemonRestarted, "Committed route requires reconciliation after hostd restarted"); err != nil {
-				return JobResult{}, err
-			}
-			result.PausedGenerated++
-			continue
-		}
-		updated, err := tx.ExecContext(ctx, `UPDATE jobs SET status='interrupted',phase='interrupted',pause_disposition=NULL,error_code=?,error_detail=?,updated_at=?,finished_at=? WHERE id=? AND status=? AND phase=?`, diagnosticDaemonRestarted, interruptedJobSummary, formattedNow, formattedNow, job.id, job.status, job.phase)
-		if err != nil {
-			return JobResult{}, err
-		}
-		if changed, err := updated.RowsAffected(); err != nil || changed != 1 {
-			return JobResult{}, ErrRecoveryConflict
-		}
-		if err := appendJobEvent(ctx, tx, formattedNow, job.id, "error", "interrupted", diagnosticDaemonRestarted, interruptedJobSummary); err != nil {
-			return JobResult{}, err
-		}
-		result.Interrupted++
-	}
-	uncertainJobIDs := make([]string, 0, len(uncertainJobs))
-	for jobID := range uncertainJobs {
-		uncertainJobIDs = append(uncertainJobIDs, jobID)
-	}
-	sort.Strings(uncertainJobIDs)
-	for _, jobID := range uncertainJobIDs {
-		updated, err := tx.ExecContext(ctx, `UPDATE jobs SET phase=?,checkpoint_json=?,pause_disposition=?,error_code=NULL,error_detail=NULL,updated_at=?
-			WHERE id=? AND status='waiting_user' AND (phase<>? OR COALESCE(pause_disposition,'')<>?)`,
-			routeReconciliationPause, `{"phase":"route_reconciliation_required"}`, routeReconciliationPause, formattedNow,
-			jobID, routeReconciliationPause, routeReconciliationPause)
-		if err != nil {
-			return JobResult{}, err
-		}
-		changed, err := updated.RowsAffected()
-		if err != nil {
-			return JobResult{}, err
-		}
-		if changed == 1 {
-			if err := appendJobEvent(ctx, tx, formattedNow, jobID, "warn", routeReconciliationPause, diagnosticDaemonRestarted, "Committed route requires reconciliation after hostd restarted"); err != nil {
-				return JobResult{}, err
-			}
-			result.PausedGenerated++
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return JobResult{}, err

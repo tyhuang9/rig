@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/generatedrecovery"
 )
 
@@ -31,20 +32,22 @@ const (
 )
 
 var (
-	ErrJobNotFound               = errors.New("job not found")
-	ErrJobTerminal               = errors.New("job is already terminal")
-	ErrInvalidInput              = errors.New("invalid job input")
-	ErrInvalidProgress           = errors.New("invalid job progress")
-	ErrEventBudget               = errors.New("job event budget exhausted")
-	ErrJobNotPaused              = errors.New("job is not waiting for user action")
-	ErrApprovalRequired          = errors.New("job still requires runtime approval")
-	ErrMigrationApprovalRequired = errors.New("job still requires migration approval")
-	ErrIdempotency               = errors.New("idempotency key conflicts with the original request")
-	ErrApplicationBusy           = errors.New("application already has an active mutation")
-	ErrReviewedRevisionStale     = errors.New("reviewed deployment revision is stale")
-	ErrReviewedRevisionsRequired = errors.New("generated deployment requires reviewed revisions")
-	ErrCancellationRequested     = errors.New("job cancellation requested")
-	ErrCancellationUnsafe        = errors.New("job cannot be cancelled while route reconciliation is required")
+	ErrJobNotFound                   = errors.New("job not found")
+	ErrJobTerminal                   = errors.New("job is already terminal")
+	ErrInvalidInput                  = errors.New("invalid job input")
+	ErrInvalidProgress               = errors.New("invalid job progress")
+	ErrEventBudget                   = errors.New("job event budget exhausted")
+	ErrJobNotPaused                  = errors.New("job is not waiting for user action")
+	ErrApprovalRequired              = errors.New("job still requires runtime approval")
+	ErrMigrationApprovalRequired     = errors.New("job still requires migration approval")
+	ErrIdempotency                   = errors.New("idempotency key conflicts with the original request")
+	ErrApplicationBusy               = errors.New("application already has an active mutation")
+	ErrReviewedRevisionStale         = errors.New("reviewed deployment revision is stale")
+	ErrReviewedRevisionsRequired     = errors.New("generated deployment requires reviewed revisions")
+	ErrDeploymentLifecycleStale      = errors.New("deployment lifecycle authority is stale")
+	ErrDeploymentLifecycleUnresolved = deploymentbinding.ErrLifecycleUnresolved
+	ErrCancellationRequested         = errors.New("job cancellation requested")
+	ErrCancellationUnsafe            = errors.New("job cannot be cancelled while route reconciliation is required")
 )
 
 // JobInput is deliberately sealed so new persisted input schemas are reviewed
@@ -95,6 +98,28 @@ type CreateRequest struct {
 // inserted, but before commit. Returning an error rolls the entire operation
 // back. Finalizers must not retain tx or perform external I/O.
 type CreateFinalizer func(*sql.Tx, Job) error
+
+// CreateTransactionHooks are trusted internal hooks for repositories that must
+// compose immutable linkage with job creation. BeforeCreate runs inside the
+// writer transaction before any job lookup or insert. Existing runs after an
+// insert collision and before mutable job replay comparison. Returning
+// handled=true commits without creating or waking a job. Finalize runs only
+// after a new queued job and its event have been inserted.
+// Hooks must not retain tx or perform external I/O.
+type CreateTransactionHooks struct {
+	BeforeCreate     func(context.Context, *sql.Tx) (handled bool, err error)
+	Existing         func(context.Context, *sql.Tx, Job) (handled bool, err error)
+	FinalizeExisting func(context.Context, *sql.Tx, Job) error
+	Finalize         func(context.Context, *sql.Tx, Job) error
+}
+
+// CreateTransactionResult distinguishes an immutable replay handled by a
+// caller hook from a newly created job.
+type CreateTransactionResult struct {
+	Job     Job
+	Created bool
+	Handled bool
+}
 
 type Job struct {
 	ID               string          `json:"id"`
@@ -183,14 +208,15 @@ type Executor interface {
 }
 
 type Service struct {
-	db             *sql.DB
-	now            func() time.Time
-	wake           chan struct{}
-	mu             sync.Mutex
-	active         map[string]context.CancelFunc
-	beforeClaim    func()
-	beforeRegister func()
-	beforeExecute  func()
+	db                 *sql.DB
+	deploymentBindings *deploymentbinding.Repository
+	now                func() time.Time
+	wake               chan struct{}
+	mu                 sync.Mutex
+	active             map[string]context.CancelFunc
+	beforeClaim        func()
+	beforeRegister     func()
+	beforeExecute      func()
 }
 
 func New(db *sql.DB) *Service {
@@ -235,70 +261,137 @@ func (s *Service) CreateWithInputChecked(request CreateRequest, check CreateFina
 }
 
 func (s *Service) createWithInput(request CreateRequest, check, finalize CreateFinalizer) (Job, bool, error) {
+	result, err := s.createWithInputContext(context.Background(), request, CreateTransactionHooks{
+		FinalizeExisting: func(_ context.Context, tx *sql.Tx, job Job) error {
+			if finalize != nil {
+				return finalize(tx, job)
+			}
+			return nil
+		},
+		Finalize: func(_ context.Context, tx *sql.Tx, job Job) error {
+			if check != nil {
+				if err := check(tx, job); err != nil {
+					return err
+				}
+			}
+			if finalize != nil {
+				return finalize(tx, job)
+			}
+			return nil
+		},
+	})
+	return result.Job, result.Created, err
+}
+
+// CreateWithInputTransaction creates a job with caller cancellation and a
+// pre-create immutable replay hook. The handled path is intentionally separate
+// from ordinary mutable job idempotency and never signals the worker.
+func (s *Service) CreateWithInputTransaction(ctx context.Context, request CreateRequest, hooks CreateTransactionHooks) (CreateTransactionResult, error) {
+	return s.createWithInputContext(ctx, request, hooks)
+}
+
+func (s *Service) createWithInputContext(ctx context.Context, request CreateRequest, hooks CreateTransactionHooks) (CreateTransactionResult, error) {
 	if request.Type == "" || request.ResourceType == "" || request.ResourceID == "" || len(request.IdempotencyKey) > 200 {
-		return Job{}, false, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
+		return CreateTransactionResult{}, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
 	}
 	input, err := marshalInput(request.Input)
 	if err != nil {
-		return Job{}, false, err
+		return CreateTransactionResult{}, err
 	}
 	now := s.now().UTC()
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Job{}, false, err
+		return CreateTransactionResult{}, err
 	}
 	defer tx.Rollback()
+	// Acquire SQLite's single writer reservation before the immutable replay
+	// read. The predicate changes no rows, but prevents two readers from both
+	// observing absence and then deadlocking while upgrading to writers.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET id=id WHERE 0`); err != nil {
+		return CreateTransactionResult{}, err
+	}
+	if hooks.BeforeCreate != nil {
+		handled, hookErr := hooks.BeforeCreate(ctx, tx)
+		if hookErr != nil {
+			return CreateTransactionResult{}, hookErr
+		}
+		if err := ctx.Err(); err != nil {
+			return CreateTransactionResult{}, err
+		}
+		if handled {
+			if err := tx.Commit(); err != nil {
+				return CreateTransactionResult{}, err
+			}
+			return CreateTransactionResult{Handled: true}, nil
+		}
+	}
 	job := Job{ID: uuid.NewString(), Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, Status: string(Queued), Phase: "queued", CreatedAt: now, UpdatedAt: now, Input: input}
 	job.RequestedBy = request.RequestedBy
-	_, err = tx.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, job.ID, job.Type, job.ResourceType, job.ResourceID, job.Status, job.Phase, nullIfBlank(request.IdempotencyKey), nullIfBlank(request.RequestedBy), string(input), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	_, err = tx.ExecContext(ctx, `INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, job.ID, job.Type, job.ResourceType, job.ResourceID, job.Status, job.Phase, nullIfBlank(request.IdempotencyKey), nullIfBlank(request.RequestedBy), string(input), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {
 		if !isConstraint(err) {
-			return Job{}, false, err
+			return CreateTransactionResult{}, err
 		}
 		if request.IdempotencyKey == "" {
-			return Job{}, false, ErrApplicationBusy
+			return CreateTransactionResult{}, ErrApplicationBusy
 		}
-		existing, lookupErr := byIdempotencyTx(tx, request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
+		existing, lookupErr := byIdempotencyTxContext(ctx, tx, request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
 		if errors.Is(lookupErr, sql.ErrNoRows) {
-			return Job{}, false, ErrApplicationBusy
+			return CreateTransactionResult{}, ErrApplicationBusy
 		}
 		if lookupErr != nil {
-			return Job{}, false, lookupErr
+			return CreateTransactionResult{}, lookupErr
 		}
-		if !sameCreateRequest(existing, request, input) {
-			return Job{}, false, ErrIdempotency
-		}
-		if finalize != nil {
-			if err = finalize(tx, existing); err != nil {
-				return Job{}, false, err
+		if hooks.Existing != nil {
+			handled, hookErr := hooks.Existing(ctx, tx, existing)
+			if hookErr != nil {
+				return CreateTransactionResult{}, hookErr
+			}
+			if err := ctx.Err(); err != nil {
+				return CreateTransactionResult{}, err
+			}
+			if handled {
+				if err := tx.Commit(); err != nil {
+					return CreateTransactionResult{}, err
+				}
+				return CreateTransactionResult{Job: existing, Handled: true}, nil
 			}
 		}
+		if !sameCreateRequest(existing, request, input) {
+			return CreateTransactionResult{}, ErrIdempotency
+		}
+		if hooks.FinalizeExisting != nil {
+			if err := hooks.FinalizeExisting(ctx, tx, existing); err != nil {
+				return CreateTransactionResult{}, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return CreateTransactionResult{}, err
+		}
 		if err = tx.Commit(); err != nil {
-			return Job{}, false, err
+			return CreateTransactionResult{}, err
 		}
 		if existing.Status == string(Queued) {
 			s.signal()
 		}
-		return existing, false, nil
+		return CreateTransactionResult{Job: existing}, nil
 	}
-	if _, err := appendEvent(tx, now, job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
-		return Job{}, false, err
+	if _, err := appendEventContext(ctx, tx, now, job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
+		return CreateTransactionResult{}, err
 	}
-	if check != nil {
-		if err = check(tx, job); err != nil {
-			return Job{}, false, err
+	if hooks.Finalize != nil {
+		if err = hooks.Finalize(ctx, tx, job); err != nil {
+			return CreateTransactionResult{}, err
 		}
 	}
-	if finalize != nil {
-		if err = finalize(tx, job); err != nil {
-			return Job{}, false, err
-		}
+	if err := ctx.Err(); err != nil {
+		return CreateTransactionResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return Job{}, false, err
+		return CreateTransactionResult{}, err
 	}
 	s.signal()
-	return job, true, nil
+	return CreateTransactionResult{Job: job, Created: true}, nil
 }
 
 func sameCreateRequest(existing Job, request CreateRequest, input json.RawMessage) bool {
@@ -404,8 +497,8 @@ func contains(s, sub string) bool {
 
 const jobSelectColumns = `id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),COALESCE(requested_by,''),COALESCE(pause_disposition,''),input_json,attempt,created_at,updated_at`
 
-func byIdempotencyTx(tx *sql.Tx, kind, resourceType, resourceID, key string) (Job, error) {
-	return scanJob(tx.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE type=? AND resource_type=? AND resource_id=? AND idempotency_key=?`, kind, resourceType, resourceID, key))
+func byIdempotencyTxContext(ctx context.Context, tx *sql.Tx, kind, resourceType, resourceID, key string) (Job, error) {
+	return scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE type=? AND resource_type=? AND resource_id=? AND idempotency_key=?`, kind, resourceType, resourceID, key))
 }
 func (s *Service) Get(id string) (Job, error) {
 	return s.scan(s.db.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
@@ -493,15 +586,19 @@ func (s *Service) Append(jobID, level, phase, code, message string) (Event, erro
 }
 
 func appendEvent(tx *sql.Tx, now time.Time, jobID, level, phase, code, message string) (Event, error) {
+	return appendEventContext(context.Background(), tx, now, jobID, level, phase, code, message)
+}
+
+func appendEventContext(ctx context.Context, tx *sql.Tx, now time.Time, jobID, level, phase, code, message string) (Event, error) {
 	var sequence int
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(sequence),0)+1 FROM job_events WHERE job_id=?`, jobID).Scan(&sequence); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM job_events WHERE job_id=?`, jobID).Scan(&sequence); err != nil {
 		return Event{}, err
 	}
 	var attempt int
-	if err := tx.QueryRow(`SELECT attempt FROM jobs WHERE id=?`, jobID).Scan(&attempt); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT attempt FROM jobs WHERE id=?`, jobID).Scan(&attempt); err != nil {
 		return Event{}, err
 	}
-	result, err := tx.Exec(`INSERT INTO job_events(job_id,sequence,attempt,timestamp,level,phase,code,message) VALUES(?,?,?,?,?,?,?,?)`, jobID, sequence, attempt, now.Format(time.RFC3339Nano), level, phase, code, message)
+	result, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id,sequence,attempt,timestamp,level,phase,code,message) VALUES(?,?,?,?,?,?,?,?)`, jobID, sequence, attempt, now.Format(time.RFC3339Nano), level, phase, code, message)
 	if err != nil {
 		return Event{}, err
 	}
@@ -612,19 +709,102 @@ func (s *Service) Cancel(id string) (Job, error) {
 	return s.Get(id)
 }
 
-// Resume atomically requeues an intentional user pause. The next claim starts
-// a new attempt; no executor can observe a partially resumed job.
+// Resume preserves the contextless compatibility API.
 func (s *Service) Resume(id string) (Job, error) {
-	tx, err := s.db.Begin()
+	return s.ResumeContext(context.Background(), id)
+}
+
+// CheckMissingApplicationDeploymentBindingContext validates immutable
+// authority without changing job state after the ordinary application lookup
+// failed. A physically retained application remains hidden; only a deleted row
+// is eligible for lifecycle-stale classification.
+func (s *Service) CheckMissingApplicationDeploymentBindingContext(ctx context.Context, id string) error {
+	if ctx == nil || s == nil || s.db == nil {
+		return deploymentbinding.ErrInvalidConfiguration
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrJobNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if job.Status != string(WaitingUser) {
+		return ErrJobNotPaused
+	}
+	if job.Type != "deploy" || job.ResourceType != "application" {
+		return deploymentbinding.ErrInvalidConfiguration
+	}
+	var applicationExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM applications WHERE id=?)`, job.ResourceID).Scan(&applicationExists); err != nil {
+		return err
+	}
+	if applicationExists {
+		return ErrJobNotFound
+	}
+	classification, err := s.classifyDeploymentBindingTx(ctx, tx, job)
+	if err != nil {
+		return err
+	}
+	switch classification {
+	case deploymentbinding.ClassificationStale:
+		return ErrDeploymentLifecycleStale
+	case deploymentbinding.ClassificationCurrent:
+		return tx.Commit()
+	default:
+		return deploymentbinding.ErrInvalidConfiguration
+	}
+}
+
+// ResumeContext atomically checks immutable deployment authority and requeues
+// an intentional user pause. The next claim starts a new attempt; no executor
+// can observe a partially authorized resume.
+func (s *Service) ResumeContext(ctx context.Context, id string) (Job, error) {
+	if ctx == nil || s == nil || s.db == nil {
+		return Job{}, deploymentbinding.ErrInvalidConfiguration
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, err
 	}
 	defer tx.Rollback()
+	// Acquire SQLite's single writer reservation before reading either the job
+	// or its immutable binding. The authority check, approval check, and requeue
+	// therefore observe one serialized state.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET id=id WHERE 0`); err != nil {
+		return Job{}, err
+	}
+	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, ErrJobNotFound
+	}
+	if err != nil {
+		return Job{}, err
+	}
+	if job.Status != string(WaitingUser) {
+		return Job{}, ErrJobNotPaused
+	}
+	classification, err := s.classifyDeploymentBindingTx(ctx, tx, job)
+	if err != nil {
+		return Job{}, err
+	}
+	switch classification {
+	case deploymentbinding.ClassificationStale:
+		return Job{}, ErrDeploymentLifecycleStale
+	case deploymentbinding.ClassificationCurrent:
+	default:
+		return Job{}, deploymentbinding.ErrInvalidConfiguration
+	}
 	now := s.now().UTC()
 	formattedNow := now.Format(time.RFC3339Nano)
 	// Make the approval check and requeue one serialized write. A controller-side
 	// preflight would allow an approval revocation to race the state mutation.
-	result, err := tx.Exec(`UPDATE jobs SET status='queued',phase='queued',progress_percent=0,checkpoint_json='{}',pause_disposition=NULL,error_code=NULL,error_detail=NULL,started_at=NULL,finished_at=NULL,updated_at=?
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status='queued',phase='queued',progress_percent=0,checkpoint_json='{}',pause_disposition=NULL,error_code=NULL,error_detail=NULL,started_at=NULL,finished_at=NULL,updated_at=?
 		WHERE id=? AND status='waiting_user' AND (
 			(pause_disposition='approval_required' AND NOT EXISTS (
 				SELECT 1 FROM deployments d
@@ -655,7 +835,7 @@ func (s *Service) Resume(id string) (Job, error) {
 	if updated != 1 {
 		var status, disposition string
 		var missingApproval, migrationApproved bool
-		err := tx.QueryRow(`SELECT j.status,COALESCE(j.pause_disposition,''),EXISTS (
+		err := tx.QueryRowContext(ctx, `SELECT j.status,COALESCE(j.pause_disposition,''),EXISTS (
 			SELECT 1 FROM deployments d
 			JOIN deployment_policy_findings f ON f.deployment_id=d.id AND f.disposition='approval_required'
 			WHERE d.job_id=j.id AND d.app_id=j.resource_id AND NOT EXISTS (
@@ -687,14 +867,18 @@ func (s *Service) Resume(id string) (Job, error) {
 		}
 		return Job{}, ErrJobNotPaused
 	}
-	if _, err := appendEvent(tx, now, id, "info", "queued", "job_resumed", "Job resumed"); err != nil {
+	if _, err := appendEventContext(ctx, tx, now, id, "info", "queued", "job_resumed", "Job resumed"); err != nil {
+		return Job{}, err
+	}
+	resumed, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
+	if err != nil {
 		return Job{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Job{}, err
 	}
 	s.signal()
-	return s.Get(id)
+	return resumed, nil
 }
 
 func terminal(status string) bool {
@@ -706,33 +890,97 @@ func terminal(status string) bool {
 	}
 }
 
-// claimNext atomically reserves the oldest queued job and records its assignment.
-func (s *Service) claimNext(ctx context.Context) (Job, bool, error) {
+type claimDisposition uint8
+
+const (
+	claimNone claimDisposition = iota
+	claimClaimed
+	claimRetired
+)
+
+const (
+	deploymentLifecycleStaleCode    = "deployment_lifecycle_stale"
+	deploymentLifecycleStaleMessage = "Deployment no longer matches the application's desired lifecycle."
+)
+
+func (s *Service) classifyDeploymentBindingTx(ctx context.Context, tx *sql.Tx, job Job) (deploymentbinding.Classification, error) {
+	if job.Type != "deploy" || job.ResourceType != "application" {
+		return deploymentbinding.ClassificationCurrent, nil
+	}
+	if s == nil || s.deploymentBindings == nil || !s.deploymentBindings.UsesDatabase(s.db) {
+		return 0, deploymentbinding.ErrInvalidConfiguration
+	}
+	binding, err := s.deploymentBindings.ReadTx(ctx, tx, job.ID)
+	if err != nil {
+		return 0, err
+	}
+	return s.deploymentBindings.CheckTx(ctx, tx, binding)
+}
+
+// claimNext atomically classifies and handles the oldest queued job. A current
+// job is assigned, while a stale deployment is retired without an attempt.
+func (s *Service) claimNext(ctx context.Context) (Job, claimDisposition, error) {
+	if ctx == nil || s == nil || s.db == nil {
+		return Job{}, claimNone, deploymentbinding.ErrInvalidConfiguration
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Job{}, false, err
+		return Job{}, claimNone, err
 	}
 	defer tx.Rollback()
-	now := s.now().UTC()
-	row := tx.QueryRowContext(ctx, `WITH next AS (SELECT id FROM jobs WHERE status='queued' ORDER BY created_at,id LIMIT 1)
-		UPDATE jobs SET status='assigned',phase='assigned',attempt=attempt+1,updated_at=?
-		WHERE id=(SELECT id FROM next) AND status='queued'
-		RETURNING `+jobSelectColumns, now.Format(time.RFC3339Nano))
-	job, err := scanJob(row)
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET id=id WHERE 0`); err != nil {
+		return Job{}, claimNone, err
+	}
+	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE status='queued' ORDER BY created_at,id LIMIT 1`))
 	if errors.Is(err, sql.ErrNoRows) {
-		return Job{}, false, nil
+		return Job{}, claimNone, nil
 	}
 	if err != nil {
-		return Job{}, false, err
+		return Job{}, claimNone, err
 	}
-	if _, err := appendEvent(tx, now, job.ID, "info", "assigned", "job_assigned", "Job assigned"); err != nil {
-		return Job{}, false, err
+	classification, err := s.classifyDeploymentBindingTx(ctx, tx, job)
+	if err != nil {
+		return Job{}, claimNone, err
+	}
+	now := s.now().UTC()
+	formattedNow := now.Format(time.RFC3339Nano)
+	if classification == deploymentbinding.ClassificationStale {
+		retired, updateErr := scanJob(tx.QueryRowContext(ctx, `UPDATE jobs
+			SET status='needs_attention',phase='needs_attention',pause_disposition=NULL,
+				error_code=?,error_detail=?,updated_at=?,finished_at=?
+			WHERE id=? AND status='queued'
+			RETURNING `+jobSelectColumns,
+			deploymentLifecycleStaleCode, deploymentLifecycleStaleMessage, formattedNow, formattedNow, job.ID))
+		if updateErr != nil {
+			return Job{}, claimNone, updateErr
+		}
+		if _, err := appendEventContext(ctx, tx, now, job.ID, "warn", "needs_attention", deploymentLifecycleStaleCode, deploymentLifecycleStaleMessage); err != nil {
+			return Job{}, claimNone, err
+		}
+		if err := tx.Commit(); err != nil {
+			return Job{}, claimNone, err
+		}
+		s.signal()
+		return retired, claimRetired, nil
+	}
+	if classification != deploymentbinding.ClassificationCurrent {
+		return Job{}, claimNone, deploymentbinding.ErrInvalidConfiguration
+	}
+	claimed, err := scanJob(tx.QueryRowContext(ctx, `UPDATE jobs
+		SET status='assigned',phase='assigned',attempt=attempt+1,updated_at=?
+		WHERE id=? AND status='queued'
+		RETURNING `+jobSelectColumns, formattedNow, job.ID))
+	if err != nil {
+		return Job{}, claimNone, err
+	}
+	if _, err := appendEventContext(ctx, tx, now, claimed.ID, "info", "assigned", "job_assigned", "Job assigned"); err != nil {
+		return Job{}, claimNone, err
 	}
 	if err := tx.Commit(); err != nil {
-		return Job{}, false, err
+		return Job{}, claimNone, err
 	}
 	s.signal()
-	return job, true, nil
+	return claimed, claimClaimed, nil
 }
 
 type reporter struct {
@@ -867,11 +1115,29 @@ func (s *Service) RunWorkerWithAdmission(ctx context.Context, executor Executor,
 	if acquire == nil {
 		return errors.New("deployment effects admission is required")
 	}
+	return s.runWorker(ctx, executor, func(parent context.Context) (context.Context, func() error, error) {
+		release, err := acquire(parent)
+		return parent, release, err
+	})
+}
+
+// ScopedAdmission returns the context that must be used for the admitted job.
+// Implementations bind nonforgeable lease-scoped authority while preserving
+// cancellation and deadlines from parent.
+type ScopedAdmission func(parent context.Context) (context.Context, func() error, error)
+
+// RunWorkerWithScopedAdmission carries admission-scoped authority from before
+// assignment through executor cleanup and terminal persistence. The scope is
+// invalidated by the admission release after runOne has returned.
+func (s *Service) RunWorkerWithScopedAdmission(ctx context.Context, executor Executor, acquire ScopedAdmission) error {
+	if acquire == nil {
+		return errors.New("scoped deployment effects admission is required")
+	}
 	return s.runWorker(ctx, executor, acquire)
 }
 
 func (s *Service) runWorker(ctx context.Context, executor Executor,
-	acquire func(context.Context) (func() error, error),
+	acquire ScopedAdmission,
 ) error {
 	if executor == nil {
 		return errors.New("job executor is required")
@@ -899,12 +1165,18 @@ func (s *Service) runWorker(ctx context.Context, executor Executor,
 			if !queued {
 				continue
 			}
-			release, err := acquire(ctx)
+			admittedContext, release, err := acquire(ctx)
 			if err != nil {
 				return normalizeWorkerError(ctx, err)
 			}
-			if release == nil {
-				return errors.New("deployment effects admission returned no release")
+			if admittedContext == nil || release == nil {
+				incompleteErr := errors.New("deployment effects admission returned incomplete scope")
+				if release != nil {
+					if releaseErr := release(); releaseErr != nil {
+						return fmt.Errorf("release incomplete deployment effects admission: %w", errors.Join(incompleteErr, releaseErr))
+					}
+				}
+				return incompleteErr
 			}
 			if ctx.Err() != nil {
 				if err := release(); err != nil {
@@ -912,7 +1184,7 @@ func (s *Service) runWorker(ctx context.Context, executor Executor,
 				}
 				return nil
 			}
-			runErr := s.runOne(ctx, executor)
+			runErr := s.runOne(admittedContext, executor)
 			if releaseErr := release(); releaseErr != nil {
 				return fmt.Errorf("release deployment effects admission: %w", errors.Join(runErr, releaseErr))
 			}
@@ -945,8 +1217,8 @@ func normalizeWorkerError(ctx context.Context, err error) error {
 }
 
 func (s *Service) runOne(ctx context.Context, executor Executor) error {
-	job, claimed, err := s.claimNext(ctx)
-	if err != nil || !claimed {
+	job, disposition, err := s.claimNext(ctx)
+	if err != nil || disposition != claimClaimed {
 		return err
 	}
 	jobCtx, cancelCause := context.WithCancelCause(ctx)

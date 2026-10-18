@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/apps"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
@@ -43,14 +44,6 @@ type configurationExporter interface {
 	ExportRevisionForExecution(context.Context, string, string, int64) (appconfig.ExecutionConfiguration, error)
 }
 
-type deploymentStore interface {
-	GetOrCreateByJob(context.Context, string, string, string) (deployments.Deployment, bool, error)
-	Get(context.Context, string, string) (deployments.Deployment, error)
-	Initialize(context.Context, string, string, string, string, int64) (deployments.Deployment, error)
-	Gate(context.Context, string, string, []deployments.Finding) error
-	Transition(context.Context, string, string, deployments.Status, string) (deployments.Deployment, error)
-}
-
 type ExecutorOptions struct {
 	DockerExecutable string
 	DockerEndpoint   string
@@ -63,15 +56,16 @@ type Executor struct {
 	applications  applicationReader
 	releases      releaseResolver
 	configuration configurationExporter
-	deployments   deploymentStore
+	deployments   *deployments.Repository
 	temporary     *securetemp.Manager
 	runner        runtimeprocess.CommandRunner
 	options       ExecutorOptions
 	cleanup       func(*securetemp.Files) error
+	apply         *composeApplyAdapter
 }
 
-func NewExecutor(applications applicationReader, releases releaseResolver, configuration configurationExporter, deploymentRepository deploymentStore, temporary *securetemp.Manager, runner runtimeprocess.CommandRunner, options ExecutorOptions) (*Executor, error) {
-	if applications == nil || releases == nil || configuration == nil || deploymentRepository == nil || temporary == nil || runner == nil {
+func NewExecutor(applications applicationReader, releases releaseResolver, configuration configurationExporter, deploymentRepository *deployments.Repository, temporary *securetemp.Manager, runner runtimeprocess.CommandRunner, options ExecutorOptions) (*Executor, error) {
+	if applications == nil || releases == nil || configuration == nil || deploymentRepository == nil || !deploymentRepository.ExecutionConfigured() || temporary == nil || runner == nil {
 		return nil, errors.New("compose runtime dependencies are required")
 	}
 	if options.DockerExecutable == "" {
@@ -92,7 +86,7 @@ func NewExecutor(applications applicationReader, releases releaseResolver, confi
 		options.ApplyTimeout <= options.WaitTimeout {
 		return nil, errors.New("compose runtime timeouts are outside supported bounds")
 	}
-	return &Executor{
+	executor := &Executor{
 		applications:  applications,
 		releases:      releases,
 		configuration: configuration,
@@ -101,12 +95,18 @@ func NewExecutor(applications applicationReader, releases releaseResolver, confi
 		runner:        runner,
 		options:       options,
 		cleanup:       func(files *securetemp.Files) error { return files.Cleanup() },
-	}, nil
+	}
+	executor.apply = newComposeApplyAdapter(deploymentRepository, runner, options, func(files *securetemp.Files) error { return executor.cleanup(files) })
+	return executor, nil
 }
 
-func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploymentexecution.Claim, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
 	if reporter == nil || job.Type != "deploy" || job.ResourceType != "application" || uuid.Validate(job.ResourceID) != nil || uuid.Validate(job.ID) != nil || uuid.Validate(job.RequestedBy) != nil || job.Attempt < 1 {
 		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "validation_failed"}
+	}
+	if claim.JobID() == "" || claim.ApplicationID() == "" || claim.Attempt() < 1 ||
+		claim.JobID() != job.ID || claim.ApplicationID() != job.ResourceID || claim.Attempt() != job.Attempt {
+		return jobs.ExecutionResult{}, errors.Join(&jobs.ExecutionError{Code: "validation_failed"}, deploymentexecution.ErrInvalidClaim)
 	}
 	input, err := jobs.DeploymentInputFor(job)
 	if err != nil {
@@ -219,57 +219,47 @@ func (e *Executor) Execute(ctx context.Context, job jobs.Job, reporter jobs.Prog
 	if err := report(reporter, jobs.Running, "wait_for_health", 90); err != nil {
 		return jobs.ExecutionResult{}, failAfterTemp("internal_error")
 	}
-	upRequest := runtimeprocess.CommandRequest{
-		Executable: e.options.DockerExecutable,
-		Args: []string{
-			"compose", "--project-name", project,
-			"--project-directory", source.workspace,
-			"--env-file", files.EnvPath,
-			"-f", files.ComposePath,
-			"up", "-d", "--wait", "--wait-timeout", waitTimeoutSeconds(e.options.WaitTimeout),
-		},
-		Directory:   source.workspace,
-		Env:         environment,
-		Timeout:     e.options.ApplyTimeout,
-		OutputLimit: runtimeprocess.DefaultOutputLimit,
+	invocation := inspectedComposeInvocation{
+		claim: claim, deploymentID: deployment.ID, releaseID: source.releaseID,
+		configurationRevisionID: configuration.RevisionID, configurationRevisionNumber: configuration.RevisionNumber,
+		findings: deploymentFindings(findings), workspace: source.workspace, project: project,
+		files: files, environment: append([]string(nil), environment...),
 	}
 
-	// Gate is intentionally the final database action before the mutating
-	// command. It rechecks approvals and moves the deployment to applying in one
-	// transaction; revocation is blocked for the duration of up --wait.
-	if err := e.deployments.Gate(ctx, job.ResourceID, deployment.ID, deploymentFindings(findings)); err != nil {
-		if cleanup() != nil {
-			return jobs.ExecutionResult{}, e.fail(ctx, deployment, "internal_error")
+	// Gate rechecks the original invocation authority and complete policy set
+	// before moving a new deployment to applying. The concrete command adapter
+	// must revalidate freshness before mutation.
+	if err := e.deployments.Gate(ctx, deployments.GateRequest{Claim: claim, DeploymentID: deployment.ID, Findings: deploymentFindings(findings)}); err != nil {
+		cleanupErr := cleanup()
+		if ctx.Err() != nil || errors.Is(err, deploymentexecution.ErrCanceled) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return jobs.ExecutionResult{}, composeGateRefusal(ctx, err, cleanupErr)
 		}
 		if errors.Is(err, deployments.ErrApprovalRequired) {
+			if cleanupErr != nil {
+				return jobs.ExecutionResult{}, composeGateRefusal(ctx, err, cleanupErr)
+			}
 			return jobs.ExecutionResult{Disposition: jobs.ExecutionWaitingUser, PauseDisposition: "approval_required"}, nil
 		}
 		if errors.Is(err, deployments.ErrRejectedCapability) {
-			return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "policy_rejected"}
+			return jobs.ExecutionResult{}, errors.Join(&jobs.ExecutionError{Code: "policy_rejected"}, err, cleanupErr)
 		}
-		return jobs.ExecutionResult{}, e.fail(ctx, deployment, "internal_error")
+		return jobs.ExecutionResult{}, composeGateRefusal(ctx, err, cleanupErr)
 	}
-	upResult, upErr := e.runner.Run(ctx, upRequest)
-	clear(upResult.Stdout)
-	clear(upResult.Stderr)
-	if upErr != nil || upResult.StdoutTruncated || upResult.StderrTruncated {
-		return jobs.ExecutionResult{}, failAfterTemp(applyDiagnosticCode(ctx, upResult, upErr))
-	}
-	deployment, err = e.deployments.Transition(ctx, job.ResourceID, deployment.ID, deployments.WaitingHealth, "")
-	if err != nil {
-		return jobs.ExecutionResult{}, failAfterTemp("internal_error")
-	}
-	if err := report(reporter, jobs.Running, "finalize", 100); err != nil {
-		return jobs.ExecutionResult{}, failAfterTemp("internal_error")
-	}
-	if cleanup() != nil {
-		return jobs.ExecutionResult{}, e.fail(ctx, deployment, "internal_error")
-	}
+	// Ownership of protected-file cleanup transfers to the fixed apply adapter.
+	cleaned = true
+	return e.apply.RunUp(ctx, invocation, reporter)
+}
 
-	if _, err := e.deployments.Transition(ctx, job.ResourceID, deployment.ID, deployments.Succeeded, ""); err != nil {
-		return jobs.ExecutionResult{}, &jobs.ExecutionError{Code: "internal_error"}
+func composeGateRefusal(ctx context.Context, gateErr, cleanupErr error) error {
+	refusal := &jobs.ExecutionError{Code: "runtime_unavailable"}
+	if ctx != nil && ctx.Err() != nil || errors.Is(gateErr, deploymentexecution.ErrCanceled) ||
+		errors.Is(gateErr, context.Canceled) || errors.Is(gateErr, context.DeadlineExceeded) {
+		if ctx != nil && ctx.Err() != nil {
+			return errors.Join(refusal, gateErr, cleanupErr, deploymentexecution.ErrCanceled, ctx.Err())
+		}
+		return errors.Join(refusal, gateErr, cleanupErr)
 	}
-	return jobs.ExecutionResult{CompletionCode: "deployment_completed"}, nil
+	return errors.Join(refusal, gateErr, cleanupErr)
 }
 
 type resolvedSource struct {

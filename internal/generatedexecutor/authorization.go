@@ -12,16 +12,17 @@ import (
 
 type authorizationStore interface {
 	Get(context.Context, string, string) (deployments.Deployment, error)
-	Gate(context.Context, string, string, []deployments.Finding) error
+	Gate(context.Context, deployments.GateRequest) error
 }
 
 type replacementReserver interface {
 	ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error)
 }
 
-// RepositoryAuthorizationGate revalidates immutable deployment/plan identity
-// and uses the deployment repository's policy transaction to move the main
-// deployment to Applying immediately before the first Docker mutation.
+// RepositoryAuthorizationGate revalidates immutable deployment/plan identity,
+// replacement capacity, bound authority, and the complete policy set for new
+// and recovered deployments. A later command boundary must revalidate before
+// any Docker mutation.
 type RepositoryAuthorizationGate struct {
 	deployments authorizationStore
 	plans       planReader
@@ -38,17 +39,24 @@ func NewAuthorizationGate(deploymentRepository authorizationStore, plans planRea
 func (g *RepositoryAuthorizationGate) Authorize(ctx context.Context, request AuthorizationRequest) (generatedruntime.ReplacementReservation, error) {
 	if g == nil || ctx == nil || uuid.Validate(request.AppID) != nil || uuid.Validate(request.DeploymentID) != nil ||
 		uuid.Validate(request.DeploymentPlanRevisionID) != nil || request.ReleaseID == "" || request.DeploymentPlanRevisionNumber < 1 ||
-		(request.CandidateSlot != generatedruntime.SlotBlue && request.CandidateSlot != generatedruntime.SlotGreen) || request.ComponentCount < 1 || request.ComponentCount > 2 {
+		(request.CandidateSlot != generatedruntime.SlotBlue && request.CandidateSlot != generatedruntime.SlotGreen) || request.ComponentCount < 1 || request.ComponentCount > 2 ||
+		request.Claim.JobID() == "" || request.Claim.ApplicationID() != request.AppID || request.Claim.Attempt() < 1 {
 		return nil, errors.New("generated authorization request is invalid")
 	}
 	deployment, err := g.deployments.Get(ctx, request.AppID, request.DeploymentID)
-	if err != nil || !deployment.ProvenanceInitialized || deployment.RuntimeStrategy != deployments.RuntimeGeneratedNode ||
+	if err != nil {
+		return nil, errors.Join(errors.New("generated deployment provenance is unavailable"), err)
+	}
+	if !deployment.ProvenanceInitialized || deployment.RuntimeStrategy != deployments.RuntimeGeneratedNode ||
 		deployment.ReleaseID != request.ReleaseID || deployment.DeploymentPlanRevisionID != request.DeploymentPlanRevisionID ||
 		deployment.DeploymentPlanRevisionNumber != request.DeploymentPlanRevisionNumber {
 		return nil, errors.New("generated deployment provenance is unavailable")
 	}
 	plan, err := g.plans.GetRevision(ctx, request.AppID, request.DeploymentPlanRevisionID, request.DeploymentPlanRevisionNumber)
-	if err != nil || plan.ID != request.DeploymentPlanRevisionID || plan.AppID != request.AppID || plan.RevisionNumber != request.DeploymentPlanRevisionNumber ||
+	if err != nil {
+		return nil, errors.Join(errors.New("generated deployment plan is unavailable"), err)
+	}
+	if plan.ID != request.DeploymentPlanRevisionID || plan.AppID != request.AppID || plan.RevisionNumber != request.DeploymentPlanRevisionNumber ||
 		plan.Plan.Strategy != deploymentplans.StrategyGeneratedNode || len(plan.Plan.Components) != request.ComponentCount {
 		return nil, errors.New("generated deployment plan is unavailable")
 	}
@@ -73,15 +81,13 @@ func (g *RepositoryAuthorizationGate) Authorize(ctx context.Context, request Aut
 	}()
 	switch deployment.Status {
 	case deployments.Applying, deployments.WaitingHealth:
-		releaseOnFailure = false
-		return reservation, nil
 	case deployments.Preparing, deployments.NeedsAttention:
-		if err = g.deployments.Gate(ctx, request.AppID, request.DeploymentID, nil); err != nil {
-			return nil, err
-		}
-		releaseOnFailure = false
-		return reservation, nil
 	default:
 		return nil, deployments.ErrInvalidTransition
 	}
+	if err = g.deployments.Gate(ctx, deployments.GateRequest{Claim: request.Claim, DeploymentID: request.DeploymentID}); err != nil {
+		return nil, err
+	}
+	releaseOnFailure = false
+	return reservation, nil
 }

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/database"
-	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/runtime/docker"
 )
@@ -238,24 +237,19 @@ func hostdAdmissionProcessStartup(manifest hostdAdmissionProcessManifest) (resul
 			resultErr = errors.Join(resultErr, release())
 		}
 	}()
-	service := jobs.New(db)
-	deploymentRepository := deployments.New(db)
-	order := make([]string, 0, 4)
+	service, _, err := newDeploymentJobService(db)
+	if err != nil {
+		return err
+	}
+	order := make([]string, 0, 3)
 	releases := 0
 	done, err := prepareRuntimeWorker(ctx, runtimeRecovery{
-		deployments: func(recoveryContext context.Context) error {
+		recoverState: func(recoveryContext context.Context) error {
 			if releases != 0 {
-				return errors.New("deployment recovery followed admission release")
+				return errors.New("runtime recovery followed admission release")
 			}
-			order = append(order, "deployments")
-			return deploymentRepository.Recover(recoveryContext)
-		},
-		jobs: func() error {
-			if releases != 0 {
-				return errors.New("job recovery followed admission release")
-			}
-			order = append(order, "jobs")
-			return service.RecoverInterrupted()
+			order = append(order, "recover")
+			return service.RecoverRuntimeContext(recoveryContext)
 		},
 		releaseAdmission: func() error {
 			releases++
@@ -278,7 +272,7 @@ func hostdAdmissionProcessStartup(manifest hostdAdmissionProcessManifest) (resul
 	case <-ctx.Done():
 		return errors.New("normal worker did not start after startup recovery")
 	}
-	if releases != 1 || !reflect.DeepEqual(order, []string{"deployments", "jobs", "release", "worker"}) {
+	if releases != 1 || !reflect.DeepEqual(order, []string{"recover", "release", "worker"}) {
 		return fmt.Errorf("startup recovery order=%v releases=%d", order, releases)
 	}
 	return hostdAdmissionPrintMarker("STARTUP_RECOVERY_SUCCEEDED")

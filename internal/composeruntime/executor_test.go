@@ -3,6 +3,7 @@ package composeruntime
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
@@ -14,10 +15,16 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
@@ -43,10 +50,14 @@ type fakeReleases struct {
 	materializeApp        string
 	readyApp              string
 	readyRelease          string
+	beforeMaterialize     func()
 }
 
 func (f *fakeReleases) Materialize(_ context.Context, owner, appID string) (releasesnapshot.Release, error) {
 	f.materializeCalls++
+	if f.beforeMaterialize != nil {
+		f.beforeMaterialize()
+	}
 	f.materializeOwner, f.materializeApp = owner, appID
 	if f.materializeErr != nil {
 		return releasesnapshot.Release{}, f.materializeErr
@@ -113,67 +124,6 @@ func cloneExecutionConfiguration(value appconfig.ExecutionConfiguration) appconf
 	return value
 }
 
-type fakeDeployments struct {
-	deployment deployments.Deployment
-	findings   []deployments.Finding
-	gateErr    error
-	actions    []string
-}
-
-func (f *fakeDeployments) GetOrCreateByJob(_ context.Context, appID, jobID, mode string) (deployments.Deployment, bool, error) {
-	if f.deployment.ID == "" {
-		f.deployment = deployments.Deployment{
-			ID:                uuid.NewString(),
-			AppID:             appID,
-			JobID:             jobID,
-			ConfigurationMode: mode,
-			Status:            deployments.Preparing,
-		}
-		f.actions = append(f.actions, "create")
-		return f.deployment, true, nil
-	}
-	return f.deployment, false, nil
-}
-
-func (f *fakeDeployments) Get(context.Context, string, string) (deployments.Deployment, error) {
-	return f.deployment, nil
-}
-
-func (f *fakeDeployments) Initialize(_ context.Context, _, _, releaseID, revisionID string, revisionNumber int64) (deployments.Deployment, error) {
-	if f.deployment.ProvenanceInitialized {
-		return deployments.Deployment{}, deployments.ErrInvalidTransition
-	}
-	f.deployment.ReleaseID = releaseID
-	f.deployment.ActualConfigurationRevisionID = revisionID
-	f.deployment.ActualConfigurationRevisionNumber = revisionNumber
-	f.deployment.ProvenanceInitialized = true
-	f.actions = append(f.actions, "initialize")
-	return f.deployment, nil
-}
-
-func (f *fakeDeployments) Gate(_ context.Context, _, _ string, findings []deployments.Finding) error {
-	f.findings = append([]deployments.Finding(nil), findings...)
-	f.actions = append(f.actions, "gate")
-	if errors.Is(f.gateErr, deployments.ErrApprovalRequired) {
-		f.deployment.Status = deployments.NeedsAttention
-	} else if errors.Is(f.gateErr, deployments.ErrRejectedCapability) {
-		f.deployment.Status = deployments.Failed
-	} else if f.gateErr == nil {
-		f.deployment.Status = deployments.Applying
-	}
-	return f.gateErr
-}
-
-func (f *fakeDeployments) Transition(_ context.Context, _, _ string, status deployments.Status, diagnostic string) (deployments.Deployment, error) {
-	if f.deployment.Status == deployments.Failed || f.deployment.Status == deployments.Cancelled || f.deployment.Status == deployments.Succeeded {
-		return deployments.Deployment{}, deployments.ErrInvalidTransition
-	}
-	f.deployment.Status = status
-	f.deployment.DiagnosticCode = diagnostic
-	f.actions = append(f.actions, "transition:"+string(status)+":"+diagnostic)
-	return f.deployment, nil
-}
-
 type fakeRunner struct {
 	requests []runtimeprocess.CommandRequest
 	run      func(int, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error)
@@ -187,20 +137,73 @@ func (f *fakeRunner) Run(_ context.Context, request runtimeprocess.CommandReques
 type recordingReporter struct {
 	updates []jobs.ProgressUpdate
 	errAt   string
+	err     error
+	before  func(jobs.ProgressUpdate)
 }
 
 func (r *recordingReporter) Report(update jobs.ProgressUpdate) error {
 	r.updates = append(r.updates, update)
+	if r.before != nil {
+		r.before(update)
+	}
 	if update.Phase == r.errAt {
+		if r.err != nil {
+			return r.err
+		}
 		return errors.New("report failed")
 	}
 	return nil
 }
 
+func TestExecutorRequiresConfiguredDeploymentExecutionRepository(t *testing.T) {
+	fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
+	for _, test := range []struct {
+		name       string
+		repository *deployments.Repository
+	}{
+		{name: "nil", repository: nil},
+		{name: "unguarded", repository: deployments.New(fixture.db)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor, err := NewExecutor(fixture.applications, fixture.releases, fixture.configuration, test.repository, fixture.executor.temporary, fixture.runner, fixture.executor.options)
+			if executor != nil || err == nil {
+				t.Fatalf("executor=%#v error=%v", executor, err)
+			}
+		})
+	}
+}
+
+func TestExecutorRejectsZeroOrMismatchedClaimBeforePreparation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*jobs.Job, *deploymentexecution.Claim)
+	}{
+		{name: "zero claim", mutate: func(_ *jobs.Job, claim *deploymentexecution.Claim) { *claim = deploymentexecution.Claim{} }},
+		{name: "job mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) { job.ID = uuid.NewString() }},
+		{name: "application mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) { job.ResourceID = uuid.NewString() }},
+		{name: "attempt mismatch", mutate: func(job *jobs.Job, _ *deploymentexecution.Claim) { job.Attempt++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
+			job, claim := fixture.job, fixture.claim
+			test.mutate(&job, &claim)
+			result, err := fixture.executor.ExecuteBound(fixture.context, job, claim, &fixture.reporter)
+			var executionErr *jobs.ExecutionError
+			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "validation_failed" || !errors.Is(err, deploymentexecution.ErrInvalidClaim) {
+				t.Fatalf("result=%#v error=%v", result, err)
+			}
+			if len(fixture.reporter.updates) != 0 || fixture.deploymentCount(t) != 0 || fixture.releases.materializeCalls != 0 ||
+				fixture.releases.localMaterializeCalls != 0 || fixture.releases.readyCalls != 0 || fixture.configuration.currentCalls != 0 ||
+				len(fixture.configuration.revisionRequest) != 0 || len(fixture.runner.requests) != 0 {
+				t.Fatalf("claim refusal performed work: progress=%#v deployments=%d releases=%#v configuration=%#v runner=%#v", fixture.reporter.updates, fixture.deploymentCount(t), fixture.releases, fixture.configuration, fixture.runner.requests)
+			}
+		})
+	}
+}
+
 func TestExecutorUsesInspectedEffectiveConfigAsSoleMutationInput(t *testing.T) {
 	fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
 	t.Setenv("HOSTD_SENTINEL_SECRET", "must-not-be-forwarded")
-
 	const configJSON = `{"services":{"web":{"image":"nginx","environment":{"TOKEN":"render-secret"}}}}`
 	configStdout := []byte(configJSON)
 	configStderr := []byte("config-secret")
@@ -217,8 +220,9 @@ func TestExecutorUsesInspectedEffectiveConfigAsSoleMutationInput(t *testing.T) {
 			}
 			return runtimeprocess.CommandResult{Stdout: configStdout, Stderr: configStderr}, nil
 		}
-		if last(fixture.deployments.actions) != "gate" {
-			t.Fatalf("gate was not final DB action before up: %v", fixture.deployments.actions)
+		persisted := fixture.deployment(t)
+		if persisted.Status != deployments.Applying {
+			t.Fatalf("final policy gate status before up=%s", persisted.Status)
 		}
 		composePath := valueAfter(request.Args, "-f")
 		if composePath == filepath.Join(fixture.workspace, "compose.yaml") {
@@ -230,16 +234,13 @@ func TestExecutorUsesInspectedEffectiveConfigAsSoleMutationInput(t *testing.T) {
 		}
 		return runtimeprocess.CommandResult{Stdout: upStdout, Stderr: upStderr}, nil
 	}
-
-	result, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+	result, err := fixture.executor.ExecuteBound(fixture.context, fixture.job, fixture.claim, &fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
-	if fixture.deployments.deployment.Status != deployments.Succeeded || fixture.deployments.deployment.ReleaseID != fixture.releases.release.ID || fixture.deployments.deployment.ActualConfigurationRevisionID != fixture.configuration.current.RevisionID {
-		t.Fatalf("deployment=%#v", fixture.deployments.deployment)
-	}
-	if fixture.configuration.currentCalls != 1 || len(fixture.configuration.revisionRequest) != 0 {
-		t.Fatalf("configuration calls current=%d exact=%v", fixture.configuration.currentCalls, fixture.configuration.revisionRequest)
+	persisted := fixture.deployment(t)
+	if persisted.Status != deployments.Succeeded || persisted.ReleaseID != fixture.releases.release.ID || persisted.ActualConfigurationRevisionID != fixture.configuration.current.RevisionID {
+		t.Fatalf("deployment=%#v", persisted)
 	}
 	assertExactExecutorRequests(t, fixture, fixture.runner.requests)
 	assertProgressPhases(t, fixture.reporter.updates, []string{"validate", "prepare_workspace", "materialize_release", "render_compose", "evaluate_policy", "apply_runtime", "wait_for_health", "finalize"})
@@ -251,31 +252,24 @@ func TestExecutorRejectsSanitizedSecretDerivedPolicyBeforeMutation(t *testing.T)
 	fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
 	const secret = "net_admin"
 	fixture.configuration.current.Environment = []byte("TOKEN='" + secret + "'\n")
-	fixture.configuration.current.SecretOrigins = []appconfig.SecretOrigin{{
-		RevisionID: fixture.configuration.current.RevisionID, RevisionNumber: fixture.configuration.current.RevisionNumber,
-		Key: []byte("TOKEN"), Value: []byte(secret),
-	}}
-	fixture.deployments.gateErr = deployments.ErrRejectedCapability
+	fixture.configuration.current.SecretOrigins = []appconfig.SecretOrigin{{RevisionID: fixture.configuration.current.RevisionID, RevisionNumber: 1, Key: []byte("TOKEN"), Value: []byte(secret)}}
 	configStdout := []byte(`{"services":{"web":{"cap_add":["NET_ADMIN"]}}}`)
 	fixture.runner.run = successfulRunner(runtimeprocess.CommandResult{Stdout: configStdout})
-
-	_, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
+	_, err := fixture.executor.ExecuteBound(fixture.context, fixture.job, fixture.claim, &fixture.reporter)
 	var executionErr *jobs.ExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != "policy_rejected" {
-		t.Fatalf("error=%v", err)
+	if !errors.As(err, &executionErr) || executionErr.Code != "policy_rejected" || len(fixture.runner.requests) != 1 {
+		t.Fatalf("error=%v requests=%d", err, len(fixture.runner.requests))
 	}
-	if len(fixture.runner.requests) != 1 {
-		t.Fatalf("secret-derived capability reached mutation: %d runner calls", len(fixture.runner.requests))
+	findings := fixture.findings(t)
+	if len(findings) != 1 || findings[0].Disposition != DispositionRejected || !strings.Contains(findings[0].Scope, "secret-origin:") {
+		t.Fatalf("findings=%#v", findings)
 	}
-	if len(fixture.deployments.findings) != 1 || fixture.deployments.findings[0].Disposition != DispositionRejected || !strings.Contains(fixture.deployments.findings[0].Scope, "secret-origin:") {
-		t.Fatalf("gate findings=%#v", fixture.deployments.findings)
-	}
-	encoded, marshalErr := json.Marshal(fixture.deployments.findings)
-	if marshalErr != nil {
-		t.Fatal(marshalErr)
-	}
+	encoded, _ := json.Marshal(findings)
 	if bytes.Contains(bytes.ToLower(encoded), []byte(secret)) {
-		t.Fatalf("secret reached gate findings: %s", encoded)
+		t.Fatalf("secret reached findings: %s", encoded)
+	}
+	if fixture.deployment(t).Status != deployments.Failed {
+		t.Fatalf("deployment=%#v", fixture.deployment(t))
 	}
 	assertCleared(t, configStdout)
 	assertRuntimeTempEmpty(t, fixture.dataRoot)
@@ -283,89 +277,84 @@ func TestExecutorRejectsSanitizedSecretDerivedPolicyBeforeMutation(t *testing.T)
 
 func TestExecutorFailureAndPauseTaxonomyCleansProtectedFiles(t *testing.T) {
 	tests := []struct {
-		name            string
-		configResult    runtimeprocess.CommandResult
-		configError     error
-		upResult        runtimeprocess.CommandResult
-		upError         error
-		gateError       error
-		cleanupError    bool
-		cancelRequested bool
-		wantCode        string
-		wantStatus      deployments.Status
-		wantPause       bool
-		wantRunnerRuns  int
-		wantDisposition string
+		name       string
+		model      runtimeprocess.CommandResult
+		configErr  error
+		upResult   runtimeprocess.CommandResult
+		upErr      error
+		cleanupErr bool
+		reportErr  bool
+		cancelAt   int
+		wantCode   string
+		wantStatus deployments.Status
+		wantRuns   int
+		wantPause  bool
 	}{
-		{name: "config truncated", configResult: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{}}}`), StdoutTruncated: true}, wantCode: "compose_config_output_truncated", wantStatus: deployments.Failed, wantRunnerRuns: 1},
-		{name: "config stderr truncated", configResult: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{}}}`), StderrTruncated: true}, wantCode: "compose_config_output_truncated", wantStatus: deployments.Failed, wantRunnerRuns: 1},
-		{name: "config empty", configResult: runtimeprocess.CommandResult{}, wantCode: "compose_config_invalid", wantStatus: deployments.Failed, wantRunnerRuns: 1},
-		{name: "config nonzero", configError: errors.New("exit status 1"), wantCode: "compose_config_invalid", wantStatus: deployments.Failed, wantRunnerRuns: 1},
-		{name: "config timeout", configError: context.DeadlineExceeded, wantCode: "compose_config_timeout", wantStatus: deployments.Failed, wantRunnerRuns: 1},
-		{name: "config termination failure overrides timeout", configError: errors.Join(context.DeadlineExceeded, runtimeprocess.ErrTerminationFailed), wantCode: "process_termination_failed", wantStatus: deployments.Failed, wantRunnerRuns: 1},
-		{name: "config cancellation", configError: context.Canceled, cancelRequested: true, wantCode: "cancelled", wantStatus: deployments.Cancelled, wantRunnerRuns: 1},
-		{name: "malformed effective config", configResult: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{}}`)}, wantCode: "compose_config_invalid", wantStatus: deployments.Failed, wantRunnerRuns: 1},
-		{name: "approval pause", configResult: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{"privileged":true}}}`)}, gateError: deployments.ErrApprovalRequired, wantStatus: deployments.NeedsAttention, wantPause: true, wantRunnerRuns: 1, wantDisposition: DispositionApprovalRequired},
-		{name: "policy rejection", configResult: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{"build":"https://example.invalid/repository.git"}}}`)}, gateError: deployments.ErrRejectedCapability, wantCode: "policy_rejected", wantStatus: deployments.Failed, wantRunnerRuns: 1, wantDisposition: DispositionRejected},
-		{name: "up nonzero is apply failure", configResult: validModel(), upError: errors.New("exit status 1"), wantCode: "compose_apply_failed", wantStatus: deployments.Failed, wantRunnerRuns: 2},
-		{name: "up stdout truncated", configResult: validModel(), upResult: runtimeprocess.CommandResult{StdoutTruncated: true}, wantCode: "compose_apply_output_truncated", wantStatus: deployments.Failed, wantRunnerRuns: 2},
-		{name: "up stderr truncated", configResult: validModel(), upResult: runtimeprocess.CommandResult{StderrTruncated: true}, wantCode: "compose_apply_output_truncated", wantStatus: deployments.Failed, wantRunnerRuns: 2},
-		{name: "outer timeout remains apply timeout", configResult: validModel(), upError: context.DeadlineExceeded, wantCode: "compose_apply_timeout", wantStatus: deployments.Failed, wantRunnerRuns: 2},
-		{name: "apply termination failure overrides timeout", configResult: validModel(), upError: errors.Join(context.DeadlineExceeded, runtimeprocess.ErrTerminationFailed), wantCode: "process_termination_failed", wantStatus: deployments.Failed, wantRunnerRuns: 2},
-		{name: "up cancellation", configResult: validModel(), upError: context.Canceled, cancelRequested: true, wantCode: "cancelled", wantStatus: deployments.Cancelled, wantRunnerRuns: 2},
-		{name: "cleanup failure overrides compose failure", configError: errors.New("exit status 1"), cleanupError: true, wantCode: "internal_error", wantStatus: deployments.Failed, wantRunnerRuns: 1},
-		{name: "cleanup failure overrides success", configResult: validModel(), cleanupError: true, wantCode: "internal_error", wantStatus: deployments.Failed, wantRunnerRuns: 2},
+		{name: "config invalid", configErr: errors.New("exit status 1"), wantCode: "compose_config_invalid", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "config stdout truncated", model: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{}}}`), StdoutTruncated: true}, wantCode: "compose_config_output_truncated", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "config stderr truncated", model: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{}}}`), StderrTruncated: true}, wantCode: "compose_config_output_truncated", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "config empty", wantCode: "compose_config_invalid", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "config malformed", model: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{}}`)}, wantCode: "compose_config_invalid", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "config timeout", configErr: context.DeadlineExceeded, wantCode: "compose_config_timeout", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "config termination", configErr: errors.Join(context.DeadlineExceeded, runtimeprocess.ErrTerminationFailed), wantCode: "process_termination_failed", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "config cancellation", configErr: context.Canceled, cancelAt: 1, wantCode: "cancelled", wantStatus: deployments.Cancelled, wantRuns: 1},
+		{name: "approval pause", model: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{"privileged":true}}}`)}, wantStatus: deployments.NeedsAttention, wantRuns: 1, wantPause: true},
+		{name: "policy rejection", model: runtimeprocess.CommandResult{Stdout: []byte(`{"services":{"web":{"build":"https://example.invalid/repository.git"}}}`)}, wantCode: "policy_rejected", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "up nonzero retains applying", model: validModel(), upErr: errors.New("exit status 1"), wantCode: "compose_apply_failed", wantStatus: deployments.Applying, wantRuns: 2},
+		{name: "up timeout retains applying", model: validModel(), upErr: context.DeadlineExceeded, wantCode: "compose_apply_timeout", wantStatus: deployments.Applying, wantRuns: 2},
+		{name: "up truncation retains applying", model: validModel(), upResult: runtimeprocess.CommandResult{StdoutTruncated: true}, wantCode: "compose_apply_output_truncated", wantStatus: deployments.Applying, wantRuns: 2},
+		{name: "up stderr truncation retains applying", model: validModel(), upResult: runtimeprocess.CommandResult{StderrTruncated: true}, wantCode: "compose_apply_output_truncated", wantStatus: deployments.Applying, wantRuns: 2},
+		{name: "up termination retains applying", model: validModel(), upErr: errors.Join(context.DeadlineExceeded, runtimeprocess.ErrTerminationFailed), wantCode: "process_termination_failed", wantStatus: deployments.Applying, wantRuns: 2},
+		{name: "up cancellation retains applying", model: validModel(), upErr: context.Canceled, cancelAt: 2, wantCode: "cancelled", wantStatus: deployments.Applying, wantRuns: 2},
+		{name: "pre-gate cleanup failure", configErr: errors.New("exit status 1"), cleanupErr: true, wantCode: "internal_error", wantStatus: deployments.Failed, wantRuns: 1},
+		{name: "cleanup after acknowledgement retains waiting", model: validModel(), cleanupErr: true, wantCode: "internal_error", wantStatus: deployments.WaitingHealth, wantRuns: 2},
+		{name: "report after acknowledgement retains waiting", model: validModel(), reportErr: true, wantCode: "internal_error", wantStatus: deployments.WaitingHealth, wantRuns: 2},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
-			fixture.deployments.gateErr = test.gateError
+			executionContext := fixture.context
+			var cancel context.CancelCauseFunc
+			if test.cancelAt != 0 {
+				executionContext, cancel = context.WithCancelCause(fixture.context)
+			}
 			fixture.runner.run = func(index int, _ runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+				if test.cancelAt == index+1 {
+					cancel(jobs.ErrCancellationRequested)
+				}
 				if index == 0 {
-					return test.configResult, test.configError
+					return test.model, test.configErr
 				}
-				return test.upResult, test.upError
+				return test.upResult, test.upErr
 			}
-			if test.cleanupError {
-				originalCleanup := fixture.executor.cleanup
-				fixture.executor.cleanup = func(files *securetemp.Files) error {
-					_ = originalCleanup(files)
-					return errors.New("cleanup failed")
-				}
+			if test.cleanupErr {
+				original := fixture.executor.cleanup
+				fixture.executor.cleanup = func(files *securetemp.Files) error { _ = original(files); return errors.New("cleanup failed") }
 			}
-			executionContext := context.Background()
-			if test.cancelRequested {
-				cancelledContext, cancel := context.WithCancelCause(executionContext)
-				cancel(jobs.ErrCancellationRequested)
-				executionContext = cancelledContext
+			if test.reportErr {
+				fixture.reporter.errAt = "finalize"
 			}
-			result, err := fixture.executor.Execute(executionContext, fixture.job, &fixture.reporter)
+			result, err := fixture.executor.ExecuteBound(executionContext, fixture.job, fixture.claim, &fixture.reporter)
 			if test.wantPause {
 				if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != "approval_required" {
 					t.Fatalf("result=%#v err=%v", result, err)
 				}
 			} else {
-				var executionErr *jobs.ExecutionError
-				if !errors.As(err, &executionErr) || executionErr.Code != test.wantCode {
-					t.Fatalf("error=%v want code=%q", err, test.wantCode)
+				var ee *jobs.ExecutionError
+				if !errors.As(err, &ee) || ee.Code != test.wantCode {
+					t.Fatalf("error=%v want=%s", err, test.wantCode)
 				}
 			}
-			if fixture.deployments.deployment.Status != test.wantStatus {
-				t.Fatalf("deployment=%#v", fixture.deployments.deployment)
+			if got := fixture.deployment(t).Status; got != test.wantStatus {
+				t.Fatalf("status=%s want=%s", got, test.wantStatus)
 			}
-			if len(fixture.runner.requests) != test.wantRunnerRuns {
-				t.Fatalf("runner calls=%d want=%d", len(fixture.runner.requests), test.wantRunnerRuns)
+			if len(fixture.runner.requests) != test.wantRuns {
+				t.Fatalf("runs=%d want=%d", len(fixture.runner.requests), test.wantRuns)
 			}
 			for _, request := range fixture.runner.requests {
-				if request.Executable == "git" || containsArgument(request.Args, "down") || containsArgument(request.Args, "rollback") {
-					t.Fatalf("failure triggered forbidden rollback/source command: %#v", request)
+				if request.Executable == "git" || containsArgument(request.Args, "down") || containsArgument(request.Args, "rm") || containsArgument(request.Args, "rollback") {
+					t.Fatalf("failure path issued forbidden source/rollback command: %#v", request)
 				}
-			}
-			if test.gateError != nil && len(fixture.deployments.findings) == 0 {
-				t.Fatal("policy gate received no findings")
-			}
-			if test.wantDisposition != "" && !hasFindingDisposition(fixture.deployments.findings, test.wantDisposition) {
-				t.Fatalf("findings=%#v want disposition=%q", fixture.deployments.findings, test.wantDisposition)
 			}
 			assertRuntimeTempEmpty(t, fixture.dataRoot)
 		})
@@ -374,78 +363,140 @@ func TestExecutorFailureAndPauseTaxonomyCleansProtectedFiles(t *testing.T) {
 
 func TestExecutorParentShutdownLeavesDeploymentForRecovery(t *testing.T) {
 	fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
-	fixture.runner.run = func(_ int, _ runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	ctx, cancel := context.WithCancel(fixture.context)
+	fixture.runner.run = func(index int, _ runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+		if index == 0 {
+			return validModel(), nil
+		}
+		cancel()
 		return runtimeprocess.CommandResult{}, context.Canceled
 	}
-	executionContext, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := fixture.executor.Execute(executionContext, fixture.job, &fixture.reporter)
-	if !errors.Is(err, context.Canceled) {
+	_, err := fixture.executor.ExecuteBound(ctx, fixture.job, fixture.claim, &fixture.reporter)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, deploymentexecution.ErrCanceled) {
 		t.Fatalf("shutdown error=%v", err)
 	}
-	if fixture.deployments.deployment.Status != deployments.Preparing || len(fixture.runner.requests) != 1 {
-		t.Fatalf("shutdown deployment=%#v requests=%v", fixture.deployments.deployment, fixture.runner.requests)
+	if fixture.deployment(t).Status != deployments.Applying || len(fixture.runner.requests) != 2 {
+		t.Fatalf("deployment=%#v requests=%v", fixture.deployment(t), fixture.runner.requests)
 	}
 	assertRuntimeTempEmpty(t, fixture.dataRoot)
 }
 
-func TestExecutorPriorReleaseConfigurationModesAndResumePin(t *testing.T) {
+func TestExecutorRejectsInvalidRequestedActorBeforeSideEffects(t *testing.T) {
+	for _, actor := range []string{"", "owner", "not-a-uuid"} {
+		t.Run(actor, func(t *testing.T) {
+			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
+			fixture.job.RequestedBy = actor
+			_, err := fixture.executor.ExecuteBound(fixture.context, fixture.job, fixture.claim, &fixture.reporter)
+			var ee *jobs.ExecutionError
+			if !errors.As(err, &ee) || ee.Code != "validation_failed" || fixture.deploymentCount(t) != 0 || len(fixture.runner.requests) != 0 {
+				t.Fatalf("error=%v deployments=%d requests=%d", err, fixture.deploymentCount(t), len(fixture.runner.requests))
+			}
+		})
+	}
+}
+
+func TestExecutorPreservesGateRefusalAndCancellationWithoutFailureMutation(t *testing.T) {
 	for _, test := range []struct {
-		name         string
-		mode         jobs.ConfigurationMode
-		initialized  bool
-		wantCurrent  int
-		wantRevision revisionRequest
+		name    string
+		cancel  bool
+		cleanup bool
 	}{
-		{name: "prior original", mode: jobs.ConfigurationOriginal, wantRevision: revisionRequest{revisionID: "release-revision", revisionNumber: 4}},
-		{name: "prior current", mode: jobs.ConfigurationCurrent, wantCurrent: 1},
-		{name: "resume uses pinned actual", mode: jobs.ConfigurationCurrent, initialized: true, wantRevision: revisionRequest{revisionID: "pinned-revision", revisionNumber: 7}},
+		{name: "live authority refusal with cleanup", cleanup: true},
+		{name: "cancelled gate", cancel: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			releaseID := strings.Repeat("a", 32)
-			fixture := newExecutorFixture(t, test.mode, releaseID)
-			fixture.applications.application.Source = apps.Source{Type: apps.SourceGitHub}
-			fixture.releases.release = releasesnapshot.Release{
-				ID:                          releaseID,
-				AppID:                       fixture.job.ResourceID,
-				WorkspacePath:               fixture.workspace,
-				ComposePath:                 "compose.yaml",
-				WorkspaceState:              releasesnapshot.WorkspaceStateReady,
-				ConfigurationRevisionID:     "release-revision",
-				ConfigurationRevisionNumber: 4,
+			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
+			ctx := fixture.context
+			var cancel context.CancelFunc
+			if test.cancel {
+				ctx, cancel = context.WithCancel(fixture.context)
 			}
-			fixture.configuration.exact = appconfig.ExecutionConfiguration{RevisionID: test.wantRevision.revisionID, RevisionNumber: test.wantRevision.revisionNumber, Environment: []byte("TOKEN='exact'\n")}
+			fixture.runner.run = func(index int, _ runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+				if index == 0 {
+					if test.cancel {
+						cancel()
+					} else if _, err := fixture.db.Exec(`UPDATE jobs SET attempt=2 WHERE id=?`, fixture.job.ID); err != nil {
+						t.Fatal(err)
+					}
+					return validModel(), nil
+				}
+				return runtimeprocess.CommandResult{}, nil
+			}
+			cleanupFailure := errors.New("cleanup failed")
+			if test.cleanup {
+				original := fixture.executor.cleanup
+				fixture.executor.cleanup = func(files *securetemp.Files) error { _ = original(files); return cleanupFailure }
+			}
+			_, err := fixture.executor.ExecuteBound(ctx, fixture.job, fixture.claim, &fixture.reporter)
+			var ee *jobs.ExecutionError
+			if !errors.As(err, &ee) || ee.Code != "runtime_unavailable" || len(fixture.runner.requests) != 1 || fixture.deployment(t).Status != deployments.Preparing {
+				t.Fatalf("error=%v requests=%d deployment=%#v", err, len(fixture.runner.requests), fixture.deployment(t))
+			}
+			if !test.cancel && !errors.Is(err, deploymentexecution.ErrIdentityLost) {
+				t.Fatalf("identity cause missing: %v", err)
+			}
+			if test.cancel && (!errors.Is(err, deploymentexecution.ErrCanceled) || !errors.Is(err, context.Canceled)) {
+				t.Fatalf("cancellation missing: %v", err)
+			}
+			if test.cleanup && !errors.Is(err, cleanupFailure) {
+				t.Fatalf("cleanup missing: %v", err)
+			}
+			assertRuntimeTempEmpty(t, fixture.dataRoot)
+		})
+	}
+}
+
+func TestExecutorPriorReleaseConfigurationModesAndResumePin(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		mode        jobs.ConfigurationMode
+		initialized bool
+		wantCurrent int
+		wantNumber  int64
+	}{
+		{name: "prior original", mode: jobs.ConfigurationOriginal, wantNumber: 4},
+		{name: "prior current", mode: jobs.ConfigurationCurrent, wantCurrent: 1, wantNumber: 1},
+		{name: "resume uses pinned actual", mode: jobs.ConfigurationCurrent, initialized: true, wantNumber: 7},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, test.mode, strings.Repeat("a", 32))
+			fixture.applications.application.Source = apps.Source{Type: apps.SourceGitHub}
+			wantID := fixture.configuration.current.RevisionID
+			if test.wantNumber == 4 {
+				wantID = fixture.releaseConfigID
+			}
+			if test.wantNumber == 7 {
+				wantID = fixture.pinnedConfigID
+			}
+			fixture.configuration.exact = appconfig.ExecutionConfiguration{RevisionID: wantID, RevisionNumber: test.wantNumber, Environment: []byte("TOKEN='exact'\n")}
 			if test.initialized {
-				fixture.deployments.deployment = deployments.Deployment{
-					ID:                                uuid.NewString(),
-					AppID:                             fixture.job.ResourceID,
-					JobID:                             fixture.job.ID,
-					Status:                            deployments.NeedsAttention,
-					ConfigurationMode:                 string(test.mode),
-					ReleaseID:                         releaseID,
-					ActualConfigurationRevisionID:     "pinned-revision",
-					ActualConfigurationRevisionNumber: 7,
-					ProvenanceInitialized:             true,
+				deployment, _, err := fixture.deployments.GetOrCreateByJob(context.Background(), fixture.job.ResourceID, fixture.job.ID, string(test.mode))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err = fixture.deployments.Initialize(context.Background(), fixture.job.ResourceID, deployment.ID, fixture.releases.release.ID, fixture.pinnedConfigID, 7); err != nil {
+					t.Fatal(err)
+				}
+				if _, err = fixture.deployments.Transition(context.Background(), fixture.job.ResourceID, deployment.ID, deployments.NeedsAttention, "approval_required"); err != nil {
+					t.Fatal(err)
 				}
 			}
 			fixture.runner.run = successfulRunner(validModel())
-			if _, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter); err != nil {
+			if _, err := fixture.executor.ExecuteBound(fixture.context, fixture.job, fixture.claim, &fixture.reporter); err != nil {
 				t.Fatal(err)
 			}
-			if fixture.configuration.currentCalls != test.wantCurrent || !reflect.DeepEqual(fixture.configuration.revisionRequest, nonzeroRevisionRequests(test.wantRevision)) {
-				t.Fatalf("current=%d exact=%v", fixture.configuration.currentCalls, fixture.configuration.revisionRequest)
+			if fixture.configuration.currentCalls != test.wantCurrent {
+				t.Fatalf("current calls=%d", fixture.configuration.currentCalls)
 			}
-			if fixture.releases.readyCalls != 1 || fixture.releases.materializeCalls != 0 {
-				t.Fatalf("release calls ready=%d materialize=%d", fixture.releases.readyCalls, fixture.releases.materializeCalls)
+			if fixture.releases.readyCalls != 1 || fixture.releases.materializeCalls != 0 || fixture.releases.localMaterializeCalls != 0 {
+				t.Fatalf("prior release resolution=%#v", fixture.releases)
 			}
-			if test.initialized && (containsArgument(fixture.deployments.actions, "initialize") || fixture.deployments.deployment.ActualConfigurationRevisionID != "pinned-revision" || fixture.deployments.deployment.ActualConfigurationRevisionNumber != 7) {
-				t.Fatalf("resume changed initialized provenance: %#v actions=%v", fixture.deployments.deployment, fixture.deployments.actions)
+			if test.wantCurrent == 0 && (len(fixture.configuration.revisionRequest) != 1 || fixture.configuration.revisionRequest[0].revisionID != wantID || fixture.configuration.revisionRequest[0].revisionNumber != test.wantNumber) {
+				t.Fatalf("exact requests=%v", fixture.configuration.revisionRequest)
 			}
-			if !test.initialized && test.mode == jobs.ConfigurationOriginal && (fixture.deployments.deployment.ActualConfigurationRevisionID != "release-revision" || fixture.deployments.deployment.ActualConfigurationRevisionNumber != 4) {
-				t.Fatalf("original mode actual configuration=%#v", fixture.deployments.deployment)
-			}
-			if !test.initialized && test.mode == jobs.ConfigurationCurrent && fixture.deployments.deployment.ActualConfigurationRevisionID != fixture.configuration.current.RevisionID {
-				t.Fatalf("current mode actual configuration=%#v", fixture.deployments.deployment)
+			persisted := fixture.deployment(t)
+			if persisted.ActualConfigurationRevisionID != wantID || persisted.ActualConfigurationRevisionNumber != test.wantNumber {
+				t.Fatalf("deployment=%#v", persisted)
 			}
 		})
 	}
@@ -454,170 +505,119 @@ func TestExecutorPriorReleaseConfigurationModesAndResumePin(t *testing.T) {
 func TestExecutorLatestGitHubUsesRequestedActorAndCurrentConfiguration(t *testing.T) {
 	fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
 	fixture.applications.application.Source = apps.Source{Type: apps.SourceGitHub}
-	fixture.releases.release = releasesnapshot.Release{
-		ID:                          strings.Repeat("a", 32),
-		AppID:                       fixture.job.ResourceID,
-		WorkspacePath:               fixture.workspace,
-		ComposePath:                 "compose.yaml",
-		WorkspaceState:              releasesnapshot.WorkspaceStateReady,
-		ConfigurationRevisionID:     "original-release-revision",
-		ConfigurationRevisionNumber: 3,
-	}
+	fixture.releases.release.SourceProvider = apps.SourceGitHub
 	fixture.runner.run = successfulRunner(validModel())
-	if _, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter); err != nil {
+	if _, err := fixture.executor.ExecuteBound(fixture.context, fixture.job, fixture.claim, &fixture.reporter); err != nil {
 		t.Fatal(err)
 	}
-	if fixture.releases.materializeCalls != 1 || fixture.releases.readyCalls != 0 || fixture.releases.materializeOwner != fixture.job.RequestedBy || fixture.releases.materializeApp != fixture.job.ResourceID {
-		t.Fatalf("release calls materialize=%d ready=%d owner=%q app=%q", fixture.releases.materializeCalls, fixture.releases.readyCalls, fixture.releases.materializeOwner, fixture.releases.materializeApp)
+	if fixture.releases.materializeCalls != 1 || fixture.releases.materializeOwner != fixture.job.RequestedBy || fixture.configuration.currentCalls != 1 {
+		t.Fatalf("releases=%#v configuration=%#v", fixture.releases, fixture.configuration)
 	}
-	if fixture.configuration.currentCalls != 1 || len(fixture.configuration.revisionRequest) != 0 {
-		t.Fatalf("configuration calls current=%d exact=%v", fixture.configuration.currentCalls, fixture.configuration.revisionRequest)
-	}
-	if fixture.deployments.deployment.ReleaseID != fixture.releases.release.ID || fixture.deployments.deployment.ActualConfigurationRevisionID != fixture.configuration.current.RevisionID {
-		t.Fatalf("initialized provenance=%#v", fixture.deployments.deployment)
-	}
-}
-
-func TestExecutorRejectsInvalidRequestedActorBeforeSideEffects(t *testing.T) {
-	for _, actor := range []string{"", "owner", "not-a-uuid"} {
-		t.Run(actor, func(t *testing.T) {
-			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
-			fixture.job.RequestedBy = actor
-			result, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
-			var executionErr *jobs.ExecutionError
-			if !errors.As(err, &executionErr) || executionErr.Code != "validation_failed" || result != (jobs.ExecutionResult{}) {
-				t.Fatalf("result=%#v error=%v", result, err)
-			}
-			if len(fixture.deployments.actions) != 0 || len(fixture.runner.requests) != 0 || fixture.configuration.currentCalls != 0 || fixture.releases.materializeCalls != 0 {
-				t.Fatalf("invalid actor caused side effects: actions=%v requests=%v", fixture.deployments.actions, fixture.runner.requests)
-			}
-			assertRuntimeTempEmpty(t, fixture.dataRoot)
-		})
+	if fixture.deployment(t).ReleaseID != fixture.releases.release.ID {
+		t.Fatalf("deployment=%#v", fixture.deployment(t))
 	}
 }
 
 func TestExecutorMapsSourceAndConfigurationDiagnostics(t *testing.T) {
-	tests := []struct {
-		name            string
-		prepare         func(*executorFixture)
-		wantCode        string
-		wantStatus      deployments.Status
-		cancelRequested bool
+	for _, test := range []struct {
+		name, code string
+		prepare    func(*executorFixture)
+		cancel     bool
+		wantStatus deployments.Status
 	}{
-		{name: "application unavailable", prepare: func(f *executorFixture) { f.applications.err = errors.New("database unavailable") }, wantCode: "invalid_source", wantStatus: deployments.Failed},
-		{name: "provider unavailable", prepare: githubFailure(&releasesnapshot.Error{Code: "provider_unavailable"}), wantCode: "provider_unavailable", wantStatus: deployments.Failed},
-		{name: "source access lost", prepare: githubFailure(&releasesnapshot.Error{Code: "source_access_lost"}), wantCode: "source_access_lost", wantStatus: deployments.Failed},
-		{name: "source too large", prepare: githubFailure(&releasesnapshot.Error{Code: "source_too_large"}), wantCode: "source_too_large", wantStatus: deployments.Failed},
-		{name: "source storage full", prepare: githubFailure(&releasesnapshot.Error{Code: releasesnapshot.ErrorCodeSourceStorageFull}), wantCode: "source_storage_full", wantStatus: deployments.Failed},
-		{name: "provider cancellation", prepare: githubFailure(&releasesnapshot.Error{Code: "canceled"}), wantCode: "cancelled", wantStatus: deployments.Cancelled, cancelRequested: true},
-		{name: "current configuration unavailable", prepare: func(f *executorFixture) { f.configuration.currentErr = errors.New("corrupt bundle") }, wantCode: "configuration_unavailable", wantStatus: deployments.Failed},
-	}
-	for _, test := range tests {
+		{name: "application unavailable", code: "invalid_source", wantStatus: deployments.Failed, prepare: func(f *executorFixture) { f.applications.err = errors.New("database unavailable") }},
+		{name: "provider unavailable", code: "provider_unavailable", prepare: func(f *executorFixture) {
+			f.applications.application.Source = apps.Source{Type: apps.SourceGitHub}
+			f.releases.materializeErr = &releasesnapshot.Error{Code: "provider_unavailable"}
+		}, wantStatus: deployments.Failed},
+		{name: "source access lost", code: "source_access_lost", wantStatus: deployments.Failed, prepare: githubFailure(&releasesnapshot.Error{Code: "source_access_lost"})},
+		{name: "source too large", code: "source_too_large", wantStatus: deployments.Failed, prepare: githubFailure(&releasesnapshot.Error{Code: "source_too_large"})},
+		{name: "source storage full", code: "source_storage_full", wantStatus: deployments.Failed, prepare: githubFailure(&releasesnapshot.Error{Code: releasesnapshot.ErrorCodeSourceStorageFull})},
+		{name: "provider cancellation", code: "cancelled", cancel: true, wantStatus: deployments.Cancelled, prepare: githubFailure(&releasesnapshot.Error{Code: "canceled"})},
+		{name: "current configuration unavailable", code: "configuration_unavailable", wantStatus: deployments.Failed, prepare: func(f *executorFixture) { f.configuration.currentErr = errors.New("corrupt bundle") }},
+	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
 			test.prepare(&fixture)
-			executionContext := context.Background()
-			if test.cancelRequested {
-				cancelledContext, cancel := context.WithCancelCause(executionContext)
-				cancel(jobs.ErrCancellationRequested)
-				executionContext = cancelledContext
+			executionContext := fixture.context
+			if test.cancel {
+				var cancel context.CancelCauseFunc
+				executionContext, cancel = context.WithCancelCause(fixture.context)
+				fixture.releases.beforeMaterialize = func() { cancel(jobs.ErrCancellationRequested) }
 			}
-			_, err := fixture.executor.Execute(executionContext, fixture.job, &fixture.reporter)
-			var executionErr *jobs.ExecutionError
-			if !errors.As(err, &executionErr) || executionErr.Code != test.wantCode {
-				t.Fatalf("error=%v want code=%q", err, test.wantCode)
+			_, err := fixture.executor.ExecuteBound(executionContext, fixture.job, fixture.claim, &fixture.reporter)
+			var ee *jobs.ExecutionError
+			if !errors.As(err, &ee) || ee.Code != test.code || fixture.deployment(t).Status != test.wantStatus || len(fixture.runner.requests) != 0 {
+				t.Fatalf("error=%v deployment=%#v requests=%d", err, fixture.deployment(t), len(fixture.runner.requests))
 			}
-			if fixture.deployments.deployment.Status != test.wantStatus || len(fixture.runner.requests) != 0 {
-				t.Fatalf("deployment=%#v requests=%v", fixture.deployments.deployment, fixture.runner.requests)
-			}
-			assertRuntimeTempEmpty(t, fixture.dataRoot)
 		})
 	}
 }
 
 func githubFailure(err error) func(*executorFixture) {
-	return func(fixture *executorFixture) {
-		fixture.applications.application.Source = apps.Source{Type: apps.SourceGitHub}
-		fixture.releases.materializeErr = err
+	return func(f *executorFixture) {
+		f.applications.application.Source = apps.Source{Type: apps.SourceGitHub}
+		f.releases.materializeErr = err
 	}
 }
 
 func TestExecutorLocalDirectoryDirectFileAndAmbiguousSource(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		makePath  func(*testing.T) (string, string, string)
-		wantError bool
+		name              string
+		direct, ambiguous bool
 	}{
-		{name: "directory", makePath: func(t *testing.T) (string, string, string) {
-			root := t.TempDir()
-			nested := filepath.Join(root, "deploy")
-			if err := os.Mkdir(nested, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(nested, "compose.yaml"), []byte("services:\n  web:\n    image: nginx\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			return root, root, "deploy/compose.yaml"
-		}},
-		{name: "direct file", makePath: func(t *testing.T) (string, string, string) {
-			root := t.TempDir()
-			compose := filepath.Join(root, "compose.yaml")
-			if err := os.WriteFile(compose, []byte("services:\n  web:\n    image: nginx\n"), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			return compose, root, "compose.yaml"
-		}},
-		{name: "ambiguous directory", wantError: true, makePath: func(t *testing.T) (string, string, string) {
-			root := t.TempDir()
-			for _, name := range []string{"compose.yaml", "compose.yml"} {
-				if err := os.WriteFile(filepath.Join(root, name), []byte("services:\n  web:\n    image: nginx\n"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-			}
-			return root, "", ""
-		}},
+		{name: "directory"}, {name: "direct file", direct: true}, {name: "ambiguous directory", ambiguous: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
-			sourcePath, _, wantCompose := test.makePath(t)
-			fixture.applications.application.Source = apps.Source{Type: apps.SourceLocal, Path: sourcePath}
-			managedWorkspace := t.TempDir()
-			if test.wantError {
-				fixture.releases.materializeErr = &releasesnapshot.Error{Code: "invalid_source"}
-			} else {
-				managedCompose := filepath.Join(managedWorkspace, filepath.FromSlash(wantCompose))
-				if err := os.MkdirAll(filepath.Dir(managedCompose), 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.WriteFile(managedCompose, []byte("services:\n  web:\n    image: nginx\n"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				canonicalManaged, err := canonicalPath(managedWorkspace)
-				if err != nil {
-					t.Fatal(err)
-				}
-				fixture.releases.release.WorkspacePath = canonicalManaged
-				fixture.releases.release.ComposePath = wantCompose
+			root := t.TempDir()
+			wantCompose := filepath.Join("deploy", "compose.yaml")
+			if test.direct || test.ambiguous {
+				wantCompose = "compose.yaml"
 			}
+			compose := filepath.Join(root, wantCompose)
+			if err := os.MkdirAll(filepath.Dir(compose), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(compose, []byte("services:\n  web:\n    image: nginx\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fixture.applications.application.Source = apps.Source{Type: apps.SourceLocal, Path: root}
+			if test.direct {
+				fixture.applications.application.Source.Path = compose
+			}
+			if test.ambiguous {
+				if err := os.WriteFile(filepath.Join(root, "compose.yml"), []byte("services:{}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				fixture.releases.materializeErr = &releasesnapshot.Error{Code: "invalid_source"}
+			}
+			managed := t.TempDir()
+			managedCompose := filepath.Join(managed, wantCompose)
+			if err := os.MkdirAll(filepath.Dir(managedCompose), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(managedCompose, []byte("services:\n  web:\n    image: nginx\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			managed, _ = canonicalPath(managed)
+			fixture.releases.release.WorkspacePath = managed
+			fixture.releases.release.ComposePath = filepath.ToSlash(wantCompose)
 			fixture.runner.run = successfulRunner(validModel())
-			_, err := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
-			if test.wantError {
-				var executionErr *jobs.ExecutionError
-				if !errors.As(err, &executionErr) || executionErr.Code != "invalid_source" || len(fixture.runner.requests) != 0 || fixture.deployments.deployment.Status != deployments.Failed {
-					t.Fatalf("error=%v requests=%v deployment=%#v", err, fixture.runner.requests, fixture.deployments.deployment)
+			_, err := fixture.executor.ExecuteBound(fixture.context, fixture.job, fixture.claim, &fixture.reporter)
+			if test.ambiguous {
+				var ee *jobs.ExecutionError
+				if !errors.As(err, &ee) || ee.Code != "invalid_source" || len(fixture.runner.requests) != 0 {
+					t.Fatalf("error=%v requests=%d", err, len(fixture.runner.requests))
 				}
 				return
 			}
-			if err != nil || len(fixture.runner.requests) != 2 {
-				t.Fatalf("error=%v requests=%v", err, fixture.runner.requests)
-			}
-			canonicalWorkspace, canonicalErr := canonicalPath(managedWorkspace)
-			if canonicalErr != nil {
-				t.Fatal(canonicalErr)
+			if err != nil || len(fixture.runner.requests) != 2 || fixture.runner.requests[0].Directory != managed {
+				t.Fatalf("error=%v requests=%#v", err, fixture.runner.requests)
 			}
 			config := fixture.runner.requests[0]
-			if config.Directory != canonicalWorkspace || valueAfter(config.Args, "--project-directory") != canonicalWorkspace || valueAfter(config.Args, "-f") != filepath.Join(canonicalWorkspace, filepath.FromSlash(wantCompose)) {
-				t.Fatalf("local config request=%#v", config)
+			if valueAfter(config.Args, "--project-directory") != managed || valueAfter(config.Args, "-f") != filepath.Join(managed, wantCompose) {
+				t.Fatalf("config request=%#v", config)
 			}
 		})
 	}
@@ -626,37 +626,30 @@ func TestExecutorLocalDirectoryDirectFileAndAmbiguousSource(t *testing.T) {
 func TestExecutorManagedWorkspaceBindIsReadOnlyForGitHubAndLocal(t *testing.T) {
 	for _, sourceType := range []string{apps.SourceGitHub, apps.SourceLocal} {
 		for _, readOnly := range []bool{false, true} {
-			name := sourceType + "/writable"
-			if readOnly {
-				name = sourceType + "/read-only"
-			}
-			t.Run(name, func(t *testing.T) {
+			t.Run(sourceType+map[bool]string{false: "/writable", true: "/read-only"}[readOnly], func(t *testing.T) {
 				fixture := newExecutorFixture(t, jobs.ConfigurationCurrent, "")
 				fixture.applications.application.Source.Type = sourceType
 				fixture.releases.release.SourceProvider = sourceType
-				body, err := json.Marshal(serviceModel(map[string]any{
-					"volumes": []any{map[string]any{"type": "bind", "source": fixture.workspace, "target": "/app", "read_only": readOnly}},
-				}))
+				body, err := json.Marshal(serviceModel(map[string]any{"volumes": []any{map[string]any{"type": "bind", "source": fixture.workspace, "target": "/app", "read_only": readOnly}}}))
 				if err != nil {
 					t.Fatal(err)
 				}
 				fixture.runner.run = successfulRunner(runtimeprocess.CommandResult{Stdout: body})
-				if !readOnly {
-					fixture.deployments.gateErr = deployments.ErrRejectedCapability
+				_, executeErr := fixture.executor.ExecuteBound(fixture.context, fixture.job, fixture.claim, &fixture.reporter)
+				findings := fixture.findings(t)
+				wantCapability := "writable_managed_bind"
+				if readOnly {
+					wantCapability = "workspace_bind_mount"
 				}
-				_, executeErr := fixture.executor.Execute(context.Background(), fixture.job, &fixture.reporter)
-				wantCapability, wantDisposition := "workspace_bind_mount", DispositionAllowed
-				if !readOnly {
-					wantCapability, wantDisposition = "writable_managed_bind", DispositionRejected
-					var executionErr *jobs.ExecutionError
-					if !errors.As(executeErr, &executionErr) || executionErr.Code != "policy_rejected" || len(fixture.runner.requests) != 1 {
-						t.Fatalf("execute error=%v requests=%d", executeErr, len(fixture.runner.requests))
+				if readOnly {
+					if executeErr != nil || len(fixture.runner.requests) != 2 || len(findings) != 1 || findings[0].Capability != wantCapability || findings[0].Disposition != DispositionAllowed {
+						t.Fatalf("error=%v findings=%#v requests=%d", executeErr, findings, len(fixture.runner.requests))
 					}
-				} else if executeErr != nil || len(fixture.runner.requests) != 2 {
-					t.Fatalf("execute error=%v requests=%d", executeErr, len(fixture.runner.requests))
-				}
-				if len(fixture.deployments.findings) != 1 || fixture.deployments.findings[0].Capability != wantCapability || fixture.deployments.findings[0].Disposition != wantDisposition {
-					t.Fatalf("findings=%#v", fixture.deployments.findings)
+				} else {
+					var ee *jobs.ExecutionError
+					if !errors.As(executeErr, &ee) || ee.Code != "policy_rejected" || len(fixture.runner.requests) != 1 || len(findings) != 1 || findings[0].Capability != wantCapability || findings[0].Disposition != DispositionRejected {
+						t.Fatalf("error=%v findings=%#v requests=%d", executeErr, findings, len(fixture.runner.requests))
+					}
 				}
 			})
 		}
@@ -664,16 +657,53 @@ func TestExecutorManagedWorkspaceBindIsReadOnlyForGitHubAndLocal(t *testing.T) {
 }
 
 type executorFixture struct {
-	executor      *Executor
-	applications  *fakeApplications
-	releases      *fakeReleases
-	configuration *fakeConfiguration
-	deployments   *fakeDeployments
-	runner        *fakeRunner
-	reporter      recordingReporter
-	job           jobs.Job
-	workspace     string
-	dataRoot      string
+	executor         *Executor
+	applications     *fakeApplications
+	releases         *fakeReleases
+	configuration    *fakeConfiguration
+	deployments      *deployments.Repository
+	db               *sql.DB
+	context          context.Context
+	workingDirectory string
+	releaseScope     func() error
+	runner           *fakeRunner
+	reporter         recordingReporter
+	job              jobs.Job
+	claim            deploymentexecution.Claim
+	workspace        string
+	dataRoot         string
+	releaseConfigID  string
+	pinnedConfigID   string
+}
+
+func (f executorFixture) deployment(t *testing.T) deployments.Deployment {
+	t.Helper()
+	var id string
+	if err := f.db.QueryRow(`SELECT id FROM deployments WHERE job_id=?`, f.job.ID).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	value, err := f.deployments.Get(context.Background(), f.job.ResourceID, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func (f executorFixture) deploymentCount(t *testing.T) int {
+	t.Helper()
+	var count int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM deployments WHERE job_id=?`, f.job.ID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func (f executorFixture) findings(t *testing.T) []deployments.Finding {
+	t.Helper()
+	if f.deploymentCount(t) == 0 {
+		return nil
+	}
+	return f.deployment(t).Findings
 }
 
 func newExecutorFixture(t *testing.T, mode jobs.ConfigurationMode, releaseID string) executorFixture {
@@ -697,7 +727,27 @@ func newExecutorFixture(t *testing.T, mode jobs.ConfigurationMode, releaseID str
 	configuration := &fakeConfiguration{
 		current: appconfig.ExecutionConfiguration{RevisionID: uuid.NewString(), RevisionNumber: 1, Environment: []byte("TOKEN='runtime-secret'\n")},
 	}
-	deploymentRepository := &fakeDeployments{}
+	db, job, claim, deploymentRepository, executionContext, workingDirectory, releaseScope := newBoundComposeJob(t, applicationID, dataRoot)
+	configurationID := configuration.current.RevisionID
+	releaseConfigurationID := uuid.NewString()
+	pinnedConfigurationID := uuid.NewString()
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, revision := range []struct {
+		id     string
+		number int64
+	}{{configurationID, 1}, {releaseConfigurationID, 4}, {pinnedConfigurationID, 7}} {
+		if _, err := db.Exec(`INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES(?,?,?,?,?,?,0,1)`, revision.id, applicationID, revision.number, "fixture:"+revision.id, job.RequestedBy, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE application_configuration_heads SET revision_id=?,revision_number=1,updated_at=? WHERE app_id=?`, configurationID, stamp, applicationID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,workspace_state,workspace_tree_sha256,configuration_revision_id,configuration_revision_number) VALUES(?,?,'ready','{}',?,'ready',?,?,4)`, releases.release.ID, applicationID, stamp, strings.Repeat("d", 64), releaseConfigurationID); err != nil {
+		t.Fatal(err)
+	}
+	releases.release.ConfigurationRevisionID = releaseConfigurationID
+	releases.release.ConfigurationRevisionNumber = 4
 	runner := &fakeRunner{}
 	executor, err := NewExecutor(applications, releases, configuration, deploymentRepository, temporary, runner, ExecutorOptions{
 		DockerExecutable: "docker-test",
@@ -713,6 +763,7 @@ func newExecutorFixture(t *testing.T, mode jobs.ConfigurationMode, releaseID str
 	if err != nil {
 		t.Fatal(err)
 	}
+	job.Input = input
 	return executorFixture{
 		executor:      executor,
 		applications:  applications,
@@ -720,18 +771,84 @@ func newExecutorFixture(t *testing.T, mode jobs.ConfigurationMode, releaseID str
 		configuration: configuration,
 		deployments:   deploymentRepository,
 		runner:        runner,
-		job: jobs.Job{
-			ID:           uuid.NewString(),
-			Type:         "deploy",
-			ResourceType: "application",
-			ResourceID:   applicationID,
-			RequestedBy:  uuid.NewString(),
-			Input:        input,
-			Attempt:      1,
-		},
-		workspace: workspace,
-		dataRoot:  dataRoot,
+		job:           job, claim: claim, db: db, context: executionContext, workingDirectory: workingDirectory, releaseScope: releaseScope,
+		workspace:       workspace,
+		dataRoot:        dataRoot,
+		releaseConfigID: releaseConfigurationID,
+		pinnedConfigID:  pinnedConfigurationID,
 	}
+}
+
+func newBoundComposeJob(t *testing.T, appID, dataRoot string) (*sql.DB, jobs.Job, deploymentexecution.Claim, *deployments.Repository, context.Context, string, func() error) {
+	t.Helper()
+	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	actorID := uuid.NewString()
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, actorID, "hash", stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'deployed',?,?)`, appID, appID, appID, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+		ApplicationID: appID, IdempotencyKey: "compose-executor", RequestedBy: actorID,
+		Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+	}, jobs.DeploymentCreateHooks{})
+	if err != nil || !created.Created {
+		t.Fatalf("create bound Compose job: created=%t error=%v", created.Created, err)
+	}
+	job := created.Job
+	job.Attempt = 1
+	if _, err := db.Exec(`UPDATE jobs SET status='running',phase='running',attempt=1,started_at=?,updated_at=? WHERE id=?`, stamp, stamp, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := deploymentexecution.NewClaim(created.Binding, job.ID, appID, job.Attempt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := applifecycle.New(db)
+	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := deployments.NewWithExecutionGuard(db, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, releaseScope, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := releaseScope(); err != nil {
+			t.Errorf("release scope: %v", err)
+		}
+	})
+	return db, job, claim, repository, deploymenteffects.WithScope(context.Background(), scope), directories.WorkingDirectory, releaseScope
 }
 
 func successfulRunner(model runtimeprocess.CommandResult) func(int, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {

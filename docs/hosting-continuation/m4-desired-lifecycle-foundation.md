@@ -104,9 +104,34 @@ final results.
 Independent security and QA reviews found and verified fixes for replay
 authority, error atomicity, bounded cleanup, and missing failure coverage.
 CodeRabbit CLI 0.9.0 reports `not_authenticated`; no CodeRabbit review ran.
-Hosted Linux race, Windows, and existing integration gates remain required.
+Hosted Linux race, Windows, and existing integration gates subsequently passed
+at the exact foundation revision recorded below.
 The existing repository-remainder race lane discovers the new package through
 `go list ./...`; no CI workflow change is needed.
+
+### Hosted foundation verification
+
+On 2026-10-18, [draft PR #188](https://github.com/tyhuang9/rig/pull/188)
+completed CI at `da607a88ee22c9af9d0a33909e94ef5531cc4f9e`: 129 check runs
+succeeded. The documentation deployment job was skipped by its existing
+main-push/manual condition. The CodeRabbit status context also reported success;
+that status is not evidence of an independent code review.
+
+Passed gates include Windows, Linux repository race checks, ordinary Docker
+deployment, controller TLS, two-application LAN, external-database TLS,
+migration uncertainty, and all eight owned crash-matrix partitions. The
+[matrix aggregate](https://github.com/tyhuang9/rig/actions/runs/39138691587/job/117745384859)
+confirmed that every partition succeeded. The PR description retains links to
+the individual important jobs.
+
+The completion receipt records rollup SHA-256
+`ea230c2312faee6032fa2a54023801d53f1de405330826720af31a504fcf74cd`
+and aggregate metadata SHA-256
+`79c12463dddef4b1afd7955ba006d754dc6cdc7c4101eaec2f5982207153adc7`.
+These results cover the published storage foundation. They do not qualify the
+unpublished lifecycle coordinator, physical-device acceptance, or full M4.
+The PR remains a draft; this work did not merge it or activate a local live
+controller data root.
 
 ## Follow-on requirements
 

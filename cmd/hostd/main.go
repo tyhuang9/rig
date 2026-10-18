@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/autodeploy"
@@ -26,6 +28,7 @@ import (
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedingress"
@@ -69,6 +72,23 @@ type hostdDaemonAssemblyOptions struct {
 	listen          func(string, string) (net.Listener, error)
 	ready           func(hostdDaemonReady)
 	backgroundStart hostdBackgroundStartObserver
+}
+
+func newDeploymentJobService(db *sql.DB) (*jobs.Service, *deploymentbinding.Repository, error) {
+	lifecycle := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+	if err != nil {
+		return nil, nil, err
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		return nil, nil, err
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		return nil, nil, err
+	}
+	return service, bindings, nil
 }
 
 func runServer(args []string) int {
@@ -169,10 +189,17 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 			bootstrapCompleted, assembly.ready)
 	}
 	var workerAdmission func(context.Context) (func() error, error)
+	var workerScopedAdmission jobs.ScopedAdmission
 	if cfg.ComposeRuntime || cfg.GeneratedRuntime {
 		workerAdmission, err = deploymentEffectsAdmission(db, ownerDirectories.WorkingDirectory)
 		if err != nil {
 			logger.Error("deployment effects admission setup failed", "error", err)
+			emergencyStop()
+			return 1
+		}
+		workerScopedAdmission, err = deploymentEffectsScopedAdmission(db, ownerDirectories.WorkingDirectory)
+		if err != nil {
+			logger.Error("scoped deployment effects admission setup failed", "error", err)
 			emergencyStop()
 			return 1
 		}
@@ -255,7 +282,11 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 		logger.Error("local diagnostics persistence failed", "error", err)
 		return 1
 	}
-	j := jobs.New(db)
+	j, deploymentBindings, err := newDeploymentJobService(db)
+	if err != nil {
+		logger.Error("deployment job lifecycle binding setup failed", "error", err)
+		return 1
+	}
 	applicationConfiguration, err := appconfig.New(db, cfg.DataRoot)
 	if err != nil {
 		logger.Error("application configuration setup failed", "error", err)
@@ -299,7 +330,8 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 	deploymentRepository := deployments.New(db)
 	runtime, err := prepareRuntimeComposition(context.Background(), cfg, runtimeCompositionDependencies{
 		db: db, applications: applications, snapshots: snapshots, configuration: applicationConfiguration,
-		deployments: deploymentRepository, plans: planStore,
+		deployments: deploymentRepository, plans: planStore, bindings: deploymentBindings,
+		effectsWorkingDirectory: ownerDirectories.WorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, runner: assembly.runner,
 		preinspectedIngress: gate.ingress})
 	if err != nil {
@@ -351,9 +383,9 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workerRun := j.RunWorker
-	if workerAdmission != nil {
+	if workerScopedAdmission != nil {
 		workerRun = func(runContext context.Context, executor jobs.Executor) error {
-			return j.RunWorkerWithAdmission(runContext, executor, workerAdmission)
+			return j.RunWorkerWithScopedAdmission(runContext, executor, workerScopedAdmission)
 		}
 	}
 	var releaseStartupAdmission func() error
@@ -361,8 +393,7 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 		releaseStartupAdmission = startupAdmission.Release
 	}
 	workerDone, err := prepareRuntimeWorker(ctx, runtimeRecovery{
-		deployments:      deploymentRepository.Recover,
-		jobs:             j.RecoverInterrupted,
+		recoverState:     j.RecoverRuntimeContext,
 		releaseAdmission: releaseStartupAdmission,
 	}, runtime.executor, workerRun, func(err error) {
 		logger.Error("job worker stopped", "error", err)
@@ -537,8 +568,7 @@ func runRecoveryOnlyControllerWithAssembly(cfg config.Config, logger *slog.Logge
 }
 
 type runtimeRecovery struct {
-	deployments      func(context.Context) error
-	jobs             func() error
+	recoverState     func(context.Context) error
 	releaseAdmission func() error
 }
 
@@ -573,20 +603,19 @@ func prepareRuntimeWorker(ctx context.Context, recovery runtimeRecovery, executo
 		}
 		return nil
 	}
-	if ctx == nil || recovery.deployments == nil || recovery.jobs == nil {
+	if ctx == nil || recovery.recoverState == nil {
 		return nil, errors.Join(errors.New("runtime recovery dependencies are required"), releaseAdmission())
 	}
-	recoverState := func() error {
-		if err := recovery.deployments(context.WithoutCancel(ctx)); err != nil {
-			return fmt.Errorf("recover deployments: %w", err)
+	recoverErr := ctx.Err()
+	if recoverErr == nil {
+		if err := recovery.recoverState(ctx); err != nil {
+			recoverErr = fmt.Errorf("recover runtime: %w", err)
 		}
-		if err := recovery.jobs(); err != nil {
-			return fmt.Errorf("recover jobs: %w", err)
-		}
-		return nil
 	}
-	recoverErr := recoverState()
 	releaseErr := releaseAdmission()
+	if recoverErr == nil {
+		recoverErr = ctx.Err()
+	}
 	if recoverErr != nil || releaseErr != nil {
 		return nil, errors.Join(recoverErr, releaseErr)
 	}

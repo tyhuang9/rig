@@ -113,7 +113,11 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	if _, err := machineStore.EnsureLocal(); err != nil {
 		t.Fatal(err)
 	}
-	appStore, jobStore := apps.New(db), jobs.New(db)
+	appStore := apps.New(db)
+	jobStore, bindingStore, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal(err)
+	}
 	configuration, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -129,11 +133,13 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	deploymentStore := deployments.New(db)
+	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	settings := config.Defaults()
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans,
+		deployments: deploymentStore, plans: plans, bindings: bindingStore,
+		effectsWorkingDirectory: effectsWorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
@@ -172,8 +178,10 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	githubSource := apicontract.GitHubSource{ConnectionID: connection.ID, InstallationID: 7, RepositoryID: 17, Branch: "main"}
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	done, err := prepareRuntimeWorker(workerCtx, runtimeRecovery{
-		deployments: deploymentStore.Recover, jobs: jobStore.RecoverInterrupted,
-	}, composition.executor, jobStore.RunWorker, func(error) {})
+		recoverState: jobStore.RecoverRuntimeContext,
+	}, composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
+	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +291,8 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	// object that already saw the grants.
 	fresh, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans,
+		deployments: deploymentStore, plans: plans, bindings: bindingStore,
+		effectsWorkingDirectory: effectsWorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("open fresh production ingress manager:", err)

@@ -18,16 +18,23 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/autodeploy"
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
+	"github.com/hostd/hostd/internal/runtimeexecutor"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -93,6 +100,7 @@ type blockingComposeRunner struct {
 	upStartedOnce sync.Once
 	upResult      runtimeprocess.CommandResult
 	upError       error
+	afterUp       func() error
 }
 
 type ownerScopedGitHubSources struct {
@@ -215,12 +223,8 @@ func TestCoordinatorJobRunsOwnerScopedGitHubComposeMaterialization(t *testing.T)
 		t.Fatal(err)
 	}
 	runner := &successfulComposeRunner{}
-	deploymentRepository := deployments.New(db)
-	executor, err := composeruntime.NewExecutor(applications, materializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{DockerExecutable: "docker-test", ConfigTimeout: 5 * time.Second, ApplyTimeout: 30 * time.Second, WaitTimeout: 10 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	jobService := jobs.New(db)
+	jobService, bindings := newComposeDeploymentJobService(t, db)
+	executor, _, admission := newBoundComposeWorkerExecutor(t, db, dataRoot, bindings, applications, materializer, configuration, temporary, runner)
 	autoRepository := autodeploy.NewRepository(db)
 	if _, err = autoRepository.Configure(context.Background(), autodeploy.ConfigureRequest{ApplicationID: application.ID, ActorUserID: owner, Enabled: true}, now); err != nil {
 		t.Fatal(err)
@@ -235,7 +239,7 @@ func TestCoordinatorJobRunsOwnerScopedGitHubComposeMaterialization(t *testing.T)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	workerDone, coordinatorDone := make(chan error, 1), make(chan error, 1)
-	go func() { workerDone <- jobService.RunWorker(ctx, executor) }()
+	go func() { workerDone <- jobService.RunWorkerWithScopedAdmission(ctx, executor, admission) }()
 	go func() { coordinatorDone <- coordinator.Run(ctx) }()
 	t.Cleanup(func() {
 		cancel()
@@ -331,6 +335,14 @@ func (r *blockingComposeRunner) Run(ctx context.Context, request runtimeprocess.
 		if r.releaseUp != nil {
 			select {
 			case <-r.releaseUp:
+				r.mu.Lock()
+				afterUp := r.afterUp
+				r.mu.Unlock()
+				if afterUp != nil {
+					if err := afterUp(); err != nil {
+						return runtimeprocess.CommandResult{}, err
+					}
+				}
 				stdout := append([]byte(nil), r.upResult.Stdout...)
 				stderr := append([]byte(nil), r.upResult.Stderr...)
 				if len(stdout) == 0 {
@@ -348,6 +360,12 @@ func (r *blockingComposeRunner) Run(ctx context.Context, request runtimeprocess.
 		return runtimeprocess.CommandResult{}, ctx.Err()
 	}
 	return runtimeprocess.CommandResult{}, errors.New("unexpected Docker command")
+}
+
+func (r *blockingComposeRunner) setAfterUp(callback func() error) {
+	r.mu.Lock()
+	r.afterUp = callback
+	r.mu.Unlock()
 }
 
 func (r *blockingComposeRunner) setConfigJSON(model []byte) {
@@ -630,22 +648,13 @@ func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := jobs.New(db)
-	deploymentRepository := deployments.New(db)
+	jobService, bindings := newComposeDeploymentJobService(t, db)
 	releaseUp := make(chan struct{})
 	var releaseUpOnce sync.Once
 	release := func() { releaseUpOnce.Do(func() { close(releaseUp) }) }
 	runner := &blockingComposeRunner{upStarted: make(chan struct{}), releaseUp: releaseUp}
 	runner.setConfigJSON([]byte(`{"services":{"web":{"image":"nginx","environment":{"TOKEN":"runtime-secret"}}}}`))
-	executor, err := composeruntime.NewExecutor(applicationStore, materializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
-		DockerExecutable: "docker-test",
-		ConfigTimeout:    5 * time.Second,
-		ApplyTimeout:     30 * time.Second,
-		WaitTimeout:      10 * time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	executor, deploymentRepository, admission := newBoundComposeWorkerExecutor(t, db, dataRoot, bindings, applicationStore, materializer, configuration, temporary, runner)
 	fixture := &composeWorkerFixture{
 		db:            db,
 		jobs:          jobService,
@@ -654,6 +663,8 @@ func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *t
 		temporary:     temporary,
 		runner:        runner,
 		executor:      executor,
+		admission:     admission,
+		bindings:      bindings,
 		app:           application,
 		actorID:       actorID,
 		dataRoot:      dataRoot,
@@ -938,8 +949,11 @@ func TestComposeWorkerCancellationPreservesPartialRuntimeAndCleansTemp(t *testin
 	}
 	waitForJob(t, fixture.jobs, job.ID, jobs.Cancelled)
 	history, err = fixture.deployments.List(context.Background(), fixture.app.ID, 10)
-	if err != nil || len(history) != 1 || history[0].Status != deployments.Cancelled || history[0].DiagnosticCode != "cancelled" {
+	if err != nil || len(history) != 1 || history[0].Status != deployments.Applying || history[0].DiagnosticCode != "" {
 		t.Fatalf("cancelled history=%#v err=%v", history, err)
+	}
+	if _, err := fixture.jobs.Resume(job.ID); err == nil {
+		t.Fatal("cancelled job unexpectedly resumed")
 	}
 	assertNoRollbackAndSecretsCleared(t, fixture.runner)
 	assertComposeRuntimeTempEmpty(t, fixture.dataRoot)
@@ -984,13 +998,127 @@ func TestComposeWorkerApplyAndOuterHealthFailuresAreSanitizedWithoutRollback(t *
 				t.Fatalf("job failure=%#v", failed)
 			}
 			history, err = fixture.deployments.List(context.Background(), fixture.app.ID, 10)
-			if err != nil || len(history) != 1 || history[0].Status != deployments.Failed || history[0].DiagnosticCode != test.code || containsRawSecret(history[0].FailureSummary) {
+			if err != nil || len(history) != 1 || history[0].Status != deployments.Applying || history[0].DiagnosticCode != "" || history[0].FailureSummary != "" {
 				t.Fatalf("deployment failure=%#v err=%v", history, err)
+			}
+			if _, err := fixture.jobs.Resume(job.ID); err == nil {
+				t.Fatal("failed job unexpectedly resumed")
 			}
 			assertNoRollbackAndSecretsCleared(t, fixture.runner)
 			assertComposeRuntimeTempEmpty(t, fixture.dataRoot)
 		})
 	}
+}
+
+func TestComposeWorkerAcknowledgedUpFinalizeFailureRecoversWithoutDuplicateMutation(t *testing.T) {
+	releaseUp := make(chan struct{})
+	fixture := newComposeWorkerFixture(t, releaseUp)
+	fixture.startWorker(t)
+	job := fixture.createJob(t)
+	waitForJob(t, fixture.jobs, job.ID, jobs.WaitingUser)
+	history, err := fixture.deployments.List(context.Background(), fixture.app.ID, 10)
+	if err != nil || len(history) != 1 {
+		t.Fatalf("paused history=%#v err=%v", history, err)
+	}
+	deploymentID := history[0].ID
+	fingerprint := approvalFingerprint(t, history[0].Findings)
+	if _, _, err := fixture.deployments.Grant(context.Background(), fixture.app.ID, fixture.actorID, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	fixture.runner.setAfterUp(func() error {
+		_, err := fixture.db.Exec(`CREATE TRIGGER compose_finalize_fault BEFORE UPDATE OF phase ON jobs WHEN NEW.phase='finalize' BEGIN SELECT RAISE(ABORT,'fixture finalize failure'); END`)
+		return err
+	})
+	if _, err := fixture.jobs.Resume(job.ID); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fixture.runner.upStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("up did not start")
+	}
+	close(releaseUp)
+	failed := waitForJob(t, fixture.jobs, job.ID, jobs.Failed)
+	if failed.ErrorCode != "internal_error" {
+		t.Fatalf("finalize failure job=%#v", failed)
+	}
+	history, err = fixture.deployments.List(context.Background(), fixture.app.ID, 10)
+	if err != nil || len(history) != 1 || history[0].ID != deploymentID || history[0].JobID != job.ID || history[0].Status != deployments.WaitingHealth {
+		t.Fatalf("acknowledged deployment history=%#v err=%v", history, err)
+	}
+	if fixture.runner.upCallCount() != 1 {
+		t.Fatalf("up calls=%d", fixture.runner.upCallCount())
+	}
+	replayed, created, err := fixture.deployments.GetOrCreateByJob(context.Background(), fixture.app.ID, job.ID, "current")
+	if err != nil || created || replayed.ID != deploymentID {
+		t.Fatalf("pre-restart replay=%#v created=%t err=%v", replayed, created, err)
+	}
+	fixture.stopWorker(t)
+	if err := fixture.temporary.Recover(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.jobs.RecoverRuntimeContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	recoveredJob, err := fixture.jobs.Get(job.ID)
+	if err != nil || recoveredJob.Status != string(jobs.Failed) || recoveredJob.Attempt != failed.Attempt {
+		t.Fatalf("recovered job=%#v err=%v", recoveredJob, err)
+	}
+	recovered, err := fixture.deployments.Get(context.Background(), fixture.app.ID, deploymentID)
+	if err != nil || recovered.Status != deployments.Failed || recovered.DiagnosticCode != "daemon_restarted" || recovered.JobID != job.ID {
+		t.Fatalf("recovered deployment=%#v err=%v", recovered, err)
+	}
+	if _, err := fixture.jobs.Resume(job.ID); err == nil {
+		t.Fatal("failed finalized job unexpectedly resumed")
+	}
+	decoy := fixture.createJob(t)
+	iterationDone := make(chan struct{})
+	var iterationOnce sync.Once
+	admission := func(parent context.Context) (context.Context, func() error, error) {
+		admitted, release, err := fixture.admission(parent)
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err := fixture.jobs.Cancel(decoy.ID); err != nil {
+			_ = release()
+			return nil, nil, err
+		}
+		return admitted, func() error {
+			err := release()
+			iterationOnce.Do(func() { close(iterationDone) })
+			return err
+		}, nil
+	}
+	workerContext, cancelWorker := context.WithCancel(context.Background())
+	workerDone := make(chan error, 1)
+	go func() {
+		workerDone <- fixture.jobs.RunWorkerWithScopedAdmission(workerContext, fixture.executor, admission)
+	}()
+	select {
+	case <-iterationDone:
+	case <-time.After(5 * time.Second):
+		cancelWorker()
+		t.Fatal("restarted worker did not complete the empty claim iteration")
+	}
+	cancelWorker()
+	select {
+	case err := <-workerDone:
+		if err != nil {
+			t.Fatalf("restarted worker: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restarted worker did not stop")
+	}
+	afterWorker, err := fixture.jobs.Get(job.ID)
+	if err != nil || afterWorker.Status != string(jobs.Failed) || afterWorker.Attempt != failed.Attempt {
+		t.Fatalf("post-worker job=%#v err=%v", afterWorker, err)
+	}
+	replayed, created, err = fixture.deployments.GetOrCreateByJob(context.Background(), fixture.app.ID, job.ID, "current")
+	if err != nil || created || replayed.ID != deploymentID || fixture.runner.upCallCount() != 1 {
+		t.Fatalf("post-restart replay=%#v created=%t upCalls=%d err=%v", replayed, created, fixture.runner.upCallCount(), err)
+	}
+	assertNoRollbackAndSecretsCleared(t, fixture.runner)
+	assertComposeRuntimeTempEmpty(t, fixture.dataRoot)
 }
 
 func TestComposeRestartRecoveryCleansExactTempAndDoesNotDuplicateLinkage(t *testing.T) {
@@ -1009,10 +1137,26 @@ func TestComposeRestartRecoveryCleansExactTempAndDoesNotDuplicateLinkage(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.deployments.Gate(context.Background(), fixture.app.ID, deployment.ID, nil); err != nil {
+	if _, err := fixture.db.Exec(`UPDATE jobs SET status='running',phase='apply_runtime',attempt=1 WHERE id=?`, job.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.db.Exec(`UPDATE jobs SET status='running',phase='apply_runtime',attempt=1 WHERE id=?`, job.ID); err != nil {
+	binding, err := fixture.bindings.Read(context.Background(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := deploymentexecution.NewClaim(binding, job.ID, fixture.app.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateCtx, releaseGate, err := fixture.admission(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.deployments.Gate(gateCtx, deployments.GateRequest{Claim: claim, DeploymentID: deployment.ID}); err != nil {
+		_ = releaseGate()
+		t.Fatal(err)
+	}
+	if err := releaseGate(); err != nil {
 		t.Fatal(err)
 	}
 	files, err := fixture.temporary.Create(job.ID, 1)
@@ -1029,10 +1173,7 @@ func TestComposeRestartRecoveryCleansExactTempAndDoesNotDuplicateLinkage(t *test
 	if err := fixture.temporary.Recover(); err != nil {
 		t.Fatal(err)
 	}
-	if err := fixture.deployments.Recover(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	if err := fixture.jobs.RecoverInterrupted(); err != nil {
+	if err := fixture.jobs.RecoverRuntimeContext(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	persistedJob, err := fixture.jobs.Get(job.ID)
@@ -1047,6 +1188,12 @@ func TestComposeRestartRecoveryCleansExactTempAndDoesNotDuplicateLinkage(t *test
 	if err != nil || created || replayed.ID != deployment.ID {
 		t.Fatalf("replay=%#v created=%t err=%v", replayed, created, err)
 	}
+	if _, err := fixture.jobs.Resume(job.ID); err == nil {
+		t.Fatal("interrupted job unexpectedly resumed")
+	}
+	if len(fixture.runner.requests) != 0 {
+		t.Fatalf("restart reran Compose: %#v", fixture.runner.requests)
+	}
 	assertComposeRuntimeTempEmpty(t, fixture.dataRoot)
 }
 
@@ -1057,7 +1204,9 @@ type composeWorkerFixture struct {
 	configuration *appconfig.Store
 	temporary     *securetemp.Manager
 	runner        *blockingComposeRunner
-	executor      *composeruntime.Executor
+	executor      jobs.Executor
+	admission     jobs.ScopedAdmission
+	bindings      *deploymentbinding.Repository
 	app           apps.Application
 	actorID       string
 	dataRoot      string
@@ -1102,14 +1251,106 @@ func newComposeWorkerFixture(t *testing.T, releaseUp chan struct{}) *composeWork
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := jobs.New(db)
-	deploymentRepository := deployments.New(db)
+	jobService, bindings := newComposeDeploymentJobService(t, db)
 	runner := &blockingComposeRunner{upStarted: make(chan struct{}), releaseUp: releaseUp}
 	releaseMaterializer, err := releasesnapshot.New(db, unreachableSourceReader{}, dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	executor, err := composeruntime.NewExecutor(applicationStore, releaseMaterializer, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
+	executor, deploymentRepository, admission := newBoundComposeWorkerExecutor(t, db, dataRoot, bindings, applicationStore, releaseMaterializer, configuration, temporary, runner)
+	return &composeWorkerFixture{db: db, jobs: jobService, deployments: deploymentRepository, configuration: configuration, temporary: temporary, runner: runner, executor: executor, admission: admission, bindings: bindings, app: app, actorID: actorID, dataRoot: dataRoot}
+}
+
+func (f *composeWorkerFixture) startWorker(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	f.cancelWorker = cancel
+	done := make(chan error, 1)
+	f.workerDone = done
+	go func() { done <- f.jobs.RunWorkerWithScopedAdmission(ctx, f.executor, f.admission) }()
+	t.Cleanup(func() { f.stopWorker(t) })
+}
+
+func (f *composeWorkerFixture) stopWorker(t *testing.T) {
+	t.Helper()
+	if f.cancelWorker == nil {
+		return
+	}
+	f.cancelWorker()
+	done := f.workerDone
+	f.cancelWorker = nil
+	f.workerDone = nil
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("worker stopped: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("worker did not stop")
+	}
+}
+
+func (f *composeWorkerFixture) createJob(t *testing.T) jobs.Job {
+	t.Helper()
+	result, err := f.jobs.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+		ApplicationID: f.app.ID,
+		RequestedBy:   f.actorID,
+		Input: jobs.DeploymentInput{
+			ConfigurationMode: jobs.ConfigurationCurrent,
+		},
+	}, jobs.DeploymentCreateHooks{})
+	if err != nil || !result.Created {
+		t.Fatalf("job=%#v created=%t err=%v", result.Job, result.Created, err)
+	}
+	return result.Job
+}
+
+func newComposeDeploymentJobService(t *testing.T, db *sql.DB) (*jobs.Service, *deploymentbinding.Repository) {
+	t.Helper()
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service, bindings
+}
+
+func newBoundComposeWorkerExecutor(
+	t *testing.T,
+	db *sql.DB,
+	dataRoot string,
+	bindings *deploymentbinding.Repository,
+	applications *apps.Store,
+	releases *releasesnapshot.Materializer,
+	configuration *appconfig.Store,
+	temporary *securetemp.Manager,
+	runner runtimeprocess.CommandRunner,
+) (jobs.Executor, *deployments.Repository, jobs.ScopedAdmission) {
+	t.Helper()
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentRepository, err := deployments.NewWithExecutionGuard(db, guard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundExecutor, err := composeruntime.NewExecutor(applications, releases, configuration, deploymentRepository, temporary, runner, composeruntime.ExecutorOptions{
 		DockerExecutable: "docker-test",
 		ConfigTimeout:    5 * time.Second,
 		ApplyTimeout:     30 * time.Second,
@@ -1118,43 +1359,22 @@ func newComposeWorkerFixture(t *testing.T, releaseUp chan struct{}) *composeWork
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &composeWorkerFixture{db: db, jobs: jobService, deployments: deploymentRepository, configuration: configuration, temporary: temporary, runner: runner, executor: executor, app: app, actorID: actorID, dataRoot: dataRoot}
-}
-
-func (f *composeWorkerFixture) startWorker(t *testing.T) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	f.cancelWorker = cancel
-	f.workerDone = make(chan error, 1)
-	go func() { f.workerDone <- f.jobs.RunWorker(ctx, f.executor) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case err := <-f.workerDone:
-			if err != nil {
-				t.Errorf("worker stopped: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("worker did not stop")
-		}
-	})
-}
-
-func (f *composeWorkerFixture) createJob(t *testing.T) jobs.Job {
-	t.Helper()
-	job, created, err := f.jobs.CreateWithInput(jobs.CreateRequest{
-		Type:         "deploy",
-		ResourceType: "application",
-		ResourceID:   f.app.ID,
-		RequestedBy:  f.actorID,
-		Input: jobs.DeploymentInput{
-			ConfigurationMode: jobs.ConfigurationCurrent,
-		},
-	})
-	if err != nil || !created {
-		t.Fatalf("job=%#v created=%t err=%v", job, created, err)
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
 	}
-	return job
+	router, err := runtimeexecutor.New(deploymentRepository, plans, releases, boundExecutor, nil, bindings, func(context.Context) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := func(parent context.Context) (context.Context, func() error, error) {
+		scope, release, err := deploymenteffects.AcquireScoped(parent, directories.WorkingDirectory)
+		if err != nil {
+			return nil, nil, err
+		}
+		return deploymenteffects.WithScope(parent, scope), release, nil
+	}
+	return router, deploymentRepository, admission
 }
 
 func waitForJob(t *testing.T, service *jobs.Service, id string, status jobs.Status) jobs.Job {

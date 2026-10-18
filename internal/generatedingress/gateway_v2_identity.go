@@ -1532,8 +1532,14 @@ func gatewayV2ConfigInputs(state gatewayV2RouteState) (map[string]routeRecord, m
 }
 
 func gatewayV2HostChallenge(state gatewayV2RouteState) (string, error) {
-	planDigest, err := gatewayV2PlanDigest(state)
-	if err != nil || !validCanonicalUUID(state.OperationID) || !validSHA256(state.Identity.Digest) {
+	return gatewayV2HostChallengeFor(state.OperationID, state.Profile, state.Identity, state.Network)
+}
+
+func gatewayV2HostChallengeFor(operationID string, profile gatewayProfileBinding,
+	identity gatewayV2Identity, network gatewayV2NetworkPlan,
+) (string, error) {
+	planDigest, err := gatewayV2PlanDigestFor(operationID, profile, identity, network)
+	if err != nil || !validCanonicalUUID(operationID) || !validSHA256(identity.Digest) {
 		return "", errors.New("invalid generated ingress v2 host challenge input")
 	}
 	return canonicalDigest(struct {
@@ -1542,8 +1548,8 @@ func gatewayV2HostChallenge(state gatewayV2RouteState) (string, error) {
 		IdentityDigest string `json:"identityDigest"`
 		PlanDigest     string `json:"planDigest"`
 	}{
-		Context: gatewayV2ChallengeContext, OperationID: state.OperationID,
-		IdentityDigest: state.Identity.Digest, PlanDigest: planDigest,
+		Context: gatewayV2ChallengeContext, OperationID: operationID,
+		IdentityDigest: identity.Digest, PlanDigest: planDigest,
 	})
 }
 

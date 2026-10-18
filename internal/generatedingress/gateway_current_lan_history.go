@@ -20,6 +20,19 @@ type gatewayCurrentLANHistoricalOrigin struct {
 func (m *Manager) validateGatewayCurrentLANRetainedHistoryLocked(ctx context.Context,
 	claims gatewayV2LANAccessStartupClaims, snapshot appaccess.GatewayRebindRecoverySnapshot,
 ) error {
+	return m.validateGatewayCurrentLANRetainedHistoryPolicyLocked(ctx, claims, snapshot, false)
+}
+
+func (m *Manager) validateGatewayCurrentLANRetainedHistoryCurrentV2AwareLocked(ctx context.Context,
+	claims gatewayV2LANAccessStartupClaims, snapshot appaccess.GatewayRebindRecoverySnapshot,
+) error {
+	return m.validateGatewayCurrentLANRetainedHistoryPolicyLocked(ctx, claims, snapshot, true)
+}
+
+func (m *Manager) validateGatewayCurrentLANRetainedHistoryPolicyLocked(ctx context.Context,
+	claims gatewayV2LANAccessStartupClaims, snapshot appaccess.GatewayRebindRecoverySnapshot,
+	allowCurrentV2 bool,
+) error {
 	// Once a rebind is current, the SQL reader's legacy no-authority fallback
 	// is no longer valid. A retired grant must retain its explicit source even
 	// after clearance; dropping the projection cannot bypass historical proof.
@@ -41,7 +54,19 @@ func (m *Manager) validateGatewayCurrentLANRetainedHistoryLocked(ctx context.Con
 	if m == nil || ctx == nil || ctx.Err() != nil || m.options.RebindCurrentStateRepository == nil {
 		return invalid
 	}
-	history, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	scan := m.scanGatewayRebindProtectedIntentHistoryLocked
+	if allowCurrentV2 {
+		scan = m.scanGatewayRebindProtectedIntentHistoryCurrentV2AwareLocked
+	}
+	var protectedBefore gatewayHistorySnapshot
+	var err error
+	if allowCurrentV2 {
+		protectedBefore, err = readGatewayHistorySnapshotPolicy(m.store, true, true)
+		if err != nil {
+			return invalid
+		}
+	}
+	history, err := scan(nil)
 	if err != nil {
 		return invalid
 	}
@@ -86,13 +111,19 @@ func (m *Manager) validateGatewayCurrentLANRetainedHistoryLocked(ctx context.Con
 	if err != nil || !reflect.DeepEqual(snapshot, confirmed) || ctx.Err() != nil {
 		return invalid
 	}
-	after, err := m.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	after, err := scan(nil)
 	if err != nil || !sameGatewayRebindCurrentHistory(history, after) {
 		return invalid
 	}
 	for source, before := range origins {
 		confirmed, err := m.gatewayCurrentLANHistoricalOriginLocked(after, snapshot, source)
 		if err != nil || !reflect.DeepEqual(before, confirmed) || ctx.Err() != nil {
+			return invalid
+		}
+	}
+	if allowCurrentV2 {
+		protectedAfter, err := readGatewayHistorySnapshotPolicy(m.store, true, true)
+		if err != nil || !sameGatewayHistorySnapshot(protectedBefore, protectedAfter) {
 			return invalid
 		}
 	}

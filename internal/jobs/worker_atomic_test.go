@@ -36,7 +36,7 @@ func TestRunnerCancellationAndProgressHaveOneTerminalOutcome(t *testing.T) {
 			t.Fatal(err)
 		}
 		service := New(db)
-		job, _, err := service.Create("deploy", "application", "app-race", "race-request")
+		job, _, err := service.Create("fake", "machine", "app-race", "race-request")
 		if err != nil {
 			db.Close()
 			t.Fatal(err)
@@ -84,7 +84,7 @@ func TestRunnerCompletionAndCancellationHaveOneTerminalOutcome(t *testing.T) {
 			t.Fatal(err)
 		}
 		service := New(db)
-		job, _, err := service.Create("deploy", "application", "app-completion-race", "completion-race-request")
+		job, _, err := service.Create("fake", "machine", "app-completion-race", "completion-race-request")
 		if err != nil {
 			db.Close()
 			t.Fatal(err)
