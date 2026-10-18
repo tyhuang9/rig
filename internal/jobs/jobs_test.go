@@ -18,19 +18,19 @@ func TestIdempotencyEventsAndRecovery(t *testing.T) {
 	}
 	defer db.Close()
 	s := New(db)
-	j, created, err := s.Create("deploy", "application", "app-one", "same-request")
+	j, created, err := s.Create("restart", "application", "app-one", "same-request")
 	if err != nil || !created {
 		t.Fatal(err)
 	}
-	again, created, err := s.Create("deploy", "application", "app-one", "same-request")
+	again, created, err := s.Create("restart", "application", "app-one", "same-request")
 	if err != nil || created || again.ID != j.ID {
 		t.Fatal("idempotency failed")
 	}
-	if _, _, err := s.Create("restart", "application", "app-one", "other-request"); err == nil {
+	if _, _, err := s.Create("stop", "application", "app-one", "other-request"); err == nil {
 		t.Fatal("concurrent mutation accepted")
 	}
-	if _, ok, err := s.claimNext(context.Background()); err != nil || !ok {
-		t.Fatalf("claim = %t, %v", ok, err)
+	if _, disposition, err := s.claimNext(context.Background()); err != nil || disposition != claimClaimed {
+		t.Fatalf("claim = %v, %v", disposition, err)
 	}
 	if err := s.Update(j.ID, Running, "running", 40, `{"secret":"ignored"}`); err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestIdempotencyEventsAndRecovery(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go s.RunFakeWorker(ctx)
-	next, _, err := s.Create("deploy", "application", "app-two", "new")
+	next, _, err := s.Create("restart", "application", "app-two", "new")
 	if err != nil {
 		t.Fatal(err)
 	}

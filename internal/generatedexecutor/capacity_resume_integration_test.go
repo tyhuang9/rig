@@ -14,8 +14,10 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
@@ -33,9 +35,9 @@ import (
 func TestCapacityPausedDeploymentResumesWithRecordedPinsAndOneReplacement(t *testing.T) {
 	fixture := newCapacityResumeFixture(t)
 
-	job, created, err := fixture.jobs.CreateWithInput(jobs.CreateRequest{
-		Type: "deploy", ResourceType: "application", ResourceID: fixture.app.ID,
-		RequestedBy: fixture.actorID, IdempotencyKey: "capacity-resume",
+	result, err := fixture.jobs.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+		ApplicationID: fixture.app.ID,
+		RequestedBy:   fixture.actorID, IdempotencyKey: "capacity-resume",
 		Input: jobs.DeploymentInput{
 			ConfigurationMode:                   jobs.ConfigurationCurrent,
 			ExpectedPlanRevisionID:              fixture.plan.ID,
@@ -43,9 +45,10 @@ func TestCapacityPausedDeploymentResumesWithRecordedPinsAndOneReplacement(t *tes
 			ExpectedConfigurationRevisionID:     fixture.configuration.RevisionID,
 			ExpectedConfigurationRevisionNumber: fixture.configuration.RevisionNumber,
 		},
-	})
-	if err != nil || !created {
-		t.Fatalf("create job=%+v created=%t err=%v", job, created, err)
+	}, jobs.DeploymentCreateHooks{})
+	job := result.Job
+	if err != nil || !result.Created {
+		t.Fatalf("create job=%+v created=%t err=%v", job, result.Created, err)
 	}
 
 	firstPause := fixture.runUntilJob(t, job.ID, jobs.WaitingUser)
@@ -274,7 +277,19 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := &capacityResumeFixture{executor: executor, db: db, app: app, actorID: actorID, jobs: jobs.New(db), deployments: deploymentRepository, runtimeState: runtimeState,
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := &capacityResumeFixture{executor: executor, db: db, app: app, actorID: actorID, jobs: jobService, deployments: deploymentRepository, runtimeState: runtimeState,
 		configurations: configurations, plan: plan, configuration: configuration, release: release, capacity: capacity,
 		compiler: compiler, runtime: runtime, routes: routes, migrations: migrations}
 	return fixture

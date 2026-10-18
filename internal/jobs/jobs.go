@@ -32,20 +32,22 @@ const (
 )
 
 var (
-	ErrJobNotFound               = errors.New("job not found")
-	ErrJobTerminal               = errors.New("job is already terminal")
-	ErrInvalidInput              = errors.New("invalid job input")
-	ErrInvalidProgress           = errors.New("invalid job progress")
-	ErrEventBudget               = errors.New("job event budget exhausted")
-	ErrJobNotPaused              = errors.New("job is not waiting for user action")
-	ErrApprovalRequired          = errors.New("job still requires runtime approval")
-	ErrMigrationApprovalRequired = errors.New("job still requires migration approval")
-	ErrIdempotency               = errors.New("idempotency key conflicts with the original request")
-	ErrApplicationBusy           = errors.New("application already has an active mutation")
-	ErrReviewedRevisionStale     = errors.New("reviewed deployment revision is stale")
-	ErrReviewedRevisionsRequired = errors.New("generated deployment requires reviewed revisions")
-	ErrCancellationRequested     = errors.New("job cancellation requested")
-	ErrCancellationUnsafe        = errors.New("job cannot be cancelled while route reconciliation is required")
+	ErrJobNotFound                   = errors.New("job not found")
+	ErrJobTerminal                   = errors.New("job is already terminal")
+	ErrInvalidInput                  = errors.New("invalid job input")
+	ErrInvalidProgress               = errors.New("invalid job progress")
+	ErrEventBudget                   = errors.New("job event budget exhausted")
+	ErrJobNotPaused                  = errors.New("job is not waiting for user action")
+	ErrApprovalRequired              = errors.New("job still requires runtime approval")
+	ErrMigrationApprovalRequired     = errors.New("job still requires migration approval")
+	ErrIdempotency                   = errors.New("idempotency key conflicts with the original request")
+	ErrApplicationBusy               = errors.New("application already has an active mutation")
+	ErrReviewedRevisionStale         = errors.New("reviewed deployment revision is stale")
+	ErrReviewedRevisionsRequired     = errors.New("generated deployment requires reviewed revisions")
+	ErrDeploymentLifecycleStale      = errors.New("deployment lifecycle authority is stale")
+	ErrDeploymentLifecycleUnresolved = deploymentbinding.ErrLifecycleUnresolved
+	ErrCancellationRequested         = errors.New("job cancellation requested")
+	ErrCancellationUnsafe            = errors.New("job cannot be cancelled while route reconciliation is required")
 )
 
 // JobInput is deliberately sealed so new persisted input schemas are reviewed
@@ -707,19 +709,102 @@ func (s *Service) Cancel(id string) (Job, error) {
 	return s.Get(id)
 }
 
-// Resume atomically requeues an intentional user pause. The next claim starts
-// a new attempt; no executor can observe a partially resumed job.
+// Resume preserves the contextless compatibility API.
 func (s *Service) Resume(id string) (Job, error) {
-	tx, err := s.db.Begin()
+	return s.ResumeContext(context.Background(), id)
+}
+
+// CheckMissingApplicationDeploymentBindingContext validates immutable
+// authority without changing job state after the ordinary application lookup
+// failed. A physically retained application remains hidden; only a deleted row
+// is eligible for lifecycle-stale classification.
+func (s *Service) CheckMissingApplicationDeploymentBindingContext(ctx context.Context, id string) error {
+	if ctx == nil || s == nil || s.db == nil {
+		return deploymentbinding.ErrInvalidConfiguration
+	}
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrJobNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if job.Status != string(WaitingUser) {
+		return ErrJobNotPaused
+	}
+	if job.Type != "deploy" || job.ResourceType != "application" {
+		return deploymentbinding.ErrInvalidConfiguration
+	}
+	var applicationExists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM applications WHERE id=?)`, job.ResourceID).Scan(&applicationExists); err != nil {
+		return err
+	}
+	if applicationExists {
+		return ErrJobNotFound
+	}
+	classification, err := s.classifyDeploymentBindingTx(ctx, tx, job)
+	if err != nil {
+		return err
+	}
+	switch classification {
+	case deploymentbinding.ClassificationStale:
+		return ErrDeploymentLifecycleStale
+	case deploymentbinding.ClassificationCurrent:
+		return tx.Commit()
+	default:
+		return deploymentbinding.ErrInvalidConfiguration
+	}
+}
+
+// ResumeContext atomically checks immutable deployment authority and requeues
+// an intentional user pause. The next claim starts a new attempt; no executor
+// can observe a partially authorized resume.
+func (s *Service) ResumeContext(ctx context.Context, id string) (Job, error) {
+	if ctx == nil || s == nil || s.db == nil {
+		return Job{}, deploymentbinding.ErrInvalidConfiguration
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, err
 	}
 	defer tx.Rollback()
+	// Acquire SQLite's single writer reservation before reading either the job
+	// or its immutable binding. The authority check, approval check, and requeue
+	// therefore observe one serialized state.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET id=id WHERE 0`); err != nil {
+		return Job{}, err
+	}
+	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, ErrJobNotFound
+	}
+	if err != nil {
+		return Job{}, err
+	}
+	if job.Status != string(WaitingUser) {
+		return Job{}, ErrJobNotPaused
+	}
+	classification, err := s.classifyDeploymentBindingTx(ctx, tx, job)
+	if err != nil {
+		return Job{}, err
+	}
+	switch classification {
+	case deploymentbinding.ClassificationStale:
+		return Job{}, ErrDeploymentLifecycleStale
+	case deploymentbinding.ClassificationCurrent:
+	default:
+		return Job{}, deploymentbinding.ErrInvalidConfiguration
+	}
 	now := s.now().UTC()
 	formattedNow := now.Format(time.RFC3339Nano)
 	// Make the approval check and requeue one serialized write. A controller-side
 	// preflight would allow an approval revocation to race the state mutation.
-	result, err := tx.Exec(`UPDATE jobs SET status='queued',phase='queued',progress_percent=0,checkpoint_json='{}',pause_disposition=NULL,error_code=NULL,error_detail=NULL,started_at=NULL,finished_at=NULL,updated_at=?
+	result, err := tx.ExecContext(ctx, `UPDATE jobs SET status='queued',phase='queued',progress_percent=0,checkpoint_json='{}',pause_disposition=NULL,error_code=NULL,error_detail=NULL,started_at=NULL,finished_at=NULL,updated_at=?
 		WHERE id=? AND status='waiting_user' AND (
 			(pause_disposition='approval_required' AND NOT EXISTS (
 				SELECT 1 FROM deployments d
@@ -750,7 +835,7 @@ func (s *Service) Resume(id string) (Job, error) {
 	if updated != 1 {
 		var status, disposition string
 		var missingApproval, migrationApproved bool
-		err := tx.QueryRow(`SELECT j.status,COALESCE(j.pause_disposition,''),EXISTS (
+		err := tx.QueryRowContext(ctx, `SELECT j.status,COALESCE(j.pause_disposition,''),EXISTS (
 			SELECT 1 FROM deployments d
 			JOIN deployment_policy_findings f ON f.deployment_id=d.id AND f.disposition='approval_required'
 			WHERE d.job_id=j.id AND d.app_id=j.resource_id AND NOT EXISTS (
@@ -782,14 +867,18 @@ func (s *Service) Resume(id string) (Job, error) {
 		}
 		return Job{}, ErrJobNotPaused
 	}
-	if _, err := appendEvent(tx, now, id, "info", "queued", "job_resumed", "Job resumed"); err != nil {
+	if _, err := appendEventContext(ctx, tx, now, id, "info", "queued", "job_resumed", "Job resumed"); err != nil {
+		return Job{}, err
+	}
+	resumed, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
+	if err != nil {
 		return Job{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Job{}, err
 	}
 	s.signal()
-	return s.Get(id)
+	return resumed, nil
 }
 
 func terminal(status string) bool {
@@ -801,33 +890,97 @@ func terminal(status string) bool {
 	}
 }
 
-// claimNext atomically reserves the oldest queued job and records its assignment.
-func (s *Service) claimNext(ctx context.Context) (Job, bool, error) {
+type claimDisposition uint8
+
+const (
+	claimNone claimDisposition = iota
+	claimClaimed
+	claimRetired
+)
+
+const (
+	deploymentLifecycleStaleCode    = "deployment_lifecycle_stale"
+	deploymentLifecycleStaleMessage = "Deployment no longer matches the application's desired lifecycle."
+)
+
+func (s *Service) classifyDeploymentBindingTx(ctx context.Context, tx *sql.Tx, job Job) (deploymentbinding.Classification, error) {
+	if job.Type != "deploy" || job.ResourceType != "application" {
+		return deploymentbinding.ClassificationCurrent, nil
+	}
+	if s == nil || s.deploymentBindings == nil || !s.deploymentBindings.UsesDatabase(s.db) {
+		return 0, deploymentbinding.ErrInvalidConfiguration
+	}
+	binding, err := s.deploymentBindings.ReadTx(ctx, tx, job.ID)
+	if err != nil {
+		return 0, err
+	}
+	return s.deploymentBindings.CheckTx(ctx, tx, binding)
+}
+
+// claimNext atomically classifies and handles the oldest queued job. A current
+// job is assigned, while a stale deployment is retired without an attempt.
+func (s *Service) claimNext(ctx context.Context) (Job, claimDisposition, error) {
+	if ctx == nil || s == nil || s.db == nil {
+		return Job{}, claimNone, deploymentbinding.ErrInvalidConfiguration
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Job{}, false, err
+		return Job{}, claimNone, err
 	}
 	defer tx.Rollback()
-	now := s.now().UTC()
-	row := tx.QueryRowContext(ctx, `WITH next AS (SELECT id FROM jobs WHERE status='queued' ORDER BY created_at,id LIMIT 1)
-		UPDATE jobs SET status='assigned',phase='assigned',attempt=attempt+1,updated_at=?
-		WHERE id=(SELECT id FROM next) AND status='queued'
-		RETURNING `+jobSelectColumns, now.Format(time.RFC3339Nano))
-	job, err := scanJob(row)
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET id=id WHERE 0`); err != nil {
+		return Job{}, claimNone, err
+	}
+	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE status='queued' ORDER BY created_at,id LIMIT 1`))
 	if errors.Is(err, sql.ErrNoRows) {
-		return Job{}, false, nil
+		return Job{}, claimNone, nil
 	}
 	if err != nil {
-		return Job{}, false, err
+		return Job{}, claimNone, err
 	}
-	if _, err := appendEvent(tx, now, job.ID, "info", "assigned", "job_assigned", "Job assigned"); err != nil {
-		return Job{}, false, err
+	classification, err := s.classifyDeploymentBindingTx(ctx, tx, job)
+	if err != nil {
+		return Job{}, claimNone, err
+	}
+	now := s.now().UTC()
+	formattedNow := now.Format(time.RFC3339Nano)
+	if classification == deploymentbinding.ClassificationStale {
+		retired, updateErr := scanJob(tx.QueryRowContext(ctx, `UPDATE jobs
+			SET status='needs_attention',phase='needs_attention',pause_disposition=NULL,
+				error_code=?,error_detail=?,updated_at=?,finished_at=?
+			WHERE id=? AND status='queued'
+			RETURNING `+jobSelectColumns,
+			deploymentLifecycleStaleCode, deploymentLifecycleStaleMessage, formattedNow, formattedNow, job.ID))
+		if updateErr != nil {
+			return Job{}, claimNone, updateErr
+		}
+		if _, err := appendEventContext(ctx, tx, now, job.ID, "warn", "needs_attention", deploymentLifecycleStaleCode, deploymentLifecycleStaleMessage); err != nil {
+			return Job{}, claimNone, err
+		}
+		if err := tx.Commit(); err != nil {
+			return Job{}, claimNone, err
+		}
+		s.signal()
+		return retired, claimRetired, nil
+	}
+	if classification != deploymentbinding.ClassificationCurrent {
+		return Job{}, claimNone, deploymentbinding.ErrInvalidConfiguration
+	}
+	claimed, err := scanJob(tx.QueryRowContext(ctx, `UPDATE jobs
+		SET status='assigned',phase='assigned',attempt=attempt+1,updated_at=?
+		WHERE id=? AND status='queued'
+		RETURNING `+jobSelectColumns, formattedNow, job.ID))
+	if err != nil {
+		return Job{}, claimNone, err
+	}
+	if _, err := appendEventContext(ctx, tx, now, claimed.ID, "info", "assigned", "job_assigned", "Job assigned"); err != nil {
+		return Job{}, claimNone, err
 	}
 	if err := tx.Commit(); err != nil {
-		return Job{}, false, err
+		return Job{}, claimNone, err
 	}
 	s.signal()
-	return job, true, nil
+	return claimed, claimClaimed, nil
 }
 
 type reporter struct {
@@ -1064,8 +1217,8 @@ func normalizeWorkerError(ctx context.Context, err error) error {
 }
 
 func (s *Service) runOne(ctx context.Context, executor Executor) error {
-	job, claimed, err := s.claimNext(ctx)
-	if err != nil || !claimed {
+	job, disposition, err := s.claimNext(ctx)
+	if err != nil || disposition != claimClaimed {
 		return err
 	}
 	jobCtx, cancelCause := context.WithCancelCause(ctx)

@@ -376,7 +376,25 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.Apps.Get(job.ResourceID); err != nil {
-		problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
+		if !errors.Is(err, sql.ErrNoRows) {
+			problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
+			return
+		}
+		// Apps.Get also hides archived applications and rows with incomplete
+		// source metadata. Validate the immutable deployment binding in a
+		// read-only transaction before deciding whether the application was
+		// physically deleted; only that case is lifecycle-stale.
+		err = s.Jobs.CheckMissingApplicationDeploymentBindingContext(r.Context(), job.ID)
+		switch {
+		case errors.Is(err, jobs.ErrDeploymentLifecycleStale):
+			problem(w, r, http.StatusConflict, "deployment_lifecycle_stale", "Deployment no longer matches the application's desired lifecycle.", nil)
+		case errors.Is(err, jobs.ErrDeploymentLifecycleUnresolved):
+			problem(w, r, http.StatusConflict, "deployment_lifecycle_unresolved", "Application lifecycle authority is unresolved.", nil)
+		case err == nil, errors.Is(err, jobs.ErrJobNotFound), errors.Is(err, jobs.ErrJobNotPaused):
+			problem(w, r, http.StatusNotFound, "job_not_found", "Job was not found", nil)
+		default:
+			problem(w, r, http.StatusInternalServerError, "internal_error", "Could not verify job lifecycle", nil)
+		}
 		return
 	}
 	strategy, err := s.jobDeploymentStrategy(r.Context(), job)
@@ -388,10 +406,14 @@ func (s *Server) resumeJob(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, http.StatusConflict, "capability_unavailable", "Runtime actions are unavailable in this configuration", nil)
 		return
 	}
-	job, err = s.Jobs.Resume(job.ID)
+	job, err = s.Jobs.ResumeContext(r.Context(), job.ID)
 	switch {
 	case err == nil:
 		writeJSON(w, http.StatusOK, apicontract.JobResponse{Job: contractJob(job)})
+	case errors.Is(err, jobs.ErrDeploymentLifecycleStale):
+		problem(w, r, http.StatusConflict, "deployment_lifecycle_stale", "Deployment no longer matches the application's desired lifecycle.", nil)
+	case errors.Is(err, jobs.ErrDeploymentLifecycleUnresolved):
+		problem(w, r, http.StatusConflict, "deployment_lifecycle_unresolved", "Application lifecycle authority is unresolved.", nil)
 	case errors.Is(err, jobs.ErrJobNotPaused):
 		problem(w, r, http.StatusConflict, "job_not_paused", "Job is not waiting for user action", nil)
 	case errors.Is(err, jobs.ErrApprovalRequired):
