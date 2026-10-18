@@ -537,6 +537,13 @@ func liveHostdRebindPendingCurrentScenario(t *testing.T, kind string) {
 	t.Helper()
 	fixture := newLiveHostdGatewayRebindFixture(t)
 	historicalID := liveHostdRebindCompleteHistorical(t, fixture)
+	if kind == "route" {
+		receipt := liveHostdRebindReadTerminal(t, fixture.dataRoot, historicalID)
+		if receipt.Disposition != appaccess.GatewayRebindDispositionCommit {
+			t.Fatal("pending route historical disposition is not commit")
+		}
+		t.Log("pending route historical disposition=commit")
+	}
 	markerID := uuid.NewString()
 	child := liveHostdRebindStartChild(t, fixture, markerID, "", "pending-"+kind+"-restart")
 	if liveHostdRebindWaitReady(t, fixture, child).RecoveryOnly {
