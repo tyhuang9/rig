@@ -239,6 +239,7 @@ func TestLiveHostdRebindChildStartupControls(t *testing.T) {
 	})
 
 	t.Run("bounded pending claim observation", liveHostdRebindClaimObservationControls)
+	t.Run("bounded pending route observation", liveHostdRebindPendingRouteObservationControls)
 	t.Run("closed startup refusal", liveHostdRebindStartupRefusalControls)
 
 	t.Run("cleanup fallback reaps stalled child", func(t *testing.T) {
