@@ -9,6 +9,10 @@ is 33 boundaries and 30 scenarios. See
 local checks and outstanding gates. The dated source snapshots below remain
 historical evidence for their recorded revisions.
 
+## Hosted acceptance cross-reference — 2026-10-18
+
+The hosted PR #186 result is recorded in the [M3 hosted acceptance addendum](m3-hosted-acceptance-20261018.md): exact head `4200796e3e41450e192368976b64089c84445d90`, run `39125153533`, and the event-reconciled 63-case Docker matrix with 387 preflight controls per partition. This supplements the pending and failed histories below; it does not change this document's earlier candidate status. Physical second-device qualification and manual screen-reader testing remain open.
+
 ## Original supported-controller snapshot
 
 Core source `ed9bc5a966032263e3c27a61745708d58ea26ada` and full-hostd harness

@@ -4,6 +4,10 @@ Status: implementation plan, 2026-09-29. Base: M2 draft PR #84 at
 `1063c3c15fcb612fd3e75156596337f5d6422fb1`. This branch is local and
 unpublished. No LAN listener or firewall rule is enabled by this document.
 
+## Hosted acceptance cross-reference — 2026-10-18
+
+The [M3 hosted acceptance addendum](m3-hosted-acceptance-20261018.md) records hosted PR #186 evidence for the exact source head, resumed route and 63-case Docker matrix. The design's physical gate remains outstanding: second-device roster coverage, redeploy/restart, address and interface drift, stale-address withdrawal, and external-database create/read. Manual screen-reader testing is also unverified.
+
 ## Branch purpose and invariants
 
 Add explicit, durable per-application LAN access through a bounded Caddy
