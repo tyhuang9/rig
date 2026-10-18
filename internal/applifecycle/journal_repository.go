@@ -405,30 +405,85 @@ func validateReceiptForIntent(operation Operation, intent Intent, receipt Receip
 }
 
 func (r *Repository) completedOperation(ctx context.Context, operation Operation) (bool, error) {
-	if _, err := receiptByKey(ctx, r.db, operation.JobID, BoundaryComplete, ""); errors.Is(err, ErrEffectNotFound) {
-		return false, nil
-	} else if err != nil {
-		return false, err
-	}
+	return completedOperationQuery(ctx, r.db, operation)
+}
+
+func completedOperationQuery(ctx context.Context, query lifecycleQuery, operation Operation) (bool, error) {
 	specs, err := effectSpecs(operation)
 	if err != nil {
 		return false, err
 	}
-	for _, spec := range specs {
-		intent, loadErr := intentByKey(ctx, r.db, operation.JobID, spec.key.Boundary, spec.key.ComponentName)
-		if errors.Is(loadErr, ErrEffectNotFound) {
-			return false, nil
+	type retainedEffect struct {
+		hasIntent  bool
+		hasReceipt bool
+	}
+	retained := make(map[EffectKey]retainedEffect, len(specs))
+	rows, err := query.QueryContext(ctx, `SELECT boundary,component_name,'intent'
+		FROM application_lifecycle_effect_intents WHERE job_id=?
+		UNION ALL
+		SELECT boundary,component_name,'receipt'
+		FROM application_lifecycle_effect_receipts WHERE job_id=?`, operation.JobID, operation.JobID)
+	if err != nil {
+		return false, err
+	}
+	for rows.Next() {
+		var boundary, component, kind string
+		if err := rows.Scan(&boundary, &component, &kind); err != nil {
+			_ = rows.Close()
+			return false, err
 		}
+		key := EffectKey{Boundary: Boundary(boundary), ComponentName: component}
+		if _, expected := effectSpecFor(operation, key); !expected {
+			_ = rows.Close()
+			return false, ErrInvalidEffect
+		}
+		state := retained[key]
+		switch kind {
+		case "intent":
+			if state.hasIntent {
+				_ = rows.Close()
+				return false, ErrInvalidEffect
+			}
+			state.hasIntent = true
+		case "receipt":
+			if state.hasReceipt {
+				_ = rows.Close()
+				return false, ErrInvalidEffect
+			}
+			state.hasReceipt = true
+		default:
+			_ = rows.Close()
+			return false, ErrInvalidEffect
+		}
+		retained[key] = state
+	}
+	rowsErr := rows.Err()
+	_ = rows.Close()
+	if rowsErr != nil {
+		return false, rowsErr
+	}
+	complete := true
+	for _, spec := range specs {
+		state := retained[spec.key]
+		if state.hasReceipt && !state.hasIntent {
+			return false, ErrInvalidEffect
+		}
+		if !state.hasIntent {
+			complete = false
+			continue
+		}
+		intent, loadErr := intentByKey(ctx, query, operation.JobID, spec.key.Boundary, spec.key.ComponentName)
 		if loadErr != nil {
 			return false, loadErr
 		}
 		if err := validateIntentForOperation(operation, intent, spec); err != nil {
 			return false, err
 		}
-		receipt, loadErr := receiptByKey(ctx, r.db, operation.JobID, spec.key.Boundary, spec.key.ComponentName)
-		if errors.Is(loadErr, ErrEffectNotFound) {
-			return false, nil
+		if !state.hasReceipt {
+			complete = false
+			continue
 		}
+		receipt, loadErr := receiptByKey(ctx, query, operation.JobID, spec.key.Boundary, spec.key.ComponentName)
 		if loadErr != nil {
 			return false, loadErr
 		}
@@ -436,17 +491,21 @@ func (r *Repository) completedOperation(ctx context.Context, operation Operation
 			return false, err
 		}
 	}
-	return true, nil
+	return complete, nil
 }
 
 func (r *Repository) anyUnresolvedOperation(ctx context.Context, applicationID string) (bool, error) {
+	return anyUnresolvedOperationQuery(ctx, r.db, applicationID)
+}
+
+func anyUnresolvedOperationQuery(ctx context.Context, query lifecycleQuery, applicationID string) (bool, error) {
 	var afterApp string
 	var afterRevision int64
 	for {
-		query := `SELECT app_id,desired_revision,job_id FROM application_lifecycle_operations
+		statement := `SELECT app_id,desired_revision,job_id FROM application_lifecycle_operations
 			WHERE (?='' OR app_id=?) AND (app_id>? OR (app_id=? AND desired_revision>?))
 			ORDER BY app_id,desired_revision LIMIT 32`
-		rows, err := r.db.QueryContext(ctx, query, applicationID, applicationID, afterApp, afterApp, afterRevision)
+		rows, err := query.QueryContext(ctx, statement, applicationID, applicationID, afterApp, afterApp, afterRevision)
 		if err != nil {
 			return true, err
 		}
@@ -470,11 +529,11 @@ func (r *Repository) anyUnresolvedOperation(ctx context.Context, applicationID s
 			return true, err
 		}
 		for _, value := range batch {
-			operation, loadErr := r.Operation(ctx, value.jobID)
+			operation, loadErr := operationByJob(ctx, query, value.jobID)
 			if loadErr != nil {
 				return true, loadErr
 			}
-			complete, loadErr := r.completedOperation(ctx, operation)
+			complete, loadErr := completedOperationQuery(ctx, query, operation)
 			if loadErr != nil {
 				return true, loadErr
 			}
@@ -487,6 +546,11 @@ func (r *Repository) anyUnresolvedOperation(ctx context.Context, applicationID s
 		}
 		afterApp, afterRevision = batch[len(batch)-1].appID, batch[len(batch)-1].revision
 	}
+}
+
+type lifecycleQuery interface {
+	queryRower
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }
 
 func effectRequestMatchesOperation(request EffectRequestV1, operation Operation) bool {
@@ -515,7 +579,7 @@ func intentByKey(ctx context.Context, query queryRower, jobID string, boundary B
 	}
 	intent.CreatedAt, err = time.Parse(time.RFC3339Nano, createdAt)
 	if err != nil {
-		return Intent{}, fmt.Errorf("parse lifecycle intent timestamp: %w", err)
+		return Intent{}, fmt.Errorf("parse lifecycle intent timestamp: %v: %w", err, ErrInvalidEffect)
 	}
 	return intent, nil
 }
@@ -541,7 +605,7 @@ func receiptByKey(ctx context.Context, query queryRower, jobID string, boundary 
 	}
 	receipt.ObservedAt, err = time.Parse(time.RFC3339Nano, observedAt)
 	if err != nil {
-		return Receipt{}, fmt.Errorf("parse lifecycle receipt timestamp: %w", err)
+		return Receipt{}, fmt.Errorf("parse lifecycle receipt timestamp: %v: %w", err, ErrInvalidEffect)
 	}
 	return receipt, nil
 }
