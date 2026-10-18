@@ -199,9 +199,32 @@ a historical running binding requires the complete original graph. Every nested
 read uses the caller's transaction. Repository/validator database identity is
 checked at composition; `database/sql` cannot introspect a transaction's origin.
 
-Production acceptance, stale retirement, resume, claim, recovery, router and
-final command checks remain implementation work. This storage unit does not
-enable lifecycle actions or grant permission at a runtime command boundary.
+Stale retirement, resume, claim, recovery, router and final command checks
+remain implementation work. Storage and admission do not enable lifecycle
+actions or grant permission at a runtime command boundary.
+
+### Atomic ordinary deployment admission
+
+Manual current-source deployment, prior-release deployment and automatic
+deployment now use one typed creation boundary. A new job, queued event,
+immutable binding and automatic dispatch linkage commit together. Validation
+or linkage failure rolls them all back; a worker wake follows only a successful
+new-job commit. Production composition requires the concrete canonical lifecycle
+validator and a binding repository for the same database.
+
+An exact retry first validates its saved historical binding, then compares the
+original actor, application and sealed input. It returns that job and binding
+without refreshing timestamps, adding events or waking the worker, including
+after desired-head drift or terminal completion. A missing binding is refused;
+replay never adopts old unbound work. HTTP replay retains authentication and
+existing-application access checks. Prior-release replay precedes mutable
+release, strategy and capability preflight.
+
+Automatic deployment keeps its current lease, source and dispatch identity
+checks inside the binding transaction. Lifecycle refusal uses the existing
+finite, sanitized deployment-failure pause; storage failure remains distinct.
+This admission boundary does not replace the still-required claim, recovery,
+router and command-boundary authorization.
 
 ## Required acceptance
 
@@ -485,7 +508,58 @@ The Linux full lifecycle JSON has SHA-256
 `11566f1bb2cd657ddaa8e1d2ece7c1cda24e1f421cac48580660b52455570215`;
 the focused Windows validator JSON has SHA-256
 `4e80209570c380041d6b970bc055041744abd072d17a01e05e1737ce43a7b6a1`.
-Acceptance/revival wiring and final command fencing remain separate work.
+Revival wiring and final command fencing remain separate work.
+
+### Ordinary deployment admission: local evidence
+
+Local commit `cf3b5e51d4087673b98013297c307342ad94ecfc` implements the
+typed admission boundary and its controller, automatic-deployment and host
+composition callers. On 2026-10-18, the Windows affected-package run passed:
+
+```text
+go test -json -count=1 ./internal/jobs ./internal/controller ./internal/autodeploy ./internal/sourceconnections ./cmd/hostd
+```
+
+It recorded 479 passing parents and 923 passing children across five packages.
+One PostgreSQL relay-outage integration parent was skipped because its external
+test service was not configured. Seven final review-repair parents were run
+separately after test-only additions: seven parents and four children passed,
+with no skips. The earlier full run is bound to a sole-writer post-run source
+manifest; it is not represented as exercising tests added afterward.
+
+Native Linux then ran all 86 selected parents and 78 children in the changed
+admission and fixture test files, across six packages. Every selected name ran
+and passed once; no selected test was skipped. The external PostgreSQL test was
+explicitly excluded from this local selection. Source hashes were identical
+before and after the run. Linux used cross-compiled binaries in WSL from their
+package directories; both platforms were local and non-race, using Go 1.26.7
+with readonly modules and `CGO_ENABLED=0`.
+
+Coverage includes real completed running/stopped lifecycle graphs, queued and
+terminal replay after desired drift, unchanged durable state, no replay wake,
+same-key concurrent creation, stopped/unresolved refusal, transaction rollback,
+saved dispatch linkage, expired/foreign lease and source/dispatch refusal, and
+release-status/capability drift. The queued desired-drift case uses explicit
+test-only status sequencing to construct an adversarial retained state that
+normal active-mutation admission prevents. Wake counts use a private test
+channel; no production testing interface was added.
+
+Scoped vet, controller build, canonical generation and formatter/diff checks
+passed at the final source. The integrated coordinator also passed its concrete
+composition and ingress/SQL smoke checks, controller build, canonical generation
+and documentation build. Independent security and QA reviews accepted this
+bounded unit. Raw JSON SHA-256 hashes:
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Windows affected-package run | `25fcaa0759a46407d7b83ab34729cbb8e0349f749bc4c60f902c0eb0fdffed69` |
+| Windows final concurrency/wake cases | `697922c49041c8eaf01bd6457163fcd0d9e5a426851e481b80d1426fbe3d6e34` |
+| Linux typed authority integration | `a15e786b7f8135964d301f71bbc3d8809d911a897d81e825df50c0e4f123a821` |
+| Linux automatic-deployment cases | `7493620cb1947320d70874d3c5c1223960dc0379853d359776f83f4c58043f5c` |
+
+These checks establish local admission behavior. They do not establish hosted
+race behavior, real Docker lifecycle effects, startup recovery acceptance,
+complete M4, or activation of a live controller.
 
 ### Pre-change baseline
 
