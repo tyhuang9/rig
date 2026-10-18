@@ -96,6 +96,28 @@ type CreateRequest struct {
 // back. Finalizers must not retain tx or perform external I/O.
 type CreateFinalizer func(*sql.Tx, Job) error
 
+// CreateTransactionHooks are trusted internal hooks for repositories that must
+// compose immutable linkage with job creation. BeforeCreate runs inside the
+// writer transaction before any job lookup or insert. Existing runs after an
+// insert collision and before mutable job replay comparison. Returning
+// handled=true commits without creating or waking a job. Finalize runs only
+// after a new queued job and its event have been inserted.
+// Hooks must not retain tx or perform external I/O.
+type CreateTransactionHooks struct {
+	BeforeCreate     func(context.Context, *sql.Tx) (handled bool, err error)
+	Existing         func(context.Context, *sql.Tx, Job) (handled bool, err error)
+	FinalizeExisting func(context.Context, *sql.Tx, Job) error
+	Finalize         func(context.Context, *sql.Tx, Job) error
+}
+
+// CreateTransactionResult distinguishes an immutable replay handled by a
+// caller hook from a newly created job.
+type CreateTransactionResult struct {
+	Job     Job
+	Created bool
+	Handled bool
+}
+
 type Job struct {
 	ID               string          `json:"id"`
 	Type             string          `json:"type"`
@@ -235,70 +257,137 @@ func (s *Service) CreateWithInputChecked(request CreateRequest, check CreateFina
 }
 
 func (s *Service) createWithInput(request CreateRequest, check, finalize CreateFinalizer) (Job, bool, error) {
+	result, err := s.createWithInputContext(context.Background(), request, CreateTransactionHooks{
+		FinalizeExisting: func(_ context.Context, tx *sql.Tx, job Job) error {
+			if finalize != nil {
+				return finalize(tx, job)
+			}
+			return nil
+		},
+		Finalize: func(_ context.Context, tx *sql.Tx, job Job) error {
+			if check != nil {
+				if err := check(tx, job); err != nil {
+					return err
+				}
+			}
+			if finalize != nil {
+				return finalize(tx, job)
+			}
+			return nil
+		},
+	})
+	return result.Job, result.Created, err
+}
+
+// CreateWithInputTransaction creates a job with caller cancellation and a
+// pre-create immutable replay hook. The handled path is intentionally separate
+// from ordinary mutable job idempotency and never signals the worker.
+func (s *Service) CreateWithInputTransaction(ctx context.Context, request CreateRequest, hooks CreateTransactionHooks) (CreateTransactionResult, error) {
+	return s.createWithInputContext(ctx, request, hooks)
+}
+
+func (s *Service) createWithInputContext(ctx context.Context, request CreateRequest, hooks CreateTransactionHooks) (CreateTransactionResult, error) {
 	if request.Type == "" || request.ResourceType == "" || request.ResourceID == "" || len(request.IdempotencyKey) > 200 {
-		return Job{}, false, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
+		return CreateTransactionResult{}, fmt.Errorf("%w: type, resource type, and resource id are required", ErrInvalidInput)
 	}
 	input, err := marshalInput(request.Input)
 	if err != nil {
-		return Job{}, false, err
+		return CreateTransactionResult{}, err
 	}
 	now := s.now().UTC()
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return Job{}, false, err
+		return CreateTransactionResult{}, err
 	}
 	defer tx.Rollback()
+	// Acquire SQLite's single writer reservation before the immutable replay
+	// read. The predicate changes no rows, but prevents two readers from both
+	// observing absence and then deadlocking while upgrading to writers.
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET id=id WHERE 0`); err != nil {
+		return CreateTransactionResult{}, err
+	}
+	if hooks.BeforeCreate != nil {
+		handled, hookErr := hooks.BeforeCreate(ctx, tx)
+		if hookErr != nil {
+			return CreateTransactionResult{}, hookErr
+		}
+		if err := ctx.Err(); err != nil {
+			return CreateTransactionResult{}, err
+		}
+		if handled {
+			if err := tx.Commit(); err != nil {
+				return CreateTransactionResult{}, err
+			}
+			return CreateTransactionResult{Handled: true}, nil
+		}
+	}
 	job := Job{ID: uuid.NewString(), Type: request.Type, ResourceType: request.ResourceType, ResourceID: request.ResourceID, Status: string(Queued), Phase: "queued", CreatedAt: now, UpdatedAt: now, Input: input}
 	job.RequestedBy = request.RequestedBy
-	_, err = tx.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, job.ID, job.Type, job.ResourceType, job.ResourceID, job.Status, job.Phase, nullIfBlank(request.IdempotencyKey), nullIfBlank(request.RequestedBy), string(input), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
+	_, err = tx.ExecContext(ctx, `INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,idempotency_key,requested_by,input_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`, job.ID, job.Type, job.ResourceType, job.ResourceID, job.Status, job.Phase, nullIfBlank(request.IdempotencyKey), nullIfBlank(request.RequestedBy), string(input), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano))
 	if err != nil {
 		if !isConstraint(err) {
-			return Job{}, false, err
+			return CreateTransactionResult{}, err
 		}
 		if request.IdempotencyKey == "" {
-			return Job{}, false, ErrApplicationBusy
+			return CreateTransactionResult{}, ErrApplicationBusy
 		}
-		existing, lookupErr := byIdempotencyTx(tx, request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
+		existing, lookupErr := byIdempotencyTxContext(ctx, tx, request.Type, request.ResourceType, request.ResourceID, request.IdempotencyKey)
 		if errors.Is(lookupErr, sql.ErrNoRows) {
-			return Job{}, false, ErrApplicationBusy
+			return CreateTransactionResult{}, ErrApplicationBusy
 		}
 		if lookupErr != nil {
-			return Job{}, false, lookupErr
+			return CreateTransactionResult{}, lookupErr
 		}
-		if !sameCreateRequest(existing, request, input) {
-			return Job{}, false, ErrIdempotency
-		}
-		if finalize != nil {
-			if err = finalize(tx, existing); err != nil {
-				return Job{}, false, err
+		if hooks.Existing != nil {
+			handled, hookErr := hooks.Existing(ctx, tx, existing)
+			if hookErr != nil {
+				return CreateTransactionResult{}, hookErr
+			}
+			if err := ctx.Err(); err != nil {
+				return CreateTransactionResult{}, err
+			}
+			if handled {
+				if err := tx.Commit(); err != nil {
+					return CreateTransactionResult{}, err
+				}
+				return CreateTransactionResult{Job: existing, Handled: true}, nil
 			}
 		}
+		if !sameCreateRequest(existing, request, input) {
+			return CreateTransactionResult{}, ErrIdempotency
+		}
+		if hooks.FinalizeExisting != nil {
+			if err := hooks.FinalizeExisting(ctx, tx, existing); err != nil {
+				return CreateTransactionResult{}, err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return CreateTransactionResult{}, err
+		}
 		if err = tx.Commit(); err != nil {
-			return Job{}, false, err
+			return CreateTransactionResult{}, err
 		}
 		if existing.Status == string(Queued) {
 			s.signal()
 		}
-		return existing, false, nil
+		return CreateTransactionResult{Job: existing}, nil
 	}
-	if _, err := appendEvent(tx, now, job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
-		return Job{}, false, err
+	if _, err := appendEventContext(ctx, tx, now, job.ID, "info", "queued", "job_queued", "Job queued"); err != nil {
+		return CreateTransactionResult{}, err
 	}
-	if check != nil {
-		if err = check(tx, job); err != nil {
-			return Job{}, false, err
+	if hooks.Finalize != nil {
+		if err = hooks.Finalize(ctx, tx, job); err != nil {
+			return CreateTransactionResult{}, err
 		}
 	}
-	if finalize != nil {
-		if err = finalize(tx, job); err != nil {
-			return Job{}, false, err
-		}
+	if err := ctx.Err(); err != nil {
+		return CreateTransactionResult{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		return Job{}, false, err
+		return CreateTransactionResult{}, err
 	}
 	s.signal()
-	return job, true, nil
+	return CreateTransactionResult{Job: job, Created: true}, nil
 }
 
 func sameCreateRequest(existing Job, request CreateRequest, input json.RawMessage) bool {
@@ -404,8 +493,8 @@ func contains(s, sub string) bool {
 
 const jobSelectColumns = `id,type,resource_type,resource_id,status,phase,progress_percent,checkpoint_json,COALESCE(error_code,''),COALESCE(error_detail,''),COALESCE(requested_by,''),COALESCE(pause_disposition,''),input_json,attempt,created_at,updated_at`
 
-func byIdempotencyTx(tx *sql.Tx, kind, resourceType, resourceID, key string) (Job, error) {
-	return scanJob(tx.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE type=? AND resource_type=? AND resource_id=? AND idempotency_key=?`, kind, resourceType, resourceID, key))
+func byIdempotencyTxContext(ctx context.Context, tx *sql.Tx, kind, resourceType, resourceID, key string) (Job, error) {
+	return scanJob(tx.QueryRowContext(ctx, `SELECT `+jobSelectColumns+` FROM jobs WHERE type=? AND resource_type=? AND resource_id=? AND idempotency_key=?`, kind, resourceType, resourceID, key))
 }
 func (s *Service) Get(id string) (Job, error) {
 	return s.scan(s.db.QueryRow(`SELECT `+jobSelectColumns+` FROM jobs WHERE id=?`, id))
@@ -493,15 +582,19 @@ func (s *Service) Append(jobID, level, phase, code, message string) (Event, erro
 }
 
 func appendEvent(tx *sql.Tx, now time.Time, jobID, level, phase, code, message string) (Event, error) {
+	return appendEventContext(context.Background(), tx, now, jobID, level, phase, code, message)
+}
+
+func appendEventContext(ctx context.Context, tx *sql.Tx, now time.Time, jobID, level, phase, code, message string) (Event, error) {
 	var sequence int
-	if err := tx.QueryRow(`SELECT COALESCE(MAX(sequence),0)+1 FROM job_events WHERE job_id=?`, jobID).Scan(&sequence); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM job_events WHERE job_id=?`, jobID).Scan(&sequence); err != nil {
 		return Event{}, err
 	}
 	var attempt int
-	if err := tx.QueryRow(`SELECT attempt FROM jobs WHERE id=?`, jobID).Scan(&attempt); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT attempt FROM jobs WHERE id=?`, jobID).Scan(&attempt); err != nil {
 		return Event{}, err
 	}
-	result, err := tx.Exec(`INSERT INTO job_events(job_id,sequence,attempt,timestamp,level,phase,code,message) VALUES(?,?,?,?,?,?,?,?)`, jobID, sequence, attempt, now.Format(time.RFC3339Nano), level, phase, code, message)
+	result, err := tx.ExecContext(ctx, `INSERT INTO job_events(job_id,sequence,attempt,timestamp,level,phase,code,message) VALUES(?,?,?,?,?,?,?,?)`, jobID, sequence, attempt, now.Format(time.RFC3339Nano), level, phase, code, message)
 	if err != nil {
 		return Event{}, err
 	}
