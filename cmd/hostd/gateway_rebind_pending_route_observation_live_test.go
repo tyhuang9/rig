@@ -4,12 +4,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -30,19 +32,44 @@ const (
 
 type liveHostdRebindPendingRouteObservation struct {
 	observed                 bool
+	appID                    string
+	jobID                    string
+	jobAttempt               int
+	jobInputSize             int
+	jobInputDigest           [sha256.Size]byte
 	jobStatus                string
 	jobPhase                 string
 	jobProgress              int
 	jobErrorCode             string
 	deploymentFound          bool
+	deploymentID             string
+	deploymentReleaseID      string
+	deploymentPlanID         string
+	deploymentPlanNumber     int64
+	deploymentConfigID       string
+	deploymentConfigNumber   int64
 	deploymentStatus         deployments.Status
 	deploymentDiagnosticCode string
 	runtimeFound             bool
+	runtimeDeploymentID      string
+	runtimeReleaseID         string
+	runtimePlanID            string
+	runtimePlanNumber        int64
+	runtimeCandidateSlot     string
+	runtimePreviousID        string
+	runtimePreviousSlot      string
 	runtimePhase             generatedruntimestate.Phase
 	runtimeDiagnosticCode    generatedruntimestate.DiagnosticCode
+	componentIdentities      []liveHostdRebindPendingRouteComponentIdentity
 	componentStates          []generatedruntimestate.ComponentState
 	componentDiagnosticCodes []generatedruntimestate.DiagnosticCode
+	activeHeadFound          bool
+	activeHead               generatedruntimestate.ActiveHead
 	events                   []jobs.Event
+}
+
+type liveHostdRebindPendingRouteComponentIdentity struct {
+	name, slot, imageArtifactID, containerName, containerID string
 }
 
 type liveHostdRebindPendingRouteObserver struct {
@@ -83,6 +110,13 @@ func (o *liveHostdRebindPendingRouteObserver) snapshot(ctx context.Context,
 	if err != nil || deploymentID == "" {
 		return observation, err
 	}
+	head, err := o.runtime.Active(ctx, o.appID)
+	if err == nil {
+		observation.activeHeadFound = true
+		observation.activeHead = head
+	} else if !errors.Is(err, generatedruntimestate.ErrNotFound) {
+		return empty, errors.New("read pending route active head snapshot failed")
+	}
 	runtime, err := o.runtime.Get(ctx, o.appID, deploymentID)
 	if errors.Is(err, generatedruntimestate.ErrNotFound) {
 		return observation, nil
@@ -97,19 +131,58 @@ func (o *liveHostdRebindPendingRouteObserver) snapshot(ctx context.Context,
 		return empty, errors.New("pending route runtime phase is invalid")
 	}
 	observation.runtimeFound = true
+	observation.runtimeDeploymentID = runtime.DeploymentID
+	observation.runtimeReleaseID = runtime.ReleaseID
+	observation.runtimePlanID = runtime.DeploymentPlanRevisionID
+	observation.runtimePlanNumber = runtime.DeploymentPlanRevisionNumber
+	observation.runtimeCandidateSlot = runtime.CandidateSlot
+	observation.runtimePreviousID = runtime.PreviousActiveDeploymentID
+	observation.runtimePreviousSlot = runtime.PreviousActiveSlot
 	observation.runtimePhase = runtime.Phase
 	observation.runtimeDiagnosticCode = runtime.DiagnosticCode
 	for _, component := range runtime.Components {
 		if !liveHostdRebindKnownComponentState(component.State) {
 			return empty, errors.New("pending route component state is invalid")
 		}
+		observation.componentIdentities = append(observation.componentIdentities,
+			liveHostdRebindPendingRouteComponentIdentity{
+				name: component.Name, slot: component.Slot, imageArtifactID: component.ImageArtifactID,
+				containerName: component.ContainerName, containerID: component.ContainerID,
+			})
 		observation.componentStates = append(observation.componentStates, component.State)
 		observation.componentDiagnosticCodes = append(observation.componentDiagnosticCodes, component.DiagnosticCode)
 	}
-	sort.Slice(observation.componentStates, func(left, right int) bool {
-		return observation.componentStates[left] < observation.componentStates[right]
+	indices := make([]int, len(observation.componentIdentities))
+	for index := range indices {
+		indices[index] = index
+	}
+	sort.Slice(indices, func(left, right int) bool {
+		return liveHostdRebindPendingRouteComponentIdentityLess(
+			observation.componentIdentities[indices[left]], observation.componentIdentities[indices[right]])
 	})
+	identities := make([]liveHostdRebindPendingRouteComponentIdentity, 0, len(indices))
+	states := make([]generatedruntimestate.ComponentState, 0, len(indices))
+	diagnostics := make([]generatedruntimestate.DiagnosticCode, 0, len(indices))
+	for _, index := range indices {
+		identities = append(identities, observation.componentIdentities[index])
+		states = append(states, observation.componentStates[index])
+		diagnostics = append(diagnostics, observation.componentDiagnosticCodes[index])
+	}
+	observation.componentIdentities = identities
+	observation.componentStates = states
+	observation.componentDiagnosticCodes = diagnostics
 	return observation, nil
+}
+
+func liveHostdRebindPendingRouteComponentIdentityLess(left, right liveHostdRebindPendingRouteComponentIdentity) bool {
+	leftValues := [...]string{left.name, left.slot, left.imageArtifactID, left.containerName, left.containerID}
+	rightValues := [...]string{right.name, right.slot, right.imageArtifactID, right.containerName, right.containerID}
+	for index := range leftValues {
+		if leftValues[index] != rightValues[index] {
+			return leftValues[index] < rightValues[index]
+		}
+	}
+	return false
 }
 
 func liveHostdRebindPendingRouteObservationFor(appID, jobID string, job jobs.Job,
@@ -124,7 +197,8 @@ func liveHostdRebindPendingRouteObservationFor(appID, jobID string, job jobs.Job
 		return observation, "", errors.New("pending route job state is invalid")
 	}
 	observation = liveHostdRebindPendingRouteObservation{
-		observed: true, jobStatus: job.Status, jobPhase: job.Phase, jobProgress: job.Progress,
+		observed: true, appID: appID, jobID: job.ID, jobAttempt: job.Attempt, jobInputSize: len(job.Input),
+		jobInputDigest: sha256.Sum256(job.Input), jobStatus: job.Status, jobPhase: job.Phase, jobProgress: job.Progress,
 		jobErrorCode: job.ErrorCode,
 	}
 	for _, event := range events {
@@ -149,6 +223,12 @@ func liveHostdRebindPendingRouteObservationFor(appID, jobID string, job jobs.Job
 		}
 		deploymentID = value.ID
 		observation.deploymentFound = true
+		observation.deploymentID = value.ID
+		observation.deploymentReleaseID = value.ReleaseID
+		observation.deploymentPlanID = value.DeploymentPlanRevisionID
+		observation.deploymentPlanNumber = value.DeploymentPlanRevisionNumber
+		observation.deploymentConfigID = value.ActualConfigurationRevisionID
+		observation.deploymentConfigNumber = value.ActualConfigurationRevisionNumber
 		observation.deploymentStatus = value.Status
 		observation.deploymentDiagnosticCode = value.DiagnosticCode
 	}
@@ -169,6 +249,186 @@ func liveHostdRebindPendingRouteObservationBudget(now time.Time, parent context.
 		deadlines = append(deadlines, deadline)
 	}
 	return liveHostdRebindBoundedBudget(now, liveHostdRebindPendingRouteObservationCap, deadlines...)
+}
+
+type liveHostdRebindPendingRouteExpectation struct {
+	jobID, planID, configurationID  string
+	planNumber, configurationNumber int64
+}
+
+func liveHostdRebindPendingRouteBoundaryBaseline(observation liveHostdRebindPendingRouteObservation,
+	expected liveHostdRebindPendingRouteExpectation,
+) (liveHostdRebindPendingRouteObservation, error) {
+	if expected.jobID == "" || expected.planID == "" || expected.planNumber < 1 ||
+		expected.configurationID == "" || expected.configurationNumber < 1 {
+		return liveHostdRebindPendingRouteObservation{}, errors.New("invalid pending route boundary expectation")
+	}
+	if !observation.observed || observation.appID == "" || observation.jobID != expected.jobID || observation.jobAttempt < 1 ||
+		observation.jobInputSize == 0 {
+		return liveHostdRebindPendingRouteObservation{}, errors.New("pending route boundary job identity is invalid")
+	}
+	if observation.jobStatus != string(jobs.Running) || observation.jobPhase != "wait_for_health" ||
+		observation.jobProgress != 85 || observation.jobErrorCode != "" {
+		return liveHostdRebindPendingRouteObservation{}, errors.New("pending route boundary job state is invalid")
+	}
+	if !observation.deploymentFound || observation.deploymentID == "" || observation.deploymentReleaseID == "" ||
+		observation.deploymentPlanID != expected.planID || observation.deploymentPlanNumber != expected.planNumber ||
+		observation.deploymentConfigID != expected.configurationID ||
+		observation.deploymentConfigNumber != expected.configurationNumber ||
+		observation.deploymentStatus != deployments.WaitingHealth || observation.deploymentDiagnosticCode != "" {
+		return liveHostdRebindPendingRouteObservation{}, errors.New("pending route boundary deployment identity is invalid")
+	}
+	if !observation.runtimeFound || observation.runtimeDeploymentID != observation.deploymentID ||
+		observation.runtimeReleaseID != observation.deploymentReleaseID ||
+		observation.runtimePlanID != expected.planID || observation.runtimePlanNumber != expected.planNumber ||
+		observation.runtimeCandidateSlot == "" || observation.runtimePreviousID == "" ||
+		observation.runtimePreviousSlot == "" || observation.runtimeCandidateSlot == observation.runtimePreviousSlot ||
+		observation.runtimePhase != generatedruntimestate.PhaseSwitchingRoute ||
+		observation.runtimeDiagnosticCode != "" {
+		return liveHostdRebindPendingRouteObservation{}, errors.New("pending route boundary runtime identity is invalid")
+	}
+	if !liveHostdRebindPendingRouteComponentsMatchState(observation,
+		generatedruntimestate.ComponentHealthy) {
+		return liveHostdRebindPendingRouteObservation{}, errors.New("pending route boundary candidate identity is invalid")
+	}
+	if !observation.activeHeadFound || observation.activeHead.AppID != observation.appID ||
+		observation.activeHead.DeploymentID != observation.runtimePreviousID ||
+		observation.activeHead.ReleaseID == "" || observation.activeHead.Slot != observation.runtimePreviousSlot ||
+		observation.activeHead.Generation < 1 {
+		return liveHostdRebindPendingRouteObservation{}, errors.New("pending route boundary current head is invalid")
+	}
+	return observation, nil
+}
+
+func liveHostdRebindPendingRouteComponentsMatchState(observation liveHostdRebindPendingRouteObservation,
+	want generatedruntimestate.ComponentState,
+) bool {
+	if len(observation.componentIdentities) != 2 ||
+		len(observation.componentStates) != len(observation.componentIdentities) ||
+		len(observation.componentDiagnosticCodes) != len(observation.componentIdentities) {
+		return false
+	}
+	if observation.componentIdentities[0].name != "api" || observation.componentIdentities[1].name != "frontend" {
+		return false
+	}
+	for index, identity := range observation.componentIdentities {
+		if identity.name == "" || identity.slot != observation.runtimeCandidateSlot || identity.imageArtifactID == "" ||
+			identity.containerName == "" || identity.containerID == "" || observation.componentStates[index] != want ||
+			observation.componentDiagnosticCodes[index] != "" ||
+			(index > 0 && (observation.componentIdentities[index-1].name == identity.name ||
+				!liveHostdRebindPendingRouteComponentIdentityLess(
+					observation.componentIdentities[index-1], identity))) {
+			return false
+		}
+	}
+	return true
+}
+
+func liveHostdRebindPendingRouteConverged(baseline, observation liveHostdRebindPendingRouteObservation) error {
+	if !baseline.observed || !observation.observed || observation.appID != baseline.appID ||
+		observation.jobID != baseline.jobID ||
+		observation.jobInputSize != baseline.jobInputSize || observation.jobInputDigest != baseline.jobInputDigest {
+		return errors.New("pending route convergence job identity changed")
+	}
+	if observation.jobAttempt != baseline.jobAttempt+1 {
+		return errors.New("pending route convergence attempt is invalid")
+	}
+	if observation.jobStatus != string(jobs.Succeeded) || observation.jobPhase != "succeeded" ||
+		observation.jobProgress != 100 || observation.jobErrorCode != "" {
+		return errors.New("pending route convergence job success is incomplete")
+	}
+	if !observation.deploymentFound || observation.deploymentID != baseline.deploymentID ||
+		observation.deploymentReleaseID != baseline.deploymentReleaseID ||
+		observation.deploymentPlanID != baseline.deploymentPlanID ||
+		observation.deploymentPlanNumber != baseline.deploymentPlanNumber ||
+		observation.deploymentConfigID != baseline.deploymentConfigID ||
+		observation.deploymentConfigNumber != baseline.deploymentConfigNumber ||
+		observation.deploymentStatus != deployments.Succeeded || observation.deploymentDiagnosticCode != "" {
+		return errors.New("pending route convergence deployment identity changed")
+	}
+	if !observation.runtimeFound || observation.runtimeDeploymentID != baseline.runtimeDeploymentID ||
+		observation.runtimeReleaseID != baseline.runtimeReleaseID ||
+		observation.runtimePlanID != baseline.runtimePlanID ||
+		observation.runtimePlanNumber != baseline.runtimePlanNumber ||
+		observation.runtimeCandidateSlot != baseline.runtimeCandidateSlot ||
+		observation.runtimePreviousID != baseline.runtimePreviousID ||
+		observation.runtimePreviousSlot != baseline.runtimePreviousSlot ||
+		observation.runtimePhase != generatedruntimestate.PhaseSucceeded || observation.runtimeDiagnosticCode != "" {
+		return errors.New("pending route convergence runtime identity changed")
+	}
+	if !slices.Equal(observation.componentIdentities, baseline.componentIdentities) ||
+		!liveHostdRebindPendingRouteComponentsMatchState(observation, generatedruntimestate.ComponentActive) {
+		return errors.New("pending route convergence candidate identity changed")
+	}
+	if !observation.activeHeadFound || observation.activeHead.AppID != baseline.activeHead.AppID ||
+		observation.activeHead.DeploymentID != baseline.deploymentID ||
+		observation.activeHead.ReleaseID != baseline.deploymentReleaseID ||
+		observation.activeHead.Slot != baseline.runtimeCandidateSlot ||
+		observation.activeHead.Generation != baseline.activeHead.Generation+1 {
+		return errors.New("pending route convergence current head is invalid")
+	}
+	return nil
+}
+
+func liveHostdRebindWaitPendingRouteConvergenceResult(parent context.Context, testDeadline time.Time,
+	hasTestDeadline bool, child *liveHostdRebindChild, jobID string,
+	baseline liveHostdRebindPendingRouteObservation, snapshot liveHostdRebindPendingRouteSnapshot,
+) (liveHostdRebindPendingRouteObservation, error) {
+	var last liveHostdRebindPendingRouteObservation
+	if child == nil || child.command == nil || child.command.Process == nil || child.waitDone == nil ||
+		jobID == "" || baseline.jobID != jobID || snapshot == nil {
+		return last, errors.New("invalid pending route convergence observation")
+	}
+	budget, err := liveHostdRebindPendingRouteObservationBudget(time.Now(), parent, testDeadline, hasTestDeadline)
+	if err != nil {
+		return last, fmt.Errorf("reserve pending route convergence observation: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
+	child.startWait()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return last, fmt.Errorf("pending route convergence observation ended: %s snapshot=%s",
+				liveHostdRebindFailureCategory(err), last)
+		}
+		select {
+		case <-child.waitDone:
+			return last, fmt.Errorf("pending route child exited before exact convergence: %s snapshot=%s",
+				liveHostdRebindFailureCategory(child.waitErr), last)
+		default:
+		}
+		last, err = snapshot(ctx, jobID)
+		if err != nil {
+			return last, errors.New("pending route convergence durable observation failed")
+		}
+		if err := ctx.Err(); err != nil {
+			return last, fmt.Errorf("pending route convergence observation ended: %s snapshot=%s",
+				liveHostdRebindFailureCategory(err), last)
+		}
+		select {
+		case <-child.waitDone:
+			return last, fmt.Errorf("pending route child exited before exact convergence: %s snapshot=%s",
+				liveHostdRebindFailureCategory(child.waitErr), last)
+		default:
+		}
+		if last.jobStatus == string(jobs.Succeeded) {
+			if err := liveHostdRebindPendingRouteConverged(baseline, last); err != nil {
+				return last, fmt.Errorf("%w snapshot=%s", err, last)
+			}
+			return last, nil
+		}
+		if liveHostdRebindPendingRouteTerminal(last.jobStatus) {
+			return last, fmt.Errorf("pending route job reached %s before exact convergence snapshot=%s",
+				liveHostdRebindSafeJobStatus(last.jobStatus), last)
+		}
+		select {
+		case <-ctx.Done():
+		case <-child.waitDone:
+		case <-ticker.C:
+		}
+	}
 }
 
 func liveHostdRebindWaitPendingRouteBoundaryResult(parent context.Context, testDeadline time.Time,
@@ -515,6 +775,63 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 	wait := func(child *liveHostdRebindChild, deadline time.Time, snapshot liveHostdRebindPendingRouteSnapshot) (liveHostdRebindBoundaryMarker, liveHostdRebindPendingRouteObservation, error) {
 		return liveHostdRebindWaitPendingRouteBoundaryResult(context.Background(), deadline, true, child, jobID, snapshot)
 	}
+	expectation := liveHostdRebindPendingRouteExpectation{
+		jobID: jobID, planID: "8df741a9-58b9-48a3-8c83-54c06b29fc32", planNumber: 3,
+		configurationID: "e7bd3565-1290-42f5-99d6-c66983f22a43", configurationNumber: 4,
+	}
+	boundaryObservation := func() liveHostdRebindPendingRouteObservation {
+		input := []byte(`{"expectedConfigurationRevisionNumber":4}`)
+		return liveHostdRebindPendingRouteObservation{
+			observed: true, appID: appID, jobID: jobID, jobAttempt: 1, jobInputSize: len(input),
+			jobInputDigest: sha256.Sum256(input), jobStatus: string(jobs.Running), jobPhase: "wait_for_health",
+			jobProgress: 85, deploymentFound: true, deploymentID: "2ad6ab89-5ae6-4b98-a14b-a9e623110615",
+			deploymentReleaseID: "release-next", deploymentPlanID: expectation.planID,
+			deploymentPlanNumber: expectation.planNumber, deploymentConfigID: expectation.configurationID,
+			deploymentConfigNumber: expectation.configurationNumber, deploymentStatus: deployments.WaitingHealth,
+			runtimeFound: true, runtimeDeploymentID: "2ad6ab89-5ae6-4b98-a14b-a9e623110615",
+			runtimeReleaseID: "release-next", runtimePlanID: expectation.planID,
+			runtimePlanNumber: expectation.planNumber, runtimeCandidateSlot: "green",
+			runtimePreviousID: "c4517430-68df-4e93-ab96-0ba4e958966f", runtimePreviousSlot: "blue",
+			runtimePhase: generatedruntimestate.PhaseSwitchingRoute,
+			componentIdentities: []liveHostdRebindPendingRouteComponentIdentity{
+				{name: "api", slot: "green", imageArtifactID: "sha256:api", containerName: "api-green", containerID: "sha256:api-container"},
+				{name: "frontend", slot: "green", imageArtifactID: "sha256:frontend", containerName: "frontend-green", containerID: "sha256:frontend-container"},
+			},
+			componentStates: []generatedruntimestate.ComponentState{
+				generatedruntimestate.ComponentHealthy, generatedruntimestate.ComponentHealthy,
+			},
+			componentDiagnosticCodes: []generatedruntimestate.DiagnosticCode{"", ""},
+			activeHeadFound:          true,
+			activeHead: generatedruntimestate.ActiveHead{
+				AppID: appID, DeploymentID: "c4517430-68df-4e93-ab96-0ba4e958966f", ReleaseID: "release-previous",
+				Slot: "blue", Generation: 7,
+			},
+		}
+	}
+	convergedObservation := func(baseline liveHostdRebindPendingRouteObservation) liveHostdRebindPendingRouteObservation {
+		result := baseline
+		result.jobAttempt = baseline.jobAttempt + 1
+		result.jobStatus, result.jobPhase, result.jobProgress = string(jobs.Succeeded), "succeeded", 100
+		result.deploymentStatus = deployments.Succeeded
+		result.runtimePhase = generatedruntimestate.PhaseSucceeded
+		result.componentIdentities = append([]liveHostdRebindPendingRouteComponentIdentity(nil), baseline.componentIdentities...)
+		result.componentStates = []generatedruntimestate.ComponentState{
+			generatedruntimestate.ComponentActive, generatedruntimestate.ComponentActive,
+		}
+		result.componentDiagnosticCodes = []generatedruntimestate.DiagnosticCode{"", ""}
+		result.activeHead = generatedruntimestate.ActiveHead{
+			AppID: baseline.activeHead.AppID, DeploymentID: baseline.deploymentID,
+			ReleaseID: baseline.deploymentReleaseID, Slot: baseline.runtimeCandidateSlot,
+			Generation: baseline.activeHead.Generation + 1,
+		}
+		return result
+	}
+	waitConvergence := func(child *liveHostdRebindChild, deadline time.Time,
+		baseline liveHostdRebindPendingRouteObservation, snapshot liveHostdRebindPendingRouteSnapshot,
+	) (liveHostdRebindPendingRouteObservation, error) {
+		return liveHostdRebindWaitPendingRouteConvergenceResult(context.Background(), deadline, true,
+			child, jobID, baseline, snapshot)
+	}
 
 	t.Run("budget preserves both cleanup reserves and finite cap", func(t *testing.T) {
 		now := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC)
@@ -545,6 +862,194 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 				}
 			})
 		}
+	})
+
+	t.Run("held marker baseline and exact resumed convergence", func(t *testing.T) {
+		child := startChild(t, "stall")
+		writeMarker(t, child, liveHostdRebindBoundaryMarker{Boundary: "current_effect_ack_lost", OperationID: operationID})
+		reads := 0
+		marker, first, err := wait(child, time.Now().Add(time.Hour), func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) {
+			reads++
+			return boundaryObservation(), nil
+		})
+		if err != nil || marker.Boundary != "current_effect_ack_lost" || reads != 0 || first.observed {
+			t.Fatalf("preexisting marker marker=%+v reads=%d first=%s error=%v", marker, reads, first, err)
+		}
+		baseline, err := liveHostdRebindPendingRouteBoundaryBaseline(boundaryObservation(), expectation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending := baseline
+		pending.jobAttempt++
+		final := convergedObservation(baseline)
+		reads = 0
+		got, err := waitConvergence(child, time.Now().Add(time.Hour), baseline,
+			func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) {
+				reads++
+				if reads == 1 {
+					return pending, nil
+				}
+				return final, nil
+			})
+		if err != nil || reads != 2 || got.jobStatus != string(jobs.Succeeded) ||
+			got.activeHead.DeploymentID != baseline.deploymentID {
+			t.Fatalf("exact convergence reads=%d observation=%s error=%v", reads, got, err)
+		}
+		liveHostdRebindKillAndReap(t, child)
+	})
+
+	t.Run("held boundary refuses incomplete or mismatched identity", func(t *testing.T) {
+		for _, test := range []struct {
+			name   string
+			mutate func(*liveHostdRebindPendingRouteObservation)
+		}{
+			{name: "job", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.jobID = secret }},
+			{name: "configuration", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.deploymentConfigID = secret }},
+			{name: "plan", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.deploymentPlanID = secret }},
+			{name: "runtime phase", mutate: func(value *liveHostdRebindPendingRouteObservation) {
+				value.runtimePhase = generatedruntimestate.PhaseWaitingHealth
+			}},
+			{name: "candidate state", mutate: func(value *liveHostdRebindPendingRouteObservation) {
+				value.componentStates[0] = generatedruntimestate.ComponentRunning
+			}},
+			{name: "candidate identity", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.componentIdentities[0].containerID = "" }},
+			{name: "prior current head", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.activeHead.DeploymentID = secret }},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				value := boundaryObservation()
+				value.componentIdentities = append([]liveHostdRebindPendingRouteComponentIdentity(nil), value.componentIdentities...)
+				value.componentStates = append([]generatedruntimestate.ComponentState(nil), value.componentStates...)
+				test.mutate(&value)
+				_, err := liveHostdRebindPendingRouteBoundaryBaseline(value, expectation)
+				if err == nil || strings.Contains(err.Error(), secret) {
+					t.Fatalf("invalid held boundary accepted: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("resumed convergence refuses changed durable identity", func(t *testing.T) {
+		baseline, err := liveHostdRebindPendingRouteBoundaryBaseline(boundaryObservation(), expectation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, test := range []struct {
+			name   string
+			mutate func(*liveHostdRebindPendingRouteObservation)
+		}{
+			{name: "attempt", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.jobAttempt++ }},
+			{name: "job input", mutate: func(value *liveHostdRebindPendingRouteObservation) {
+				value.jobInputDigest = sha256.Sum256([]byte(secret))
+			}},
+			{name: "configuration pin", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.deploymentConfigID = secret }},
+			{name: "plan pin", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.deploymentPlanNumber++ }},
+			{name: "runtime deployment", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.runtimeDeploymentID = secret }},
+			{name: "candidate identity", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.componentIdentities[0].containerID = secret }},
+			{name: "component state", mutate: func(value *liveHostdRebindPendingRouteObservation) {
+				value.componentStates[0] = generatedruntimestate.ComponentHealthy
+			}},
+			{name: "current deployment", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.activeHead.DeploymentID = secret }},
+			{name: "current generation", mutate: func(value *liveHostdRebindPendingRouteObservation) { value.activeHead.Generation++ }},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				value := convergedObservation(baseline)
+				value.componentIdentities = append([]liveHostdRebindPendingRouteComponentIdentity(nil), value.componentIdentities...)
+				value.componentStates = append([]generatedruntimestate.ComponentState(nil), value.componentStates...)
+				test.mutate(&value)
+				err := liveHostdRebindPendingRouteConverged(baseline, value)
+				if err == nil || strings.Contains(err.Error(), secret) {
+					t.Fatalf("changed durable identity accepted: %v", err)
+				}
+			})
+		}
+	})
+
+	t.Run("resumed convergence refuses every terminal failure", func(t *testing.T) {
+		baseline, err := liveHostdRebindPendingRouteBoundaryBaseline(boundaryObservation(), expectation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, status := range []jobs.Status{jobs.WaitingUser, jobs.Failed, jobs.Cancelled, jobs.Interrupted, jobs.NeedsAttention} {
+			t.Run(string(status), func(t *testing.T) {
+				child := startChild(t, "stall")
+				terminal := baseline
+				terminal.jobAttempt++
+				terminal.jobStatus, terminal.jobPhase = string(status), string(status)
+				_, err := waitConvergence(child, time.Now().Add(time.Hour), baseline,
+					func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) { return terminal, nil })
+				if err == nil || !strings.Contains(err.Error(), "before exact convergence") || strings.Contains(err.Error(), secret) {
+					t.Fatalf("terminal status=%s error=%v", status, err)
+				}
+				liveHostdRebindKillAndReap(t, child)
+			})
+		}
+	})
+
+	t.Run("resumed convergence child exit timeout and observer errors are closed", func(t *testing.T) {
+		baseline, err := liveHostdRebindPendingRouteBoundaryBaseline(boundaryObservation(), expectation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending := baseline
+		pending.jobAttempt++
+		t.Run("child exit", func(t *testing.T) {
+			child := startChild(t, "exit")
+			_, err := waitConvergence(child, time.Now().Add(time.Hour), baseline,
+				func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) { return pending, nil })
+			if err == nil || !strings.Contains(err.Error(), "child exited") || strings.Contains(err.Error(), secret) {
+				t.Fatalf("child exit error=%v", err)
+			}
+			liveHostdRebindAssertChildReaped(t, child)
+		})
+		t.Run("timeout", func(t *testing.T) {
+			child := startChild(t, "stall")
+			_, err := waitConvergence(child, time.Now().Add(liveHostdRebindStartupCleanupReserve+100*time.Millisecond),
+				baseline, func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) { return pending, nil })
+			if err == nil || !strings.Contains(err.Error(), "deadline_exceeded") || strings.Contains(err.Error(), secret) {
+				t.Fatalf("timeout error=%v", err)
+			}
+			liveHostdRebindKillAndReap(t, child)
+		})
+		t.Run("observer error", func(t *testing.T) {
+			child := startChild(t, "stall")
+			_, err := waitConvergence(child, time.Now().Add(time.Hour), baseline,
+				func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) {
+					return liveHostdRebindPendingRouteObservation{}, errors.New(secret)
+				})
+			if err == nil || !strings.Contains(err.Error(), "durable observation failed") || strings.Contains(err.Error(), secret) {
+				t.Fatalf("observer error=%v", err)
+			}
+			liveHostdRebindKillAndReap(t, child)
+		})
+		t.Run("post snapshot cancellation", func(t *testing.T) {
+			child := startChild(t, "stall")
+			parent, cancel := context.WithCancel(context.Background())
+			_, err := liveHostdRebindWaitPendingRouteConvergenceResult(parent, time.Now().Add(time.Hour), true,
+				child, jobID, baseline, func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) {
+					cancel()
+					return convergedObservation(baseline), nil
+				})
+			if err == nil || !strings.Contains(err.Error(), "observation ended: canceled") ||
+				!strings.Contains(err.Error(), "job=succeeded") || strings.Contains(err.Error(), secret) {
+				t.Fatalf("post snapshot cancellation error=%v", err)
+			}
+			liveHostdRebindKillAndReap(t, child)
+		})
+		t.Run("post snapshot child exit", func(t *testing.T) {
+			child := startChild(t, "stall")
+			_, err := waitConvergence(child, time.Now().Add(time.Hour), baseline,
+				func(context.Context, string) (liveHostdRebindPendingRouteObservation, error) {
+					if err := liveHostdRebindKillAndReapError(child); err != nil {
+						t.Fatal(err)
+					}
+					return convergedObservation(baseline), nil
+				})
+			if err == nil || !strings.Contains(err.Error(), "child exited") ||
+				!strings.Contains(err.Error(), "job=succeeded") || strings.Contains(err.Error(), secret) {
+				t.Fatalf("post snapshot child exit error=%v", err)
+			}
+			liveHostdRebindAssertChildReaped(t, child)
+		})
 	})
 
 	t.Run("durable marker wins an actual terminal ordering race", func(t *testing.T) {
@@ -701,6 +1206,7 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		}()
 
 		actorID, planID, releaseID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+		configurationID, foreignConfigurationID, foreignAppID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 		now := time.Date(2030, time.January, 2, 3, 4, 5, 0, time.UTC).Format(time.RFC3339Nano)
 		if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?, ?,?)`,
 			actorID, actorID, "hash", now, now); err != nil {
@@ -708,6 +1214,10 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		}
 		if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'draft',?,?)`,
 			appID, appID, "Pending route observer", now, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'draft',?,?)`,
+			foreignAppID, foreignAppID, "Foreign pending route observer", now, now); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(
@@ -726,10 +1236,108 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 			releaseID, appID, now, strings.Repeat("d", 64), strings.Repeat("e", 64), planID); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := db.Exec(`INSERT INTO application_configuration_revisions(
+			id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count,
+			bundle_version,deployment_plan_revision_id,deployment_plan_revision_number
+		) VALUES(?,?,1,?,?,?,1,1,2,?,1),(?,?,2,?,?,?,1,1,2,?,1)`,
+			configurationID, appID, "apps/"+appID+"/configuration/"+configurationID+".secret", actorID, now, planID,
+			foreignConfigurationID, appID, "apps/"+appID+"/configuration/"+foreignConfigurationID+".secret", actorID, now, planID); err != nil {
+			t.Fatal(err)
+		}
 
-		jobStore, deploymentStore := jobs.New(db), deployments.New(db)
-		foreignJob, created, err := jobStore.CreateWithInput(jobs.CreateRequest{
+		jobStore, deploymentStore, runtimeStore := jobs.New(db), deployments.New(db), generatedruntimestate.New(db)
+		priorJob, created, err := jobStore.CreateWithInput(jobs.CreateRequest{
 			Type: "deploy", ResourceType: "application", ResourceID: appID, RequestedBy: actorID, Input: jobs.NoInput{},
+		})
+		if err != nil || !created {
+			t.Fatalf("create prior active observer job: created=%t error=%v", created, err)
+		}
+		priorDeployment, created, err := deploymentStore.GetOrCreateByJob(context.Background(), appID, priorJob.ID,
+			string(jobs.ConfigurationCurrent))
+		if err != nil || !created {
+			t.Fatalf("create prior active observer deployment: created=%t error=%v", created, err)
+		}
+		if _, err := deploymentStore.InitializeRuntime(context.Background(), appID, priorDeployment.ID, releaseID,
+			configurationID, 1, deployments.RuntimeGeneratedNode, planID, 1); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := deploymentStore.Transition(context.Background(), appID, priorDeployment.ID, deployments.Applying, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, created, err := runtimeStore.Begin(context.Background(), generatedruntimestate.BeginInput{
+			DeploymentID: priorDeployment.ID, AppID: appID, ReleaseID: releaseID,
+			DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, ComponentNames: []string{"api"},
+		}); err != nil || !created {
+			t.Fatalf("begin prior active observer runtime: created=%t error=%v", created, err)
+		}
+		artifactID := uuid.NewString()
+		if _, err := db.Exec(`INSERT INTO generated_image_artifacts(
+			id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,compiler_version,
+			build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at
+		) VALUES(?,?,?,?,?,'observer-control',?,1,?,'ready',?,?,?)`, artifactID, releaseID, planID, 1, "api",
+			strings.Repeat("f", 64), "sha256:"+strings.Repeat("a", 64), now, now, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtimeStore.SetImageReady(context.Background(), appID, priorDeployment.ID, "api", artifactID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtimeStore.SetContainerStarting(context.Background(), appID, priorDeployment.ID, "api",
+			"rig-observer-blue-api"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtimeStore.SetContainerRunning(context.Background(), appID, priorDeployment.ID, "api",
+			strings.Repeat("b", 64)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtimeStore.AdvanceComponent(context.Background(), appID, priorDeployment.ID, "api",
+			generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
+			t.Fatal(err)
+		}
+		for _, transition := range []struct {
+			from, to generatedruntimestate.Phase
+		}{
+			{generatedruntimestate.PhasePreflight, generatedruntimestate.PhaseBuilding},
+			{generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate},
+			{generatedruntimestate.PhaseStartingCandidate, generatedruntimestate.PhaseWaitingHealth},
+			{generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute},
+		} {
+			if _, err := runtimeStore.Advance(context.Background(), appID, priorDeployment.ID,
+				transition.from, transition.to, ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := deploymentStore.Transition(context.Background(), appID, priorDeployment.ID, deployments.WaitingHealth, ""); err != nil {
+			t.Fatal(err)
+		}
+		priorHead, switched, err := runtimeStore.SwitchActive(context.Background(), appID, priorDeployment.ID, 0)
+		if err != nil || !switched || priorHead.DeploymentID != priorDeployment.ID || priorHead.Generation != 1 {
+			t.Fatalf("establish prior active observer head: head=%#v switched=%t error=%v", priorHead, switched, err)
+		}
+		if _, err := runtimeStore.Advance(context.Background(), appID, priorDeployment.ID,
+			generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := runtimeStore.Advance(context.Background(), appID, priorDeployment.ID,
+			generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := deploymentStore.Transition(context.Background(), appID, priorDeployment.ID, deployments.Succeeded, ""); err != nil {
+			t.Fatal(err)
+		}
+		// This observer fixture represents an already completed prior deployment.
+		// Retain its terminal job row before admitting another mutation, just as
+		// the failed historical job below is materialized directly in SQLite.
+		if _, err := db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',progress_percent=100,
+			attempt=1,started_at=?,finished_at=?,updated_at=? WHERE id=?`, now, now, now, priorJob.ID); err != nil {
+			t.Fatal(err)
+		}
+
+		foreignJob, created, err := jobStore.CreateWithInput(jobs.CreateRequest{
+			Type: "deploy", ResourceType: "application", ResourceID: appID, RequestedBy: actorID,
+			Input: jobs.DeploymentInput{
+				ConfigurationMode: jobs.ConfigurationCurrent, ExpectedPlanRevisionID: planID, ExpectedPlanRevisionNumber: 1,
+				ExpectedConfigurationRevisionID: foreignConfigurationID, ExpectedConfigurationRevisionNumber: 2,
+			},
 		})
 		if err != nil || !created {
 			t.Fatalf("create historical observer job: created=%t error=%v", created, err)
@@ -738,6 +1346,10 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 			string(jobs.ConfigurationCurrent))
 		if err != nil || !created {
 			t.Fatalf("create historical observer deployment: created=%t error=%v", created, err)
+		}
+		if _, err := deploymentStore.InitializeRuntime(context.Background(), appID, foreignDeployment.ID, releaseID,
+			foreignConfigurationID, 2, deployments.RuntimeGeneratedNode, planID, 1); err != nil {
+			t.Fatal(err)
 		}
 		if _, err := db.Exec(`UPDATE jobs SET status='failed',phase='failed',progress_percent=60,error_code='runtime_unavailable',error_detail=?,finished_at=?,updated_at=? WHERE id=?`,
 			secret, now, now, foreignJob.ID); err != nil {
@@ -750,7 +1362,10 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 
 		exactJob, created, err := jobStore.CreateWithInput(jobs.CreateRequest{
 			Type: "deploy", ResourceType: "application", ResourceID: appID, RequestedBy: actorID,
-			Input: jobs.DeploymentInput{ReleaseID: releaseID, ConfigurationMode: jobs.ConfigurationCurrent},
+			Input: jobs.DeploymentInput{
+				ConfigurationMode: jobs.ConfigurationCurrent, ExpectedPlanRevisionID: planID, ExpectedPlanRevisionNumber: 1,
+				ExpectedConfigurationRevisionID: configurationID, ExpectedConfigurationRevisionNumber: 1,
+			},
 		})
 		if err != nil || !created {
 			t.Fatalf("create exact observer job: created=%t error=%v", created, err)
@@ -760,14 +1375,13 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		if err != nil || !created {
 			t.Fatalf("create exact observer deployment: created=%t error=%v", created, err)
 		}
-		if _, err := deploymentStore.InitializeRuntime(context.Background(), appID, exactDeployment.ID, releaseID, "", 0,
+		if _, err := deploymentStore.InitializeRuntime(context.Background(), appID, exactDeployment.ID, releaseID, configurationID, 1,
 			deployments.RuntimeGeneratedNode, planID, 1); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := deploymentStore.Transition(context.Background(), appID, exactDeployment.ID, deployments.Applying, ""); err != nil {
 			t.Fatal(err)
 		}
-		runtimeStore := generatedruntimestate.New(db)
 		if _, created, err := runtimeStore.Begin(context.Background(), generatedruntimestate.BeginInput{
 			DeploymentID: exactDeployment.ID, AppID: appID, ReleaseID: releaseID,
 			DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, ComponentNames: []string{secret},
@@ -806,25 +1420,49 @@ func liveHostdRebindPendingRouteObservationControls(t *testing.T) {
 		}
 		persisted, err := jobStore.Get(exactJob.ID)
 		events, eventsErr := jobStore.Events(exactJob.ID, 0)
+		persistedForeignDeployment, foreignDeploymentErr := deploymentStore.Get(context.Background(), appID, foreignDeployment.ID)
+		foreignHead, foreignHeadErr := runtimeStore.Active(context.Background(), foreignAppID)
 		privateEvent := len(events) == 2 && events[1].Message == secret
 		if err != nil || eventsErr != nil || !strings.Contains(persisted.Checkpoint, secret) ||
 			persisted.ErrorCode != "apply_failed" || persisted.ErrorDetail != secret || !privateEvent {
 			t.Fatalf("private durable observer fixture was not established: job_error=%v events_error=%v private_event=%t",
 				err, eventsErr, privateEvent)
 		}
+		if foreignDeploymentErr != nil || persistedForeignDeployment.ActualConfigurationRevisionID != foreignConfigurationID ||
+			persistedForeignDeployment.ActualConfigurationRevisionNumber != 2 || foreignHeadErr != nil ||
+			foreignHead.AppID != foreignAppID || foreignHead.DeploymentID != "" || foreignHead.ReleaseID != "" ||
+			foreignHead.Slot != "" || foreignHead.Generation != 0 {
+			t.Fatalf("foreign durable observer fixture was not established: deployment_error=%v head_error=%v",
+				foreignDeploymentErr, foreignHeadErr)
+		}
 
 		observation, err := liveHostdRebindNewPendingRouteObserver(db, appID).snapshot(context.Background(), exactJob.ID)
 		diagnostic := observation.String()
-		privateDiagnostic := strings.Contains(diagnostic, secret)
-		if err != nil || observation.jobStatus != string(jobs.Failed) || observation.jobPhase != "failed" ||
+		privateDiagnostic := slices.ContainsFunc([]string{
+			secret, appID, exactJob.ID, exactDeployment.ID, releaseID, planID, configurationID,
+			priorDeployment.ID, foreignAppID, foreignJob.ID, foreignDeployment.ID, foreignConfigurationID,
+		}, func(value string) bool { return strings.Contains(diagnostic, value) })
+		if err != nil || observation.jobID != exactJob.ID || observation.jobAttempt != 1 || observation.jobInputSize == 0 ||
+			observation.jobStatus != string(jobs.Failed) || observation.jobPhase != "failed" ||
 			observation.jobProgress != 70 || observation.jobErrorCode != "apply_failed" ||
-			!observation.deploymentFound || observation.deploymentStatus != deployments.Failed ||
+			!observation.deploymentFound || observation.deploymentID != exactDeployment.ID ||
+			observation.deploymentReleaseID != releaseID || observation.deploymentPlanID != planID ||
+			observation.deploymentPlanNumber != 1 || observation.deploymentConfigID != configurationID ||
+			observation.deploymentConfigNumber != 1 || observation.deploymentStatus != deployments.Failed ||
 			observation.deploymentDiagnosticCode != "process_termination_failed" || !observation.runtimeFound ||
+			observation.runtimeDeploymentID != exactDeployment.ID || observation.runtimeReleaseID != releaseID ||
+			observation.runtimePlanID != planID || observation.runtimePlanNumber != 1 ||
+			observation.runtimeCandidateSlot == "" || observation.runtimeCandidateSlot == priorHead.Slot ||
+			observation.runtimePreviousID != priorDeployment.ID || observation.runtimePreviousSlot != priorHead.Slot ||
 			observation.runtimePhase != generatedruntimestate.PhaseFailed ||
 			observation.runtimeDiagnosticCode != generatedruntimestate.DiagnosticStartFailed ||
+			len(observation.componentIdentities) != 1 || observation.componentIdentities[0].name != secret ||
 			len(observation.componentStates) != 1 || observation.componentStates[0] != generatedruntimestate.ComponentFailed ||
 			len(observation.componentDiagnosticCodes) != 1 ||
 			observation.componentDiagnosticCodes[0] != generatedruntimestate.DiagnosticInternalError ||
+			!observation.activeHeadFound || observation.activeHead.AppID != appID ||
+			observation.activeHead.DeploymentID != priorDeployment.ID || observation.activeHead.ReleaseID != releaseID ||
+			observation.activeHead.Slot != priorHead.Slot || observation.activeHead.Generation != priorHead.Generation ||
 			len(observation.events) != 2 || privateDiagnostic ||
 			!strings.Contains(diagnostic, "job_error=apply_failed") ||
 			!strings.Contains(diagnostic, "deployment=failed deployment_diagnostic=process_termination_failed") ||
