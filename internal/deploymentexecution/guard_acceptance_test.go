@@ -61,6 +61,46 @@ func TestGuardPolicyGateUsesClosedPersistedStagePolicy(t *testing.T) {
 	}
 }
 
+func TestGuardComposeChecksUseSeparateClosedStagePolicies(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		status      string
+		observation bool
+		want        error
+	}{
+		{name: "up applying", status: "applying"},
+		{name: "up waiting health", status: "waiting_health", want: deploymentexecution.ErrStageInvalid},
+		{name: "up preparing", status: "preparing", want: deploymentexecution.ErrStageInvalid},
+		{name: "observation applying", status: "applying", observation: true},
+		{name: "observation waiting health", status: "waiting_health", observation: true},
+		{name: "observation preparing", status: "preparing", observation: true, want: deploymentexecution.ErrStageInvalid},
+		{name: "observation succeeded", status: "succeeded", observation: true, want: deploymentexecution.ErrStageInvalid},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutionFixture(t, false)
+			fixture.exec(t, `UPDATE deployments SET status=? WHERE id=?`, test.status, fixture.deploymentID)
+			pin, claim, release := fixture.pinWithRelease(t)
+			defer func() { pin.Leave(); _ = release() }()
+			tx, err := fixture.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			if test.observation {
+				err = pin.CheckComposeObservationTx(tx, claim, fixture.deploymentID)
+			} else {
+				err = pin.CheckComposeUpTx(tx, claim, fixture.deploymentID)
+			}
+			if test.want == nil && err != nil {
+				t.Fatalf("check error=%v", err)
+			}
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("check error=%v want=%v", err, test.want)
+			}
+		})
+	}
+}
+
 func TestClaimAndGuardRequireExactIdentityAndComposition(t *testing.T) {
 	fixture := newExecutionFixture(t, false)
 	if _, err := deploymentexecution.NewClaim(fixture.binding, fixture.job.ID, fixture.appID, 0); !errors.Is(err, deploymentexecution.ErrInvalidClaim) {
@@ -429,6 +469,48 @@ func TestGuardPolicyGateDoesNotCacheSuccessfulAuthority(t *testing.T) {
 	if err := pin.CheckPolicyGateTx(tx, claim, fixture.deploymentID); !errors.Is(err, deploymentexecution.ErrAuthorityStale) {
 		t.Fatalf("fresh drift check error=%v", err)
 	}
+}
+
+func TestGuardComposeUpDoesNotCacheBindingOrGlobalFence(t *testing.T) {
+	t.Run("later lifecycle authority is stale", func(t *testing.T) {
+		fixture := newExecutionFixture(t, true)
+		fixture.exec(t, `UPDATE deployments SET status='applying' WHERE id=?`, fixture.deploymentID)
+		pin, claim := fixture.pin(t)
+		defer pin.Leave()
+		check := func() error {
+			tx, err := fixture.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			return pin.CheckComposeUpTx(tx, claim, fixture.deploymentID)
+		}
+		if err := check(); err != nil {
+			t.Fatalf("initial Compose check: %v", err)
+		}
+		fixture.exec(t, `UPDATE jobs SET status='succeeded',phase='succeeded',finished_at=?,updated_at=? WHERE id=?`, fixture.stamp, fixture.stamp, fixture.job.ID)
+		fixture.completeOperation(t, applifecycle.Restart, applifecycle.BaselineRunning, 1, "after-compose-gate")
+		fixture.exec(t, `UPDATE jobs SET status='running',phase='running',attempt=1,finished_at=NULL WHERE id=?`, fixture.job.ID)
+		if err := check(); !errors.Is(err, deploymentexecution.ErrAuthorityStale) {
+			t.Fatalf("fresh Compose authority error=%v", err)
+		}
+	})
+
+	t.Run("global pending start is observed", func(t *testing.T) {
+		fixture := newExecutionFixture(t, true)
+		fixture.exec(t, `UPDATE deployments SET status='applying' WHERE id=?`, fixture.deploymentID)
+		fixture.beginOtherStart(t, true)
+		pin, claim := fixture.pin(t)
+		defer pin.Leave()
+		tx, err := fixture.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := pin.CheckComposeUpTx(tx, claim, fixture.deploymentID); !errors.Is(err, deploymentexecution.ErrPositiveFence) {
+			t.Fatalf("fresh Compose fence error=%v", err)
+		}
+	})
 }
 
 func TestGuardPolicyGateUsesCanonicalGlobalPendingStartFence(t *testing.T) {
