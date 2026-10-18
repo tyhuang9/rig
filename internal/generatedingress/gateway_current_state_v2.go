@@ -85,6 +85,16 @@ type gatewayCurrentRouteSourceV1 struct {
 	Digest   string `json:"digest"`
 }
 
+type gatewayCurrentRouteSourceUpgrade struct {
+	StateDigest            string `json:"stateDigest"`
+	SourceRouteStateDigest string `json:"sourceRouteStateDigest"`
+}
+
+type gatewayCurrentRouteOriginV2 struct {
+	SourceV1      *gatewayCurrentRouteSourceV1
+	SourceUpgrade *gatewayCurrentRouteSourceUpgrade
+}
+
 // gatewayCurrentRouteStateV2 is initially a stable-state storage format.
 // Pending lifecycle, route, and LAN recovery shapes are intentionally absent;
 // strict decoding rejects them until their complete state machines exist.
@@ -96,7 +106,8 @@ type gatewayCurrentRouteStateV2 struct {
 	Identity               gatewayCurrentIdentity              `json:"identity"`
 	Network                gatewayV2NetworkPlan                `json:"network"`
 	TransferManifestDigest string                              `json:"transferManifestDigest"`
-	SourceV1               gatewayCurrentRouteSourceV1         `json:"sourceV1"`
+	SourceV1               *gatewayCurrentRouteSourceV1        `json:"sourceV1,omitempty"`
+	SourceUpgrade          *gatewayCurrentRouteSourceUpgrade   `json:"sourceUpgrade,omitempty"`
 	Apps                   map[string]gatewayCurrentAppRouteV2 `json:"apps"`
 	Digest                 string                              `json:"digest"`
 }
@@ -104,7 +115,7 @@ type gatewayCurrentRouteStateV2 struct {
 type gatewayCurrentRouteStateV2Store struct {
 	directory *stateStore
 	lineage   appaccess.GatewayCurrentLineageRef
-	sourceV1  gatewayCurrentRouteSourceV1
+	origin    gatewayCurrentRouteOriginV2
 	path      string
 	purpose   string
 }
@@ -123,6 +134,72 @@ type gatewayCurrentAppRouteDigestEnvelopeV2 struct {
 
 func validGatewayCurrentRouteSourceV1(value gatewayCurrentRouteSourceV1) bool {
 	return value.Revision > 0 && validSHA256(value.Digest)
+}
+
+func validGatewayCurrentRouteSourceUpgrade(value gatewayCurrentRouteSourceUpgrade) bool {
+	return validSHA256(value.StateDigest) && validSHA256(value.SourceRouteStateDigest)
+}
+
+func validGatewayCurrentRouteOriginDescriptorV2(lineage appaccess.GatewayCurrentLineageRef,
+	sourceV1 *gatewayCurrentRouteSourceV1, sourceUpgrade *gatewayCurrentRouteSourceUpgrade,
+) bool {
+	switch lineage.Kind {
+	case appaccess.GatewayRebindSourceGatewayRebind:
+		return sourceV1 != nil && sourceUpgrade == nil && validGatewayCurrentRouteSourceV1(*sourceV1)
+	case appaccess.GatewayRebindSourceGatewayUpgrade:
+		return sourceV1 == nil && sourceUpgrade != nil && validGatewayCurrentRouteSourceUpgrade(*sourceUpgrade)
+	default:
+		return false
+	}
+}
+
+func validGatewayCurrentRouteOriginV2(lineage appaccess.GatewayCurrentLineageRef,
+	identity gatewayCurrentIdentity, sourceV1 *gatewayCurrentRouteSourceV1,
+	sourceUpgrade *gatewayCurrentRouteSourceUpgrade,
+) bool {
+	return validGatewayCurrentRouteOriginDescriptorV2(lineage, sourceV1, sourceUpgrade) &&
+		((lineage.Kind == appaccess.GatewayRebindSourceGatewayRebind && identity.Kind == gatewayCurrentIdentityRebind) ||
+			(lineage.Kind == appaccess.GatewayRebindSourceGatewayUpgrade && identity.Kind == gatewayCurrentIdentityUpgrade))
+}
+
+func cloneGatewayCurrentRouteOriginV2(value gatewayCurrentRouteOriginV2) gatewayCurrentRouteOriginV2 {
+	result := gatewayCurrentRouteOriginV2{}
+	if value.SourceV1 != nil {
+		copy := *value.SourceV1
+		result.SourceV1 = &copy
+	}
+	if value.SourceUpgrade != nil {
+		copy := *value.SourceUpgrade
+		result.SourceUpgrade = &copy
+	}
+	return result
+}
+
+func gatewayCurrentRouteOriginForStateV2(value gatewayCurrentRouteStateV2) gatewayCurrentRouteOriginV2 {
+	return cloneGatewayCurrentRouteOriginV2(gatewayCurrentRouteOriginV2{
+		SourceV1: value.SourceV1, SourceUpgrade: value.SourceUpgrade,
+	})
+}
+
+func sameGatewayCurrentRouteOriginDescriptorV2(left, right gatewayCurrentRouteOriginV2) bool {
+	return reflect.DeepEqual(left.SourceV1, right.SourceV1) &&
+		reflect.DeepEqual(left.SourceUpgrade, right.SourceUpgrade)
+}
+
+func gatewayCurrentUpgradeRouteOriginV2(state gatewayV2RouteState,
+	source routeState,
+) (gatewayCurrentRouteOriginV2, error) {
+	if !validGatewayV2RouteState(state) || !validRouteState(source) {
+		return gatewayCurrentRouteOriginV2{}, errors.New("invalid generated ingress current V2 upgrade origin")
+	}
+	stateDigest, stateErr := canonicalDigest(state)
+	sourceDigest, sourceErr := canonicalDigest(source)
+	if stateErr != nil || sourceErr != nil || !validSHA256(stateDigest) || !validSHA256(sourceDigest) {
+		return gatewayCurrentRouteOriginV2{}, errors.New("invalid generated ingress current V2 upgrade origin")
+	}
+	return gatewayCurrentRouteOriginV2{SourceUpgrade: &gatewayCurrentRouteSourceUpgrade{
+		StateDigest: stateDigest, SourceRouteStateDigest: sourceDigest,
+	}}, nil
 }
 
 func validGatewayCurrentRuntimeReleaseIDV2(value string) bool {
@@ -190,7 +267,8 @@ func validGatewayCurrentRouteStateV2(value gatewayCurrentRouteStateV2) bool {
 		value.Lineage.ProfileSpecDigest != value.Profile.SpecDigest ||
 		!validGatewayCurrentIdentity(value.Lineage, value.Identity) ||
 		!validGatewayV2NetworkPlan(value.Network) || !gatewayV2NetworkExcludesSelectedLAN(value.Profile, value.Network) ||
-		!validSHA256(value.TransferManifestDigest) || !validGatewayCurrentRouteSourceV1(value.SourceV1) ||
+		!validSHA256(value.TransferManifestDigest) ||
+		!validGatewayCurrentRouteOriginV2(value.Lineage, value.Identity, value.SourceV1, value.SourceUpgrade) ||
 		value.Apps == nil || len(value.Apps) > maxStateApps {
 		return false
 	}
@@ -256,6 +334,14 @@ func cloneGatewayCurrentRouteStateV2(value gatewayCurrentRouteStateV2) gatewayCu
 		profile := *value.Identity.RebindProfile
 		result.Identity.RebindProfile = &profile
 	}
+	if value.SourceV1 != nil {
+		source := *value.SourceV1
+		result.SourceV1 = &source
+	}
+	if value.SourceUpgrade != nil {
+		source := *value.SourceUpgrade
+		result.SourceUpgrade = &source
+	}
 	result.Apps = make(map[string]gatewayCurrentAppRouteV2, len(value.Apps))
 	for appID, app := range value.Apps {
 		result.Apps[appID] = cloneGatewayCurrentAppRouteV2(app)
@@ -272,7 +358,15 @@ func gatewayCurrentRouteStateNameV2(generation uint64, operationID string) (stri
 func newGatewayCurrentRouteStateV2Store(dataRoot string, lineage appaccess.GatewayCurrentLineageRef,
 	sourceV1 gatewayCurrentRouteSourceV1,
 ) (*gatewayCurrentRouteStateV2Store, error) {
-	if !validGatewayCurrentLineage(lineage) || !validGatewayCurrentRouteSourceV1(sourceV1) {
+	return newGatewayCurrentRouteStateV2StoreForOrigin(dataRoot, lineage,
+		gatewayCurrentRouteOriginV2{SourceV1: &sourceV1})
+}
+
+func newGatewayCurrentRouteStateV2StoreForOrigin(dataRoot string, lineage appaccess.GatewayCurrentLineageRef,
+	origin gatewayCurrentRouteOriginV2,
+) (*gatewayCurrentRouteStateV2Store, error) {
+	if !validGatewayCurrentLineage(lineage) ||
+		!validGatewayCurrentRouteOriginDescriptorV2(lineage, origin.SourceV1, origin.SourceUpgrade) {
 		return nil, errors.New("invalid generated ingress current V2 route store")
 	}
 	directory, err := newStateStore(dataRoot)
@@ -282,13 +376,14 @@ func newGatewayCurrentRouteStateV2Store(dataRoot string, lineage appaccess.Gatew
 	name, purpose := gatewayCurrentRouteStateNameV2(lineage.ProtectedGeneration, lineage.OperationID)
 	return &gatewayCurrentRouteStateV2Store{
 		directory: directory, lineage: lineage,
-		sourceV1: sourceV1, path: filepath.Join(directory.root, name), purpose: purpose,
+		origin: cloneGatewayCurrentRouteOriginV2(origin), path: filepath.Join(directory.root, name), purpose: purpose,
 	}, nil
 }
 
 func (s *gatewayCurrentRouteStateV2Store) installBaseline(value gatewayCurrentRouteStateV2) error {
 	if s == nil || s.directory == nil || value.Revision != 1 || value.Lineage != s.lineage ||
-		value.SourceV1 != s.sourceV1 || !validGatewayCurrentRouteStateV2(value) {
+		!sameGatewayCurrentRouteOriginDescriptorV2(gatewayCurrentRouteOriginForStateV2(value), s.origin) ||
+		!validGatewayCurrentRouteStateV2(value) {
 		return errors.New("invalid generated ingress current V2 route baseline")
 	}
 	state := gatewayUpgradeStateStore{directory: s.directory}
@@ -337,7 +432,8 @@ func (s *gatewayCurrentRouteStateV2Store) readCanonical() (gatewayCurrentRouteSt
 
 func (s *gatewayCurrentRouteStateV2Store) load() (gatewayCurrentRouteStateV2, error) {
 	value, err := s.readCanonical()
-	if err != nil || value.Lineage != s.lineage || value.SourceV1 != s.sourceV1 ||
+	if err != nil || value.Lineage != s.lineage ||
+		!sameGatewayCurrentRouteOriginDescriptorV2(gatewayCurrentRouteOriginForStateV2(value), s.origin) ||
 		!validGatewayCurrentRouteStateV2(value) {
 		return gatewayCurrentRouteStateV2{}, errors.New("invalid generated ingress current V2 route state")
 	}
@@ -347,7 +443,8 @@ func (s *gatewayCurrentRouteStateV2Store) load() (gatewayCurrentRouteStateV2, er
 func sameGatewayCurrentRouteOriginV2(left, right gatewayCurrentRouteStateV2) bool {
 	return left.Version == right.Version && left.Lineage == right.Lineage && left.Profile == right.Profile &&
 		reflect.DeepEqual(left.Identity, right.Identity) && left.Network == right.Network &&
-		left.TransferManifestDigest == right.TransferManifestDigest && left.SourceV1 == right.SourceV1
+		left.TransferManifestDigest == right.TransferManifestDigest &&
+		reflect.DeepEqual(left.SourceV1, right.SourceV1) && reflect.DeepEqual(left.SourceUpgrade, right.SourceUpgrade)
 }
 
 // saveNext is a lock-scoped storage update, not an independently atomic CAS.
@@ -359,7 +456,8 @@ func (s *gatewayCurrentRouteStateV2Store) saveNext(previous, next gatewayCurrent
 	if s == nil || s.directory == nil || previous.Revision == math.MaxUint64 ||
 		next.Revision != previous.Revision+1 || !sameGatewayCurrentRouteOriginV2(previous, next) ||
 		previous.Lineage != s.lineage ||
-		previous.SourceV1 != s.sourceV1 || !validGatewayCurrentRouteStateV2(previous) ||
+		!sameGatewayCurrentRouteOriginDescriptorV2(gatewayCurrentRouteOriginForStateV2(previous), s.origin) ||
+		!validGatewayCurrentRouteStateV2(previous) ||
 		!validGatewayCurrentRouteStateV2(next) {
 		return errors.New("invalid generated ingress current V2 route update")
 	}

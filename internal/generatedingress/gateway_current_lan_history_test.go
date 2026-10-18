@@ -12,7 +12,7 @@ import (
 )
 
 func TestGatewayCurrentLANStartupRequiresRetainedHistoricalProof(t *testing.T) {
-	f, _, _, physical := gatewayRebindCurrentStartupFixture(t)
+	f, snapshot, _, physical := gatewayRebindCurrentStartupFixture(t)
 	grants := gatewayCurrentStartupGrants(t, f.baseline)
 	cleared := cloneGatewayCurrentRouteState(f.baseline)
 	disables := make([]GatewayV2LANDisableStartupClaim, len(grants))
@@ -127,6 +127,30 @@ func TestGatewayCurrentLANStartupRequiresRetainedHistoricalProof(t *testing.T) {
 	if err != nil || loadErr != nil || !sameGatewayHistorySnapshot(before, after) || !reflect.DeepEqual(loaded, cleared) ||
 		physical.applyCalls != 0 || physical.restoreCalls != 0 || physical.stopCalls != 0 {
 		t.Fatal("historical proof inspection changed protected history or physical state")
+	}
+
+	claims, err := validateGatewayV2LANAccessStartupClaims(grants, disables)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2 := gatewayCurrentRouteStateV2ForTest(t, f)
+	v2.SourceV1 = &gatewayCurrentRouteSourceV1{Revision: cleared.Revision, Digest: cleared.Digest}
+	for appID, app := range v2.Apps {
+		app.LAN = nil
+		v2.Apps[appID] = app
+	}
+	gatewayCurrentProjectionV2Refresh(t, &v2)
+	gatewayCurrentInstallV2TestState(t, f.dataRoot, v2)
+	if _, err := f.manager.scanGatewayRebindProtectedIntentHistoryCurrentV2AwareLocked(nil); err != nil {
+		t.Fatalf("format-aware retained history scan refused exact V2 sidecar: %v", err)
+	}
+	if err := f.manager.validateGatewayCurrentLANRetainedHistoryCurrentV2AwareLocked(
+		context.Background(), claims, snapshot); err != nil {
+		t.Fatalf("format-aware retained history refused exact V2 sidecar: %v", err)
+	}
+	if err := f.manager.validateGatewayCurrentLANRetainedHistoryLocked(
+		context.Background(), claims, snapshot); err == nil {
+		t.Fatal("legacy retained-history reader accepted a current V2 sidecar")
 	}
 }
 

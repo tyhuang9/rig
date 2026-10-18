@@ -144,14 +144,53 @@ ownership and LAN reservation while rendering only serving apps. An all-dormant
 roster retains the gateway's shared listeners and generic challenges with
 deny-only responses. An unchanged serving roster produces byte-identical V1
 configuration; making one app dormant preserves its neighbors' routes and
-challenges. The rebind lineage supplies the existing physical challenge token.
-Upgrade identity is deliberately refused by physical rendering and challenge
-expectations until its distinct source contract is implemented.
+challenges. Upgrade and rebind each retain their original physical challenge
+token and configuration derivation.
 
 Expected configuration and probe targets are not physical traffic or ownership
-proofs. Production format selection, promotion and physical observations remain
+proofs. Automatic production promotion and lifecycle traffic changes remain
 later integration work. Local-only applications must not require enabling LAN
 sharing to acquire lifecycle support.
+
+### Protected format selection and promotion
+
+The private reader selects V2 explicitly, and private preparation creates an
+all-serving baseline with unchanged traffic configuration. Selection validates
+the real protected origin, SQL-selected lineage and complete ownership
+projection. Malformed, unreadable or unprojectable state refuses without V1
+fallback. Legacy history and mutation paths refuse V2 until their adapters exist.
+
+Upgrade and rebind have different origin proofs. Upgrade can legitimately have
+generation zero and uses its committed journal; it has no current-route V1
+source or terminal rebind receipt. The separate origin arm expresses those facts
+while retaining the existing rebind wire shape and challenge derivation.
+
+Preparation requires the existing effects and gateway exclusions, revalidates
+the complete runtime and consent census, proves unchanged physical configuration,
+then creates the baseline exclusively. It repeats physical observation after
+creation or retry, followed by final protected, SQL, desired-head and fence
+checks. Failure after file creation retains that file and refuses success;
+retry validates it without overwriting history. There is no production caller.
+The local verification record below covers this preparation unit.
+
+Two further contracts remain necessary before general lifecycle actions:
+versioned operation anchors that represent genuine upgrade provenance, and a
+separate adoption path for gateways that have always been localhost-only. That
+path must retain real local ownership without inventing a LAN profile.
+
+### Next unit: ordinary deployment bindings
+
+Each ordinary deployment needs an immutable binding to its accepted desired
+revision. A deployment queued before Stop must not gain permission from a later
+Start. The accepted design keeps bindings separate from existing job input and
+release bytes, validates historical operation evidence before current authority,
+and preserves exact replay without waking the worker.
+
+A one-time migration will bind eligible existing jobs to explicit revision-zero
+legacy authority. Runtime paths will never backfill missing bindings. Stale work
+will be retired atomically; corrupt authority will refuse execution. Acceptance,
+resume, claim, recovery, router and final command checks remain implementation
+work, with the same canonical lifecycle validator used inside caller transactions.
 
 ## Required acceptance
 
@@ -342,6 +381,60 @@ Independent security and QA reviews accepted the projection. JSON hashes:
 
 This unit performs no file selection, promotion, Docker command or network
 observation. It cannot establish physical withdrawal or enable lifecycle.
+
+### Protected selection and promotion: local evidence
+
+On 2026-10-18, the protected-format selection and exclusive promotion unit
+passed the following bounded checks with Go 1.26.7, readonly modules and
+`CGO_ENABLED=0`:
+
+| Check set | Parents | Children | Skips |
+| --- | ---: | ---: | ---: |
+| Windows legacy selection, projection, state, history and LAN regressions | 64 | 125 | 4 |
+| Retained Windows selection, promotion, storage and LAN checkpoints | 4 | 86 | 0 |
+| Final native Linux selection, promotion and regression groups | 68 | 213 | 0 |
+
+Every selected name ran once per invocation and passed or took a documented
+platform skip. The four Windows skips were existing permission/symlink checks;
+all executed successfully on Linux. Linux ran cross-compiled test binaries in
+WSL from their package directory, without race instrumentation.
+
+Four final Windows cases separately passed after test-only review repairs:
+old-format serialization/load/save compatibility, refusal of a nonterminal
+upgrade, rejection of mutating commands by the observer's read-only allowlist,
+and the real SQLite authority plus production observer wrapper. Their four
+invocations contained nine named parent/child runs. For example:
+
+```text
+go test -json -count=1 -timeout=5m ./internal/generatedingress -run '^TestPrepareGatewayCurrentV2$/^production_observer_wrapper_uses_real_SQL_authority$'
+```
+
+The full final Linux parents include these repairs. Unchanged earlier Windows
+cases were reused: the promotion checkpoint has an actual eleven-file
+before/after hash receipt; selection and storage/LAN provenance uses the sole
+writer's edit history and file timestamps, with hashes captured afterward.
+Those earlier checkpoints are not represented as runs of later-added cases.
+
+The fixed compatibility sample is a serializer/digest sentinel. A separate
+valid dynamic pre-union fixture verifies protected raw-byte loading and
+`saveNext`; this is not a fixed complete historical payload. Inspection uses a
+deterministic Docker runner. Its command allowlist permits the exact config GET
+and outbound config copy, and rejects reload, POST and inbound copy controls.
+
+Representative raw JSON SHA-256 hashes:
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Linux final promotion parent | `4fdf77f5071476ce488370f336544597fe28b0ed265e8a1af0b2cbc83cde15cf` |
+| Linux final protected selection parent | `55bbd09f758dacc86333815ffe119fe25d9f934b7f8f406209b7c5dfcebfe78c` |
+| Linux final storage parent | `a8afa64f68d19b652852747dff4ca69c4a8d57ba1d7d0bf9953093d6261d31b6` |
+| Windows final production observer case | `bc3f937ac104d46b7ea0718efb742f2fd92cb81db77b2806497982658a9b68c7` |
+
+Independent security and QA reviews accepted the bounded source and repaired
+tests. The controller build and canonical generation check passed at the same
+ten production-file hashes before the final test-only repairs. These checks do
+not prove live Docker traffic withdrawal, container lifecycle effects, recovery
+activation, or full M4 acceptance.
 
 ### Pre-change baseline
 

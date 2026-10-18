@@ -166,7 +166,7 @@ func TestGatewayCurrentProjectionV2(t *testing.T) {
 		app.Traffic = gatewayCurrentTrafficDormantV2
 		app.Authority = gatewayCurrentRouteStateV2AuthoredAuthority(gatewayCurrentDesiredStoppedV2, gatewayCurrentLifecycleWithdrawV2)
 		state.Apps[appA] = app
-		state.SourceV1 = gatewayCurrentRouteSourceV1{Revision: v1.Revision, Digest: v1.Digest}
+		state.SourceV1 = &gatewayCurrentRouteSourceV1{Revision: v1.Revision, Digest: v1.Digest}
 		gatewayCurrentProjectionV2Refresh(t, &state)
 
 		v1Config := gatewayCurrentProjectionV2Config(t, gatewayCurrentProjectionV1ConfigBytes(t, v1))
@@ -381,20 +381,24 @@ func TestGatewayCurrentProjectionV2(t *testing.T) {
 		}
 	})
 
-	t.Run("unsupported_upgrade_refuses_physical_config_and_dormant_tokens_are_exact", func(t *testing.T) {
+	t.Run("genuine_upgrade_renders_exact_physical_config_and_dormant_tokens", func(t *testing.T) {
 		oldBefore := gatewayCurrentProjectionV1ConfigBytes(t, baseV1)
 		upgrade := gatewayCurrentProjectionV2UpgradeFixture(t, fixture, baseV2)
 		if _, err := projectGatewayCurrentStateV2(upgrade); err != nil {
 			t.Fatalf("valid retained upgrade projection was refused: %v", err)
 		}
-		if body, err := gatewayCurrentPhysicalConfigBytesV2(upgrade); err == nil || body != nil {
-			t.Fatalf("unsupported upgrade identity rendered physical config: %x error=%v", body, err)
+		body, err := gatewayCurrentPhysicalConfigBytesV2(upgrade)
+		wantBody, wantErr := expectedGatewayV2FinalConfig(fixture.history.Predecessor.State)
+		if err != nil || wantErr != nil || !bytes.Equal(body, wantBody) {
+			t.Fatalf("upgrade physical config mismatch: error=%v wantError=%v equal=%v", err, wantErr, bytes.Equal(body, wantBody))
 		}
-		if token, err := gatewayCurrentPhysicalProbeTokenV2(upgrade); err == nil || token != "" {
-			t.Fatalf("unsupported upgrade identity produced physical token: %q error=%v", token, err)
+		token, err := gatewayCurrentPhysicalProbeTokenV2(upgrade)
+		wantToken, wantTokenErr := gatewayV2HostChallenge(fixture.history.Predecessor.State)
+		if err != nil || wantTokenErr != nil || token != wantToken {
+			t.Fatalf("upgrade physical token=%q want=%q error=%v wantError=%v", token, wantToken, err, wantTokenErr)
 		}
-		if expected, err := gatewayCurrentDormantExpectationsV2(upgrade); err == nil || expected != nil {
-			t.Fatalf("unsupported upgrade identity produced dormant expectations: %#v error=%v", expected, err)
+		if expected, err := gatewayCurrentDormantExpectationsV2(upgrade); err != nil || len(expected) != 0 {
+			t.Fatalf("serving upgrade dormant expectations: %#v error=%v", expected, err)
 		}
 		oldAfter := gatewayCurrentProjectionV1ConfigBytes(t, baseV1)
 		if !bytes.Equal(oldBefore, oldAfter) {
@@ -403,11 +407,11 @@ func TestGatewayCurrentProjectionV2(t *testing.T) {
 
 		_, mixed, appA, _ := gatewayCurrentProjectionV2TwoAppFixture(t, baseV1, baseV2)
 		mixed = gatewayCurrentProjectionV2Dormant(t, mixed, appA, gatewayCurrentDesiredStoppedV2)
-		expected, err := gatewayCurrentDormantExpectationsV2(mixed)
-		if err != nil || len(expected) != 1 || expected[0].LAN == nil {
-			t.Fatalf("dormant expectation=%#v error=%v", expected, err)
+		dormantExpected, err := gatewayCurrentDormantExpectationsV2(mixed)
+		if err != nil || len(dormantExpected) != 1 || dormantExpected[0].LAN == nil {
+			t.Fatalf("dormant expectation=%#v error=%v", dormantExpected, err)
 		}
-		token, err := gatewayCurrentPhysicalProbeTokenV2(mixed)
+		token, err = gatewayCurrentPhysicalProbeTokenV2(mixed)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -420,8 +424,8 @@ func TestGatewayCurrentProjectionV2(t *testing.T) {
 				GenericPortChallenge: gatewayV2PortChallenge(token, mixed.Apps[appA].LAN.Raw.Port),
 			},
 		}
-		if !reflect.DeepEqual(expected[0], want) {
-			t.Fatalf("dormant challenge descriptor=%#v want=%#v", expected[0], want)
+		if !reflect.DeepEqual(dormantExpected[0], want) {
+			t.Fatalf("dormant challenge descriptor=%#v want=%#v", dormantExpected[0], want)
 		}
 		config := gatewayCurrentProjectionV2Config(t, gatewayCurrentProjectionV2ConfigBytes(t, mixed))
 		local := config.Apps.HTTP.Servers["generated"]
@@ -460,7 +464,7 @@ func gatewayCurrentProjectionV2TwoAppFixture(t *testing.T, baseV1 gatewayCurrent
 	v1.Apps[appB] = gatewayCurrentAppRoute{Route: routeB, LAN: bindingB}
 	gatewayCurrentProjectionV2RefreshV1(t, &v1)
 	v2 := cloneGatewayCurrentRouteStateV2(baseV2)
-	v2.SourceV1 = gatewayCurrentRouteSourceV1{Revision: v1.Revision, Digest: v1.Digest}
+	v2.SourceV1 = &gatewayCurrentRouteSourceV1{Revision: v1.Revision, Digest: v1.Digest}
 	v2.Apps[appB] = gatewayCurrentAppRouteV2{
 		Route: routeB,
 		Runtime: gatewayCurrentRuntimePinV2{
@@ -559,12 +563,20 @@ func gatewayCurrentProjectionV2UpgradeFixture(t *testing.T, fixture gatewayCurre
 		}
 	}
 	identity := selection.State.Identity
+	origin, err := gatewayCurrentUpgradeRouteOriginV2(selection.State, fixture.history.Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestDigest, err := appaccess.GatewayRebindTransferManifestDigest(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	value := gatewayCurrentRouteStateV2{
 		Version: gatewayCurrentRouteStateVersionV2, Revision: 1, Lineage: lineage,
 		Profile:  selection.State.Profile,
 		Identity: gatewayCurrentIdentity{Kind: gatewayCurrentIdentityUpgrade, Upgrade: &identity},
-		Network:  selection.State.Network, TransferManifestDigest: template.TransferManifestDigest,
-		SourceV1: template.SourceV1, Apps: apps,
+		Network:  selection.State.Network, TransferManifestDigest: manifestDigest,
+		SourceUpgrade: origin.SourceUpgrade, Apps: apps,
 	}
 	gatewayCurrentProjectionV2Refresh(t, &value)
 	return value

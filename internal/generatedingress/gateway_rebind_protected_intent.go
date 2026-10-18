@@ -461,7 +461,27 @@ func (m *Manager) resolveGatewayRebindProtectedIntentLocked(operationID string) 
 // claim; future effect and recovery callers must perform that cross-store
 // comparison while holding their required lock and lease.
 func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func()) (gatewayRebindProtectedIntentHistory, error) {
-	upgrade, before, err := m.scanGatewayUpgradeHistoryLockedModeRebindAware(false, "")
+	result, err := m.scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint, false)
+	return result, err
+}
+
+func (m *Manager) scanGatewayRebindProtectedIntentHistoryCurrentV2AwareLocked(checkpoint func()) (
+	gatewayRebindProtectedIntentHistory, error,
+) {
+	return m.scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint, true)
+}
+
+func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint func(), allowCurrentV2 bool) (
+	gatewayRebindProtectedIntentHistory, error,
+) {
+	var upgrade gatewayUpgradeHistory
+	var before gatewayHistorySnapshot
+	var err error
+	if allowCurrentV2 {
+		upgrade, before, err = m.scanGatewayUpgradeHistoryLockedModeCurrentV2Aware(false, "")
+	} else {
+		upgrade, before, err = m.scanGatewayUpgradeHistoryLockedModeRebindAware(false, "")
+	}
 	if err != nil || !upgrade.committed || len(upgrade.generations) == 0 {
 		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor history is invalid")
 	}
@@ -644,7 +664,7 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLocked(checkpoint func(
 	if checkpoint != nil {
 		checkpoint()
 	}
-	after, err := readGatewayHistorySnapshotMode(m.store, true)
+	after, err := readGatewayHistorySnapshotPolicy(m.store, true, allowCurrentV2)
 	if err != nil || !sameGatewayHistorySnapshot(before, after) {
 		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind intent history changed during inspection")
 	}

@@ -11,7 +11,29 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appaccess"
 )
+
+// This mirrors the accepted pre-origin-union wire type. Keep the value
+// sourceV1 field and field order independent from the production serializer so
+// pointer/omitempty changes cannot make the compatibility oracle tautological.
+type gatewayCurrentRouteStateV2PreOriginOracle struct {
+	Version                uint64                              `json:"version"`
+	Revision               uint64                              `json:"revision"`
+	Lineage                appaccess.GatewayCurrentLineageRef  `json:"lineage"`
+	Profile                gatewayProfileBinding               `json:"profile"`
+	Identity               gatewayCurrentIdentity              `json:"identity"`
+	Network                gatewayV2NetworkPlan                `json:"network"`
+	TransferManifestDigest string                              `json:"transferManifestDigest"`
+	SourceV1               gatewayCurrentRouteSourceV1         `json:"sourceV1"`
+	Apps                   map[string]gatewayCurrentAppRouteV2 `json:"apps"`
+	Digest                 string                              `json:"digest"`
+}
+
+type gatewayCurrentRouteStateDigestEnvelopeV2PreOriginOracle struct {
+	Purpose string                                    `json:"purpose"`
+	State   gatewayCurrentRouteStateV2PreOriginOracle `json:"state"`
+}
 
 func gatewayCurrentRouteStateV2ForTest(t *testing.T, fixture gatewayCurrentStateFixture) gatewayCurrentRouteStateV2 {
 	t.Helper()
@@ -34,7 +56,7 @@ func gatewayCurrentRouteStateV2ForTest(t *testing.T, fixture gatewayCurrentState
 		Lineage: fixture.baseline.Lineage, Profile: fixture.baseline.Profile,
 		Identity: cloneGatewayCurrentRouteState(fixture.baseline).Identity,
 		Network:  fixture.baseline.Network, TransferManifestDigest: fixture.baseline.TransferManifestDigest,
-		SourceV1: gatewayCurrentRouteSourceV1{Revision: fixture.baseline.Revision, Digest: fixture.baseline.Digest},
+		SourceV1: &gatewayCurrentRouteSourceV1{Revision: fixture.baseline.Revision, Digest: fixture.baseline.Digest},
 		Apps:     apps,
 	}
 	var err error
@@ -197,6 +219,120 @@ func TestGatewayCurrentRouteStateV2Storage(t *testing.T) {
 		}
 	})
 
+	t.Run("pre_origin_union_rebind_wire_digest_load_and_save_compatibility", func(t *testing.T) {
+		const literalDigest = "81bc41cdb37d51c1b7e577d28e37543feb7271f8f037ad519c3223beaeac7ce4"
+		const literalWire = `{"version":2,"revision":1,"lineage":{"kind":"","operationId":"","profileRevisionId":"","profileRevisionNumber":0,"profileSpecDigest":"","protectedGeneration":0,"protectedIdentityDigest":""},"profile":{"revisionId":"","revisionNumber":0,"specDigest":"","selectedIpv4":"","interfaceId":"","portStart":0,"portEnd":0},"identity":{"kind":""},"network":{"subnet":"","gatewayIpv4":"","containerIpv4":""},"transferManifestDigest":"","sourceV1":{"revision":7,"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"apps":{},"digest":"81bc41cdb37d51c1b7e577d28e37543feb7271f8f037ad519c3223beaeac7ce4"}`
+		literal := gatewayCurrentRouteStateV2{
+			Version: 2, Revision: 1,
+			SourceV1: &gatewayCurrentRouteSourceV1{
+				Revision: 7, Digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
+			Apps:   map[string]gatewayCurrentAppRouteV2{},
+			Digest: literalDigest,
+		}
+		literalBytes, err := json.Marshal(literal)
+		if err != nil || string(literalBytes) != literalWire {
+			t.Fatalf("pre-union literal wire changed: got=%s want=%s error=%v", literalBytes, literalWire, err)
+		}
+		literalComputed, err := gatewayCurrentRouteStateDigestV2(literal)
+		if err != nil || literalComputed != literalDigest {
+			t.Fatalf("pre-union literal digest changed: got=%s want=%s error=%v", literalComputed, literalDigest, err)
+		}
+
+		oracle := gatewayCurrentRouteStateV2PreOriginOracle{
+			Version: baseline.Version, Revision: baseline.Revision, Lineage: baseline.Lineage,
+			Profile: baseline.Profile, Identity: baseline.Identity, Network: baseline.Network,
+			TransferManifestDigest: baseline.TransferManifestDigest, SourceV1: *baseline.SourceV1,
+			Apps: baseline.Apps,
+		}
+		oracleDigest, err := canonicalDigest(gatewayCurrentRouteStateDigestEnvelopeV2PreOriginOracle{
+			Purpose: "hostd/generated-ingress/routes/current/v2/state-digest/v1", State: oracle,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		oracle.Digest = oracleDigest
+		wantBytes, err := json.Marshal(oracle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gotBytes, err := json.Marshal(baseline)
+		if err != nil || !bytes.Equal(gotBytes, wantBytes) || baseline.Digest != oracleDigest {
+			t.Fatalf("prechange rebind bytes/digest changed: bytesEqual=%v gotDigest=%s wantDigest=%s error=%v",
+				bytes.Equal(gotBytes, wantBytes), baseline.Digest, oracleDigest, err)
+		}
+
+		store, err := newGatewayCurrentRouteStateV2Store(t.TempDir(), baseline.Lineage, *baseline.SourceV1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gatewayCurrentRouteStateV2WriteRaw(t, store, wantBytes)
+		loaded, err := store.load()
+		if err != nil || !reflect.DeepEqual(loaded, baseline) {
+			t.Fatalf("load prechange rebind bytes: %v", err)
+		}
+		next := gatewayCurrentRouteStateV2WithDormantApp(t, loaded, gatewayCurrentDesiredStoppedV2)
+		next.Revision++
+		next.Digest, _ = gatewayCurrentRouteStateDigestV2(next)
+		if err := store.saveNext(loaded, next); err != nil {
+			t.Fatalf("save from prechange rebind bytes: %v", err)
+		}
+		confirmed, err := store.load()
+		if err != nil || !reflect.DeepEqual(confirmed, next) {
+			t.Fatalf("reload after compatible save: %v", err)
+		}
+	})
+
+	t.Run("exclusive_source_origin_union_and_upgrade_store", func(t *testing.T) {
+		upgrade := gatewayCurrentProjectionV2UpgradeFixture(t, fixture, baseline)
+		if upgrade.SourceV1 != nil || upgrade.SourceUpgrade == nil || !validGatewayCurrentRouteStateV2(upgrade) {
+			t.Fatalf("genuine upgrade origin is invalid: %#v", gatewayCurrentRouteOriginForStateV2(upgrade))
+		}
+		for _, generation := range []uint64{0, 7} {
+			value := cloneGatewayCurrentRouteStateV2(upgrade)
+			value.Lineage.ProtectedGeneration = generation
+			value.Digest, _ = gatewayCurrentRouteStateDigestV2(value)
+			store, err := newGatewayCurrentRouteStateV2StoreForOrigin(t.TempDir(), value.Lineage,
+				gatewayCurrentRouteOriginForStateV2(value))
+			if err != nil || store.installBaseline(value) != nil {
+				t.Fatalf("install upgrade generation %d: %v", generation, err)
+			}
+			loaded, err := store.load()
+			if err != nil || !reflect.DeepEqual(value, loaded) {
+				t.Fatalf("load upgrade generation %d: %v", generation, err)
+			}
+		}
+
+		both := cloneGatewayCurrentRouteStateV2(upgrade)
+		sourceV1 := *baseline.SourceV1
+		both.SourceV1 = &sourceV1
+		both.Digest, _ = gatewayCurrentRouteStateDigestV2(both)
+		neither := cloneGatewayCurrentRouteStateV2(upgrade)
+		neither.SourceUpgrade = nil
+		neither.Digest, _ = gatewayCurrentRouteStateDigestV2(neither)
+		wrong := cloneGatewayCurrentRouteStateV2(upgrade)
+		wrong.SourceUpgrade.StateDigest = strings.Repeat("z", 64)
+		wrong.Digest, _ = gatewayCurrentRouteStateDigestV2(wrong)
+		wrongLineage := cloneGatewayCurrentRouteStateV2(upgrade)
+		wrongLineage.Lineage.ProtectedJournalDigest = ""
+		wrongLineage.Digest, _ = gatewayCurrentRouteStateDigestV2(wrongLineage)
+		for name, value := range map[string]gatewayCurrentRouteStateV2{
+			"both": both, "neither": neither, "wrong_origin": wrong, "wrong_lineage": wrongLineage,
+		} {
+			t.Run(name, func(t *testing.T) {
+				if validGatewayCurrentRouteStateV2(value) {
+					t.Fatal("invalid origin union was accepted")
+				}
+			})
+		}
+
+		copy := cloneGatewayCurrentRouteStateV2(upgrade)
+		copy.SourceUpgrade.StateDigest = strings.Repeat("e", 64)
+		if copy.SourceUpgrade.StateDigest == upgrade.SourceUpgrade.StateDigest {
+			t.Fatal("upgrade origin clone aliases source")
+		}
+	})
+
 	t.Run("dormant_retains_runtime_and_optional_lan", func(t *testing.T) {
 		value := gatewayCurrentRouteStateV2WithDormantApp(t, baseline, gatewayCurrentDesiredStoppedV2)
 		appID := gatewayCurrentRouteStateV2FirstApp(t, value)
@@ -285,7 +421,7 @@ func TestGatewayCurrentRouteStateV2Storage(t *testing.T) {
 
 	t.Run("exclusive_baseline_and_revision_cas", func(t *testing.T) {
 		dataRoot := t.TempDir()
-		store, err := newGatewayCurrentRouteStateV2Store(dataRoot, baseline.Lineage, baseline.SourceV1)
+		store, err := newGatewayCurrentRouteStateV2Store(dataRoot, baseline.Lineage, *baseline.SourceV1)
 		if err != nil || store.installBaseline(baseline) != nil || store.installBaseline(baseline) != nil {
 			t.Fatalf("install or exact replay: %v", err)
 		}
@@ -320,7 +456,7 @@ func TestGatewayCurrentRouteStateV2Storage(t *testing.T) {
 		if err := store.saveNext(next, changedOrigin); err == nil {
 			t.Fatal("changed immutable V1 origin was accepted")
 		}
-		wrongSource := baseline.SourceV1
+		wrongSource := *baseline.SourceV1
 		wrongSource.Revision++
 		wrongStore, err := newGatewayCurrentRouteStateV2Store(dataRoot, baseline.Lineage, wrongSource)
 		if err != nil {
@@ -334,7 +470,7 @@ func TestGatewayCurrentRouteStateV2Storage(t *testing.T) {
 		if wrongLineage.TerminalReceiptDigest == baseline.Lineage.TerminalReceiptDigest {
 			wrongLineage.TerminalReceiptDigest = strings.Repeat("e", 64)
 		}
-		wrongLineageStore, err := newGatewayCurrentRouteStateV2Store(dataRoot, wrongLineage, baseline.SourceV1)
+		wrongLineageStore, err := newGatewayCurrentRouteStateV2Store(dataRoot, wrongLineage, *baseline.SourceV1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -402,7 +538,7 @@ func TestGatewayCurrentRouteStateV2Storage(t *testing.T) {
 				if err := json.Unmarshal(test.body, &normalized); err != nil || !validGatewayCurrentRouteStateV2(normalized) {
 					t.Fatalf("malformed control did not normalize to the valid signed state: %v", err)
 				}
-				store, err := newGatewayCurrentRouteStateV2Store(t.TempDir(), baseline.Lineage, baseline.SourceV1)
+				store, err := newGatewayCurrentRouteStateV2Store(t.TempDir(), baseline.Lineage, *baseline.SourceV1)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -416,7 +552,7 @@ func TestGatewayCurrentRouteStateV2Storage(t *testing.T) {
 		future := cloneGatewayCurrentRouteStateV2(baseline)
 		future.Version++
 		future.Digest, _ = gatewayCurrentRouteStateDigestV2(future)
-		store, err := newGatewayCurrentRouteStateV2Store(t.TempDir(), baseline.Lineage, baseline.SourceV1)
+		store, err := newGatewayCurrentRouteStateV2Store(t.TempDir(), baseline.Lineage, *baseline.SourceV1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -430,7 +566,7 @@ func TestGatewayCurrentRouteStateV2Storage(t *testing.T) {
 	})
 
 	t.Run("bounded_protected_payload", func(t *testing.T) {
-		store, err := newGatewayCurrentRouteStateV2Store(t.TempDir(), baseline.Lineage, baseline.SourceV1)
+		store, err := newGatewayCurrentRouteStateV2Store(t.TempDir(), baseline.Lineage, *baseline.SourceV1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -473,7 +609,7 @@ func TestGatewayCurrentRouteStateV2Storage(t *testing.T) {
 		if !reflect.DeepEqual(v1Keys, wantV1Keys) {
 			t.Fatalf("V1 canonical shape changed: got=%v want=%v", v1Keys, wantV1Keys)
 		}
-		v2Store, err := newGatewayCurrentRouteStateV2Store(fixture.dataRoot, baseline.Lineage, baseline.SourceV1)
+		v2Store, err := newGatewayCurrentRouteStateV2Store(fixture.dataRoot, baseline.Lineage, *baseline.SourceV1)
 		if err != nil || v2Store.installBaseline(baseline) != nil {
 			t.Fatalf("install adjacent V2: %v", err)
 		}
