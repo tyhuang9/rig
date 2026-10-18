@@ -282,7 +282,7 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 		logger.Error("local diagnostics persistence failed", "error", err)
 		return 1
 	}
-	j, _, err := newDeploymentJobService(db)
+	j, deploymentBindings, err := newDeploymentJobService(db)
 	if err != nil {
 		logger.Error("deployment job lifecycle binding setup failed", "error", err)
 		return 1
@@ -330,7 +330,7 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 	deploymentRepository := deployments.New(db)
 	runtime, err := prepareRuntimeComposition(context.Background(), cfg, runtimeCompositionDependencies{
 		db: db, applications: applications, snapshots: snapshots, configuration: applicationConfiguration,
-		deployments: deploymentRepository, plans: planStore,
+		deployments: deploymentRepository, plans: planStore, bindings: deploymentBindings,
 	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, runner: assembly.runner,
 		preinspectedIngress: gate.ingress})
 	if err != nil {

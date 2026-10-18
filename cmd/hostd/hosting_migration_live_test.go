@@ -184,7 +184,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	}
 	sourceClock := time.Now().UTC()
 	appStore := apps.New(db)
-	jobStore, _, err := newDeploymentJobService(db)
+	jobStore, bindingStore, err := newDeploymentJobService(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +208,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	settings.GeneratedRuntime = true
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans,
+		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 	}, runtimeCompositionOptions{
 		dockerExecutable: docker,
 		migrationRunnerFactory: func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
@@ -644,7 +644,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reopenedJobs, _, err := newDeploymentJobService(db)
+	reopenedJobs, reopenedBindings, err := newDeploymentJobService(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +652,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	recoveryRunner := &migrationJourneyRunner{}
 	reopened, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: apps.New(db), snapshots: reopenedSnapshots, configuration: reopenedConfiguration,
-		deployments: reopenedDeployments, plans: reopenedPlans,
+		deployments: reopenedDeployments, plans: reopenedPlans, bindings: reopenedBindings,
 	}, runtimeCompositionOptions{
 		dockerExecutable: docker,
 		migrationRunnerFactory: func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {

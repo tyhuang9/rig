@@ -168,7 +168,7 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 		t.Fatal(err)
 	}
 	applicationStore := apps.New(db)
-	jobStore, _, err := newDeploymentJobService(db)
+	jobStore, bindingStore, err := newDeploymentJobService(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: applicationStore, snapshots: snapshots, configuration: configurationStore,
-		deployments: deploymentStore, plans: planStore,
+		deployments: deploymentStore, plans: planStore, bindings: bindingStore,
 	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("compose supported hostd rebind baseline:", err)
