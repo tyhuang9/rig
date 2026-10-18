@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/autodeploy"
@@ -26,6 +28,7 @@ import (
 	"github.com/hostd/hostd/internal/controller"
 	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedingress"
@@ -69,6 +72,23 @@ type hostdDaemonAssemblyOptions struct {
 	listen          func(string, string) (net.Listener, error)
 	ready           func(hostdDaemonReady)
 	backgroundStart hostdBackgroundStartObserver
+}
+
+func newDeploymentJobService(db *sql.DB) (*jobs.Service, *deploymentbinding.Repository, error) {
+	lifecycle := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+	if err != nil {
+		return nil, nil, err
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		return nil, nil, err
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		return nil, nil, err
+	}
+	return service, bindings, nil
 }
 
 func runServer(args []string) int {
@@ -262,7 +282,11 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 		logger.Error("local diagnostics persistence failed", "error", err)
 		return 1
 	}
-	j := jobs.New(db)
+	j, _, err := newDeploymentJobService(db)
+	if err != nil {
+		logger.Error("deployment job lifecycle binding setup failed", "error", err)
+		return 1
+	}
 	applicationConfiguration, err := appconfig.New(db, cfg.DataRoot)
 	if err != nil {
 		logger.Error("application configuration setup failed", "error", err)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/jobs"
 )
 
@@ -80,7 +81,7 @@ type CoordinatorRepository interface {
 }
 
 type JobCreator interface {
-	CreateWithInputFinalized(jobs.CreateRequest, jobs.CreateFinalizer) (jobs.Job, bool, error)
+	CreateDeploymentWithInputTransaction(context.Context, jobs.DeploymentCreateRequest, jobs.DeploymentCreateHooks) (jobs.DeploymentCreateResult, error)
 }
 
 type CoordinatorEvent struct {
@@ -526,18 +527,19 @@ func (coordinator *Coordinator) dispatch(ctx context.Context, status Status, lea
 			return
 		}
 	}
-	_, _, err = coordinator.jobs.CreateWithInputFinalized(jobs.CreateRequest{
-		Type: "deploy", ResourceType: "application", ResourceID: dispatch.ApplicationID,
-		IdempotencyKey: DispatchIdempotencyKey(lease.ConfigRevision, dispatch.Sequence),
-		RequestedBy:    status.SourceOwnerUserID,
-		Input:          jobs.DeploymentInput{ReleaseID: preflight.ReleaseID, ConfigurationMode: jobs.ConfigurationCurrent},
-	}, func(tx *sql.Tx, job jobs.Job) error {
+	link := func(linkCtx context.Context, tx *sql.Tx, job jobs.Job, _ deploymentbinding.Binding) error {
 		linkAt := coordinator.config.Clock.Now().UTC()
 		if !linkAt.Before(lease.ExpiresAt) {
 			return ErrState
 		}
-		return coordinator.repository.LinkDispatchJobTx(ctx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, linkAt)
-	})
+		return coordinator.repository.LinkDispatchJobTx(linkCtx, tx, lease, dispatch.Sequence, dispatch.Generation, job.ID, linkAt)
+	}
+	_, err = coordinator.jobs.CreateDeploymentWithInputTransaction(ctx, jobs.DeploymentCreateRequest{
+		ApplicationID:  dispatch.ApplicationID,
+		IdempotencyKey: DispatchIdempotencyKey(lease.ConfigRevision, dispatch.Sequence),
+		RequestedBy:    status.SourceOwnerUserID,
+		Input:          jobs.DeploymentInput{ReleaseID: preflight.ReleaseID, ConfigurationMode: jobs.ConfigurationCurrent},
+	}, jobs.DeploymentCreateHooks{FinalizeNew: link, ValidateReplay: link})
 	if err != nil {
 		if errors.Is(err, ErrDispatchPreflightChanged) {
 			coordinator.restartPreparedDispatch(ctx, lease, dispatch, event)
@@ -553,6 +555,20 @@ func (coordinator *Coordinator) dispatch(ctx context.Context, status Status, lea
 			coordinator.retryOrPause(ctx, lease, priorAttempt, OutcomeApplicationBusy, PauseDeploymentFailed, coordinator.config.Clock.Now().UTC(), event)
 			return
 		}
+		if isDeploymentLifecycleRefusal(err) {
+			now, valid := coordinator.mutationTime(lease, event)
+			if !valid {
+				return
+			}
+			if pauseErr := coordinator.repository.Pause(ctx, lease, PauseDeploymentFailed, now); pauseErr != nil {
+				event.Outcome = OutcomePersistenceUnavailable
+				return
+			}
+			event.Paused++
+			setPausedLifecycle(event, PauseDeploymentFailed)
+			event.Outcome = OutcomeDeploymentFailed
+			return
+		}
 		// The prepared dispatch is durable and the job/link transaction rolled
 		// back together. Leave it prepared so the exact dispatch can be replayed.
 		event.Outcome = OutcomePersistenceUnavailable
@@ -563,6 +579,12 @@ func (coordinator *Coordinator) dispatch(ctx context.Context, status Status, lea
 	event.PauseCode = ObservedPauseNone
 	event.RetryAttempt = 0
 	event.NextAction = NextActionPollJob
+}
+
+func isDeploymentLifecycleRefusal(err error) bool {
+	return errors.Is(err, deploymentbinding.ErrBindingNotFound) ||
+		errors.Is(err, deploymentbinding.ErrInvalidBinding) ||
+		errors.Is(err, deploymentbinding.ErrLifecycleUnresolved)
 }
 
 func (coordinator *Coordinator) handlePreflightError(ctx context.Context, status Status, lease WorkLease, dispatch PreparedDispatch, preflightErr error, event *CoordinatorEvent) {

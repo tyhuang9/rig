@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/generatedrecovery"
 )
 
@@ -205,14 +206,15 @@ type Executor interface {
 }
 
 type Service struct {
-	db             *sql.DB
-	now            func() time.Time
-	wake           chan struct{}
-	mu             sync.Mutex
-	active         map[string]context.CancelFunc
-	beforeClaim    func()
-	beforeRegister func()
-	beforeExecute  func()
+	db                 *sql.DB
+	deploymentBindings *deploymentbinding.Repository
+	now                func() time.Time
+	wake               chan struct{}
+	mu                 sync.Mutex
+	active             map[string]context.CancelFunc
+	beforeClaim        func()
+	beforeRegister     func()
+	beforeExecute      func()
 }
 
 func New(db *sql.DB) *Service {

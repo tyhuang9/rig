@@ -18,10 +18,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/autodeploy"
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/githubapp"
 	"github.com/hostd/hostd/internal/jobs"
@@ -220,7 +222,7 @@ func TestCoordinatorJobRunsOwnerScopedGitHubComposeMaterialization(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := jobs.New(db)
+	jobService := newComposeDeploymentJobService(t, db)
 	autoRepository := autodeploy.NewRepository(db)
 	if _, err = autoRepository.Configure(context.Background(), autodeploy.ConfigureRequest{ApplicationID: application.ID, ActorUserID: owner, Enabled: true}, now); err != nil {
 		t.Fatal(err)
@@ -630,7 +632,7 @@ func TestLegacyLocalSourceDraftMigratesAndCompletesManagedComposeDeployment(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := jobs.New(db)
+	jobService := newComposeDeploymentJobService(t, db)
 	deploymentRepository := deployments.New(db)
 	releaseUp := make(chan struct{})
 	var releaseUpOnce sync.Once
@@ -1102,7 +1104,7 @@ func newComposeWorkerFixture(t *testing.T, releaseUp chan struct{}) *composeWork
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := jobs.New(db)
+	jobService := newComposeDeploymentJobService(t, db)
 	deploymentRepository := deployments.New(db)
 	runner := &blockingComposeRunner{upStarted: make(chan struct{}), releaseUp: releaseUp}
 	releaseMaterializer, err := releasesnapshot.New(db, unreachableSourceReader{}, dataRoot)
@@ -1142,19 +1144,34 @@ func (f *composeWorkerFixture) startWorker(t *testing.T) {
 
 func (f *composeWorkerFixture) createJob(t *testing.T) jobs.Job {
 	t.Helper()
-	job, created, err := f.jobs.CreateWithInput(jobs.CreateRequest{
-		Type:         "deploy",
-		ResourceType: "application",
-		ResourceID:   f.app.ID,
-		RequestedBy:  f.actorID,
+	result, err := f.jobs.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+		ApplicationID: f.app.ID,
+		RequestedBy:   f.actorID,
 		Input: jobs.DeploymentInput{
 			ConfigurationMode: jobs.ConfigurationCurrent,
 		},
-	})
-	if err != nil || !created {
-		t.Fatalf("job=%#v created=%t err=%v", job, created, err)
+	}, jobs.DeploymentCreateHooks{})
+	if err != nil || !result.Created {
+		t.Fatalf("job=%#v created=%t err=%v", result.Job, result.Created, err)
 	}
-	return job
+	return result.Job
+}
+
+func newComposeDeploymentJobService(t *testing.T, db *sql.DB) *jobs.Service {
+	t.Helper()
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
 }
 
 func waitForJob(t *testing.T, service *jobs.Service, id string, status jobs.Status) jobs.Job {

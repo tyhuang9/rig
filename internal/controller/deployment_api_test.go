@@ -20,10 +20,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/apicontract"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/composeruntime"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
@@ -43,6 +45,7 @@ type deploymentAPIFixture struct {
 	jobs        *jobs.Service
 	deployments *deployments.Repository
 	plans       *deploymentplans.Store
+	server      *controller.Server
 	handler     http.Handler
 	app         apps.Application
 	otherApp    apps.Application
@@ -92,19 +95,37 @@ func newDeploymentAPIFixtureWithRuntimes(t *testing.T, composeRuntime, generated
 	if err != nil {
 		t.Fatal(err)
 	}
-	jobService := jobs.New(db)
+	jobService := newDeploymentJobTestService(t, db)
 	deploymentStore := deployments.New(db)
 	planStore, err := deploymentplans.New(db, stateRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	logs := &bytes.Buffer{}
-	handler := (&controller.Server{
+	server := &controller.Server{
 		Auth: authService, Apps: appStore, Jobs: jobService, Machines: machineStore,
 		Deployments: deploymentStore, DeploymentPlans: planStore, ComposeRuntime: composeRuntime, GeneratedRuntime: generatedRuntime, FakeRuntime: fakeRuntime,
 		DataRoot: t.TempDir(), Logger: slog.New(slog.NewJSONHandler(logs, nil)),
-	}).Handler()
-	return deploymentAPIFixture{db: db, auth: authService, session: session, otherUserID: otherID, apps: appStore, jobs: jobService, deployments: deploymentStore, plans: planStore, handler: handler, app: app, otherApp: otherApp, stateRoot: stateRoot, logs: logs}
+	}
+	handler := server.Handler()
+	return deploymentAPIFixture{db: db, auth: authService, session: session, otherUserID: otherID, apps: appStore, jobs: jobService, deployments: deploymentStore, plans: planStore, server: server, handler: handler, app: app, otherApp: otherApp, stateRoot: stateRoot, logs: logs}
+}
+
+func newDeploymentJobTestService(t *testing.T, db *sql.DB) *jobs.Service {
+	t.Helper()
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return service
 }
 
 func (f deploymentAPIFixture) request(method, path, body string) *httptest.ResponseRecorder {
@@ -121,10 +142,11 @@ func (f deploymentAPIFixture) request(method, path, body string) *httptest.Respo
 
 func (f deploymentAPIFixture) createDeployment(t *testing.T, appID, mode string) (jobs.Job, deployments.Deployment) {
 	t.Helper()
-	job, _, err := f.jobs.CreateWithInput(jobs.CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: appID, RequestedBy: f.userID(t), Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationMode(mode)}})
+	result, err := f.jobs.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{ApplicationID: appID, RequestedBy: f.userID(t), Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationMode(mode)}}, jobs.DeploymentCreateHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	job := result.Job
 	deployment, _, err := f.deployments.GetOrCreateByJob(context.Background(), appID, job.ID, mode)
 	if err != nil {
 		t.Fatal(err)
@@ -526,6 +548,68 @@ func TestPriorReleaseDeploymentValidatesReadinessModeAndAppBoundary(t *testing.T
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestPriorReleaseDeploymentExactReplayPrecedesMutableReleasePreflight(t *testing.T) {
+	f := newDeploymentAPIFixture(t, true, false)
+	releaseID := f.insertRelease(t, f.app.ID, "ready")
+	path := "/api/v1/apps/" + f.app.ID + "/releases/" + releaseID + "/deployments"
+	const key = "historical-release-replay"
+	created := f.requestWithKey(http.MethodPost, path, `{"configurationMode":"current"}`, key)
+	if created.Code != http.StatusAccepted {
+		t.Fatalf("create release deployment: %d %s", created.Code, created.Body.String())
+	}
+	var original apicontract.JobMutationResponse
+	if err := json.Unmarshal(created.Body.Bytes(), &original); err != nil || !original.Created || original.Job.ID == "" {
+		t.Fatalf("create release deployment response=%#v err=%v", original, err)
+	}
+	if _, err := f.jobs.Cancel(original.Job.ID); err != nil {
+		t.Fatal(err)
+	}
+	type durableSnapshot struct {
+		status, phase, updatedAt, appID, mode, authorizer, bindingCreatedAt string
+		desiredRevision, events                                             int64
+	}
+	load := func() durableSnapshot {
+		t.Helper()
+		var value durableSnapshot
+		if err := f.db.QueryRow(`SELECT j.status,j.phase,j.updated_at,b.app_id,b.mode,
+			COALESCE(b.authorizing_lifecycle_job_id,''),b.created_at,b.desired_revision,
+			(SELECT COUNT(*) FROM job_events e WHERE e.job_id=j.id)
+			FROM jobs j JOIN application_deployment_lifecycle_bindings b ON b.job_id=j.id
+			WHERE j.id=?`, original.Job.ID).Scan(&value.status, &value.phase, &value.updatedAt, &value.appID,
+			&value.mode, &value.authorizer, &value.bindingCreatedAt, &value.desiredRevision, &value.events); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	before := load()
+	if _, err := f.db.Exec(`UPDATE releases SET status='failed' WHERE id=?`, releaseID); err != nil {
+		t.Fatal(err)
+	}
+	replayed := f.requestWithKey(http.MethodPost, path, `{"configurationMode":"current"}`, key)
+	if replayed.Code != http.StatusOK {
+		t.Fatalf("historical release replay: %d %s", replayed.Code, replayed.Body.String())
+	}
+	var response apicontract.JobMutationResponse
+	if err := json.Unmarshal(replayed.Body.Bytes(), &response); err != nil || response.Created || response.Job.ID != original.Job.ID || response.Job.Status != string(jobs.Cancelled) {
+		t.Fatalf("historical release replay response=%#v err=%v", response, err)
+	}
+	after := load()
+	if after != before {
+		t.Fatalf("historical release replay mutated durable state before=%#v after=%#v", before, after)
+	}
+	if _, err := f.db.Exec(`UPDATE releases SET status='ready' WHERE id=?`, releaseID); err != nil {
+		t.Fatal(err)
+	}
+	f.server.ComposeRuntime = false
+	capabilityReplay := f.requestWithKey(http.MethodPost, path, `{"configurationMode":"current"}`, key)
+	if capabilityReplay.Code != http.StatusOK {
+		t.Fatalf("capability-drift release replay: %d %s", capabilityReplay.Code, capabilityReplay.Body.String())
+	}
+	if capabilityAfter := load(); capabilityAfter != before {
+		t.Fatalf("capability-drift replay mutated durable state before=%#v after=%#v", before, capabilityAfter)
 	}
 }
 
@@ -1197,10 +1281,11 @@ func (f deploymentAPIFixture) acceptPlanFixture(t *testing.T, appID string, stra
 func (f deploymentAPIFixture) createDeploymentWithPlan(t *testing.T, revision deploymentplans.DeploymentPlanRevision) jobs.Job {
 	t.Helper()
 	releaseID := f.insertReleaseWithPlan(t, revision.AppID, "ready", revision)
-	job, _, err := f.jobs.CreateWithInput(jobs.CreateRequest{Type: "deploy", ResourceType: "application", ResourceID: revision.AppID, RequestedBy: f.userID(t), Input: jobs.DeploymentInput{ReleaseID: releaseID, ConfigurationMode: jobs.ConfigurationCurrent}})
+	result, err := f.jobs.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{ApplicationID: revision.AppID, RequestedBy: f.userID(t), Input: jobs.DeploymentInput{ReleaseID: releaseID, ConfigurationMode: jobs.ConfigurationCurrent}}, jobs.DeploymentCreateHooks{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	job := result.Job
 	deployment, _, err := f.deployments.GetOrCreateByJob(context.Background(), revision.AppID, job.ID, string(jobs.ConfigurationCurrent))
 	if err != nil {
 		t.Fatal(err)
