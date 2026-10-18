@@ -103,9 +103,9 @@ A receipt cannot authorize another command. If a receipted postcondition later
 drifts, this finite model pauses rather than repeating an unjournaled effect.
 Automatic repair of such drift remains a separate recoverability limit.
 
-The storage, admission and guarded restart-recovery evidence below establish
-their bounded portions of this contract. Worker claim/resume and final effect
-consumers still require their own executable acceptance evidence.
+The storage, admission, guarded restart-recovery and worker claim/resume evidence
+below establish their bounded portions of this contract. Router preparation and
+final effect consumers still require their own executable acceptance evidence.
 
 ### Retained runtime boundary
 
@@ -199,10 +199,10 @@ a historical running binding requires the complete original graph. Every nested
 read uses the caller's transaction. Repository/validator database identity is
 checked at composition; `database/sql` cannot introspect a transaction's origin.
 
-Guarded restart recovery now preserves stale deployment evidence and retires
-stale nonterminal jobs. Resume, claim, router and final command checks remain
-separate work. Storage, admission and recovery do not enable lifecycle actions
-or grant permission at a runtime command boundary.
+Guarded restart recovery and claim now preserve stale deployment evidence and
+retire stale nonterminal jobs; Resume refuses stale authority. Router and final
+command checks remain separate work. Storage, admission, recovery and queue
+checks do not enable lifecycle actions or grant runtime command permission.
 
 ### Atomic ordinary deployment admission
 
@@ -254,6 +254,35 @@ refuse deployment work; the job API retains generic non-deployment interruption.
 Lifecycle-completion bookkeeping repair remains a required preceding startup
 hook. This unit neither implements that hook nor performs Docker commands,
 resource cleanup, route restoration or lifecycle activation.
+
+### Deployment claim and Resume
+
+Claim reserves SQLite's writer before reading the oldest queued job and its
+original binding. Current authority permits assignment. Valid stale authority
+atomically retires the job to `needs_attention` with one fixed
+`deployment_lifecycle_stale` event, preserving attempt, progress, checkpoint and
+runtime records. A distinct retired result allows the next eligible job to
+proceed without calling an executor for stale work. Missing, corrupt or
+unresolved authority leaves the job unchanged and ends that worker invocation;
+it does not spin on the same row or silently skip an authority failure.
+
+`ResumeContext` checks the saved binding, runtime approvals, requeue and event
+inside one writer transaction. A failed event rolls back the requeue. Only a
+successful commit wakes the worker. The HTTP endpoint propagates the request
+context and returns fixed `deployment_lifecycle_stale` or
+`deployment_lifecycle_unresolved` conflicts without replacing authority.
+
+The missing-visible-application path is read-only. A raw existence check keeps
+archived applications and applications with incomplete source metadata hidden
+with the existing 404 response. Only a physically absent application proceeds
+to historical binding validation: valid stale history produces 409 and corrupt
+history produces 500. This diagnostic path cannot requeue a job. Existing actor,
+capability and approval checks remain in place for visible applications.
+
+Generic non-deployment worker behavior remains compatible. Real deployment
+fixtures use typed admission and an explicit binding repository; generic worker
+fixtures exercise generic jobs. These queue checks do not authorize commands
+after a later desired-state change.
 
 ## Required acceptance
 
@@ -641,12 +670,62 @@ finite behavioral scope. Evidence receipt SHA-256 hashes:
 | Integrated native Linux startup checks | `e550de2c8a4baaf23fc00a63fecfb32ce73577bde6fde2aedf5332072a4fd830` |
 | Final live-fixture compilation and canonical check | `76694b430dabf7a9b49c764556141be4c51a5c355e93b180343ebf6a3f4a9012` |
 
-These are local restart-recovery results. Worker claim/resume, final runtime
-command fencing, lifecycle-completion repair, hosted race checks, actual Docker
-lifecycle behavior and full M4 acceptance remain separate requirements.
-Broader package acceptance also awaits the remaining jobs fixture migrations
-owned by the claim/resume unit; these selected checks are not a full-package
-integration baseline.
+These are local restart-recovery results. The claim/resume unit below supplies
+the remaining jobs fixture migrations and broader jobs/controller checks.
+Final runtime command fencing, lifecycle-completion repair, hosted race checks,
+actual Docker lifecycle behavior and full M4 acceptance remain separate
+requirements.
+
+### Deployment claim and Resume: local evidence
+
+Commit `ecb5e135f96f0dd509cf981bb94dfc06ec1cffc2` was integrated locally
+at `c28d5abbdced9991ab9ce99709863f27a110fb93`. On 2026-10-18, the final
+Windows jobs/controller run passed 238 parents and 565 subtests with no failures
+or skips:
+
+```text
+go test -json -count=1 -timeout=5m ./internal/jobs ./internal/controller
+go run ./cmd/openapi-gen -check
+go vet ./internal/jobs ./internal/controller ./internal/generatedexecutor
+go build ./internal/jobs ./internal/controller ./internal/generatedexecutor
+```
+
+The earlier three-package run also passed all 37 generated-executor parents and
+16 subtests. It preceded the final jobs/controller visibility repair and remains
+recorded as such, rather than being relabeled a full-suite run at the final
+source. The changed real capacity-resume fixture was exercised again on native
+Linux after that repair.
+
+Native Linux ran all 80 parents and 85 subtests from the nine changed test files,
+with zero failures/skips: jobs 56/29, controller 23/56 and generated executor 1/0.
+The independent harness verifies every selected parent was discovered and passed
+once and that all 15 frozen source hashes stayed unchanged. Tests cover stale
+retirement, next-job progress, no attempt increment, corruption before stale
+classification, unresolved one-shot refusal, atomic Resume rollback, preserved
+visibility and approval-revocation serialization. Cancellation is tested with a
+pre-canceled request; event-trigger failure separately proves rollback after the
+requeue update. Synthetic lifecycle validators isolate jobs-package gate logic;
+the canonical graph coverage is recorded in the earlier binding/recovery units.
+
+After integration, the startup/wrapper selection passed 16 parents and six
+subtests on Windows. The controller build and canonical
+`scripts/check-generation.ps1` also passed. All source blobs from the reviewed
+claim/resume commit match the integrated tree. Independent security and QA
+reviews found no remaining issue in this bounded scope.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Final Windows jobs/controller JSON | `03f29062e4c4192a5573b78dd779d03c01bca595b3c8a4475d796d800be9cfad` |
+| Focused final visibility/rollback JSON | `ebac7e26fafc13b6a0b69ba19d946af845041fb1ea51b1128348625ecd47a0b2` |
+| Native Linux source freeze | `c47abe79cddca8fca880ebd0bef96b40b64a6732176459409d642fdb6e7051a6` |
+| Native Linux results receipt | `16f8350293c432eca492cc0ed3290955aee5cd76d3c3942a83824d96de4525ad` |
+| Combined startup/claim integration receipt | `4eabe436eb2316822b4fdafbf5ea8febeb5cfdbcc02263f74441ea935e19f9b9` |
+
+Checks use pinned Go 1.26.7 with readonly modules and `CGO_ENABLED=0`.
+Native Linux runs through WSL without race instrumentation. No Docker command,
+live-controller activation or hosted lifecycle acceptance is established by
+these results. Router preparation and final runtime command fencing remain
+required before public lifecycle activation.
 
 ### Pre-change baseline
 
