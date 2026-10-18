@@ -103,8 +103,9 @@ A receipt cannot authorize another command. If a receipted postcondition later
 drifts, this finite model pauses rather than repeating an unjournaled effect.
 Automatic repair of such drift remains a separate recoverability limit.
 
-The storage, admission, guarded restart-recovery, worker claim/resume and router
-preparation evidence below establish their bounded portions of this contract.
+The storage, admission, guarded restart-recovery, worker claim/resume, router
+preparation and shared policy Gate evidence below establish their bounded
+portions of this contract.
 Final effect consumers still require their own executable acceptance evidence.
 
 ### Retained runtime boundary
@@ -311,7 +312,7 @@ restoration or resource cleanup is introduced here. Final command checks must
 still verify current authority, current attempt and the original live effects
 scope when an actual effect is about to run.
 
-### Dormant deployment policy guard
+### Deployment policy guard foundation
 
 The shared `deploymentexecution` guard keeps the original immutable binding,
 job/application identity and positive worker attempt in a private Claim. The
@@ -337,10 +338,44 @@ the caller's transaction. Other unfinished lifecycle actions retain their
 existing per-application and rebind rules; they do not become a new global
 positive fence. Ordinary deployment has no same-operation exception.
 
-This unit is dormant and read-only. It does not wire production Gate consumers,
-execute Compose or generated commands, authorize cleanup, or enable lifecycle
-capability. Those concrete adapters still need mandatory current checks at each
-actual effect boundary, with SQL closed before external commands.
+The foundation provides read-only validation. The bound policy Gate below adds
+production consumer wiring. Concrete runtime adapters still need mandatory
+current checks at each actual effect boundary, with SQL closed before external
+commands. Lifecycle capability remains unavailable.
+
+### Bound dispatch and shared policy Gate
+
+The router constructs one Claim from the original saved binding, exact job and
+application, and worker attempt before preparation. Both real delegates require
+`ExecuteBound` and reject a zero or mismatched Claim before progress or
+preparation. Their old unbound entry points are removed. The router retains its
+two binding checks and forwards the original context, Claim and reporter.
+
+Real runtime composition validates the original deployment and binding
+repositories against the same database before setup. It constructs one guarded
+deployment repository with the canonical positive-fence validator and the
+owner's admission working directory, then shares it across both runtimes, the
+router and generated authorization. The original read/non-Gate repository is
+unchanged; calling Gate on an unconfigured repository fails closed.
+
+Gate pins the original scope before opening its own transaction. It reserves
+the SQLite writer before reading authority or policy, validates the current
+binding, running attempt, deployment and global fence, and ends the transaction
+before leaving the pin. First evaluation persists the complete validated finding
+set. Once findings exist, retry input must match the entire semantic set:
+policy version, capability, scope, fingerprint and disposition. Recovered
+applying/waiting-health checks also compare empty sets exactly. Every required
+approval needs one exact active tuple; rejection takes precedence.
+
+Preparing/needs-attention retains the existing valid policy transitions.
+Recovered applying/waiting-health results are read-only, including rejection
+and missing approval. Authority, evidence, storage and cancellation refusals
+retain deployment/runtime/component state and their typed causes. Cancellation
+is checked before returning an approval or capacity wait. Ephemeral cleanup
+errors join the original cause; generated authorization releases only its
+unattempted process reservation. This unit does not supply final command,
+cleanup or success-observation permission. Compose and generated effect guards
+remain required before lifecycle activation.
 
 ## Required acceptance
 
@@ -908,6 +943,71 @@ source hashes before and after execution.
 All checks use Go 1.26.7 with readonly modules. Linux execution is native and
 non-race. No Docker, hosted CI, production Gate/command wiring or lifecycle
 activation is claimed by this dormant unit.
+
+### Bound dispatch and shared policy Gate: local evidence
+
+Source commit `f5efff492eae96821c5d3b05b8605ed92bd13c1e` was integrated
+locally as `b955842b09cdaff7ac92c66027e5936ec936dfbb`. Both committed source
+trees are `35db1a73f5f483171246dedfbae5541c56253978`. The 24 reviewed files
+were unchanged through final verification on 2026-10-18.
+
+Final acceptance used CI's pinned Go 1.26.7, readonly modules and
+`CGO_ENABLED=0`. The four affected packages were run in full; all non-live test
+parents from the changed jobs, controller and hostd fixture files were also
+selected. Every selected parent was discovered exactly once.
+
+| Platform | Passed parents | Passed subtests | Skips / failures |
+| --- | ---: | ---: | --- |
+| Windows | 137 | 329 | One symlink-privilege parent skip; no failures |
+| Native Linux through WSL | 138 | 329 | None |
+
+Linux passed `TestPolicyRejectsSymlinkAncestor`, covering the Windows skip.
+The checks cover exact Claim forwarding, same-database and scope rejection,
+complete retry/recovery policy sets, exact approval freshness, cancellation
+before policy classification, original read-error causes and retained state
+after ordinary non-cancelled refusals. Real SQLite begin/insert/update/commit
+faults prove rollback; the commit fault uses a deferred foreign key and fails at
+Commit rather than at insertion. Existing secret, configuration, source,
+approval/resume and capacity contracts remain exercised by real router/scoped
+admission fixtures. Security, QA and integration review found no unresolved
+source issue.
+
+```text
+go test -json -count=1 -timeout=5m ./internal/deployments ./internal/runtimeexecutor ./internal/composeruntime ./internal/generatedexecutor
+go vet ./cmd/hostd ./internal/composeruntime ./internal/controller ./internal/deployments ./internal/generatedexecutor ./internal/jobs ./internal/runtimeexecutor
+go vet -tags live_docker ./cmd/hostd
+go test -c -tags live_docker -o <evidence>/hostd-live.test.exe ./cmd/hostd
+go build -o <evidence>/hostd.exe ./cmd/hostd
+pwsh -NoProfile -File scripts/check-generation.ps1
+git diff --check
+```
+
+The receipts retain actual per-package commands, anchored fixture selections,
+toolchain path/environment, raw output, exit codes and source hashes before and
+after execution. Native Linux checks are not race-instrumented. Live Docker
+fixtures were compiled and vetted, not executed.
+
+Earlier supplemental Windows checks used Go 1.27.0: four full packages passed
+92 parents and 212 subtests with the same symlink skip, while an overlapping
+focused selection passed 32 parents and 92 subtests. An initial metadata error
+in their summary was corrected in a separately retained summary. The final
+Go 1.26.7 runs above establish CI-toolchain compatibility. Earlier fixture and
+compile failures remain recorded. Two live-only fixture compiler fixes advanced
+the source freeze from v1 to v2; the final checks use v2.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Reviewed source v2 manifest | `a0c4c00f672da9f1255db089c55693b7e163b18c9311fae7c52c7e8889386523` |
+| Reviewed source v2 patch | `9132b60c90c2463cd6722fb12f13ee1379bf467f4e3fa1dde7ed6abcd5de7fc2` |
+| Root source/test freeze | `01e0d5fc3b54f5e24389564bd003c199fc78d95a5325f126bc0acc1fdb0f8fcb` |
+| Go 1.26.7 Windows receipt | `81f054ac509235b3e19ecbdc4a2e9fa3a62262588206e756834e17af8eba38d4` |
+| Go 1.26.7 native Linux receipt | `86923e198bf243af69bf7f612f3df3c3c5d01dbdedba04b2266ba55407d1a86c` |
+| Corrected supplemental Windows summary | `58807da6cfa8052a873dd2f133efb3d5075370f9a44b8fe94b5d39003144b441` |
+
+Final command freshness, generated recovery shortcuts, cleanup authorization,
+startup completion repair and actual Docker/race acceptance remain separate
+work. This local integration does not enable lifecycle capability or activate a
+controller data root.
 
 ### Pre-change baseline
 
