@@ -74,6 +74,39 @@ unresolved safety fence.
 - [ ] Full acceptance, independent review and capability enablement for each
       proven runtime strategy.
 
+### Next unit: durable acceptance and observations
+
+The reviewed design calls for atomic creation of a queued job, desired
+transition and immutable operation with exact retained runtime pins. Historical
+idempotent requests must return the original acceptance before consulting busy
+state or changed runtime pins. They grant no new execution permission.
+
+Each operation uses a finite set of immutable boundary intents and receipts.
+New observations require the exact current running worker attempt and desired
+revision; identical receipt replay returns history independently of later job
+changes. SQL must enforce the graph, component set and outcome, including when
+a caller catches a rejected write and commits its surrounding transaction.
+
+| Action and observed baseline | Required observation order |
+| --- | --- |
+| Stop, running or stopped | Withdraw, every component stopped, complete |
+| Start, running | Healthy, serving, complete |
+| Start or restart, stopped | Observe routes absent, every component started, healthy, serving, complete |
+| Restart, running | Withdraw, every component stopped, every component started, healthy, serving, complete |
+
+Stopped-baseline withdrawal is observation only. A pending start without a
+proven running receipt blocks unrelated positive runtime effects even after a
+job status change or controller restart. Reconciliation of that exact pending
+operation still requires fresh ownership, precondition and capacity checks.
+
+A receipt cannot authorize another command. If a receipted postcondition later
+drifts, this finite model pauses rather than repeating an unjournaled effect.
+Automatic repair of such drift remains a separate recoverability limit.
+
+This section records the implementation contract, not completed behavior.
+Storage, admission, worker recovery and all effect consumers still need their
+own executable acceptance evidence.
+
 ## Required acceptance
 
 Tests must cover stale or malformed authority; same-state revision changes;
@@ -125,6 +158,83 @@ These results cover this local unit only. A callback check cannot eliminate a
 race after it returns. Durable operation binding, shared exclusion, the deeper
 revival consumers, and actual lifecycle effects are still required. No separate
 delivery or public capability enablement is claimed for this unit.
+
+### Durable operation storage: local evidence
+
+Migration 039 and the internal repository now retain atomic job/desired-intent/
+operation acceptance, exact component pins, and a finite intent/receipt journal.
+Historical replay precedes mutable checks in the serialized job transaction.
+New journal writes require the current running attempt; SQL enforces the action
+graph, component barriers and outcomes. Savepoints remove partial authority
+after post-write decode failures while preserving unrelated caller work.
+
+Authority reads validate canonical records and semantic identity. Unresolved
+checks include older operations; completion requires every graph proof. A
+malformed matching start receipt keeps the global pending-start fence closed.
+These reads require caller-held effects exclusion before their results can be
+used for effects; paginated reads are not a standalone atomic snapshot.
+
+Final checks on 2026-10-18 passed:
+
+```text
+go test -json -count=1 -timeout=5m ./internal/applifecycle
+go test -json -count=1 -timeout=5m ./internal/jobs ./internal/database ./internal/runtimeexecutor
+go vet ./internal/applifecycle ./internal/jobs ./internal/database ./internal/generatedingress
+go build ./cmd/hostd
+pwsh -NoProfile -File scripts/check-generation.ps1
+```
+
+Windows and native Linux each passed 27 lifecycle parents and 102 children.
+The Windows jobs/database/dispatch regression run passed 139 parents and 89
+children. Every discovered parent ran and passed once; there were no failures
+or skips. Linux ran a cross-compiled test executable in WSL, with both native
+and JSON conversion exits zero. Local runs were not race-instrumented.
+Independent security and QA reviews accepted the repairs. JSON hashes:
+
+- Windows lifecycle: `0b919be24f4dd65ba88ab7098e924579bf8721ccfa4be7808c62dfc6f601c4a8`.
+- Windows regressions: `fcc963c95a5a39242f89c464d06c14193566b331a57ba97a4fb4041267df750a`.
+- Linux lifecycle: `5389938b6a667553a02ebfa1f6b4ffec3cd7fdc17aa005d8eb1533c082946f1e`.
+
+Migration copies are byte-identical at SHA-256
+`359a0b996b5aecae943fc5750a1de58fb773a6c32912a97989ce9f35437a2265`.
+Ordinary deployment bindings, actual exclusion/admission adapters, startup
+completion repair, physical effects and public actions remain unimplemented.
+These storage results do not establish those behaviors.
+
+### Dormant route storage: local evidence
+
+A separate protected current-route V2 format now represents serving and dormant
+applications while retaining their runtime identity and optional LAN consent.
+It binds the complete expected lineage and immutable V1 source. Canonical byte
+validation rejects duplicate JSON keys, case aliases and unsupported fields.
+Existing V1 files, purposes, canonical bytes and digests remain unchanged.
+
+The store is disconnected from production selection and traffic handling.
+Pending transitions and LAN recovery records are deliberately rejected until
+their state machines exist. Its update method requires caller-held gateway
+exclusion; it is not an independently atomic filesystem compare-and-swap.
+
+On 2026-10-18, Windows and native Linux each passed the same three parents and
+30 child tests, with every selected name running and passing once and no skips
+or failures. The new V2 parent accounts for 31 of those named runs. The selector
+also includes both existing V1 baseline/update regression parents:
+
+```text
+go test -json -count=1 -timeout=5m ./internal/generatedingress -run '^(TestGatewayCurrentRouteStateV2Storage|TestGatewayCurrentV1TerminalBuildsAdditiveScopedBaseline|TestGatewayCurrentUpdatePreservesOriginAndTerminalReceipt)$'
+go vet ./internal/generatedingress
+```
+
+Linux used the same selector in a cross-compiled test executable, run in WSL;
+its native exit and JSON conversion exit were both zero. These local runs were
+not race-instrumented. Formatter and diff checks passed, and independent
+security and QA reviews accepted the lineage and parser repairs. JSON hashes:
+
+- Windows: `3c2e2c0b5ea55939e18a61ef3019d1aa278953b869990fc918b7790f47d83df3`.
+- Linux: `0e6f47e4f693945d0a7ceca4c602353f50cd821c181f7bd422846017ab015cbe`.
+
+These checks establish storage behavior only. They do not prove actual traffic
+withdrawal, container stop/start, protected-format promotion, rebind V3 or
+controller recovery.
 
 ### Pre-change baseline
 
