@@ -135,6 +135,114 @@ type Repository struct {
 
 func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }
 
+func (r *Repository) UsesDatabase(db *sql.DB) bool {
+	return r != nil && db != nil && r.db == db
+}
+
+// RecordImageReadyTx attaches an exact ready artifact to a pending component
+// inside the caller's guarded writer transaction. Replays may only verify the
+// identical already-attached component.
+func (r *Repository) RecordImageReadyTx(ctx context.Context, tx *sql.Tx, appID, deploymentID, componentName, artifactID string) error {
+	if r == nil || r.db == nil || ctx == nil || tx == nil || !canonicalUUID(appID) || !canonicalUUID(deploymentID) ||
+		!validText(componentName, 256) || !canonicalUUID(artifactID) {
+		return ErrInvalidTransition
+	}
+	var state ComponentState
+	var currentArtifact string
+	err := tx.QueryRowContext(ctx, `SELECT c.state,COALESCE(c.image_artifact_id,'')
+		FROM generated_runtime_components c JOIN generated_runtime_deployments d ON d.deployment_id=c.deployment_id
+		WHERE c.deployment_id=? AND c.component_name=? AND d.app_id=?`, deploymentID, componentName, appID).
+		Scan(&state, &currentArtifact)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
+		return err
+	}
+	if state == ComponentImageReady {
+		if currentArtifact != artifactID {
+			return ErrInvalidTransition
+		}
+		return nil
+	}
+	if state != ComponentPending || currentArtifact != "" {
+		return ErrInvalidTransition
+	}
+	now := r.now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `UPDATE generated_runtime_components SET image_artifact_id=?,state='image_ready',updated_at=?
+		WHERE deployment_id=? AND component_name=? AND state='pending' AND image_artifact_id IS NULL
+		AND EXISTS(SELECT 1 FROM generated_runtime_deployments d WHERE d.deployment_id=? AND d.app_id=? AND d.phase='building')`,
+		artifactID, now, deploymentID, componentName, deploymentID, appID)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrInvalidTransition
+	}
+	return nil
+}
+
+// FinishBuildingTx advances a fully image-ready generated deployment to the
+// next persisted phase derived from its migration state. The caller cannot
+// choose the phase.
+func (r *Repository) FinishBuildingTx(ctx context.Context, tx *sql.Tx, appID, deploymentID string) (Phase, error) {
+	if r == nil || r.db == nil || ctx == nil || tx == nil || !canonicalUUID(appID) || !canonicalUUID(deploymentID) {
+		return "", ErrInvalidTransition
+	}
+	var migration MigrationState
+	var phase Phase
+	var expectedComponents int
+	if err := tx.QueryRowContext(ctx, `SELECT d.phase,d.migration_state,p.component_count
+		FROM generated_runtime_deployments d JOIN deployment_plan_revisions p
+		ON p.id=d.deployment_plan_revision_id AND p.app_id=d.app_id AND p.revision_number=d.deployment_plan_revision_number
+		WHERE d.deployment_id=? AND d.app_id=?`, deploymentID, appID).Scan(&phase, &migration, &expectedComponents); errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	} else if err != nil {
+		return "", err
+	}
+	if phase != PhaseBuilding {
+		return "", ErrInvalidTransition
+	}
+	var total, ready int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*),COALESCE(SUM(CASE WHEN c.state='image_ready' AND c.container_name IS NULL AND c.container_id IS NULL
+		AND a.state='ready' AND a.id=c.image_artifact_id AND a.release_id=d.release_id
+		AND a.deployment_plan_revision_id=d.deployment_plan_revision_id AND a.deployment_plan_revision_number=d.deployment_plan_revision_number
+		AND a.component_id=c.component_name THEN 1 ELSE 0 END),0)
+		FROM generated_runtime_components c JOIN generated_runtime_deployments d ON d.deployment_id=c.deployment_id
+		LEFT JOIN generated_image_artifacts a ON a.id=c.image_artifact_id WHERE c.deployment_id=?`, deploymentID).Scan(&total, &ready); err != nil {
+		return "", err
+	}
+	if expectedComponents < 1 || total != expectedComponents || ready != expectedComponents {
+		return "", ErrInvalidTransition
+	}
+	next := Phase("")
+	switch migration {
+	case MigrationPending:
+		next = PhaseMigrating
+	case MigrationNotRequired:
+		next = PhaseStartingCandidate
+	default:
+		return "", ErrInvalidTransition
+	}
+	now := r.now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `UPDATE generated_runtime_deployments SET phase=?,updated_at=? WHERE deployment_id=? AND app_id=? AND phase='building' AND migration_state=?`, next, now, deploymentID, appID, migration)
+	if err != nil {
+		return "", err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if changed != 1 {
+		return "", ErrInvalidTransition
+	}
+	return next, nil
+}
+
 // Begin creates the durable preflight record and derives the inactive slot
 // from the current active head in the same transaction. A replay with the exact
 // same immutable identity returns the existing record.

@@ -8,12 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
@@ -61,13 +64,27 @@ const (
 
 // BuilderError carries only a stable code. Raw CLI output is cleared while
 // classifying failures and never crosses this package boundary.
-type BuilderError struct{ Code BuilderErrorCode }
+type BuilderError struct {
+	Code  BuilderErrorCode
+	cause error
+}
 
 func (e *BuilderError) Error() string { return "generated builder: " + string(e.Code) }
+func (e *BuilderError) Unwrap() error { return e.cause }
 
 func IsBuilderError(err error, code BuilderErrorCode) bool {
 	var target *BuilderError
 	return errors.As(err, &target) && target.Code == code
+}
+
+type builderAuthorityRefusal struct{ cause error }
+
+func (e *builderAuthorityRefusal) Error() string { return "generated builder: authority refused" }
+func (e *builderAuthorityRefusal) Unwrap() error { return e.cause }
+
+func isBuilderAuthorityRefusal(err error) bool {
+	var target *builderAuthorityRefusal
+	return errors.As(err, &target)
 }
 
 // BuilderManagerOptions defines the fixed local execution boundary for the
@@ -195,16 +212,25 @@ type buildkitContainer struct {
 // controller process; persisted identity makes restarts reuse only the exact
 // controller-owned resources.
 type BuilderManager struct {
-	directory *securetemp.GeneratedBuilderDirectory
-	runner    runtimeprocess.CommandRunner
-	options   BuilderManagerOptions
+	repository *deployments.Repository
+	directory  *securetemp.GeneratedBuilderDirectory
+	runner     runtimeprocess.CommandRunner
+	options    BuilderManagerOptions
+
+	// afterCommandPrepared is a deterministic test barrier. Production leaves
+	// it nil; it never grants authority or receives a mutable repository handle.
+	afterCommandPrepared func(runtimeprocess.CommandRequest)
+	// beforePrepareLock is a deterministic test barrier after the command
+	// authority is pinned and before process-local builder serialization.
+	// Production leaves it nil.
+	beforePrepareLock func()
 
 	mu      sync.Mutex
 	session *BuilderSession
 }
 
-func NewBuilderManager(runner runtimeprocess.CommandRunner, options BuilderManagerOptions) (*BuilderManager, error) {
-	if runner == nil || options.DataRoot == "" || pathsecurity.RejectWindowsNamespace(options.DataRoot) || !filepath.IsAbs(options.DataRoot) || filepath.Clean(options.DataRoot) != options.DataRoot {
+func NewBuilderManager(repository *deployments.Repository, runner runtimeprocess.CommandRunner, options BuilderManagerOptions) (*BuilderManager, error) {
+	if repository == nil || !repository.ExecutionConfigured() || nilGeneratedImageDependency(runner) || options.DataRoot == "" || pathsecurity.RejectWindowsNamespace(options.DataRoot) || !filepath.IsAbs(options.DataRoot) || filepath.Clean(options.DataRoot) != options.DataRoot {
 		return nil, &BuilderError{Code: BuilderConfigurationInvalid}
 	}
 	if options.DockerExecutable == "" || pathsecurity.RejectWindowsNamespace(options.DockerExecutable) || !filepath.IsAbs(options.DockerExecutable) || filepath.Clean(options.DockerExecutable) != options.DockerExecutable || !localDockerEndpoint(options.DockerEndpoint) {
@@ -229,16 +255,28 @@ func NewBuilderManager(runner runtimeprocess.CommandRunner, options BuilderManag
 	if err != nil {
 		return nil, &BuilderError{Code: BuilderFilesystemInvalid}
 	}
-	return &BuilderManager{directory: directory, runner: runner, options: options}, nil
+	return &BuilderManager{repository: repository, directory: directory, runner: runner, options: options}, nil
+}
+
+func (m *BuilderManager) usesRepository(repository *deployments.Repository) bool {
+	return m != nil && repository != nil && m.repository == repository && repository.ExecutionConfigured()
 }
 
 // Prepare creates the network/builder if absent, bootstraps BuildKit, and
 // verifies that the persisted name still resolves to a docker-container
 // builder. It never adopts a same-named resource with a different driver or
 // a network whose ownership labels do not match the persisted identity.
-func (m *BuilderManager) Prepare(ctx context.Context) (BuilderSession, error) {
-	if m == nil {
+func (m *BuilderManager) prepare(ctx context.Context, selection deployments.GeneratedImageBuildSelection) (BuilderSession, error) {
+	if m == nil || !m.usesRepository(m.repository) {
 		return BuilderSession{}, &BuilderError{Code: BuilderConfigurationInvalid}
+	}
+	authority, err := m.repository.PinGeneratedImageCommand(selection)
+	if err != nil {
+		return BuilderSession{}, err
+	}
+	defer authority.Leave()
+	if m.beforePrepareLock != nil {
+		m.beforePrepareLock()
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -252,13 +290,13 @@ func (m *BuilderManager) Prepare(ctx context.Context) (BuilderSession, error) {
 	if err := m.verifyQuotaPlatform(ctx, env); err != nil {
 		return BuilderSession{}, err
 	}
-	if err := m.ensureNetwork(ctx, identity, env); err != nil {
+	if err := m.ensureNetwork(ctx, authority, identity, env); err != nil {
 		return BuilderSession{}, err
 	}
-	if err := m.ensureBuildkitContainer(ctx, identity, env); err != nil {
+	if err := m.ensureBuildkitContainer(ctx, authority, identity, env); err != nil {
 		return BuilderSession{}, err
 	}
-	if err := m.ensureBuilder(ctx, identity, env); err != nil {
+	if err := m.ensureBuilder(ctx, authority, identity, env); err != nil {
 		return BuilderSession{}, err
 	}
 	session := BuilderSession{
@@ -268,6 +306,9 @@ func (m *BuilderManager) Prepare(ctx context.Context) (BuilderSession, error) {
 		storageQuotaBytes: m.options.StateQuotaBytes,
 	}
 	m.session = &session
+	if err := authority.CheckObservation(); err != nil {
+		return BuilderSession{}, err
+	}
 	return session, nil
 }
 
@@ -275,6 +316,9 @@ func (m *BuilderManager) verifyQuotaPlatform(ctx context.Context, env []string) 
 	result, runErr := m.run(ctx, []string{"info", "--format", "{{json .}}"}, env)
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
+	if code := commandErrorCode(ctx, result, runErr); code != "" {
+		return &BuilderError{Code: code, cause: builderCause(ctx, runErr)}
+	}
 	if runErr != nil {
 		return provisionError(ctx, result, runErr)
 	}
@@ -397,36 +441,44 @@ func validControllerName(value, prefix string) bool {
 	return true
 }
 
-func (m *BuilderManager) ensureNetwork(ctx context.Context, identity builderIdentity, env []string) error {
+func (m *BuilderManager) ensureNetwork(ctx context.Context, authority *deployments.GeneratedImageCommandExecution, identity builderIdentity, env []string) error {
 	network, found, err := m.inspectNetwork(ctx, identity.NetworkName, env)
 	if err != nil {
 		return err
 	}
 	if found {
 		if !matchesNetwork(network, identity) {
-			return &BuilderError{Code: BuilderDriftDetected}
+			return builderFailure(ctx, BuilderDriftDetected)
 		}
-		return nil
+		return authority.CheckObservation()
 	}
-	result, runErr := m.run(ctx, []string{"network", "create", "--driver", "bridge", "--opt", "com.docker.network.bridge.enable_icc=false", "--label", "rig.controller=generated-builder", "--label", "rig.builder=" + identity.BuilderName, "--label", "rig.network=" + identity.NetworkName, identity.NetworkName}, env)
+	result, runErr := m.runMutation(ctx, authority.CheckBeforeBuilderNetworkCreate, []string{"network", "create", "--driver", "bridge", "--opt", "com.docker.network.bridge.enable_icc=false", "--label", "rig.controller=generated-builder", "--label", "rig.builder=" + identity.BuilderName, "--label", "rig.network=" + identity.NetworkName, identity.NetworkName}, env)
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
 	if runErr != nil {
+		if isBuilderAuthorityRefusal(runErr) {
+			return runErr
+		}
 		// A concurrent controller may have created the exact resource. Inspect
 		// before classifying this as a provisioning failure.
-		if retried, retryFound, retryErr := m.inspectNetwork(ctx, identity.NetworkName, env); retryErr == nil && retryFound && matchesNetwork(retried, identity) {
-			return nil
+		retried, retryFound, retryErr := m.inspectNetwork(ctx, identity.NetworkName, env)
+		if retryErr == nil && retryFound && matchesNetwork(retried, identity) {
+			if observationErr := authority.CheckObservation(); observationErr == nil {
+				return nil
+			} else {
+				return augmentBuilderFailure(ctx, provisionError(ctx, result, runErr), retryErr, observationErr)
+			}
 		}
-		return provisionError(ctx, result, runErr)
+		return augmentBuilderFailure(ctx, provisionError(ctx, result, runErr), retryErr)
 	}
 	network, found, err = m.inspectNetwork(ctx, identity.NetworkName, env)
 	if err != nil {
 		return err
 	}
 	if !found || !matchesNetwork(network, identity) {
-		return &BuilderError{Code: BuilderDriftDetected}
+		return builderFailure(ctx, BuilderDriftDetected)
 	}
-	return nil
+	return authority.CheckObservation()
 }
 
 func (m *BuilderManager) inspectNetwork(ctx context.Context, name string, env []string) (dockerNetwork, bool, error) {
@@ -434,14 +486,18 @@ func (m *BuilderManager) inspectNetwork(ctx context.Context, name string, env []
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
 	if runErr != nil {
-		if dockerNotFound(result) {
+		if definitiveDockerInspectAbsence(ctx, result, runErr,
+			"Error response from daemon: network "+name+" not found") {
 			return dockerNetwork{}, false, nil
 		}
 		return dockerNetwork{}, false, provisionError(ctx, result, runErr)
 	}
 	var network dockerNetwork
-	if json.Unmarshal(result.Stdout, &network) != nil {
-		return dockerNetwork{}, false, &BuilderError{Code: BuilderDriftDetected}
+	if result.StdoutTruncated || result.StderrTruncated || json.Unmarshal(result.Stdout, &network) != nil {
+		return dockerNetwork{}, false, builderFailure(ctx, BuilderDriftDetected)
+	}
+	if cause := builderCause(ctx, nil); cause != nil {
+		return dockerNetwork{}, false, &BuilderError{Code: BuilderCancelled, cause: cause}
 	}
 	return network, true, nil
 }
@@ -450,16 +506,16 @@ func matchesNetwork(network dockerNetwork, identity builderIdentity) bool {
 	return network.Name == identity.NetworkName && network.Driver == "bridge" && network.Scope == "local" && !network.Internal && network.Options["com.docker.network.bridge.enable_icc"] == "false" && network.Labels["rig.controller"] == "generated-builder" && network.Labels["rig.builder"] == identity.BuilderName && network.Labels["rig.network"] == identity.NetworkName
 }
 
-func (m *BuilderManager) ensureBuilder(ctx context.Context, identity builderIdentity, env []string) error {
+func (m *BuilderManager) ensureBuilder(ctx context.Context, authority *deployments.GeneratedImageCommandExecution, identity builderIdentity, env []string) error {
 	builder, found, err := m.findBuilder(ctx, identity.BuilderName, env)
 	if err != nil {
 		return err
 	}
 	if found && !matchesBuildxBuilder(builder, identity) {
-		return &BuilderError{Code: BuilderDriftDetected}
+		return builderFailure(ctx, BuilderDriftDetected)
 	}
 	if !found {
-		result, runErr := m.run(ctx, []string{
+		result, runErr := m.runMutation(ctx, authority.CheckBeforeBuildxCreate, []string{
 			"buildx", "create", "--name", identity.BuilderName, "--node", identity.NodeName,
 			"--driver", "remote", "--driver-opt", "default-load=false", "--use",
 			buildkitRemoteEndpoint(identity),
@@ -467,27 +523,38 @@ func (m *BuilderManager) ensureBuilder(ctx context.Context, identity builderIden
 		defer clear(result.Stdout)
 		defer clear(result.Stderr)
 		if runErr != nil {
-			if retry, retryFound, retryErr := m.findBuilder(ctx, identity.BuilderName, env); retryErr == nil && retryFound && matchesBuildxBuilder(retry, identity) {
-				return m.bootstrapAndVerify(ctx, identity, env)
+			if isBuilderAuthorityRefusal(runErr) {
+				return runErr
 			}
-			return provisionError(ctx, result, runErr)
+			retry, retryFound, retryErr := m.findBuilder(ctx, identity.BuilderName, env)
+			if retryErr == nil && retryFound && matchesBuildxBuilder(retry, identity) {
+				if bootstrapErr := m.bootstrapAndVerify(ctx, authority, identity, env); bootstrapErr == nil {
+					return nil
+				} else {
+					return augmentBuilderFailure(ctx, provisionError(ctx, result, runErr), retryErr, bootstrapErr)
+				}
+			}
+			return augmentBuilderFailure(ctx, provisionError(ctx, result, runErr), retryErr)
 		}
 		builder, found, err = m.findBuilder(ctx, identity.BuilderName, env)
 		if err != nil {
 			return err
 		}
 		if !found || !matchesBuildxBuilder(builder, identity) {
-			return &BuilderError{Code: BuilderDriftDetected}
+			return builderFailure(ctx, BuilderDriftDetected)
 		}
 	}
-	return m.bootstrapAndVerify(ctx, identity, env)
+	return m.bootstrapAndVerify(ctx, authority, identity, env)
 }
 
-func (m *BuilderManager) bootstrapAndVerify(ctx context.Context, identity builderIdentity, env []string) error {
-	result, runErr := m.run(ctx, []string{"buildx", "inspect", "--builder", identity.BuilderName, "--bootstrap"}, env)
+func (m *BuilderManager) bootstrapAndVerify(ctx context.Context, authority *deployments.GeneratedImageCommandExecution, identity builderIdentity, env []string) error {
+	result, runErr := m.runMutation(ctx, authority.CheckBeforeBuilderBootstrap, []string{"buildx", "inspect", "--builder", identity.BuilderName, "--bootstrap"}, env)
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
 	if runErr != nil {
+		if isBuilderAuthorityRefusal(runErr) {
+			return runErr
+		}
 		return bootstrapError(ctx, result, runErr)
 	}
 	builder, found, err := m.findBuilder(ctx, identity.BuilderName, env)
@@ -495,16 +562,16 @@ func (m *BuilderManager) bootstrapAndVerify(ctx context.Context, identity builde
 		return err
 	}
 	if !found || !matchesBuildxBuilder(builder, identity) {
-		return &BuilderError{Code: BuilderDriftDetected}
+		return builderFailure(ctx, BuilderDriftDetected)
 	}
 	container, found, err := m.inspectBuildkitContainer(ctx, identity, env)
 	if err != nil {
 		return err
 	}
 	if !found || !matchesBuildkitContainer(container, identity, m.options.StateQuotaBytes) {
-		return &BuilderError{Code: BuilderDriftDetected}
+		return builderFailure(ctx, BuilderDriftDetected)
 	}
-	return nil
+	return authority.CheckObservation()
 }
 
 func matchesBuildxBuilder(builder buildxBuilder, identity builderIdentity) bool {
@@ -515,16 +582,16 @@ func buildkitRemoteEndpoint(identity builderIdentity) string {
 	return buildkitRemoteScheme + buildkitContainerName(identity)
 }
 
-func (m *BuilderManager) ensureBuildkitContainer(ctx context.Context, identity builderIdentity, env []string) error {
+func (m *BuilderManager) ensureBuildkitContainer(ctx context.Context, authority *deployments.GeneratedImageCommandExecution, identity builderIdentity, env []string) error {
 	container, found, err := m.inspectBuildkitContainer(ctx, identity, env)
 	if err != nil {
 		return err
 	}
 	if found {
 		if !matchesBuildkitContainerConfiguration(container, identity, m.options.StateQuotaBytes) {
-			return &BuilderError{Code: BuilderDriftDetected}
+			return builderFailure(ctx, BuilderDriftDetected)
 		}
-		return m.recoverBuildkitContainer(ctx, identity, container, env)
+		return m.recoverBuildkitContainer(ctx, authority, identity, container, env)
 	}
 
 	quota := fmt.Sprintf("%d", m.options.StateQuotaBytes)
@@ -541,58 +608,76 @@ func (m *BuilderManager) ensureBuildkitContainer(ctx context.Context, identity b
 		buildkitImage,
 	}
 	args = append(args, buildkitCommand(m.options.StateQuotaBytes)...)
-	result, runErr := m.run(ctx, args, env)
+	result, runErr := m.runMutation(ctx, authority.CheckBeforeBuildkitRun, args, env)
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
 	if runErr != nil {
-		if retried, retryFound, retryErr := m.inspectBuildkitContainer(ctx, identity, env); retryErr == nil && retryFound {
-			if !matchesBuildkitContainerConfiguration(retried, identity, m.options.StateQuotaBytes) {
-				return &BuilderError{Code: BuilderDriftDetected}
-			}
-			return m.recoverBuildkitContainer(ctx, identity, retried, env)
+		if isBuilderAuthorityRefusal(runErr) {
+			return runErr
 		}
-		return quotaProvisionError(ctx, result, runErr)
+		retried, retryFound, retryErr := m.inspectBuildkitContainer(ctx, identity, env)
+		if retryErr == nil && retryFound {
+			if !matchesBuildkitContainerConfiguration(retried, identity, m.options.StateQuotaBytes) {
+				return augmentBuilderFailure(ctx, quotaProvisionError(ctx, result, runErr), builderFailure(ctx, BuilderDriftDetected))
+			}
+			if recoverErr := m.recoverBuildkitContainer(ctx, authority, identity, retried, env); recoverErr == nil {
+				return nil
+			} else {
+				return augmentBuilderFailure(ctx, quotaProvisionError(ctx, result, runErr), recoverErr)
+			}
+		}
+		return augmentBuilderFailure(ctx, quotaProvisionError(ctx, result, runErr), retryErr)
 	}
 	container, found, err = m.inspectBuildkitContainer(ctx, identity, env)
 	if err != nil {
 		return err
 	}
 	if !found || !matchesBuildkitContainerConfiguration(container, identity, m.options.StateQuotaBytes) {
-		return &BuilderError{Code: BuilderDriftDetected}
+		return builderFailure(ctx, BuilderDriftDetected)
 	}
-	return m.recoverBuildkitContainer(ctx, identity, container, env)
+	return m.recoverBuildkitContainer(ctx, authority, identity, container, env)
 }
 
-func (m *BuilderManager) recoverBuildkitContainer(ctx context.Context, identity builderIdentity, container buildkitContainer, env []string) error {
+func (m *BuilderManager) recoverBuildkitContainer(ctx context.Context, authority *deployments.GeneratedImageCommandExecution, identity builderIdentity, container buildkitContainer, env []string) error {
 	if buildkitContainerReady(container) {
-		return nil
+		return authority.CheckObservation()
 	}
 	var args []string
+	var check func() error
 	switch {
 	case container.State.Restarting:
 		args = []string{"container", "restart", "--time", "10", container.ID}
+		check = authority.CheckBeforeBuildkitRestart
 	case container.State.Paused:
 		args = []string{"container", "unpause", container.ID}
+		check = authority.CheckBeforeBuildkitUnpause
 	default:
 		args = []string{"container", "start", container.ID}
+		check = authority.CheckBeforeBuildkitStart
 	}
-	result, runErr := m.run(ctx, args, env)
+	result, runErr := m.runMutation(ctx, check, args, env)
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
+	if isBuilderAuthorityRefusal(runErr) {
+		return runErr
+	}
 	recovered, found, inspectErr := m.inspectBuildkitContainer(ctx, identity, env)
 	if inspectErr != nil {
-		return inspectErr
+		return reconcileBuilderMutation(ctx, result, runErr, inspectErr)
 	}
 	if !found || recovered.ID != container.ID || !matchesBuildkitContainerConfiguration(recovered, identity, m.options.StateQuotaBytes) {
-		return &BuilderError{Code: BuilderDriftDetected}
+		return reconcileBuilderMutation(ctx, result, runErr, builderFailure(ctx, BuilderDriftDetected))
 	}
 	if buildkitContainerReady(recovered) {
+		if observationErr := authority.CheckObservation(); observationErr != nil {
+			return reconcileBuilderMutation(ctx, result, runErr, observationErr)
+		}
 		return nil
 	}
 	if runErr != nil {
 		return provisionError(ctx, result, runErr)
 	}
-	return &BuilderError{Code: BuilderProvisionFailed}
+	return builderFailure(ctx, BuilderProvisionFailed)
 }
 
 func (m *BuilderManager) inspectBuildkitContainer(ctx context.Context, identity builderIdentity, env []string) (buildkitContainer, bool, error) {
@@ -601,14 +686,19 @@ func (m *BuilderManager) inspectBuildkitContainer(ctx context.Context, identity 
 	defer clear(result.Stdout)
 	defer clear(result.Stderr)
 	if runErr != nil {
-		if dockerNotFound(result) {
+		if definitiveDockerInspectAbsence(ctx, result, runErr,
+			"Error: No such container: "+name,
+			"Error response from daemon: No such container: "+name) {
 			return buildkitContainer{}, false, nil
 		}
 		return buildkitContainer{}, false, provisionError(ctx, result, runErr)
 	}
 	var container buildkitContainer
-	if json.Unmarshal(result.Stdout, &container) != nil {
-		return buildkitContainer{}, false, &BuilderError{Code: BuilderDriftDetected}
+	if result.StdoutTruncated || result.StderrTruncated || json.Unmarshal(result.Stdout, &container) != nil {
+		return buildkitContainer{}, false, builderFailure(ctx, BuilderDriftDetected)
+	}
+	if cause := builderCause(ctx, nil); cause != nil {
+		return buildkitContainer{}, false, &BuilderError{Code: BuilderCancelled, cause: cause}
 	}
 	return container, true, nil
 }
@@ -686,6 +776,9 @@ func (m *BuilderManager) findBuilder(ctx context.Context, name string, env []str
 	if runErr != nil {
 		return buildxBuilder{}, false, provisionError(ctx, result, runErr)
 	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		return buildxBuilder{}, false, builderFailure(ctx, BuilderOutputTruncated)
+	}
 	var match *buildxBuilder
 	for _, line := range strings.Split(string(result.Stdout), "\n") {
 		line = strings.TrimSpace(line)
@@ -694,32 +787,59 @@ func (m *BuilderManager) findBuilder(ctx context.Context, name string, env []str
 		}
 		var builder buildxBuilder
 		if json.Unmarshal([]byte(line), &builder) != nil || builder.Name == "" || builder.Driver == "" {
-			return buildxBuilder{}, false, &BuilderError{Code: BuilderDriftDetected}
+			return buildxBuilder{}, false, builderFailure(ctx, BuilderDriftDetected)
 		}
 		if builder.Name != name {
 			continue
 		}
 		if match != nil {
-			return buildxBuilder{}, false, &BuilderError{Code: BuilderDriftDetected}
+			return buildxBuilder{}, false, builderFailure(ctx, BuilderDriftDetected)
 		}
 		copy := builder
 		match = &copy
 	}
 	if match == nil {
+		if cause := builderCause(ctx, nil); cause != nil {
+			return buildxBuilder{}, false, &BuilderError{Code: BuilderCancelled, cause: cause}
+		}
 		return buildxBuilder{}, false, nil
+	}
+	if cause := builderCause(ctx, nil); cause != nil {
+		return buildxBuilder{}, false, &BuilderError{Code: BuilderCancelled, cause: cause}
 	}
 	return *match, true, nil
 }
 
 func (m *BuilderManager) run(ctx context.Context, args []string, env []string) (runtimeprocess.CommandResult, error) {
-	return m.runner.Run(ctx, runtimeprocess.CommandRequest{
+	return m.runner.Run(ctx, m.commandRequest(args, env))
+}
+
+func (m *BuilderManager) commandRequest(args []string, env []string) runtimeprocess.CommandRequest {
+	return runtimeprocess.CommandRequest{
 		Executable:  m.options.DockerExecutable,
 		Args:        append([]string(nil), args...),
 		Directory:   m.directory.Root(),
 		Env:         append([]string(nil), env...),
 		Timeout:     m.options.PrepareTimeout,
 		OutputLimit: m.options.OutputLimit,
-	})
+	}
+}
+
+func (m *BuilderManager) runMutation(ctx context.Context, check func() error, args []string, env []string) (runtimeprocess.CommandResult, error) {
+	request := m.commandRequest(args, env)
+	if m.afterCommandPrepared != nil {
+		m.afterCommandPrepared(request)
+	}
+	if check == nil {
+		return runtimeprocess.CommandResult{}, &builderAuthorityRefusal{cause: deploymentexecution.ErrInvalidConfiguration}
+	}
+	if err := check(); err != nil {
+		return runtimeprocess.CommandResult{}, &builderAuthorityRefusal{cause: err}
+	}
+	if err := ctx.Err(); err != nil {
+		return runtimeprocess.CommandResult{}, &builderAuthorityRefusal{cause: errors.Join(deploymentexecution.ErrCanceled, err, context.Cause(ctx))}
+	}
+	return m.runner.Run(ctx, request)
 }
 
 func generatedBuilderEnvironment(endpoint, dockerConfig, buildxConfig string) []string {
@@ -748,44 +868,87 @@ func generatedBuilderEnvironment(endpoint, dockerConfig, buildxConfig string) []
 	return environment
 }
 
-func dockerNotFound(result runtimeprocess.CommandResult) bool {
-	message := strings.ToLower(string(append(append([]byte(nil), result.Stdout...), result.Stderr...)))
-	return strings.Contains(message, "not found") || strings.Contains(message, "no such")
+func definitiveDockerInspectAbsence(ctx context.Context, result runtimeprocess.CommandResult, runErr error, exactMessages ...string) bool {
+	if ctx == nil || ctx.Err() != nil || runErr == nil || result.StdoutTruncated || result.StderrTruncated || strings.TrimSpace(string(result.Stdout)) != "" ||
+		errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) || errors.Is(runErr, runtimeprocess.ErrTerminationFailed) {
+		return false
+	}
+	exitErr, ok := runErr.(*exec.ExitError)
+	if !ok || exitErr.ProcessState == nil || !exitErr.ProcessState.Exited() || exitErr.ProcessState.ExitCode() != 1 {
+		return false
+	}
+	message := strings.TrimSpace(string(result.Stderr))
+	for _, expected := range exactMessages {
+		if message == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func provisionError(ctx context.Context, result runtimeprocess.CommandResult, err error) error {
 	if code := commandErrorCode(ctx, result, err); code != "" {
-		return &BuilderError{Code: code}
+		return &BuilderError{Code: code, cause: builderCause(ctx, err)}
 	}
-	return &BuilderError{Code: BuilderProvisionFailed}
+	return &BuilderError{Code: BuilderProvisionFailed, cause: builderCause(ctx, err)}
 }
 
 func quotaProvisionError(ctx context.Context, result runtimeprocess.CommandResult, err error) error {
 	if code := commandErrorCode(ctx, result, err); code != "" {
-		return &BuilderError{Code: code}
+		return &BuilderError{Code: code, cause: builderCause(ctx, err)}
 	}
 	output := strings.ToLower(string(append(append([]byte(nil), result.Stdout...), result.Stderr...)))
 	if strings.Contains(output, "no space left on device") || strings.Contains(output, "disk quota exceeded") {
-		return &BuilderError{Code: BuilderHardQuotaExhausted}
+		return &BuilderError{Code: BuilderHardQuotaExhausted, cause: builderCause(ctx, err)}
 	}
 	if strings.Contains(output, "tmpfs") && (strings.Contains(output, "not supported") || strings.Contains(output, "unsupported") || strings.Contains(output, "invalid mount config") || strings.Contains(output, "unknown mount option")) {
-		return &BuilderError{Code: BuilderHardQuotaUnavailable}
+		return &BuilderError{Code: BuilderHardQuotaUnavailable, cause: builderCause(ctx, err)}
 	}
-	return &BuilderError{Code: BuilderProvisionFailed}
+	return &BuilderError{Code: BuilderProvisionFailed, cause: builderCause(ctx, err)}
 }
 
 func bootstrapError(ctx context.Context, result runtimeprocess.CommandResult, err error) error {
 	if code := commandErrorCode(ctx, result, err); code != "" {
-		return &BuilderError{Code: code}
+		return &BuilderError{Code: code, cause: builderCause(ctx, err)}
 	}
-	return &BuilderError{Code: BuilderBootstrapFailed}
+	return &BuilderError{Code: BuilderBootstrapFailed, cause: builderCause(ctx, err)}
 }
 
 func builderContextError(err error) error {
 	if errors.Is(err, context.Canceled) {
-		return &BuilderError{Code: BuilderCancelled}
+		return &BuilderError{Code: BuilderCancelled, cause: errors.Join(deploymentexecution.ErrCanceled, err)}
 	}
-	return &BuilderError{Code: BuilderTimedOut}
+	return &BuilderError{Code: BuilderTimedOut, cause: errors.Join(deploymentexecution.ErrCanceled, err)}
+}
+
+func builderCause(ctx context.Context, err error) error {
+	if ctx != nil && ctx.Err() != nil {
+		return errors.Join(err, deploymentexecution.ErrCanceled, ctx.Err(), context.Cause(ctx))
+	}
+	return err
+}
+
+func builderFailure(ctx context.Context, code BuilderErrorCode, causes ...error) error {
+	causes = append(causes, builderCause(ctx, nil))
+	return &BuilderError{Code: code, cause: errors.Join(causes...)}
+}
+
+func augmentBuilderFailure(ctx context.Context, base error, causes ...error) error {
+	var typed *BuilderError
+	code := BuilderProvisionFailed
+	if errors.As(base, &typed) {
+		code = typed.Code
+	}
+	causes = append([]error{base}, causes...)
+	return builderFailure(ctx, code, causes...)
+}
+
+func reconcileBuilderMutation(ctx context.Context, result runtimeprocess.CommandResult, runErr error, causes ...error) error {
+	if runErr != nil {
+		return augmentBuilderFailure(ctx, provisionError(ctx, result, runErr), causes...)
+	}
+	causes = append(causes, builderCause(ctx, nil))
+	return errors.Join(causes...)
 }
 
 func commandErrorCode(ctx context.Context, result runtimeprocess.CommandResult, err error) BuilderErrorCode {

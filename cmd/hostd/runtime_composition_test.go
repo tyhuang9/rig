@@ -584,14 +584,15 @@ func TestRuntimeCompositionRebindFenceFailsBeforeRecovery(t *testing.T) {
 }
 
 func TestGeneratedCompositionFailureStopsAtExactStep(t *testing.T) {
-	for _, failAt := range []string{
+	steps := []string{
 		"compose_temp_create", "compose_temp_recover", "generated_build_temp_create", "generated_build_temp_recover",
 		"generated_environment_temp_create", "generated_environment_temp_recover",
-		"artifact_repository_create", "artifact_repository_recover", "controller_directories_create", "builder_create", "compiler_create",
-		"environment_stager_create", "ingress_create", "ingress_recover", "runtime_engine_create",
+		"artifact_repository_create", "artifact_repository_recover", "controller_directories_create", "builder_create",
+		"environment_stager_create", "ingress_create", "ingress_recover", "runtime_engine_create", "compiler_create",
 		"migration_runner_create", "runtime_state_create", "authorization_gate_create", "generated_executor_create",
 		"compose_executor_create", "runtime_router_create",
-	} {
+	}
+	for index, failAt := range steps {
 		t.Run(failAt, func(t *testing.T) {
 			fixture := newRuntimeCompositionFixture(t)
 			fixture.configuration.ComposeRuntime = true
@@ -609,7 +610,7 @@ func TestGeneratedCompositionFailureStopsAtExactStep(t *testing.T) {
 				},
 				recoverIngress: func(context.Context, *generatedingress.Manager) error { return nil },
 			})
-			if !errors.Is(err, failure) || result.executor != nil || calls[len(calls)-1] != failAt {
+			if !errors.Is(err, failure) || result.executor != nil || !reflect.DeepEqual(calls, steps[:index+1]) {
 				t.Fatalf("result=%#v err=%v calls=%v", result, err, calls)
 			}
 		})

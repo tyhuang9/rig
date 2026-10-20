@@ -35,7 +35,9 @@ func manualCompilerFixture(t *testing.T) compilerFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.compiler.plans = compilerPlanReader{revision: fixture.revision}
+	fixture.release.ResolvedSHA = inspection.Analysis.StructuralFingerprint
+	fixture.releaseReader.release = fixture.release
+	fixture.rebind(t, "app")
 	fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
 		for _, arg := range request.Args {
 			if strings.Contains(arg, "rig-install-command") || strings.Contains(arg, "rig-build-command") {
@@ -58,11 +60,11 @@ func TestCompilerBuildsUndetectedManualPlanAndCompatibleLaterSources(t *testing.
 			if changed {
 				writeTestFile(t, filepath.Join(fixture.release.WorkspacePath, "package.json"), `{"scripts":{"start":"different-detected-command"},"engines":{"node":">=24"}}`)
 			}
-			artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
+			artifact, err := fixture.compile(context.Background())
 			if err != nil || artifact.State != ArtifactReady {
 				t.Fatalf("manual compiler: %v %#v", err, artifact)
 			}
-			if fixture.releaseReader.calls != 2 || fixture.builder.calls != 1 {
+			if fixture.releaseReader.calls != 2 || fixture.builderPrepareCalls() != 1 {
 				t.Fatal("manual plan bypassed normal integrity/build lifecycle")
 			}
 		})
@@ -86,12 +88,12 @@ func TestManualCompilerRetainsPinRuntimeAndWorkspaceChecks(t *testing.T) {
 				fixture.releaseReader.beforeSecond = func() { fixture.releaseReader.release.WorkspaceTreeSHA256 = strings.Repeat("d", 64) }
 			}
 			fixture.compiler.plans = compilerPlanReader{revision: fixture.revision}
-			_, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "app", "", 0)
+			_, err := fixture.compile(context.Background())
 			expected := "deployment_plan_review_required"
 			if condition == "workspace-changed" {
 				expected = string(DiagnosticSourceIntegrityFailed)
 			}
-			if !IsCompileCode(err, expected) || fixture.builder.calls != 0 || fixture.runner.request.Executable != "" {
+			if !IsCompileCode(err, expected) || fixture.builderPrepareCalls() != 0 || fixture.runner.request.Executable != "" {
 				t.Fatalf("unsafe manual compile %s: %v", condition, err)
 			}
 		})

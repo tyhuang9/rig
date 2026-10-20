@@ -9,12 +9,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedimagestate"
+	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
@@ -25,13 +30,30 @@ import (
 
 const defaultBuildTimeout = 30 * time.Minute
 
-type CompileError struct{ Code string }
+type CompileError struct {
+	Code      string
+	cause     error
+	uncertain bool
+}
 
-func (e *CompileError) Error() string { return "generated image: " + e.Code }
+func (e *CompileError) Error() string                  { return "generated image: " + e.Code }
+func (e *CompileError) Unwrap() error                  { return e.cause }
+func (e *CompileError) generatedImageBoundaryFailure() {}
+func (e *CompileError) generatedImageUncertain()       {}
 
 func IsCompileCode(err error, code string) bool {
 	var target *CompileError
 	return errors.As(err, &target) && target.Code == code
+}
+
+func IsGeneratedImageBoundaryFailure(err error) bool {
+	var target interface{ generatedImageBoundaryFailure() }
+	return errors.As(err, &target)
+}
+
+func IsCompileUncertain(err error) bool {
+	var target *CompileError
+	return errors.As(err, &target) && target.uncertain
 }
 
 type releaseWorkspaceReader interface {
@@ -46,15 +68,20 @@ type buildConfigurationExporter interface {
 	ExportComponentBuildForExecution(context.Context, string, string, int64, string, int64, string) (appconfig.ExecutionConfiguration, error)
 }
 
-type artifactWriter interface {
-	Begin(context.Context, BeginArtifactInput) (Artifact, bool, error)
-	Complete(context.Context, string, string) (Artifact, error)
-	Fail(context.Context, string, DiagnosticCode) (Artifact, error)
-	Cancel(context.Context, string) (Artifact, error)
+type imageValidator interface {
+	ValidateImage(context.Context, generatedruntime.ImageSpec) error
 }
 
-type builderPreparer interface {
-	Prepare(context.Context) (BuilderSession, error)
+type CompileRequest struct {
+	Claim                        deploymentexecution.Claim
+	DeploymentID                 string
+	ReleaseID                    string
+	ConfigurationRevisionID      string
+	ConfigurationRevisionNumber  int64
+	DeploymentPlanRevisionID     string
+	DeploymentPlanRevisionNumber int64
+	ComponentName                string
+	Findings                     []deployments.Finding
 }
 
 type CompilerOptions struct {
@@ -65,20 +92,28 @@ type CompilerOptions struct {
 }
 
 type Compiler struct {
-	releases  releaseWorkspaceReader
-	plans     deploymentPlanReader
-	config    buildConfigurationExporter
-	artifacts artifactWriter
-	temporary *securetemp.Manager
-	builder   builderPreparer
-	runner    runtimeprocess.CommandRunner
-	options   CompilerOptions
-	cleanup   func(*securetemp.Files) error
-	buildSlot chan struct{}
+	releases   releaseWorkspaceReader
+	plans      deploymentPlanReader
+	config     buildConfigurationExporter
+	repository *deployments.Repository
+	temporary  *securetemp.Manager
+	builder    *BuilderManager
+	runner     runtimeprocess.CommandRunner
+	validator  imageValidator
+	options    CompilerOptions
+	cleanup    func(*securetemp.Files) error
+	buildSlot  chan struct{}
+
+	// afterBuildCommandPrepared is a deterministic test barrier. Production
+	// leaves it nil; the fixed guarded check still decides whether Docker runs.
+	afterBuildCommandPrepared func(runtimeprocess.CommandRequest)
+	// afterImageValidated is a deterministic test barrier between physical
+	// observation and the guarded atomic Ready/ImageReady result transaction.
+	afterImageValidated func()
 }
 
-func NewCompiler(releases releaseWorkspaceReader, plans deploymentPlanReader, config buildConfigurationExporter, artifacts artifactWriter, temporary *securetemp.Manager, builder builderPreparer, runner runtimeprocess.CommandRunner, options CompilerOptions) (*Compiler, error) {
-	if releases == nil || plans == nil || config == nil || artifacts == nil || temporary == nil || builder == nil || runner == nil {
+func NewCompiler(releases releaseWorkspaceReader, plans deploymentPlanReader, config buildConfigurationExporter, repository *deployments.Repository, temporary *securetemp.Manager, builder *BuilderManager, runner runtimeprocess.CommandRunner, validator imageValidator, options CompilerOptions) (*Compiler, error) {
+	if nilGeneratedImageDependency(releases) || nilGeneratedImageDependency(plans) || nilGeneratedImageDependency(config) || repository == nil || !repository.ExecutionConfigured() || temporary == nil || builder == nil || !builder.usesRepository(repository) || nilGeneratedImageDependency(runner) || nilGeneratedImageDependency(validator) {
 		return nil, errors.New("generated image compiler dependencies are required")
 	}
 	if options.BuildTimeout == 0 {
@@ -90,95 +125,150 @@ func NewCompiler(releases releaseWorkspaceReader, plans deploymentPlanReader, co
 	if options.BuildTimeout < time.Second || options.BuildTimeout > 2*time.Hour || options.ContextBytes < 0 || options.ContextEntries < 0 || options.BuildConcurrency < 1 || options.BuildConcurrency > 4 {
 		return nil, errors.New("generated build limits are outside supported bounds")
 	}
-	return &Compiler{releases: releases, plans: plans, config: config, artifacts: artifacts, temporary: temporary, builder: builder, runner: runner, options: options, cleanup: func(files *securetemp.Files) error { return files.Cleanup() }, buildSlot: make(chan struct{}, options.BuildConcurrency)}, nil
+	return &Compiler{releases: releases, plans: plans, config: config, repository: repository, temporary: temporary, builder: builder, runner: runner, validator: validator, options: options, cleanup: func(files *securetemp.Files) error { return files.Cleanup() }, buildSlot: make(chan struct{}, options.BuildConcurrency)}, nil
+}
+
+func nilGeneratedImageDependency(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 // Compile produces or reuses the immutable image for one component. Repository
 // commands remain data until BuildKit executes the controller-generated recipe.
-func (c *Compiler) Compile(ctx context.Context, appID, releaseID, componentName, configurationRevisionID string, configurationRevisionNumber int64) (Artifact, error) {
-	if uuid.Validate(appID) != nil || !validReleaseID(releaseID) || !validText(componentName, 256) || configurationRevisionNumber < 0 || (configurationRevisionNumber == 0) != (configurationRevisionID == "") {
-		return Artifact{}, &CompileError{Code: "validation_failed"}
+func (c *Compiler) Compile(ctx context.Context, request CompileRequest) (Artifact, error) {
+	if c == nil || ctx == nil || request.Claim.JobID() == "" || uuid.Validate(request.Claim.ApplicationID()) != nil || request.Claim.Attempt() < 1 || uuid.Validate(request.DeploymentID) != nil || !validReleaseID(request.ReleaseID) || !validText(request.ComponentName, 256) || uuid.Validate(request.ConfigurationRevisionID) != nil || request.ConfigurationRevisionNumber < 1 || uuid.Validate(request.DeploymentPlanRevisionID) != nil || request.DeploymentPlanRevisionNumber < 1 {
+		return Artifact{}, compileBoundary("validation_failed", false, deploymentexecution.ErrInvalidClaim)
 	}
-	release, err := c.releases.ReadyWorkspace(ctx, appID, releaseID)
+	request.Findings = append([]deployments.Finding(nil), request.Findings...)
+	appID := request.Claim.ApplicationID()
+	release, err := c.releases.ReadyWorkspace(ctx, appID, request.ReleaseID)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
-			return Artifact{}, &CompileError{Code: string(DiagnosticBuildCancelled)}
-		}
-		return Artifact{}, &CompileError{Code: "source_integrity_failed"}
+		return Artifact{}, compileReadFailure(ctx, "source_integrity_failed", err)
 	}
-	if release.DeploymentPlanRevisionID == "" || release.DeploymentPlanRevisionNumber < 1 {
-		return Artifact{}, &CompileError{Code: "deployment_plan_review_required"}
+	if release.ID != request.ReleaseID || release.AppID != appID || release.DeploymentPlanRevisionID != request.DeploymentPlanRevisionID || release.DeploymentPlanRevisionNumber != request.DeploymentPlanRevisionNumber {
+		return Artifact{}, compileBoundary("source_integrity_failed", false, errors.Join(deployments.ErrInvalidDeployment, compileContextCause(ctx)))
 	}
-	revision, err := c.plans.GetRevision(ctx, appID, release.DeploymentPlanRevisionID, release.DeploymentPlanRevisionNumber)
+	revision, err := c.plans.GetRevision(ctx, appID, request.DeploymentPlanRevisionID, request.DeploymentPlanRevisionNumber)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
-			return Artifact{}, &CompileError{Code: string(DiagnosticBuildCancelled)}
-		}
-		return Artifact{}, &CompileError{Code: "deployment_plan_review_required"}
+		return Artifact{}, compileReadFailure(ctx, "deployment_plan_review_required", err)
 	}
 	if !compatiblePlan(ctx, release, revision) {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return Artifact{}, &CompileError{Code: string(DiagnosticBuildCancelled)}
-		}
-		return Artifact{}, &CompileError{Code: "deployment_plan_review_required"}
+		return Artifact{}, compileBoundary("deployment_plan_review_required", false, compileContextCause(ctx))
 	}
-	configuration, err := c.config.ExportComponentBuildForExecution(ctx, appID, configurationRevisionID, configurationRevisionNumber, revision.ID, revision.RevisionNumber, componentName)
+	configuration, err := c.config.ExportComponentBuildForExecution(ctx, appID, request.ConfigurationRevisionID, request.ConfigurationRevisionNumber, revision.ID, revision.RevisionNumber, request.ComponentName)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
-			return Artifact{}, &CompileError{Code: string(DiagnosticBuildCancelled)}
-		}
 		if appconfig.IsCode(err, "configuration_review_required") {
-			return Artifact{}, &CompileError{Code: "configuration_review_required"}
+			return Artifact{}, compileBoundary("configuration_review_required", false, errors.Join(err, compileContextCause(ctx)))
 		}
-		return Artifact{}, &CompileError{Code: "configuration_unavailable"}
+		return Artifact{}, compileReadFailure(ctx, "configuration_unavailable", err)
 	}
 	defer configuration.Clear()
-	if configuration.RevisionID != configurationRevisionID || configuration.RevisionNumber != configurationRevisionNumber || len(configuration.Environment) != 0 || len(configuration.SecretOrigins) != 0 {
-		return Artifact{}, &CompileError{Code: "configuration_unavailable"}
+	if configuration.RevisionID != request.ConfigurationRevisionID || configuration.RevisionNumber != request.ConfigurationRevisionNumber || len(configuration.Environment) != 0 || len(configuration.SecretOrigins) != 0 {
+		return Artifact{}, compileBoundary("configuration_unavailable", false, errors.Join(deployments.ErrInvalidDeployment, compileContextCause(ctx)))
 	}
 	publicValues, err := canonicalPublicBuildValues(configuration.PublicBuildValues)
 	if err != nil {
-		return Artifact{}, &CompileError{Code: "configuration_unavailable"}
+		return Artifact{}, compileBoundary("configuration_unavailable", false, errors.Join(err, compileContextCause(ctx)))
 	}
 	defer clear(publicValues)
-	definition, definitionDigest, err := definitionForBuild(revision, componentName, publicValues)
+	definition, definitionDigest, err := definitionForBuild(revision, request.ComponentName, publicValues)
 	if err != nil {
-		return Artifact{}, &CompileError{Code: "unsupported_runtime"}
+		return Artifact{}, compileBoundary("unsupported_runtime", false, errors.Join(err, compileContextCause(ctx)))
 	}
 	if len(publicValues) != 0 && definition.buildCommand == "" {
-		return Artifact{}, &CompileError{Code: "build_configuration_requires_build_command"}
+		return Artifact{}, compileBoundary("build_configuration_requires_build_command", false, errors.Join(deployments.ErrInvalidDeployment, compileContextCause(ctx)))
 	}
-	artifact, created, err := c.artifacts.Begin(ctx, BeginArtifactInput{
-		ReleaseID: release.ID, DeploymentPlanRevisionID: revision.ID, DeploymentPlanRevisionNumber: revision.RevisionNumber,
-		ComponentID: definition.name, CompilerVersion: CompilerVersion, BuildDefinitionDigest: definitionDigest,
-	})
+	authorityRequest := deployments.GeneratedImageRequest{
+		Claim: request.Claim, DeploymentID: request.DeploymentID, ReleaseID: release.ID,
+		ConfigurationRevisionID: request.ConfigurationRevisionID, ConfigurationRevisionNumber: request.ConfigurationRevisionNumber,
+		DeploymentPlanRevisionID: revision.ID, DeploymentPlanRevisionNumber: revision.RevisionNumber,
+		ComponentName: definition.name, CompilerVersion: CompilerVersion, BuildDefinitionDigest: definitionDigest,
+		PlanCanonicalDigest: revision.CanonicalDigest,
+		SourceProvider:      release.SourceProvider, SourceRepositoryID: release.RepositoryID, SourceResolvedDigest: release.ResolvedSHA,
+		PlanSourceProvider: revision.Plan.Source.Provider, PlanSourceRepositoryID: revision.Plan.Source.RepositoryID, PlanSourceResolvedDigest: revision.Plan.Source.ResolvedDigest,
+		ArchiveSHA256: release.ArchiveSHA256, WorkspaceTreeSHA256: release.WorkspaceTreeSHA256,
+		Findings: append([]deployments.Finding(nil), request.Findings...),
+	}
+	execution, err := c.repository.PinGeneratedImage(ctx, authorityRequest)
 	if err != nil {
-		return Artifact{}, &CompileError{Code: "internal_error"}
+		return Artifact{}, compileBoundary("authority_unavailable", false, err)
+	}
+	defer execution.Leave()
+	attached, err := execution.HasPersistedImage()
+	if err != nil {
+		return Artifact{}, compileBoundary("authority_unavailable", false, err)
+	}
+	var artifact Artifact
+	var created bool
+	if attached {
+		artifact, err = execution.ObservePersistedImage()
+	} else {
+		artifact, created, err = execution.SelectArtifact()
+	}
+	if err != nil {
+		return Artifact{}, compileBoundary("authority_unavailable", false, err)
+	}
+	if !created && artifact.State == generatedimagestate.ArtifactBuilding {
+		return Artifact{}, compileBoundary("build_in_progress", true, generatedimagestate.ErrInvalidArtifactTransition)
 	}
 	if !created {
-		return artifact, nil
+		spec := compileImageSpec(request, definition, artifact)
+		if validationErr := c.validator.ValidateImage(ctx, spec); validationErr == nil {
+			if c.afterImageValidated != nil {
+				c.afterImageValidated()
+			}
+			if err := execution.RecordReusedImageReady(); err != nil {
+				return Artifact{}, compileBoundary("image_result_unavailable", true, err)
+			}
+			return artifact, nil
+		} else if !attached && generatedruntime.IsDefinitiveImageMismatch(validationErr) {
+			artifact, err = execution.ReplaceMissingReusableArtifact()
+			if err != nil {
+				return Artifact{}, compileBoundary("image_result_unavailable", true, errors.Join(validationErr, err))
+			}
+			created = true
+		} else {
+			return Artifact{}, compileBoundary("image_validation_uncertain", true, errors.Join(validationErr, compileContextCause(ctx)))
+		}
+	}
+	if !created || artifact.State != generatedimagestate.ArtifactBuilding {
+		return Artifact{}, compileBoundary("image_selection_invalid", false, deployments.ErrInvalidTransition)
 	}
 	select {
 	case c.buildSlot <- struct{}{}:
 		defer func() { <-c.buildSlot }()
 	case <-ctx.Done():
-		return Artifact{}, c.cancelArtifact(artifact.ID)
+		return Artifact{}, compileBoundary(string(DiagnosticBuildCancelled), true, compileContextCause(ctx))
 	}
-	return c.build(ctx, appID, release, revision, definition, definitionDigest, publicValues, artifact)
+	selection, err := execution.BuildSelection()
+	if err != nil {
+		return Artifact{}, compileBoundary("authority_unavailable", false, err)
+	}
+	return c.build(ctx, request, release, revision, definition, definitionDigest, publicValues, artifact, execution, selection)
 }
 
-func (c *Compiler) build(ctx context.Context, appID string, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, definition componentDefinition, definitionDigest string, publicValues []appconfig.ValueInput, artifact Artifact) (Artifact, error) {
+func (c *Compiler) build(ctx context.Context, request CompileRequest, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, definition componentDefinition, definitionDigest string, publicValues []appconfig.ValueInput, artifact Artifact, execution *deployments.GeneratedImageExecution, selection deployments.GeneratedImageBuildSelection) (Artifact, error) {
 	files, err := c.temporary.Create(artifact.ID, int(artifact.AttemptNumber))
 	if err != nil {
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+		return Artifact{}, c.recordKnownFailure(ctx, execution, DiagnosticInternalError, err)
 	}
 	cleaned := false
+	var cleanupErr error
 	cleanup := func() error {
 		if cleaned {
-			return nil
+			return cleanupErr
 		}
 		cleaned = true
-		return c.cleanup(files)
+		cleanupErr = c.cleanup(files)
+		return cleanupErr
 	}
 	defer func() { _ = cleanup() }()
 
@@ -189,50 +279,38 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 			code = DiagnosticBuildContextTooLarge
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
-			_ = cleanup()
-			return Artifact{}, c.cancelArtifact(artifact.ID)
+			return Artifact{}, compileBoundary(string(DiagnosticBuildCancelled), true, finalizeBuildCause(ctx, cleanup, err))
 		}
-		_ = cleanup()
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, code)
+		return Artifact{}, c.recordKnownFailure(ctx, execution, code, errors.Join(err, cleanup()))
 	}
 	// Revalidate after copying so a file-swap race cannot reach Docker.
-	validated, err := c.releases.ReadyWorkspace(ctx, appID, release.ID)
+	validated, err := c.releases.ReadyWorkspace(ctx, request.Claim.ApplicationID(), release.ID)
 	if err != nil || validated.WorkspaceTreeSHA256 != release.WorkspaceTreeSHA256 || !compatiblePlan(ctx, validated, revision) {
-		_ = cleanup()
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticSourceIntegrityFailed)
+		return Artifact{}, c.recordKnownFailure(ctx, execution, DiagnosticSourceIntegrityFailed, finalizeBuildCause(ctx, cleanup, err))
 	}
 	if err := writeRecipe(layout, definition); err != nil {
-		_ = cleanup()
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+		return Artifact{}, c.recordKnownFailure(ctx, execution, DiagnosticInternalError, errors.Join(err, cleanup()))
 	}
 	if definition.buildCommand != "" {
 		body, err := json.Marshal(publicValues)
 		if err != nil {
-			_ = cleanup()
-			return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+			return Artifact{}, c.recordKnownFailure(ctx, execution, DiagnosticInternalError, errors.Join(err, cleanup()))
 		}
 		if err := writeBuildFile(layout.publicBuildValues, body, 0o600); err != nil {
 			clear(body)
-			_ = cleanup()
-			return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+			return Artifact{}, c.recordKnownFailure(ctx, execution, DiagnosticInternalError, errors.Join(err, cleanup()))
 		}
 		clear(body)
 	}
-	session, err := c.builder.Prepare(ctx)
+	session, err := c.builder.prepare(ctx, selection)
 	if err != nil {
-		_ = cleanup()
-		diagnostic := builderDiagnostic(err)
-		if diagnostic == DiagnosticBuildCancelled {
-			return Artifact{}, c.cancelArtifact(artifact.ID)
-		}
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, diagnostic)
+		return Artifact{}, compileBoundary(string(builderDiagnostic(err)), true, finalizeBuildCause(ctx, cleanup, err))
 	}
 	if !validBuilderSession(session) {
-		_ = cleanup()
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+		return Artifact{}, compileBoundary(string(DiagnosticInternalError), true, finalizeBuildCause(ctx, cleanup, deployments.ErrInvalidDeployment))
 	}
 
-	tag := imageTag(appID, release.ID, definition.name, definitionDigest)
+	tag := imageTag(request.Claim.ApplicationID(), release.ID, definition.name, definitionDigest)
 	args := []string{"buildx", "build", "--builder", session.BuilderName, "--file", layout.containerfile, "--iidfile", layout.imageIDFile, "--load", "--no-cache", "--progress", "plain"}
 	if definition.installBehavior != "" {
 		args = append(args, "--secret", "id=rig-install-command,src="+layout.installCommand)
@@ -243,7 +321,7 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 	}
 	args = append(args,
 		"--label", "io.rig.managed=generated-image",
-		"--label", "io.rig.application="+appID,
+		"--label", "io.rig.application="+request.Claim.ApplicationID(),
 		"--label", "io.rig.release="+release.ID,
 		"--label", "io.rig.artifact="+artifact.ID,
 		"--label", "io.rig.plan="+revision.ID,
@@ -252,34 +330,92 @@ func (c *Compiler) build(ctx context.Context, appID string, release releasesnaps
 		"--label", "io.rig.definition="+definitionDigest,
 		"--tag", tag, layout.contextDirectory,
 	)
-	result, runErr := c.runner.Run(ctx, runtimeprocess.CommandRequest{
+	command := runtimeprocess.CommandRequest{
 		Executable: session.DockerExecutable,
 		Args:       args,
 		Directory:  files.Directory, Env: session.Environment(), Timeout: c.options.BuildTimeout, OutputLimit: runtimeprocess.DefaultOutputLimit,
-	})
+	}
+	if c.afterBuildCommandPrepared != nil {
+		c.afterBuildCommandPrepared(command)
+	}
+	commandAuthority, err := c.repository.PinGeneratedImageCommand(selection)
+	if err != nil {
+		return Artifact{}, compileBoundary("authority_unavailable", false, finalizeBuildCause(ctx, cleanup, err))
+	}
+	defer commandAuthority.Leave()
+	if err := commandAuthority.CheckBeforeBuildLoad(); err != nil {
+		return Artifact{}, compileBoundary("authority_unavailable", false, finalizeBuildCause(ctx, cleanup, err))
+	}
+	if err := compileContextCause(ctx); err != nil {
+		return Artifact{}, compileBoundary(string(DiagnosticBuildCancelled), true, finalizeBuildCause(ctx, cleanup, err))
+	}
+	result, runErr := c.runner.Run(ctx, command)
 	diagnostic := classifyBuildResult(ctx, result, runErr)
 	clear(result.Stdout)
 	clear(result.Stderr)
 	if diagnostic != "" {
-		_ = cleanup()
-		if diagnostic == DiagnosticBuildCancelled {
-			return Artifact{}, c.cancelArtifact(artifact.ID)
-		}
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, diagnostic)
+		return Artifact{}, compileBoundary(string(diagnostic), true, finalizeBuildCause(ctx, cleanup, runErr))
 	}
 	imageID, err := readImageID(layout.imageIDFile)
 	if err != nil {
-		_ = cleanup()
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticBuildFailed)
+		return Artifact{}, compileBoundary(string(DiagnosticBuildFailed), true, finalizeBuildCause(ctx, cleanup, err))
 	}
 	if err := cleanup(); err != nil {
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+		return Artifact{}, compileBoundary(string(DiagnosticInternalError), true, errors.Join(err, compileContextCause(ctx)))
 	}
-	completed, err := c.artifacts.Complete(ctx, artifact.ID, imageID)
-	if err != nil {
-		return Artifact{}, c.failArtifact(ctx, artifact.ID, DiagnosticInternalError)
+	validatedArtifact := artifact
+	validatedArtifact.ImageContentID = imageID
+	if err := c.validator.ValidateImage(ctx, compileImageSpec(request, definition, validatedArtifact)); err != nil {
+		return Artifact{}, compileBoundary("image_validation_uncertain", true, errors.Join(err, compileContextCause(ctx)))
+	}
+	if c.afterImageValidated != nil {
+		c.afterImageValidated()
+	}
+	if err := execution.RecordBuiltImageReady(imageID); err != nil {
+		return Artifact{}, compileBoundary("image_result_unavailable", true, err)
+	}
+	completed, ok := execution.SelectedArtifact()
+	if !ok || completed.State != generatedimagestate.ArtifactReady || completed.ImageContentID != imageID {
+		return Artifact{}, compileBoundary("image_result_unavailable", true, deployments.ErrInvalidDeployment)
 	}
 	return completed, nil
+}
+
+func compileImageSpec(request CompileRequest, definition componentDefinition, artifact Artifact) generatedruntime.ImageSpec {
+	return generatedruntime.ImageSpec{AppID: request.Claim.ApplicationID(), ReleaseID: request.ReleaseID, ArtifactID: artifact.ID,
+		DeploymentPlanRevisionID: request.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: request.DeploymentPlanRevisionNumber,
+		ConfigurationRevisionID: request.ConfigurationRevisionID, ConfigurationRevisionNumber: request.ConfigurationRevisionNumber,
+		ComponentName: request.ComponentName, Role: definition.role, ImageContentID: artifact.ImageContentID, BuildDefinitionDigest: artifact.BuildDefinitionDigest}
+}
+
+func (c *Compiler) recordKnownFailure(ctx context.Context, execution *deployments.GeneratedImageExecution, code DiagnosticCode, cause error) error {
+	if canceled := compileContextCause(ctx); canceled != nil {
+		return compileBoundary(string(code), true, errors.Join(cause, canceled))
+	}
+	if err := execution.RecordObservedBuildFailure(generatedimagestate.DiagnosticCode(code)); err != nil {
+		return compileBoundary(string(code), true, errors.Join(cause, err))
+	}
+	return compileBoundary(string(code), false, cause)
+}
+
+func compileReadFailure(ctx context.Context, code string, cause error) error {
+	return compileBoundary(code, false, errors.Join(cause, compileContextCause(ctx)))
+}
+
+func compileContextCause(ctx context.Context) error {
+	if ctx == nil || ctx.Err() == nil {
+		return nil
+	}
+	return errors.Join(deploymentexecution.ErrCanceled, ctx.Err(), context.Cause(ctx))
+}
+
+func finalizeBuildCause(ctx context.Context, cleanup func() error, causes ...error) error {
+	causes = append(causes, cleanup(), compileContextCause(ctx))
+	return errors.Join(causes...)
+}
+
+func compileBoundary(code string, uncertain bool, causes ...error) error {
+	return &CompileError{Code: code, uncertain: uncertain, cause: errors.Join(causes...)}
 }
 
 func compatiblePlan(ctx context.Context, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision) bool {
@@ -305,20 +441,6 @@ func compatiblePlan(ctx context.Context, release releasesnapshot.Release, revisi
 		return false
 	}
 	return true
-}
-
-func (c *Compiler) failArtifact(ctx context.Context, artifactID string, code DiagnosticCode) error {
-	finalize, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	_, _ = c.artifacts.Fail(finalize, artifactID, code)
-	return &CompileError{Code: string(code)}
-}
-
-func (c *Compiler) cancelArtifact(artifactID string) error {
-	finalize, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	_, _ = c.artifacts.Cancel(finalize, artifactID)
-	return &CompileError{Code: string(DiagnosticBuildCancelled)}
 }
 
 func classifyBuildResult(ctx context.Context, result runtimeprocess.CommandResult, err error) DiagnosticCode {

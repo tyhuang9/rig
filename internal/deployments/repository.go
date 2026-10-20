@@ -117,6 +117,7 @@ type Repository struct {
 	afterGatePolicyRead               func()
 	afterComposeIdentityRead          func()
 	afterGeneratedNetworkIdentityRead func()
+	afterGeneratedImageIdentityRead   func()
 }
 
 func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }

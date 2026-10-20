@@ -42,6 +42,7 @@ type deploymentStore interface {
 	Get(context.Context, string, string) (deployments.Deployment, error)
 	InitializeRuntime(context.Context, string, string, string, string, int64, deployments.RuntimeStrategy, string, int64) (deployments.Deployment, error)
 	Transition(context.Context, string, string, deployments.Status, string) (deployments.Deployment, error)
+	FinishGeneratedImagePreparation(context.Context, deployments.GeneratedNetworkRequest) (generatedruntimestate.Phase, error)
 }
 
 type planReader interface {
@@ -50,12 +51,11 @@ type planReader interface {
 }
 
 type imageCompiler interface {
-	Compile(context.Context, string, string, string, string, int64) (generatedimage.Artifact, error)
+	Compile(context.Context, generatedimage.CompileRequest) (generatedimage.Artifact, error)
 }
 
 type artifactStore interface {
 	Get(context.Context, string) (generatedimage.Artifact, error)
-	MarkUnavailable(context.Context, string) (generatedimage.Artifact, error)
 }
 
 type runtimeState interface {
@@ -65,7 +65,6 @@ type runtimeState interface {
 	Advance(context.Context, string, string, generatedruntimestate.Phase, generatedruntimestate.Phase, generatedruntimestate.DiagnosticCode) (generatedruntimestate.Deployment, error)
 	BeginMigration(context.Context, string, string) (generatedruntimestate.Deployment, error)
 	FinishMigration(context.Context, string, string, bool) (generatedruntimestate.Deployment, error)
-	SetImageReady(context.Context, string, string, string, string) (generatedruntimestate.Component, error)
 	SetContainerStarting(context.Context, string, string, string, string) (generatedruntimestate.Component, error)
 	SetContainerRunning(context.Context, string, string, string, string) (generatedruntimestate.Component, error)
 	AdvanceComponent(context.Context, string, string, string, generatedruntimestate.ComponentState, generatedruntimestate.ComponentState) (generatedruntimestate.Component, error)
@@ -76,7 +75,6 @@ type runtimeState interface {
 type runtimeEngine interface {
 	ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error)
 	RetainReplacementCapacity(generatedruntime.ReplacementReservation) error
-	ValidateImage(context.Context, generatedruntime.ImageSpec) error
 	EnsureAppNetwork(context.Context, deployments.GeneratedNetworkRequest) error
 	CreateInactiveCandidate(context.Context, generatedruntime.CandidateSpec) (generatedruntime.Candidate, error)
 	AdoptCandidate(generatedruntime.Candidate, generatedruntime.ReplacementReservation) (generatedruntime.Candidate, error)

@@ -496,43 +496,6 @@ func (e *Engine) inspectImage(ctx context.Context, spec CandidateSpec) (imageIns
 	})
 }
 
-func (e *Engine) inspectImageSpec(ctx context.Context, spec ImageSpec) (imageInspection, error) {
-	result, runErr := e.run(ctx, []string{"image", "inspect", "--format", imageInspectFormat, spec.ImageContentID}, e.options.CommandTimeout)
-	if runErr != nil {
-		notFound := dockerNotFound(result)
-		diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticImageUnavailable)
-		clearResult(&result)
-		if notFound {
-			return imageInspection{}, &Error{Code: DiagnosticImageUnavailable}
-		}
-		return imageInspection{}, &Error{Code: diagnostic}
-	}
-	if result.StdoutTruncated || result.StderrTruncated {
-		clearResult(&result)
-		return imageInspection{}, &Error{Code: DiagnosticRuntimeOutputTruncated}
-	}
-	var image imageInspection
-	decodeErr := json.Unmarshal(result.Stdout, &image)
-	clearResult(&result)
-	if decodeErr != nil || image.ID != spec.ImageContentID || image.Size < 1 {
-		return imageInspection{}, &Error{Code: DiagnosticImageDriftDetected}
-	}
-	expected := map[string]string{
-		"io.rig.managed":     "generated-image",
-		"io.rig.application": spec.AppID,
-		"io.rig.release":     spec.ReleaseID,
-		"io.rig.artifact":    spec.ArtifactID,
-		"io.rig.plan":        spec.DeploymentPlanRevisionID,
-		"io.rig.component":   spec.ComponentName,
-		"io.rig.role":        spec.Role,
-		"io.rig.definition":  spec.BuildDefinitionDigest,
-	}
-	if !containsLabels(image.Labels, expected) || image.User != "node" || image.WorkingDirectory != "/workspace" || len(image.Entrypoint) != 1 || image.Entrypoint[0] != "/usr/local/bin/rig-entrypoint" {
-		return imageInspection{}, &Error{Code: DiagnosticImageDriftDetected}
-	}
-	return image, nil
-}
-
 func (e *Engine) ensureNetwork(ctx context.Context, request deployments.GeneratedNetworkRequest, name string) error {
 	execution, err := e.deployments.PinGeneratedNetwork(ctx, request)
 	if err != nil {

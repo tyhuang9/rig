@@ -8,6 +8,7 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
@@ -16,27 +17,13 @@ import (
 
 var errMigrationInterrupted = errors.New("generated migration execution was interrupted")
 
-func (e *Executor) build(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment) (map[string]generatedimage.Artifact, error) {
+func (e *Executor) build(ctx context.Context, claim deploymentexecution.Claim, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment) (map[string]generatedimage.Artifact, error) {
 	artifacts := make(map[string]generatedimage.Artifact, len(runtimeDeployment.Components))
 	for _, stateComponent := range sortedComponents(runtimeDeployment.Components) {
 		switch stateComponent.State {
-		case generatedruntimestate.ComponentPending:
-			artifact, err := e.compileValidated(ctx, resolved, stateComponent.Name)
+		case generatedruntimestate.ComponentPending, generatedruntimestate.ComponentImageReady:
+			artifact, err := e.compileValidated(ctx, claim, resolved, stateComponent.Name)
 			if err != nil {
-				return artifacts, err
-			}
-			if _, err = e.state.SetImageReady(ctx, resolved.deployment.AppID, resolved.deployment.ID, stateComponent.Name, artifact.ID); err != nil {
-				return artifacts, staticError("persist image readiness")
-			}
-			artifacts[stateComponent.Name] = artifact
-		case generatedruntimestate.ComponentImageReady:
-			artifact, err := e.artifacts.Get(ctx, stateComponent.ImageArtifactID)
-			if err != nil || !artifactMatches(resolved, stateComponent.Name, artifact) {
-				return artifacts, staticError("persisted image provenance unavailable")
-			}
-			if err = e.runtime.ValidateImage(ctx, imageSpec(resolved, artifact)); err != nil {
-				// The component row is already immutable at ImageReady. Replacing
-				// its artifact would make recovery ambiguous, so fail closed.
 				return artifacts, err
 			}
 			artifacts[stateComponent.Name] = artifact
@@ -47,44 +34,20 @@ func (e *Executor) build(ctx context.Context, resolved resolvedDeployment, runti
 	return artifacts, nil
 }
 
-func (e *Executor) compileValidated(ctx context.Context, resolved resolvedDeployment, component string) (generatedimage.Artifact, error) {
-	artifact, err := e.compiler.Compile(ctx, resolved.deployment.AppID, resolved.release.ID, component, resolved.configurationID, resolved.configurationNumber)
+func (e *Executor) compileValidated(ctx context.Context, claim deploymentexecution.Claim, resolved resolvedDeployment, component string) (generatedimage.Artifact, error) {
+	artifact, err := e.compiler.Compile(ctx, generatedimage.CompileRequest{
+		Claim: claim, DeploymentID: resolved.deployment.ID, ReleaseID: resolved.release.ID,
+		ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
+		DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
+		ComponentName: component, Findings: append([]deployments.Finding(nil), resolved.deployment.Findings...),
+	})
 	if err != nil {
 		return generatedimage.Artifact{}, err
 	}
 	if !artifactMatches(resolved, component, artifact) {
 		return generatedimage.Artifact{}, staticError("compiler artifact provenance mismatch")
 	}
-	err = e.runtime.ValidateImage(ctx, imageSpec(resolved, artifact))
-	if err == nil {
-		return artifact, nil
-	}
-	if !generatedruntime.IsCode(err, generatedruntime.DiagnosticImageUnavailable) && !generatedruntime.IsCode(err, generatedruntime.DiagnosticImageDriftDetected) {
-		return generatedimage.Artifact{}, err
-	}
-	if _, markErr := e.artifacts.MarkUnavailable(ctx, artifact.ID); markErr != nil {
-		return generatedimage.Artifact{}, staticError("mark image unavailable")
-	}
-	artifact, err = e.compiler.Compile(ctx, resolved.deployment.AppID, resolved.release.ID, component, resolved.configurationID, resolved.configurationNumber)
-	if err != nil {
-		return generatedimage.Artifact{}, err
-	}
-	if !artifactMatches(resolved, component, artifact) {
-		return generatedimage.Artifact{}, staticError("rebuilt artifact provenance mismatch")
-	}
-	if err = e.runtime.ValidateImage(ctx, imageSpec(resolved, artifact)); err != nil {
-		return generatedimage.Artifact{}, err
-	}
 	return artifact, nil
-}
-
-func imageSpec(resolved resolvedDeployment, artifact generatedimage.Artifact) generatedruntime.ImageSpec {
-	component, _ := componentPlan(resolved.plan, artifact.ComponentID)
-	return generatedruntime.ImageSpec{
-		AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, ArtifactID: artifact.ID,
-		DeploymentPlanRevisionID: resolved.plan.ID, ImageContentID: artifact.ImageContentID,
-		ComponentName: artifact.ComponentID, Role: component.Role, BuildDefinitionDigest: artifact.BuildDefinitionDigest,
-	}
 }
 
 func artifactMatches(resolved resolvedDeployment, component string, artifact generatedimage.Artifact) bool {

@@ -101,6 +101,9 @@ type fakeDeployments struct {
 	getErr              error
 	transitionErr       error
 	transitionErrStatus deployments.Status
+	state               *fakeRuntimeState
+	finishErr           error
+	finishRequests      []deployments.GeneratedNetworkRequest
 }
 
 func (f *fakeDeployments) GetOrCreateByJob(context.Context, string, string, string) (deployments.Deployment, bool, error) {
@@ -131,6 +134,22 @@ func (f *fakeDeployments) Transition(_ context.Context, _, _ string, status depl
 	return f.deployment, nil
 }
 
+func (f *fakeDeployments) FinishGeneratedImagePreparation(_ context.Context, request deployments.GeneratedNetworkRequest) (generatedruntimestate.Phase, error) {
+	f.finishRequests = append(f.finishRequests, request)
+	if f.finishErr != nil {
+		return "", f.finishErr
+	}
+	if f.state == nil {
+		return "", deployments.ErrInvalidDeployment
+	}
+	next := generatedruntimestate.PhaseStartingCandidate
+	if f.state.deployment.MigrationState == generatedruntimestate.MigrationPending {
+		next = generatedruntimestate.PhaseMigrating
+	}
+	f.state.deployment.Phase = next
+	return next, nil
+}
+
 type fakePlans struct {
 	revision deploymentplans.DeploymentPlanRevision
 	head     *deploymentplans.DeploymentPlanRevision
@@ -149,21 +168,74 @@ func (f *fakePlans) GetRevision(context.Context, string, string, int64) (deploym
 }
 
 type fakeCompiler struct {
-	events    *[]string
-	artifacts []generatedimage.Artifact
-	calls     int
-	pins      []appconfig.RevisionIdentity
+	events     *[]string
+	artifacts  []generatedimage.Artifact
+	errs       []error
+	calls      int
+	pins       []appconfig.RevisionIdentity
+	requests   []generatedimage.CompileRequest
+	before     func(generatedimage.CompileRequest)
+	state      *fakeRuntimeState
+	repository *deployments.Repository
+	release    releasesnapshot.Release
+	plan       deploymentplans.DeploymentPlanRevision
 }
 
-func (f *fakeCompiler) Compile(_ context.Context, _, _, _, configurationID string, configurationNumber int64) (generatedimage.Artifact, error) {
+func (f *fakeCompiler) Compile(ctx context.Context, request generatedimage.CompileRequest) (generatedimage.Artifact, error) {
 	*f.events = append(*f.events, "compile")
-	f.pins = append(f.pins, appconfig.RevisionIdentity{RevisionID: configurationID, RevisionNumber: configurationNumber})
+	f.requests = append(f.requests, request)
+	f.pins = append(f.pins, appconfig.RevisionIdentity{RevisionID: request.ConfigurationRevisionID, RevisionNumber: request.ConfigurationRevisionNumber})
+	if f.before != nil {
+		f.before(request)
+	}
 	index := f.calls
 	f.calls++
+	if index < len(f.errs) && f.errs[index] != nil {
+		return generatedimage.Artifact{}, f.errs[index]
+	}
 	if index >= len(f.artifacts) {
 		index = len(f.artifacts) - 1
 	}
-	return f.artifacts[index], nil
+	artifact := f.artifacts[index]
+	if f.repository != nil {
+		execution, err := f.repository.PinGeneratedImage(ctx, deployments.GeneratedImageRequest{
+			Claim: request.Claim, DeploymentID: request.DeploymentID, ReleaseID: request.ReleaseID,
+			ConfigurationRevisionID: request.ConfigurationRevisionID, ConfigurationRevisionNumber: request.ConfigurationRevisionNumber,
+			DeploymentPlanRevisionID: request.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: request.DeploymentPlanRevisionNumber,
+			ComponentName: request.ComponentName, CompilerVersion: artifact.CompilerVersion, BuildDefinitionDigest: artifact.BuildDefinitionDigest,
+			PlanCanonicalDigest: f.plan.CanonicalDigest,
+			SourceProvider:      f.release.SourceProvider, SourceRepositoryID: f.release.RepositoryID, SourceResolvedDigest: f.release.ResolvedSHA,
+			PlanSourceProvider: f.plan.Plan.Source.Provider, PlanSourceRepositoryID: f.plan.Plan.Source.RepositoryID, PlanSourceResolvedDigest: f.plan.Plan.Source.ResolvedDigest,
+			ArchiveSHA256: f.release.ArchiveSHA256, WorkspaceTreeSHA256: f.release.WorkspaceTreeSHA256,
+			Findings: append([]deployments.Finding(nil), request.Findings...),
+		})
+		if err != nil {
+			return generatedimage.Artifact{}, err
+		}
+		defer execution.Leave()
+		selected, created, err := execution.SelectArtifact()
+		if err != nil || selected.ID != artifact.ID {
+			return generatedimage.Artifact{}, errors.Join(err, deployments.ErrInvalidDeployment)
+		}
+		if created {
+			err = execution.RecordBuiltImageReady(artifact.ImageContentID)
+		} else {
+			err = execution.RecordReusedImageReady()
+		}
+		if err != nil {
+			return generatedimage.Artifact{}, err
+		}
+		selected, _ = execution.SelectedArtifact()
+		if selected.ID == "" {
+			return generatedimage.Artifact{}, deployments.ErrInvalidDeployment
+		}
+		return selected, nil
+	}
+	if f.state != nil {
+		component := f.state.component(request.ComponentName)
+		component.State, component.ImageArtifactID = generatedruntimestate.ComponentImageReady, artifact.ID
+	}
+	return artifact, nil
 }
 
 type fakeArtifacts struct {
@@ -506,7 +578,8 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	artifact := readyArtifact(testArtifactID)
 	deploymentsFake := &fakeDeployments{deployment: deployments.Deployment{ID: testDeploymentID, AppID: testAppID, JobID: testJobID, Status: deployments.Preparing, ConfigurationMode: "current"}}
 	state := &fakeRuntimeState{active: generatedruntimestate.ActiveHead{AppID: testAppID}, migrationRequired: migration}
-	compiler := &fakeCompiler{events: &events, artifacts: []generatedimage.Artifact{artifact}}
+	deploymentsFake.state = state
+	compiler := &fakeCompiler{events: &events, artifacts: []generatedimage.Artifact{artifact}, state: state}
 	configuration := &fakeConfiguration{value: []byte("DATABASE_URL=secret\n")}
 	artifacts := &fakeArtifacts{values: map[string]generatedimage.Artifact{artifact.ID: artifact}}
 	runtime := &fakeRuntime{events: &events}
@@ -716,6 +789,8 @@ func TestGeneratedExecutorRejectsUnpinnedLatestJobBeforeRuntimeSideEffects(t *te
 
 func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
+	finding := deployments.Finding{PolicyVersion: "v1", Capability: "network", Scope: "app", Fingerprint: strings.Repeat("a", 64), Disposition: "allowed"}
+	fixture.deployments.deployment.Findings = []deployments.Finding{finding}
 	result, err := fixture.execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("result=%+v err=%v", result, err)
@@ -725,6 +800,23 @@ func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
 		deployment.ActualConfigurationRevisionID != testConfigID || deployment.ActualConfigurationRevisionNumber != 3 || fixture.compiler.calls != 1 ||
 		fixture.compiler.pins[0].RevisionID != testConfigID || fixture.compiler.pins[0].RevisionNumber != 3 {
 		t.Fatalf("reviewed deployment=%+v compiler pins=%+v", deployment, fixture.compiler.pins)
+	}
+	if len(fixture.compiler.requests) != 1 || len(fixture.deployments.finishRequests) != 1 {
+		t.Fatalf("compiler requests=%+v finish requests=%+v", fixture.compiler.requests, fixture.deployments.finishRequests)
+	}
+	compileRequest := fixture.compiler.requests[0]
+	if !reflect.DeepEqual(compileRequest.Claim, fixture.claim) || compileRequest.DeploymentID != testDeploymentID || compileRequest.ReleaseID != testReleaseID ||
+		compileRequest.ConfigurationRevisionID != testConfigID || compileRequest.ConfigurationRevisionNumber != 3 ||
+		compileRequest.DeploymentPlanRevisionID != testPlanID || compileRequest.DeploymentPlanRevisionNumber != 2 || compileRequest.ComponentName != "api" || !reflect.DeepEqual(compileRequest.Findings, []deployments.Finding{finding}) {
+		t.Fatalf("compiler request=%+v", compileRequest)
+	}
+	wantFinish := generatedNetworkRequest(fixture.claim, resolvedDeployment{deployment: deployment, configurationID: testConfigID, configurationNumber: 3, plan: fixture.plan})
+	if !reflect.DeepEqual(fixture.deployments.finishRequests[0], wantFinish) {
+		t.Fatalf("finish request=%+v want=%+v", fixture.deployments.finishRequests[0], wantFinish)
+	}
+	fixture.deployments.deployment.Findings[0].Capability = "mutated"
+	if compileRequest.Findings[0].Capability != finding.Capability || fixture.deployments.finishRequests[0].Findings[0].Capability != finding.Capability {
+		t.Fatal("executor forwarded mutable policy findings")
 	}
 }
 
@@ -948,7 +1040,7 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 	if result.CompletionCode != "deployment_completed" || fixture.deployments.deployment.Status != deployments.Succeeded || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
 		t.Fatalf("result=%+v deployment=%+v runtime phase=%s", result, fixture.deployments.deployment, fixture.state.deployment.Phase)
 	}
-	wantEvents := []string{"authorize", "compile", "validate_image", "ensure_network", "ensure_network", "migration", "ensure_network", "create", "start", "health", "route"}
+	wantEvents := []string{"authorize", "compile", "ensure_network", "ensure_network", "migration", "ensure_network", "create", "start", "health", "route"}
 	if !reflect.DeepEqual(*fixture.events, wantEvents) {
 		t.Fatalf("events=%v want=%v", *fixture.events, wantEvents)
 	}
@@ -1203,38 +1295,114 @@ func TestGeneratedExecutorPreservesRuntimePolicyApprovalPause(t *testing.T) {
 	}
 }
 
-func TestGeneratedExecutorMarksDriftedImageUnavailableAndRebuildsOnce(t *testing.T) {
+func TestGeneratedExecutorUsesCompilerOwnedImageAttestation(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
 	second := readyArtifact(testArtifactID2)
-	fixture.compiler.artifacts = append(fixture.compiler.artifacts, second)
+	fixture.compiler.artifacts = []generatedimage.Artifact{second}
 	fixture.artifacts.values[second.ID] = second
-	fixture.runtime.validateErrs = []error{&generatedruntime.Error{Code: generatedruntime.DiagnosticImageDriftDetected}, nil}
 	if _, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter); err != nil {
 		t.Fatal(err)
 	}
-	if fixture.compiler.calls != 2 || !reflect.DeepEqual(fixture.artifacts.markedUnavailable, []string{testArtifactID}) {
-		t.Fatalf("compile calls=%d marked=%v", fixture.compiler.calls, fixture.artifacts.markedUnavailable)
+	if fixture.compiler.calls != 1 || fixture.runtime.validateCalls != 0 || len(fixture.artifacts.markedUnavailable) != 0 {
+		t.Fatalf("compile calls=%d runtime validations=%d marked=%v", fixture.compiler.calls, fixture.runtime.validateCalls, fixture.artifacts.markedUnavailable)
 	}
 	if fixture.state.deployment.Components[0].ImageArtifactID != testArtifactID2 {
 		t.Fatalf("persisted artifact=%s", fixture.state.deployment.Components[0].ImageArtifactID)
 	}
 }
 
-func TestGeneratedExecutorFailsClosedWhenRebuiltImageStillDrifts(t *testing.T) {
+func TestGeneratedExecutorPreservesCompilerImageAuthorityRefusal(t *testing.T) {
 	fixture := newExecutorFixture(t, false)
-	second := readyArtifact(testArtifactID2)
-	fixture.compiler.artifacts = append(fixture.compiler.artifacts, second)
-	fixture.artifacts.values[second.ID] = second
-	fixture.runtime.validateErrs = []error{
-		&generatedruntime.Error{Code: generatedruntime.DiagnosticImageDriftDetected},
-		&generatedruntime.Error{Code: generatedruntime.DiagnosticImageDriftDetected},
+	cause := &generatedimage.CompileError{Code: "image_validation_uncertain"}
+	fixture.compiler.errs = []error{cause}
+	var boundaryDeployment deployments.Deployment
+	var boundaryRuntime generatedruntimestate.Deployment
+	fixture.compiler.before = func(generatedimage.CompileRequest) {
+		boundaryDeployment = fixture.deployments.deployment
+		boundaryRuntime = fixture.state.deployment
+		boundaryRuntime.Components = append([]generatedruntimestate.Component(nil), boundaryRuntime.Components...)
 	}
 	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	if err == nil || fixture.compiler.calls != 2 || len(fixture.runtime.createdSpecs) != 0 {
+	if !errors.Is(err, cause) || fixture.compiler.calls != 1 || fixture.runtime.validateCalls != 0 || len(fixture.runtime.createdSpecs) != 0 {
 		t.Fatalf("err=%v compile calls=%d create calls=%d", err, fixture.compiler.calls, len(fixture.runtime.createdSpecs))
 	}
-	if !reflect.DeepEqual(fixture.artifacts.markedUnavailable, []string{testArtifactID}) {
-		t.Fatalf("marked unavailable=%v", fixture.artifacts.markedUnavailable)
+	if len(fixture.artifacts.markedUnavailable) != 0 || !reflect.DeepEqual(fixture.deployments.deployment, boundaryDeployment) || !reflect.DeepEqual(fixture.state.deployment, boundaryRuntime) {
+		t.Fatalf("marked unavailable=%v deployment=%+v runtime=%+v", fixture.artifacts.markedUnavailable, fixture.deployments.deployment, fixture.state.deployment)
+	}
+	if fixture.runtime.retained != 0 || fixture.runtime.stopped != 0 || len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
+		t.Fatalf("retained=%d stopped=%d reservations=%+v", fixture.runtime.retained, fixture.runtime.stopped, fixture.authorization.reservations)
+	}
+}
+
+func TestGeneratedExecutorRetainsCandidateCapacityOnImageRefusalWithPriorCandidateRisk(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		state         generatedruntimestate.ComponentState
+		containerName string
+		containerID   string
+		compilerCause error
+		wantCompiler  int
+	}{
+		{
+			name: "compiler refusal after name-only candidate risk", state: generatedruntimestate.ComponentPending,
+			containerName: "rig-prior-candidate", compilerCause: &generatedimage.CompileError{Code: "authority_unavailable"}, wantCompiler: 1,
+		},
+		{name: "unexpected running component", state: generatedruntimestate.ComponentRunning, containerName: "rig-prior-candidate", containerID: strings.Repeat("a", 64)},
+		{name: "unexpected healthy component", state: generatedruntimestate.ComponentHealthy, containerName: "rig-prior-candidate", containerID: strings.Repeat("a", 64)},
+		{name: "unknown component state", state: generatedruntimestate.ComponentState("unknown")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			var boundaryDeployment deployments.Deployment
+			var boundaryRuntime generatedruntimestate.Deployment
+			fixture.authorization.after = func() {
+				component := &fixture.state.deployment.Components[0]
+				component.State = test.state
+				component.ContainerName = test.containerName
+				component.ContainerID = test.containerID
+				// Snapshot the durable boundary after the successful authorization
+				// transition rather than the fixture's pre-Gate Preparing state.
+				fixture.deployments.deployment.Status = deployments.Applying
+				boundaryDeployment = fixture.deployments.deployment
+				boundaryRuntime = fixture.state.deployment
+				boundaryRuntime.Components = append([]generatedruntimestate.Component(nil), boundaryRuntime.Components...)
+			}
+			if test.compilerCause != nil {
+				fixture.compiler.errs = []error{test.compilerCause}
+			}
+
+			_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+			var executionErr *jobs.ExecutionError
+			if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" ||
+				(test.compilerCause != nil && !errors.Is(err, test.compilerCause)) ||
+				(test.compilerCause == nil && !strings.Contains(err.Error(), "unexpected component state while building")) {
+				t.Fatalf("image refusal error=%v", err)
+			}
+			if fixture.compiler.calls != test.wantCompiler || fixture.runtime.retained != 1 || fixture.runtime.stopped != 0 ||
+				!reflect.DeepEqual(fixture.deployments.deployment, boundaryDeployment) || !reflect.DeepEqual(fixture.state.deployment, boundaryRuntime) {
+				t.Fatalf("compiler=%d retained=%d stopped=%d deployment=%+v runtime=%+v", fixture.compiler.calls, fixture.runtime.retained, fixture.runtime.stopped, fixture.deployments.deployment, fixture.state.deployment)
+			}
+		})
+	}
+}
+
+func TestGeneratedExecutorPreservesImageFinishAuthorityRefusal(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	fixture.deployments.finishErr = deploymentexecution.ErrAuthorityStale
+
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	var executionErr *jobs.ExecutionError
+	if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deploymentexecution.ErrAuthorityStale) {
+		t.Fatalf("result=%+v error=%v", result, err)
+	}
+	if fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled ||
+		fixture.state.deployment.Phase != generatedruntimestate.PhaseBuilding || len(fixture.state.deployment.Components) != 1 ||
+		fixture.state.deployment.Components[0].State != generatedruntimestate.ComponentImageReady ||
+		fixture.state.deployment.Components[0].ImageArtifactID != testArtifactID {
+		t.Fatalf("deployment=%+v runtime=%+v", fixture.deployments.deployment, fixture.state.deployment)
+	}
+	if fixture.compiler.calls != 1 || len(fixture.deployments.finishRequests) != 1 || len(fixture.runtime.createdSpecs) != 0 || len(fixture.runtime.started) != 0 {
+		t.Fatalf("compiler=%d finish=%d creates=%d starts=%d", fixture.compiler.calls, len(fixture.deployments.finishRequests), len(fixture.runtime.createdSpecs), len(fixture.runtime.started))
 	}
 }
 

@@ -14,9 +14,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/sourceinspection"
@@ -31,7 +36,20 @@ func TestLiveGeneratedImageCompiler(t *testing.T) { runLiveGeneratedImageCompile
 
 func TestLiveManualGeneratedImageCompiler(t *testing.T) { runLiveGeneratedImageCompiler(t, true) }
 
+func TestLiveGeneratedImageAuthority(t *testing.T) {
+	t.Run("BuildAndReuse", func(t *testing.T) {
+		runLiveGeneratedImageCompilerMode(t, false, "build_and_reuse")
+	})
+	t.Run("AuthorityLostBeforeBuildLoad", func(t *testing.T) {
+		runLiveGeneratedImageCompilerMode(t, false, "authority_lost")
+	})
+}
+
 func runLiveGeneratedImageCompiler(t *testing.T, manual bool) {
+	runLiveGeneratedImageCompilerMode(t, manual, "")
+}
+
+func runLiveGeneratedImageCompilerMode(t *testing.T, manual bool, mode string) {
 	if os.Getenv("RIG_RUN_LIVE_GENERATED_RUNTIME") != "1" {
 		t.Skip("set RIG_RUN_LIVE_GENERATED_RUNTIME=1 on a disposable Linux Docker host")
 	}
@@ -54,43 +72,12 @@ func runLiveGeneratedImageCompiler(t *testing.T, manual bool) {
 	runner := runtimeprocess.ExecRunner{}
 	buildObservation := &liveGeneratedImageBuildObservation{delegate: runner, status: "not_attempted"}
 	dataRoot := t.TempDir()
-	builder, err := NewBuilderManager(buildObservation, BuilderManagerOptions{
-		DataRoot:         dataRoot,
-		DockerExecutable: dockerExecutable,
-		DockerEndpoint:   dockerEndpoint,
-		PrepareTimeout:   2 * time.Minute,
-		OutputLimit:      64 << 10,
-	})
+	controllerDirectories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {
-		t.Fatal("live generated image builder configuration failed")
-	}
-	identity, dockerEnvironment, err := builder.preparePersistentState()
-	if err != nil {
-		t.Fatal("live generated image builder state failed")
-	}
-	// A task-local verified Buildx binary may be supplied when this disposable
-	// host has no system plugin. The production builder still owns its config.
-	if plugin := os.Getenv("RIG_LIVE_BUILDX_PLUGIN"); plugin != "" {
-		if !filepath.IsAbs(plugin) {
-			t.Fatal("live Buildx plugin must be absolute")
-		}
-		for _, entry := range dockerEnvironment {
-			if config, ok := strings.CutPrefix(entry, "DOCKER_CONFIG="); ok {
-				pluginDirectory := filepath.Join(config, "cli-plugins")
-				if err := os.Mkdir(pluginDirectory, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				if err := os.Symlink(plugin, filepath.Join(pluginDirectory, "docker-buildx")); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
+		t.Fatal("live generated runtime controller directory configuration failed")
 	}
 	liveContext, cancelLive := context.WithTimeout(context.Background(), 7*time.Minute)
 	defer cancelLive()
-	if !liveDockerIsLinux(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment) {
-		t.Fatal("live generated image Docker preflight failed")
-	}
 
 	workspace := t.TempDir()
 	const componentRoot = "app root"
@@ -148,6 +135,43 @@ func runLiveGeneratedImageCompiler(t *testing.T, manual bool) {
 			t.Fatal("live manual setup digest failed")
 		}
 	}
+	authority := newGeneratedImageTestAuthority(t, release, revision, "app")
+	release, revision = authority.release, authority.revision
+	builder, err := NewBuilderManager(authority.repository, buildObservation, BuilderManagerOptions{
+		DataRoot:         dataRoot,
+		DockerExecutable: dockerExecutable,
+		DockerEndpoint:   dockerEndpoint,
+		PrepareTimeout:   2 * time.Minute,
+		OutputLimit:      64 << 10,
+	})
+	if err != nil {
+		t.Fatal("live generated image builder configuration failed")
+	}
+	identity, dockerEnvironment, err := builder.preparePersistentState()
+	if err != nil {
+		t.Fatal("live generated image builder state failed")
+	}
+	// A task-local verified Buildx binary may be supplied when this disposable
+	// host has no system plugin. The production builder still owns its config.
+	if plugin := os.Getenv("RIG_LIVE_BUILDX_PLUGIN"); plugin != "" {
+		if !filepath.IsAbs(plugin) {
+			t.Fatal("live Buildx plugin must be absolute")
+		}
+		for _, entry := range dockerEnvironment {
+			if config, ok := strings.CutPrefix(entry, "DOCKER_CONFIG="); ok {
+				pluginDirectory := filepath.Join(config, "cli-plugins")
+				if err := os.Mkdir(pluginDirectory, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(plugin, filepath.Join(pluginDirectory, "docker-buildx")); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	if !liveDockerIsLinux(liveContext, runner, dockerExecutable, builder.directory.Root(), dockerEnvironment) {
+		t.Fatal("live generated image Docker preflight failed")
+	}
 	definition, definitionDigest, err := definitionFor(revision, "app")
 	if err != nil {
 		t.Fatal("live generated image definition failed")
@@ -169,27 +193,75 @@ func runLiveGeneratedImageCompiler(t *testing.T, manual bool) {
 		t.Fatal("live generated image temporary storage failed")
 	}
 	releaseReader := &compilerReleaseReader{release: release}
-	artifacts := &compilerArtifactWriter{}
-	builderObservation := &liveGeneratedImageBuilderObservation{delegate: builder, status: "not_attempted"}
+	runtimeTemporary, err := securetemp.NewGeneratedRuntime(dataRoot)
+	if err != nil {
+		t.Fatal("live generated runtime temporary storage failed")
+	}
+	environment, err := generatedruntime.NewSecureEnvironmentStager(runtimeTemporary)
+	if err != nil {
+		t.Fatal("live generated runtime environment configuration failed")
+	}
+	validator, err := generatedruntime.NewEngine(buildObservation, environment, liveGeneratedImageCapacity{}, authority.repository, generatedruntime.EngineOptions{
+		DockerExecutable: dockerExecutable, DockerEndpoint: dockerEndpoint,
+		DockerConfigDirectory: controllerDirectories.DockerConfigDirectory, WorkingDirectory: controllerDirectories.WorkingDirectory,
+	})
+	if err != nil {
+		t.Fatal("live generated image attestor configuration failed")
+	}
 	compiler, err := NewCompiler(
 		releaseReader,
 		compilerPlanReader{revision: revision},
 		&compilerConfiguration{},
-		artifacts,
+		authority.repository,
 		temporary,
-		builderObservation,
+		builder,
 		buildObservation,
+		validator,
 		CompilerOptions{BuildTimeout: 6 * time.Minute},
 	)
 	if err != nil {
 		t.Fatal("live generated image compiler configuration failed")
 	}
-	artifact, err := compiler.Compile(liveContext, appID, releaseID, "app", "", 0)
-	if err != nil {
-		t.Fatalf("live generated image production compile failed: diagnostic=%s,builder_status=%s,build_status=%s", liveGeneratedImageFailureCode(err), builderObservation.status, buildObservation.status)
+	request := CompileRequest{
+		Claim: authority.claim, DeploymentID: authority.request.DeploymentID, ReleaseID: releaseID,
+		ConfigurationRevisionID: release.ConfigurationRevisionID, ConfigurationRevisionNumber: release.ConfigurationRevisionNumber,
+		DeploymentPlanRevisionID: revision.ID, DeploymentPlanRevisionNumber: revision.RevisionNumber, ComponentName: "app",
 	}
-	if artifact.State != ArtifactReady || !validImageContentID(artifact.ImageContentID) || artifacts.failed != "" {
+	if mode == "authority_lost" {
+		compiler.afterBuildCommandPrepared = func(command runtimeprocess.CommandRequest) {
+			if len(command.Args) < 2 || command.Args[0] != "buildx" || command.Args[1] != "build" {
+				t.Fatalf("unexpected prepared live command: %#v", command.Args)
+			}
+			invalidateGeneratedImageJobAttempt(t, authority)
+		}
+	}
+	artifact, err := compiler.Compile(deploymenteffects.WithScope(liveContext, authority.scope), request)
+	if mode == "authority_lost" {
+		if artifact != (Artifact{}) || !errors.Is(err, deploymentexecution.ErrIdentityLost) || buildObservation.buildCalls != 0 {
+			t.Fatalf("live authority refusal artifact=%#v error=%v build_calls=%d", artifact, err, buildObservation.buildCalls)
+		}
+		persisted, persistedErr := NewArtifactRepository(authority.db).Get(context.Background(), latestGeneratedImageArtifactID(t, authority, "app"))
+		component, componentErr := generatedruntimestate.New(authority.db).Component(context.Background(), authority.claim.ApplicationID(), authority.request.DeploymentID, "app")
+		if persistedErr != nil || persisted.State != ArtifactBuilding || componentErr != nil || component.State != generatedruntimestate.ComponentPending || component.ImageArtifactID != "" {
+			t.Fatalf("live authority refusal changed durable evidence: artifact=%#v artifact_err=%v component=%#v component_err=%v", persisted, persistedErr, component, componentErr)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("live generated image production compile failed: diagnostic=%s,build_status=%s", liveGeneratedImageFailureCode(err), buildObservation.status)
+	}
+	if artifact.State != ArtifactReady || !validImageContentID(artifact.ImageContentID) {
 		t.Fatal("live generated image production compile returned an invalid artifact")
+	}
+	if mode == "build_and_reuse" {
+		firstBuildCalls := buildObservation.buildCalls
+		reused, reuseErr := compiler.Compile(deploymenteffects.WithScope(liveContext, authority.scope), request)
+		if reuseErr != nil || reused.ID != artifact.ID || reused.ImageContentID != artifact.ImageContentID || reused.State != ArtifactReady {
+			t.Fatalf("live generated image reuse artifact=%#v error=%v", reused, reuseErr)
+		}
+		if firstBuildCalls != 1 || buildObservation.buildCalls != firstBuildCalls {
+			t.Fatalf("live generated image reuse build calls before=%d after=%d", firstBuildCalls, buildObservation.buildCalls)
+		}
 	}
 	operationEntries, err := os.ReadDir(filepath.Join(dataRoot, "runtime", "generated-build"))
 	if err != nil || len(operationEntries) != 0 {
@@ -205,21 +277,42 @@ func runLiveGeneratedImageCompiler(t *testing.T, manual bool) {
 }
 
 type liveGeneratedImageBuilderObservation struct {
-	delegate builderPreparer
+	delegate liveGeneratedImageBuilderPreparer
 	status   string
 }
 
+type liveGeneratedImageBuilderPreparer interface {
+	Prepare(context.Context) (BuilderSession, error)
+}
+
+type liveGeneratedImageCapacity struct{}
+
+func (liveGeneratedImageCapacity) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
+	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
+}
+
 type liveGeneratedImageBuildObservation struct {
-	delegate runtimeprocess.CommandRunner
-	status   string
+	delegate   runtimeprocess.CommandRunner
+	status     string
+	buildCalls int
 }
 
 func (observation *liveGeneratedImageBuildObservation) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	result, err := observation.delegate.Run(ctx, request)
 	if len(request.Args) >= 2 && request.Args[0] == "buildx" && request.Args[1] == "build" {
+		observation.buildCalls++
 		observation.status = liveGeneratedImageBuildResultStatus(ctx, result, err)
 	}
 	return result, err
+}
+
+func latestGeneratedImageArtifactID(t *testing.T, authority *generatedImageTestAuthority, component string) string {
+	t.Helper()
+	var id string
+	if err := authority.db.QueryRow(`SELECT id FROM generated_image_artifacts WHERE release_id=? AND component_id=? ORDER BY attempt_number DESC LIMIT 1`, authority.release.ID, component).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func liveGeneratedImageBuildResultStatus(ctx context.Context, result runtimeprocess.CommandResult, err error) string {
@@ -344,13 +437,13 @@ func TestLiveGeneratedImageBuilderObservationUsesOnlyFixedStatus(t *testing.T) {
 	}
 	for _, test := range []struct {
 		name    string
-		builder *compilerBuilder
+		builder *liveGeneratedImageBuilderPreparerFake
 		want    string
 	}{
-		{"ready", &compilerBuilder{session: validSession}, "ready"},
-		{"invalid session", &compilerBuilder{session: BuilderSession{}}, "invalid_session"},
-		{"typed failure", &compilerBuilder{err: &BuilderError{Code: BuilderDriftDetected}}, "builder_drift_detected"},
-		{"raw failure", &compilerBuilder{err: errors.New("sensitive raw builder error")}, "unclassified"},
+		{"ready", &liveGeneratedImageBuilderPreparerFake{session: validSession}, "ready"},
+		{"invalid session", &liveGeneratedImageBuilderPreparerFake{session: BuilderSession{}}, "invalid_session"},
+		{"typed failure", &liveGeneratedImageBuilderPreparerFake{err: &BuilderError{Code: BuilderDriftDetected}}, "builder_drift_detected"},
+		{"raw failure", &liveGeneratedImageBuilderPreparerFake{err: errors.New("sensitive raw builder error")}, "unclassified"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			observation := &liveGeneratedImageBuilderObservation{delegate: test.builder, status: "not_attempted"}
@@ -360,6 +453,15 @@ func TestLiveGeneratedImageBuilderObservationUsesOnlyFixedStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+type liveGeneratedImageBuilderPreparerFake struct {
+	session BuilderSession
+	err     error
+}
+
+func (f *liveGeneratedImageBuilderPreparerFake) Prepare(context.Context) (BuilderSession, error) {
+	return f.session, f.err
 }
 
 func TestLiveGeneratedImageBuildObservationUsesOnlyFixedStatus(t *testing.T) {

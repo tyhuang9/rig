@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -13,26 +14,70 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 type builderDaemonFake struct {
 	mu sync.Mutex
 
-	network            *dockerNetwork
-	builders           map[string]buildxBuilder
-	nodes              map[string]builderIdentity
-	boxes              map[string]buildkitContainer
-	calls              []runtimeprocess.CommandRequest
-	err                error
-	stderr             []byte
-	outputs            [][]byte
-	osType             string
-	containerRunErr    error
-	containerRunStderr []byte
-	infoOverride       *dockerInfo
-	replaceOnLifecycle bool
-	duplicateBuilders  bool
+	network             *dockerNetwork
+	builders            map[string]buildxBuilder
+	nodes               map[string]builderIdentity
+	boxes               map[string]buildkitContainer
+	calls               []runtimeprocess.CommandRequest
+	err                 error
+	stderr              []byte
+	outputs             [][]byte
+	osType              string
+	containerRunErr     error
+	containerRunStderr  []byte
+	containerRunLostAck bool
+	buildxCreateLostAck bool
+	infoOverride        *dockerInfo
+	replaceOnLifecycle  bool
+	duplicateBuilders   bool
+}
+
+type blockingBuilderRunner struct {
+	delegate runtimeprocess.CommandRunner
+	target   string
+	entered  chan struct{}
+	release  chan struct{}
+	once     sync.Once
+}
+
+type builderRunnerFunc func(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error)
+
+func (f builderRunnerFunc) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	return f(ctx, request)
+}
+
+var (
+	builderCompletedExitOnce sync.Once
+	builderCompletedExitErr  error
+)
+
+func completedBuilderExitError() error {
+	builderCompletedExitOnce.Do(func() {
+		command := exec.Command(os.Args[0], "-test.run=^TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder$")
+		command.Env = append(os.Environ(), "RIG_TEST_BUILDER_COMPLETED_EXIT=1")
+		builderCompletedExitErr = command.Run()
+	})
+	return builderCompletedExitErr
+}
+
+func (r *blockingBuilderRunner) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	if commandKindForBuilderTest(request) == r.target {
+		r.once.Do(func() { close(r.entered) })
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return runtimeprocess.CommandResult{}, ctx.Err()
+		}
+	}
+	return r.delegate.Run(ctx, request)
 }
 
 func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -64,9 +109,10 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 		switch request.Args[1] {
 		case "inspect":
 			if d.network == nil || request.Args[len(request.Args)-1] != d.network.Name {
-				output := []byte("Error response from daemon: network not found")
+				name := request.Args[len(request.Args)-1]
+				output := []byte("Error response from daemon: network " + name + " not found")
 				d.outputs = append(d.outputs, output)
-				return runtimeprocess.CommandResult{Stderr: output}, errors.New("exit status 1")
+				return runtimeprocess.CommandResult{Stderr: output}, completedBuilderExitError()
 			}
 			body, _ := json.Marshal(d.network)
 			d.outputs = append(d.outputs, body)
@@ -112,6 +158,9 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 			d.nodes[name] = builderIdentity{BuilderName: name, NodeName: flagArgument(request.Args, "--node")}
 			output := []byte(name)
 			d.outputs = append(d.outputs, output)
+			if d.buildxCreateLostAck {
+				return runtimeprocess.CommandResult{Stdout: output}, errors.New("buildx create acknowledgement lost")
+			}
 			return runtimeprocess.CommandResult{Stdout: output}, nil
 		case "inspect":
 			output := []byte("Name: fake\nDriver: remote\n")
@@ -124,15 +173,15 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 			name := request.Args[len(request.Args)-1]
 			container, exists := d.boxes[name]
 			if !exists {
-				output := []byte("Error response from daemon: No such container")
+				output := []byte("Error: No such container: " + name)
 				d.outputs = append(d.outputs, output)
-				return runtimeprocess.CommandResult{Stderr: output}, errors.New("exit status 1")
+				return runtimeprocess.CommandResult{Stderr: output}, completedBuilderExitError()
 			}
 			body, _ := json.Marshal(container)
 			d.outputs = append(d.outputs, body)
 			return runtimeprocess.CommandResult{Stdout: body}, nil
 		case "run":
-			if d.containerRunErr != nil {
+			if d.containerRunErr != nil && !d.containerRunLostAck {
 				output := append([]byte(nil), d.containerRunStderr...)
 				d.outputs = append(d.outputs, output)
 				return runtimeprocess.CommandResult{Stderr: output}, d.containerRunErr
@@ -153,6 +202,9 @@ func (d *builderDaemonFake) Run(_ context.Context, request runtimeprocess.Comman
 			d.boxes[name] = validBuildkitContainer(identity, quota)
 			output := []byte("sha256:" + strings.Repeat("1", 64))
 			d.outputs = append(d.outputs, output)
+			if d.containerRunLostAck {
+				return runtimeprocess.CommandResult{Stdout: output}, d.containerRunErr
+			}
 			return runtimeprocess.CommandResult{Stdout: output}, nil
 		case "start", "restart", "unpause":
 			id := request.Args[len(request.Args)-1]
@@ -199,6 +251,9 @@ func (d *builderDaemonFake) outputWasCleared() bool {
 }
 
 func TestBuilderManagerCreatesBootstrapsAndScopesTheBuilder(t *testing.T) {
+	if os.Getenv("RIG_TEST_BUILDER_COMPLETED_EXIT") == "1" {
+		os.Exit(1)
+	}
 	t.Setenv("DOCKER_CONFIG", filepath.Join(t.TempDir(), "inherited-docker"))
 	t.Setenv("BUILDX_CONFIG", filepath.Join(t.TempDir(), "inherited-buildx"))
 	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
@@ -684,6 +739,103 @@ func TestBuilderManagerClassifiesDaemonFailureAndClearsOutput(t *testing.T) {
 	}
 }
 
+func TestBuilderManagerFailsClosedOnAmbiguousMissingInspections(t *testing.T) {
+	exitErr := completedBuilderExitError()
+	var completedExit *exec.ExitError
+	if !errors.As(exitErr, &completedExit) || completedExit.ProcessState == nil || completedExit.ExitCode() != 1 {
+		t.Fatal("builder test helper did not provide a completed exit-one process")
+	}
+	for _, resource := range []string{"network", "container"} {
+		for _, ambiguity := range []string{"transport", "cancellation", "truncation", "termination", "joined exit", "wrapped exit"} {
+			t.Run(resource+"_"+ambiguity, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				runner := builderRunnerFunc(func(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+					name := request.Args[len(request.Args)-1]
+					message := "Error response from daemon: network " + name + " not found"
+					if resource == "container" {
+						message = "Error: No such container: " + name
+					}
+					result := runtimeprocess.CommandResult{Stderr: []byte(message)}
+					err := error(errors.New("ambiguous Docker transport failure"))
+					switch ambiguity {
+					case "cancellation":
+						cancel()
+						err = exitErr
+					case "truncation":
+						result.StderrTruncated = true
+						err = exitErr
+					case "termination":
+						err = errors.Join(exitErr, runtimeprocess.ErrTerminationFailed)
+					case "joined exit":
+						err = errors.Join(exitErr, errors.New("Docker transport failed after process exit"))
+					case "wrapped exit":
+						err = fmt.Errorf("Docker client wrapper: %w", exitErr)
+					}
+					return result, err
+				})
+				manager := newBuilderManagerForTest(t, runner)
+				identity, env, err := manager.preparePersistentState()
+				if err != nil {
+					t.Fatal(err)
+				}
+				found := true
+				if resource == "network" {
+					_, found, err = manager.inspectNetwork(ctx, identity.NetworkName, env)
+				} else {
+					_, found, err = manager.inspectBuildkitContainer(ctx, identity, env)
+				}
+				if err == nil || found {
+					t.Fatalf("ambiguous missing inspection was accepted: found=%t error=%v", found, err)
+				}
+				if ambiguity == "cancellation" && !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancellation cause lost: %v", err)
+				}
+				if ambiguity == "truncation" && !IsBuilderError(err, BuilderOutputTruncated) {
+					t.Fatalf("truncation classification=%v", err)
+				}
+				if ambiguity == "termination" && !errors.Is(err, runtimeprocess.ErrTerminationFailed) {
+					t.Fatalf("termination cause lost: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestBuilderManagerQuotaObservationRejectsUncertainResults(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		code BuilderErrorCode
+		run  func(context.CancelFunc) (runtimeprocess.CommandResult, error)
+	}{
+		{name: "truncated", code: BuilderOutputTruncated, run: func(context.CancelFunc) (runtimeprocess.CommandResult, error) {
+			body, _ := json.Marshal(validDockerInfo())
+			return runtimeprocess.CommandResult{Stdout: body, StdoutTruncated: true}, nil
+		}},
+		{name: "termination", code: BuilderTerminationFailed, run: func(context.CancelFunc) (runtimeprocess.CommandResult, error) {
+			return runtimeprocess.CommandResult{}, runtimeprocess.ErrTerminationFailed
+		}},
+		{name: "cancellation after read", code: BuilderCancelled, run: func(cancel context.CancelFunc) (runtimeprocess.CommandResult, error) {
+			body, _ := json.Marshal(validDockerInfo())
+			cancel()
+			return runtimeprocess.CommandResult{Stdout: body}, nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			runner := builderRunnerFunc(func(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+				return test.run(cancel)
+			})
+			manager := newBuilderManagerForTest(t, runner)
+			err := manager.verifyQuotaPlatform(ctx, nil)
+			if !IsBuilderError(err, test.code) {
+				t.Fatalf("quota observation error=%v want=%s", err, test.code)
+			}
+		})
+	}
+}
+
 func TestBuilderManagerPrepareIsConcurrentAndIdempotent(t *testing.T) {
 	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
 	manager := newBuilderManagerForTest(t, daemon)
@@ -728,15 +880,349 @@ func TestBuilderManagerPrepareIsConcurrentAndIdempotent(t *testing.T) {
 	}
 }
 
-func newBuilderManagerForTest(t *testing.T, runner runtimeprocess.CommandRunner) *BuilderManager {
-	t.Helper()
-	manager, err := NewBuilderManager(runner, BuilderManagerOptions{
-		DataRoot: t.TempDir(), DockerExecutable: filepath.Join(t.TempDir(), "docker"), PrepareTimeout: time.Minute,
+func TestBuilderManagerRevalidatesAuthorityBeforeEveryMutation(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		command   string
+		configure func(*builderDaemonFake, builderIdentity)
+	}{
+		{name: "network create", command: "network create"},
+		{name: "buildkit run", command: "container run", configure: func(daemon *builderDaemonFake, identity builderIdentity) {
+			daemon.network = validBuilderNetwork(identity)
+		}},
+		{name: "buildkit start", command: "container start", configure: func(daemon *builderDaemonFake, identity builderIdentity) {
+			daemon.network = validBuilderNetwork(identity)
+			container := validBuildkitContainer(identity, defaultStateQuotaBytes)
+			container.State.Running = false
+			daemon.boxes[buildkitContainerName(identity)] = container
+		}},
+		{name: "buildkit restart", command: "container restart", configure: func(daemon *builderDaemonFake, identity builderIdentity) {
+			daemon.network = validBuilderNetwork(identity)
+			container := validBuildkitContainer(identity, defaultStateQuotaBytes)
+			container.State.Restarting = true
+			daemon.boxes[buildkitContainerName(identity)] = container
+		}},
+		{name: "buildkit unpause", command: "container unpause", configure: func(daemon *builderDaemonFake, identity builderIdentity) {
+			daemon.network = validBuilderNetwork(identity)
+			container := validBuildkitContainer(identity, defaultStateQuotaBytes)
+			container.State.Paused = true
+			daemon.boxes[buildkitContainerName(identity)] = container
+		}},
+		{name: "buildx create", command: "buildx create", configure: func(daemon *builderDaemonFake, identity builderIdentity) {
+			daemon.network = validBuilderNetwork(identity)
+			daemon.boxes[buildkitContainerName(identity)] = validBuildkitContainer(identity, defaultStateQuotaBytes)
+		}},
+		{name: "builder bootstrap", command: "buildx inspect", configure: func(daemon *builderDaemonFake, identity builderIdentity) {
+			daemon.network = validBuilderNetwork(identity)
+			daemon.boxes[buildkitContainerName(identity)] = validBuildkitContainer(identity, defaultStateQuotaBytes)
+			daemon.builders[identity.BuilderName] = buildxBuilder{Name: identity.BuilderName, Driver: "remote", Nodes: []buildxNode{{Name: identity.NodeName, Endpoint: buildkitRemoteEndpoint(identity)}}}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder), boxes: make(map[string]buildkitContainer)}
+			manager := newBuilderManagerForTest(t, daemon)
+			identity, _, err := manager.preparePersistentState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.configure != nil {
+				test.configure(daemon, identity)
+			}
+			beforeArtifact, ok := manager.execution.SelectedArtifact()
+			if !ok {
+				t.Fatal("selected artifact unavailable before builder check")
+			}
+			state := generatedruntimestate.New(manager.authority.db)
+			beforeComponent, err := state.Component(context.Background(), manager.authority.claim.ApplicationID(), manager.authority.request.DeploymentID, manager.authority.request.ComponentName)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			barrierCalls := 0
+			manager.afterCommandPrepared = func(request runtimeprocess.CommandRequest) {
+				if commandKindForBuilderTest(request) != test.command {
+					return
+				}
+				barrierCalls++
+				invalidateGeneratedImageJobAttempt(t, manager.authority)
+			}
+			_, err = manager.Prepare(context.Background())
+			if !errors.Is(err, deploymentexecution.ErrIdentityLost) {
+				t.Fatalf("authority refusal=%v", err)
+			}
+			if barrierCalls != 1 {
+				t.Fatalf("prepared-command barrier calls=%d", barrierCalls)
+			}
+			for _, request := range daemon.requests() {
+				if commandKindForBuilderTest(request) == test.command {
+					t.Fatalf("refused mutation entered runner: %#v", request.Args)
+				}
+			}
+			afterArtifact, err := NewArtifactRepository(manager.authority.db).Get(context.Background(), beforeArtifact.ID)
+			if err != nil || afterArtifact != beforeArtifact {
+				t.Fatalf("artifact changed after refusal: before=%#v after=%#v err=%v", beforeArtifact, afterArtifact, err)
+			}
+			afterComponent, err := state.Component(context.Background(), manager.authority.claim.ApplicationID(), manager.authority.request.DeploymentID, manager.authority.request.ComponentName)
+			if err != nil || afterComponent != beforeComponent {
+				t.Fatalf("component changed after refusal: before=%#v after=%#v err=%v", beforeComponent, afterComponent, err)
+			}
+		})
+	}
+}
+
+func TestBuilderManagerReconcilesExactLostAcknowledgementsUnderFreshAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure func(*builderDaemonFake)
+		command   string
+	}{
+		{name: "buildkit run", command: "container run", configure: func(daemon *builderDaemonFake) {
+			daemon.containerRunErr = errors.New("container run acknowledgement lost")
+			daemon.containerRunLostAck = true
+		}},
+		{name: "buildx create", command: "buildx create", configure: func(daemon *builderDaemonFake) {
+			daemon.buildxCreateLostAck = true
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+			test.configure(daemon)
+			manager := newBuilderManagerForTest(t, daemon)
+			session, err := manager.Prepare(context.Background())
+			if err != nil || !validBuilderSession(session) {
+				t.Fatalf("lost acknowledgement session=%#v error=%v", session, err)
+			}
+			entries := 0
+			for _, request := range daemon.requests() {
+				if commandKindForBuilderTest(request) == test.command {
+					entries++
+				}
+			}
+			if entries != 1 {
+				t.Fatalf("mutation entries=%d want=1; commands=%#v", entries, commandKinds(daemon.requests()))
+			}
+		})
+	}
+}
+
+func TestBuilderManagerStopsBeforeNextMutationWhenAuthorityChangesAfterPriorCommand(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager := newBuilderManagerForTest(t, daemon)
+	manager.afterCommandPrepared = func(request runtimeprocess.CommandRequest) {
+		if commandKindForBuilderTest(request) == "container run" {
+			invalidateGeneratedImageJobAttempt(t, manager.authority)
+		}
+	}
+	_, err := manager.Prepare(context.Background())
+	if !errors.Is(err, deploymentexecution.ErrIdentityLost) {
+		t.Fatalf("authority refusal=%v", err)
+	}
+	if daemon.network == nil {
+		t.Fatal("prior network create did not complete")
+	}
+	if len(daemon.boxes) != 0 {
+		t.Fatalf("next mutation entered runner: %#v", daemon.boxes)
+	}
+}
+
+func TestBuilderManagerSharesPhysicalResourcesWithoutSharingApplicationAuthority(t *testing.T) {
+	releaseA, revisionA := defaultGeneratedImageTestSource()
+	authorityA := newGeneratedImageTestAuthority(t, releaseA, revisionA, "app")
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager, err := NewBuilderManager(authorityA.repository, daemon, BuilderManagerOptions{
+		DataRoot: t.TempDir(), DockerExecutable: filepath.Join(t.TempDir(), "docker.exe"), PrepareTimeout: time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return manager
+	executionA, selectionA := authorityA.selectBuild(t)
+	defer executionA.Leave()
+	artifactA, created := executionA.SelectedArtifact()
+	if !created {
+		t.Fatal("application A build selection was not newly created")
+	}
+	componentA, err := generatedruntimestate.New(authorityA.db).Component(context.Background(), authorityA.claim.ApplicationID(), authorityA.request.DeploymentID, authorityA.request.ComponentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionA, err := manager.prepare(authorityA.context, selectionA)
+	if err != nil || !validBuilderSession(sessionA) {
+		t.Fatalf("prepare application A: session=%#v error=%v", sessionA, err)
+	}
+	executionA.Leave()
+	if err := authorityA.releaseScope(); err != nil {
+		t.Fatalf("release application A scope: %v", err)
+	}
+
+	releaseB, revisionB := defaultGeneratedImageTestSource()
+	authorityB := newGeneratedImageTestAuthorityWithDependencies(t, authorityA.db, authorityA.repository, authorityA.bindings, authorityA.workingDirectory, releaseB, revisionB, "app", "", 0)
+	executionB, selectionB := authorityB.selectBuild(t)
+	defer executionB.Leave()
+	artifactB, created := executionB.SelectedArtifact()
+	if !created {
+		t.Fatal("application B build selection was not newly created")
+	}
+	componentB, err := generatedruntimestate.New(authorityB.db).Component(context.Background(), authorityB.claim.ApplicationID(), authorityB.request.DeploymentID, authorityB.request.ComponentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeB := daemon.requests()
+	sessionB, err := manager.prepare(authorityB.context, selectionB)
+	if err != nil || !validBuilderSession(sessionB) || sessionB.BuilderName != sessionA.BuilderName {
+		t.Fatalf("prepare application B with shared identity: A=%#v B=%#v error=%v", sessionA, sessionB, err)
+	}
+	for _, request := range daemon.requests()[len(beforeB):] {
+		switch commandKindForBuilderTest(request) {
+		case "network create", "container run", "buildx create":
+			t.Fatalf("application B recreated shared physical resource: %#v", request.Args)
+		}
+	}
+
+	bootstrapBefore := 0
+	for _, request := range daemon.requests() {
+		if commandKindForBuilderTest(request) == "buildx inspect" {
+			bootstrapBefore++
+		}
+	}
+	barriers := 0
+	manager.afterCommandPrepared = func(request runtimeprocess.CommandRequest) {
+		if commandKindForBuilderTest(request) != "buildx inspect" {
+			return
+		}
+		barriers++
+		invalidateGeneratedImageJobAttempt(t, authorityB)
+	}
+	_, err = manager.prepare(authorityB.context, selectionB)
+	if !errors.Is(err, deploymentexecution.ErrIdentityLost) || barriers != 1 {
+		t.Fatalf("application B bootstrap authority refusal barriers=%d error=%v", barriers, err)
+	}
+	bootstrapAfter := 0
+	for _, request := range daemon.requests() {
+		if commandKindForBuilderTest(request) == "buildx inspect" {
+			bootstrapAfter++
+		}
+	}
+	if bootstrapAfter != bootstrapBefore {
+		t.Fatalf("revoked application B entered bootstrap: before=%d after=%d", bootstrapBefore, bootstrapAfter)
+	}
+	afterB, err := NewArtifactRepository(authorityB.db).Get(context.Background(), artifactB.ID)
+	if err != nil || afterB != artifactB {
+		t.Fatalf("application B refusal changed artifact: before=%#v after=%#v error=%v", artifactB, afterB, err)
+	}
+	afterComponentB, err := generatedruntimestate.New(authorityB.db).Component(context.Background(), authorityB.claim.ApplicationID(), authorityB.request.DeploymentID, authorityB.request.ComponentName)
+	if err != nil || afterComponentB != componentB {
+		t.Fatalf("application B refusal changed component: before=%#v after=%#v error=%v", componentB, afterComponentB, err)
+	}
+
+	processCalls := len(daemon.requests())
+	if _, err := manager.prepare(authorityA.context, selectionA); err == nil {
+		t.Fatal("expired application A authority reused cached builder session")
+	}
+	if len(daemon.requests()) != processCalls {
+		t.Fatalf("expired application A entered process runner: before=%d after=%d", processCalls, len(daemon.requests()))
+	}
+	afterA, err := NewArtifactRepository(authorityA.db).Get(context.Background(), artifactA.ID)
+	if err != nil || afterA != artifactA {
+		t.Fatalf("shared manager changed application A artifact: before=%#v after=%#v error=%v", artifactA, afterA, err)
+	}
+	afterComponentA, err := generatedruntimestate.New(authorityA.db).Component(context.Background(), authorityA.claim.ApplicationID(), authorityA.request.DeploymentID, authorityA.request.ComponentName)
+	if err != nil || afterComponentA != componentA {
+		t.Fatalf("shared manager changed application A component: before=%#v after=%#v error=%v", componentA, afterComponentA, err)
+	}
+}
+
+func TestBuilderManagerCommandPinKeepsOriginalScopeWithoutHoldingSQL(t *testing.T) {
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	blocking := &blockingBuilderRunner{delegate: daemon, target: "network create", entered: make(chan struct{}), release: make(chan struct{})}
+	manager := newBoundBuilderManager(t, blocking, BuilderManagerOptions{DataRoot: t.TempDir(), DockerExecutable: filepath.Join(t.TempDir(), "docker.exe"), PrepareTimeout: time.Minute})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	prepareDone := make(chan error, 1)
+	go func() {
+		_, err := manager.Prepare(ctx)
+		prepareDone <- err
+	}()
+	select {
+	case <-blocking.entered:
+	case <-ctx.Done():
+		t.Fatalf("builder command did not enter: %v", ctx.Err())
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(blocking.release)
+		}
+	}()
+
+	manager.execution.Leave()
+	releaseStarted := make(chan struct{})
+	releaseDone := make(chan error, 1)
+	go func() {
+		close(releaseStarted)
+		releaseDone <- manager.authority.releaseScope()
+	}()
+	<-releaseStarted
+	for {
+		probe, err := manager.authority.repository.PinGeneratedImage(manager.authority.context, manager.authority.request)
+		if errors.Is(err, deploymentexecution.ErrScopeUnavailable) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("scope-closing probe error=%v", err)
+		}
+		probe.Leave()
+		select {
+		case <-ctx.Done():
+			t.Fatalf("scope release did not enter closing state: %v", ctx.Err())
+		default:
+			runtime.Gosched()
+		}
+	}
+	select {
+	case err := <-releaseDone:
+		t.Fatalf("scope released while command pin was active: %v", err)
+	default:
+	}
+
+	writerDone := make(chan error, 1)
+	go func() {
+		_, err := manager.authority.db.ExecContext(ctx, `UPDATE applications SET updated_at=updated_at WHERE id=?`, manager.authority.claim.ApplicationID())
+		writerDone <- err
+	}()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("independent writer failed while Docker command blocked: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("independent writer blocked behind Docker command: %v", ctx.Err())
+	}
+
+	close(blocking.release)
+	released = true
+	select {
+	case err := <-prepareDone:
+		if err != nil {
+			t.Fatalf("builder preparation after unblock: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("builder did not finish after unblock: %v", ctx.Err())
+	}
+	select {
+	case err := <-releaseDone:
+		if err != nil {
+			t.Fatalf("release scope after command: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("scope remained pinned after builder return: %v", ctx.Err())
+	}
+}
+
+func newBuilderManagerForTest(t *testing.T, runner runtimeprocess.CommandRunner) *boundBuilderManager {
+	t.Helper()
+	return newBoundBuilderManager(t, runner, BuilderManagerOptions{
+		DataRoot: t.TempDir(), DockerExecutable: filepath.Join(t.TempDir(), "docker"), PrepareTimeout: time.Minute,
+	})
 }
 
 func labelsFromCreate(args []string) map[string]string {
@@ -809,6 +1295,21 @@ func validBuildkitContainer(identity builderIdentity, quotaBytes int64) buildkit
 	container.NetworkSettings.Networks = map[string]json.RawMessage{identity.NetworkName: json.RawMessage(`{}`)}
 	container.Mounts = []dockerMount{{Type: "tmpfs", Destination: buildkitStatePath, RW: true}}
 	return container
+}
+
+func validBuilderNetwork(identity builderIdentity) *dockerNetwork {
+	return &dockerNetwork{
+		Name: identity.NetworkName, Driver: "bridge", Scope: "local",
+		Labels:  map[string]string{"rig.controller": "generated-builder", "rig.builder": identity.BuilderName, "rig.network": identity.NetworkName},
+		Options: map[string]string{"com.docker.network.bridge.enable_icc": "false"},
+	}
+}
+
+func commandKindForBuilderTest(request runtimeprocess.CommandRequest) string {
+	if len(request.Args) < 2 {
+		return ""
+	}
+	return request.Args[0] + " " + request.Args[1]
 }
 
 func validDockerInfo() dockerInfo {

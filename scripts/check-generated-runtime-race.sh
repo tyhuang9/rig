@@ -59,6 +59,7 @@ case "$suite" in
       ./internal/projectanalysis
       ./internal/deploymentplans
       ./internal/generatedimage
+      ./internal/generatedimagestate
       ./internal/generatedruntime
       ./internal/generatedexecutor
       ./internal/generatedruntimestate
