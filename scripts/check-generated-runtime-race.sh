@@ -60,6 +60,7 @@ case "$suite" in
       ./internal/deploymentplans
       ./internal/generatedimage
       ./internal/generatedimagestate
+      ./internal/generatedmigration
       ./internal/generatedruntime
       ./internal/generatedexecutor
       ./internal/generatedruntimestate
