@@ -42,6 +42,7 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	}
 	// Preparing a fresh migrated controller is fixture setup, not part of the
 	// bounded outage/restart journey. Both phases retain a finite budget.
+	setupStarted := time.Now()
 	setupCtx, cancelSetup := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancelSetup()
 	pool, reopenPG := relayOutagePostgres(t, setupCtx, dsn)
@@ -69,7 +70,7 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	firstRun, stopFirst, firstSupervisor := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil)
 	firstFixture := relayOutageFirstRunFixture{stopSupervisor: stopFirst, server: server, handler: handler, done: firstRun}
 	t.Cleanup(func() { firstFixture.Stop(t) })
-	relayOutageWaitInitialSubscriptionSync(t, setupCtx, db, pool, controllerID, status.SubscriptionID, firstSupervisor)
+	relayOutageWaitInitialSubscriptionSync(t, setupCtx, setupStarted, db, pool, controllerID, status.SubscriptionID, firstSupervisor, handler)
 	firstFixture.Stop(t)
 	if setupCtx.Err() != nil {
 		t.Fatal("initial relay fixture exceeded setup deadline")
@@ -629,30 +630,33 @@ func (fixture *relayOutageFirstRunFixture) Stop(t *testing.T) {
 	})
 }
 
-func relayOutageWaitInitialSubscriptionSync(t *testing.T, parent context.Context, db *sql.DB, pool *pgxpool.Pool, controllerID, subscriptionID string, supervisor *controllerrelay.Supervisor) {
+func relayOutageWaitInitialSubscriptionSync(t *testing.T, parent context.Context, setupStarted time.Time, db *sql.DB, pool *pgxpool.Pool, controllerID, subscriptionID string, supervisor *controllerrelay.Supervisor, handler *wss.Handler) {
 	t.Helper()
 	deadline := time.NewTimer(relayOutageInitialSyncTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
+	waitStarted := time.Now()
+	remainingAtWaitEntry := relayOutageSetupRemainingAt(parent, waitStarted)
 	for {
 		if relayOutagePostgresDiagnosticCount(parent, pool, `SELECT COUNT(*) FROM relay_subscriptions WHERE controller_id=$1 AND subscription_id=$2`, controllerID, subscriptionID) == 1 {
 			return
 		}
 		select {
 		case <-parent.Done():
-			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor)
+			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor, handler, relayOutageCaptureInitialSyncFailure(relayOutageInitialSyncTrigger(true, false), time.Since(setupStarted), remainingAtWaitEntry, time.Since(waitStarted)))
 		case <-deadline.C:
-			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor)
+			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor, handler, relayOutageCaptureInitialSyncFailure(relayOutageInitialSyncTrigger(false, true), time.Since(setupStarted), remainingAtWaitEntry, time.Since(waitStarted)))
 		case <-ticker.C:
 		}
 	}
 }
 
-func relayOutageFatalInitialSubscriptionSync(t *testing.T, db *sql.DB, pool *pgxpool.Pool, controllerID string, supervisor *controllerrelay.Supervisor) {
+func relayOutageFatalInitialSubscriptionSync(t *testing.T, db *sql.DB, pool *pgxpool.Pool, controllerID string, supervisor *controllerrelay.Supervisor, handler *wss.Handler, failure relayOutageInitialSyncFailureDiagnostics) {
 	t.Helper()
 	snapshot := relayOutageSafeSupervisorSnapshot(supervisor)
-	t.Fatalf("timed out waiting for initial authenticated subscription sync: sqlite_active_controller_subscriptions=%d sqlite_subscription_sync_heads=%d sqlite_inflight_sync_sets=%d postgres_relay_sessions=%d postgres_controller_leases=%d postgres_subscriptions_sync_commands=%d postgres_current_relay_subscriptions=%d supervisor_state=%s supervisor_outcome=%s supervisor_paused=%t",
+	stats := relayOutageSafeHandlerStats(handler)
+	t.Fatalf("timed out waiting for initial authenticated subscription sync: sqlite_active_controller_subscriptions=%d sqlite_subscription_sync_heads=%d sqlite_inflight_sync_sets=%d postgres_relay_sessions=%d postgres_controller_leases=%d postgres_subscriptions_sync_commands=%d postgres_current_relay_subscriptions=%d supervisor_state=%s supervisor_outcome=%s supervisor_paused=%t initial_sync_trigger=%s setup_elapsed_ms=%d setup_remaining_ms=%d initial_sync_wait_ms=%d supervisor_epoch=%d supervisor_fence=%d wss_handshake=%d wss_authenticated=%d wss_closed=%d wss_store_failure=%d wss_read_failure=%d wss_write_failure=%d wss_current_active=%d wss_current_authenticated=%d wss_leases_active=%d",
 		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_controller_subscriptions WHERE controller_id=? AND state='active'`, controllerID),
 		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_subscription_sync_heads WHERE controller_id=?`, controllerID),
 		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_subscription_sync_sets WHERE controller_id=? AND state='inflight'`, controllerID),
@@ -660,7 +664,8 @@ func relayOutageFatalInitialSubscriptionSync(t *testing.T, db *sql.DB, pool *pgx
 		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_controller_leases WHERE controller_id=$1`, controllerID),
 		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_session_commands WHERE controller_id=$1 AND command_type='subscriptions.sync'`, controllerID),
 		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_subscriptions WHERE controller_id=$1 AND retired_generation IS NULL`, controllerID),
-		snapshot.state, snapshot.outcome, snapshot.paused)
+		snapshot.state, snapshot.outcome, snapshot.paused, failure.trigger, failure.setupElapsedMS, failure.setupRemainingMS, failure.waitElapsedMS, snapshot.epoch, snapshot.fence,
+		stats.handshake, stats.authenticated, stats.closed, stats.storeFailure, stats.readFailure, stats.writeFailure, stats.currentActive, stats.currentAuthenticated, stats.leasesActive)
 }
 
 func relayOutageSQLiteDiagnosticCount(parent context.Context, db *sql.DB, query string, args ...any) int {
@@ -702,6 +707,8 @@ type relayOutageSafeSnapshot struct {
 	state   string
 	outcome string
 	paused  bool
+	epoch   int64
+	fence   int64
 }
 
 func relayOutageSafeSupervisorSnapshot(supervisor *controllerrelay.Supervisor) relayOutageSafeSnapshot {
@@ -709,7 +716,7 @@ func relayOutageSafeSupervisorSnapshot(supervisor *controllerrelay.Supervisor) r
 		return relayOutageSafeSnapshot{state: "unavailable", outcome: "unavailable"}
 	}
 	snapshot := supervisor.Snapshot()
-	return relayOutageSafeSnapshot{state: relayOutageSafeSupervisorState(snapshot.State), outcome: relayOutageSafeSupervisorOutcome(snapshot.Outcome), paused: snapshot.Paused}
+	return relayOutageSafeSnapshot{state: relayOutageSafeSupervisorState(snapshot.State), outcome: relayOutageSafeSupervisorOutcome(snapshot.Outcome), paused: snapshot.Paused, epoch: relayOutageDiagnosticUint64(snapshot.Epoch), fence: relayOutageDiagnosticUint64(snapshot.Fence)}
 }
 
 func relayOutageSafeSupervisorState(state string) string {
