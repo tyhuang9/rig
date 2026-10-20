@@ -149,6 +149,33 @@ requires its own hosted Docker and race results.
 No controller was refreshed or activated for these checks. Physical second-device
 and manual screen-reader acceptance remain separate outstanding work.
 
+## Hosted compiler fixture correction on 2026-10-20
+
+At published head `db2b0c161635a899b2c4f303da1c8fddaf4dc557`, the
+[Docker hosting job](https://github.com/tyhuang9/rig/actions/runs/39480849678/job/118828692866)
+reported `image_validation_uncertain` after a successful image build in
+`TestLiveGeneratedImageCompiler`. The later image-authority gate did not run.
+The same job's database roundtrip fixture passed using the runtime image
+inspection path, so this evidence does not establish a parser incompatibility.
+Raw log SHA-256:
+`c28685b0ff46db704cac6a45f2a83b1a7c49f344866704eb43bfff0aa0a8d3d0`.
+
+The compiler fixture supplied its builder-owned Docker configuration directory
+to the runtime validator. That validator requires an empty controller-owned
+configuration directory before inspection; build tooling may populate its own
+directory. The fixture now calls production `PrepareControllerDirectories`
+and uses those separate runtime configuration and working directories, as
+production composition and the passing database fixture already do. The empty
+configuration safeguard, parser and production code are unchanged.
+
+Pinned Go 1.26.7 focused Windows checks passed nine generated-image parents and
+43 children, plus two controller-directory parents, with no skips or failures.
+The affected live compiler test compiled and explicitly skipped because local
+Linux Docker is unavailable. Formatting and diff checks passed. Evidence is in
+`temp/m3-lan-external-db-20261015/m4-generated-image-authority-verification/live-config-repair/`.
+This repair still requires a fresh hosted compiler and image-authority run;
+local checks do not prove the physical failure is resolved.
+
 ## Limits and rollback
 
 Keep deployment activation disabled while the remaining M4 boundaries are
