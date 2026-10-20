@@ -3,8 +3,9 @@ package generatedruntime
 import (
 	"context"
 	"errors"
-	"math"
 	"sync"
+
+	"github.com/hostd/hostd/internal/generatedcapacity"
 )
 
 type capacityRequest struct {
@@ -12,22 +13,21 @@ type capacityRequest struct {
 	disk   uint64
 }
 
-// capacityGate makes the read/check/reserve sequence atomic inside one
-// controller process. After a restart, live containers are already reflected
-// in the host's available resource snapshot, so in-memory reservations can be
-// reconstructed by new deployment attempts rather than persisted.
+// capacityGate retains the generatedruntime diagnostic boundary while
+// delegating raw host-budget accounting to generatedcapacity.
 type capacityGate struct {
-	source CapacitySource
-	mu     sync.Mutex
-	memory uint64
-	disk   uint64
+	budget *generatedcapacity.Budget
 }
 
 func newCapacityGate(source CapacitySource) (*capacityGate, error) {
-	if source == nil {
+	budget, err := generatedcapacity.New(source)
+	if errors.Is(err, generatedcapacity.ErrSourceRequired) {
 		return nil, errors.New("generated runtime capacity source is required")
 	}
-	return &capacityGate{source: source}, nil
+	if err != nil {
+		return nil, err
+	}
+	return &capacityGate{budget: budget}, nil
 }
 
 func (g *capacityGate) acquire(ctx context.Context, request capacityRequest) (*capacityLease, error) {
@@ -35,36 +35,36 @@ func (g *capacityGate) acquire(ctx context.Context, request capacityRequest) (*c
 }
 
 func (g *capacityGate) acquireCount(ctx context.Context, request capacityRequest, count int) (*capacityLease, error) {
-	if g == nil || request.memory == 0 || request.disk == 0 {
+	if g == nil || g.budget == nil {
 		return nil, &Error{Code: DiagnosticInternalError}
 	}
-	if count < 1 || uint64(count) > math.MaxUint64/request.memory || uint64(count) > math.MaxUint64/request.disk {
-		return nil, &Error{Code: DiagnosticValidationFailed}
-	}
-	request.memory *= uint64(count)
-	request.disk *= uint64(count)
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	snapshot, err := g.source.Snapshot(ctx)
+	leases, err := g.budget.Acquire(ctx, generatedcapacity.Limits{
+		MemoryBytes: request.memory,
+		DiskBytes:   request.disk,
+	}, count)
 	if err != nil {
-		if errors.Is(ctx.Err(), context.Canceled) || errors.Is(err, context.Canceled) {
-			return nil, &Error{Code: DiagnosticCancelled}
-		}
-		return nil, &Error{Code: DiagnosticRuntimeUnavailable}
+		return nil, capacityDiagnostic(ctx, err)
 	}
-	if snapshot.MemoryAvailableBytes < g.memory || snapshot.DiskAvailableBytes < g.disk ||
-		request.memory > snapshot.MemoryAvailableBytes-g.memory || request.disk > snapshot.DiskAvailableBytes-g.disk {
-		return nil, &Error{Code: DiagnosticInsufficientReplacementSpace}
-	}
-	g.memory += request.memory
-	g.disk += request.disk
 	return &capacityLease{release: func() {
-		g.mu.Lock()
-		defer g.mu.Unlock()
-		g.memory -= request.memory
-		g.disk -= request.disk
+		for _, lease := range leases {
+			lease.Release()
+		}
 	}}, nil
+}
+
+func capacityDiagnostic(ctx context.Context, err error) error {
+	switch {
+	case errors.Is(err, generatedcapacity.ErrInvalidLimits):
+		return &Error{Code: DiagnosticInternalError}
+	case errors.Is(err, generatedcapacity.ErrInvalidCount):
+		return &Error{Code: DiagnosticValidationFailed}
+	case errors.Is(err, generatedcapacity.ErrInsufficientCapacity):
+		return &Error{Code: DiagnosticInsufficientReplacementSpace}
+	case ctx != nil && errors.Is(ctx.Err(), context.Canceled), errors.Is(err, context.Canceled):
+		return &Error{Code: DiagnosticCancelled}
+	default:
+		return &Error{Code: DiagnosticRuntimeUnavailable}
+	}
 }
 
 type replacementReservation struct {

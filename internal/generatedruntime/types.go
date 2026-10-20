@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
 )
 
@@ -183,14 +184,9 @@ type CandidateDescription = generatedidentity.CandidateDescription
 // exact app-private network without duplicating the naming algorithm.
 type AppNetworkDescription = generatedidentity.AppNetworkDescription
 
-type CapacitySnapshot struct {
-	MemoryAvailableBytes uint64
-	DiskAvailableBytes   uint64
-}
+type CapacitySnapshot = generatedcapacity.Snapshot
 
-type CapacitySource interface {
-	Snapshot(context.Context) (CapacitySnapshot, error)
-}
+type CapacitySource = generatedcapacity.Source
 
 type capacityLease struct {
 	once    sync.Once

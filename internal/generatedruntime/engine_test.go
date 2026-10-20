@@ -770,11 +770,11 @@ func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t
 	if !IsCode(err, DiagnosticCandidateCleanupFailed) {
 		t.Fatalf("expected fail-closed cleanup diagnostic, got %v", err)
 	}
-	engine.capacity.mu.Lock()
-	reservedMemory := engine.capacity.memory
-	engine.capacity.mu.Unlock()
-	if reservedMemory != uint64(defaultLimits().MemoryBytes) {
-		t.Fatalf("unresolved candidate released admission: reserved=%d", reservedMemory)
+	if _, acquireErr := engine.capacity.acquireCount(runtimeContext, capacityRequest{
+		memory: uint64(defaultLimits().MemoryBytes),
+		disk:   defaultReplacementDisk,
+	}, 8); !IsCode(acquireErr, DiagnosticInsufficientReplacementSpace) {
+		t.Fatalf("unresolved candidate released admission: %v", acquireErr)
 	}
 	for _, request := range runner.requests {
 		if commandKind(request.Args) == "container rm" {

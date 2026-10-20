@@ -2,6 +2,7 @@ package generatedruntime
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 )
@@ -108,6 +109,39 @@ func TestCapacityGateAtomicallyAdmitsTwoComponentReplacements(t *testing.T) {
 	}
 }
 
+func TestCapacityGatePreservesSourceAndContextDiagnosticMapping(t *testing.T) {
+	request := capacityRequest{memory: 1, disk: 1}
+	for _, test := range []struct {
+		name   string
+		source fixedCapacitySource
+		want   DiagnosticCode
+	}{
+		{name: "source failure", source: fixedCapacitySource{err: errors.New("source failed")}, want: DiagnosticRuntimeUnavailable},
+		{name: "cancelled source", source: fixedCapacitySource{err: context.Canceled}, want: DiagnosticCancelled},
+		{name: "deadline source", source: fixedCapacitySource{err: context.DeadlineExceeded}, want: DiagnosticRuntimeUnavailable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gate, err := newCapacityGate(test.source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := gate.acquire(context.Background(), request); !IsCode(err, test.want) {
+				t.Fatalf("diagnostic = %v, want %s", err, test.want)
+			}
+		})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	gate, err := newCapacityGate(fixedCapacitySource{err: ctx.Err()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.acquire(ctx, request); !IsCode(err, DiagnosticCancelled) {
+		t.Fatalf("cancelled context diagnostic = %v", err)
+	}
+}
+
 func TestReplacementReservationConsumesDistinctComponentSharesConcurrently(t *testing.T) {
 	gate, err := newCapacityGate(fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 100, DiskAvailableBytes: 100}})
 	if err != nil {
@@ -184,15 +218,16 @@ func TestReplacementReservationRetentionIsIrreversibleAcrossAliasesAndReleases(t
 	if ok, _ := reservation.consume(gate, "web"); ok {
 		t.Fatal("retained aggregate accepted a later component")
 	}
-	if _, err := gate.acquire(context.Background(), capacityRequest{memory: 50, disk: 1}); !IsCode(err, DiagnosticInsufficientReplacementSpace) {
-		t.Fatalf("retained aggregate did not block competitor: %v", err)
+	for _, request := range []capacityRequest{{memory: 41, disk: 1}, {memory: 1, disk: 41}} {
+		if _, err := gate.acquire(context.Background(), request); !IsCode(err, DiagnosticInsufficientReplacementSpace) {
+			t.Fatalf("retained aggregate did not block competitor %+v: %v", request, err)
+		}
 	}
-	gate.mu.Lock()
-	reservedMemory, reservedDisk := gate.memory, gate.disk
-	gate.mu.Unlock()
-	if reservedMemory != 60 || reservedDisk != 60 {
-		t.Fatalf("retained aggregate accounting changed: memory=%d disk=%d", reservedMemory, reservedDisk)
+	remaining, err := gate.acquireCount(context.Background(), capacityRequest{memory: 20, disk: 20}, 2)
+	if err != nil {
+		t.Fatalf("retained aggregate consumed more than its exact shares: %v", err)
 	}
+	remaining.Release()
 }
 
 func TestReplacementReservationRejectsForeignRetentionAndReleasesUnattemptedAggregate(t *testing.T) {
