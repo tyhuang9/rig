@@ -199,6 +199,7 @@ func TestGeneratedNetworkRefusalAfterFirstRealCandidateRetainsWholeAggregate(t *
 		artifacts = append(artifacts, artifact)
 	}
 	fixture.compiler.artifacts = artifacts
+	fixture.compiler.release, fixture.compiler.plan = release, plan
 	fixture.capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 1 << 30, DiskAvailableBytes: 512 << 20})
 	runner := &realNetworkRetentionRunner{db: fixture.db, specs: make(map[string]realNetworkRetentionSpec), containers: make(map[string]realNetworkRetentionSpec)}
 	for index, component := range plan.Plan.Components {
@@ -623,7 +624,10 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	compiler := &fakeCompiler{events: &events, artifacts: []generatedimage.Artifact{artifact}}
+	compiler := &fakeCompiler{
+		events: &events, artifacts: []generatedimage.Artifact{artifact}, repository: deploymentRepository,
+		release: release, plan: plan,
+	}
 	runtimeState := generatedruntimestate.New(db)
 	runtime := &capacityResumeRuntime{fakeRuntime: &fakeRuntime{events: &events}}
 	routes := &fakeRoutes{events: &events}

@@ -203,10 +203,13 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 	for {
 		switch runtimeDeployment.Phase {
 		case generatedruntimestate.PhaseBuilding:
-			artifacts, err = e.build(ctx, resolved, runtimeDeployment)
+			artifacts, err = e.build(ctx, claim, resolved, runtimeDeployment)
 			if err != nil {
-				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
+				// Every refusal while interpreting or compiling the durable Building
+				// aggregate is image-boundary uncertainty. In particular, malformed
+				// candidate evidence must retain capacity and must not flow through
+				// detached terminal writers.
+				return jobs.ExecutionResult{}, e.generatedImageRefusal(ctx, reservation, networkCapacityRisk, err)
 			}
 			if err = e.runtime.EnsureAppNetwork(ctx, networkRequest); err != nil {
 				if generatedruntime.IsGeneratedNetworkBoundaryFailure(err) {
@@ -215,13 +218,16 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
 				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
-			next := generatedruntimestate.PhaseStartingCandidate
-			if runtimeDeployment.MigrationState == generatedruntimestate.MigrationPending {
-				next = generatedruntimestate.PhaseMigrating
+			next, finishErr := e.deployments.FinishGeneratedImagePreparation(ctx, networkRequest)
+			if finishErr != nil {
+				return jobs.ExecutionResult{}, e.generatedImageRefusal(ctx, reservation, networkCapacityRisk, finishErr)
 			}
-			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseBuilding, next, "")
-			if advanceErr != nil {
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+			advanced, getErr := e.state.Get(ctx, deployment.AppID, deployment.ID)
+			if getErr != nil {
+				return jobs.ExecutionResult{}, e.generatedImageRefusal(ctx, reservation, networkCapacityRisk, getErr)
+			}
+			if advanced.Phase != next {
+				return jobs.ExecutionResult{}, e.generatedImageRefusal(ctx, reservation, networkCapacityRisk, deployments.ErrInvalidDeployment)
 			}
 			runtimeDeployment = advanced
 
@@ -390,8 +396,15 @@ func generatedNetworkRequest(claim deploymentexecution.Claim, resolved resolvedD
 		Claim: claim, DeploymentID: resolved.deployment.ID, ReleaseID: resolved.deployment.ReleaseID,
 		ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
 		DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
-		Findings: nil,
+		Findings: append([]deployments.Finding(nil), resolved.deployment.Findings...),
 	}
+}
+
+func (e *Executor) generatedImageRefusal(ctx context.Context, reservation generatedruntime.ReplacementReservation, retain bool, cause error) error {
+	if retain {
+		cause = errors.Join(cause, e.runtime.RetainReplacementCapacity(reservation))
+	}
+	return generatedAuthorizationRefusal(ctx, cause)
 }
 
 func generatedNetworkCapacityRisk(deployment generatedruntimestate.Deployment) bool {

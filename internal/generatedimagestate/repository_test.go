@@ -1,4 +1,4 @@
-package generatedimage
+package generatedimagestate
 
 import (
 	"context"
@@ -25,7 +25,7 @@ const (
 func TestArtifactRepositoryRetriesTerminalAttemptsAndReusesReady(t *testing.T) {
 	db := openArtifactDatabase(t)
 	seedBuildableRelease(t, db)
-	repository := NewArtifactRepository(db)
+	repository := NewRepository(db)
 	clock := sequenceClock(
 		time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC),
 		time.Date(2026, 8, 31, 12, 1, 0, 0, time.UTC),
@@ -99,7 +99,7 @@ func TestArtifactRepositoryRetriesTerminalAttemptsAndReusesReady(t *testing.T) {
 func TestArtifactRepositoryBeginIsConcurrentAndIdempotent(t *testing.T) {
 	db := openArtifactDatabase(t)
 	seedBuildableRelease(t, db)
-	repository := NewArtifactRepository(db)
+	repository := NewRepository(db)
 	input := artifactInput()
 
 	const workers = 16
@@ -144,7 +144,7 @@ func TestArtifactRepositoryBeginIsConcurrentAndIdempotent(t *testing.T) {
 func TestArtifactRepositoryValidatesProvenanceAndTransitions(t *testing.T) {
 	db := openArtifactDatabase(t)
 	seedBuildableRelease(t, db)
-	repository := NewArtifactRepository(db)
+	repository := NewRepository(db)
 	input := artifactInput()
 
 	invalid := input
@@ -214,7 +214,7 @@ func TestArtifactRepositoryValidatesProvenanceAndTransitions(t *testing.T) {
 func TestArtifactRepositoryRecoverRetainsHistoryAndAllowsRetry(t *testing.T) {
 	db := openArtifactDatabase(t)
 	seedBuildableRelease(t, db)
-	repository := NewArtifactRepository(db)
+	repository := NewRepository(db)
 	input := artifactInput()
 	first, _, err := repository.Begin(context.Background(), input)
 	if err != nil {

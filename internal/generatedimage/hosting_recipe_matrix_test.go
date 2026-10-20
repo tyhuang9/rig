@@ -8,9 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/projectanalysis"
@@ -69,10 +67,7 @@ func TestCompilerStagesStandaloneRecipeFixtures(t *testing.T) {
 			if tc.name == "vite" {
 				fixture.config.values = []appconfig.ValueInput{{Key: "VITE_BUILD_MARKER", Value: "vite-public-A"}}
 			}
-			fixture.compiler, err = NewCompiler(fixture.releaseReader, compilerPlanReader{revision: fixture.revision}, fixture.config, fixture.artifacts, fixture.temporary, fixture.builder, fixture.runner, CompilerOptions{BuildTimeout: time.Minute})
-			if err != nil {
-				t.Fatal(err)
-			}
+			fixture.rebind(t, tc.component)
 			fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
 				contextDirectory := request.Args[len(request.Args)-1]
 				for _, name := range tc.included {
@@ -93,7 +88,7 @@ func TestCompilerStagesStandaloneRecipeFixtures(t *testing.T) {
 				}
 				return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("5", 64)), 0o600)
 			}
-			artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, tc.component, uuid.NewString(), 1)
+			artifact, err := fixture.compile(context.Background())
 			if err != nil || artifact.State != ArtifactReady {
 				t.Fatalf("artifact=%+v err=%v", artifact, err)
 			}

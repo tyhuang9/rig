@@ -8,9 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/projectanalysis"
@@ -48,11 +46,6 @@ func TestCompilerStagesHostingNotesFixtureWithoutDocker(t *testing.T) {
 	fixture.release.ResolvedSHA = inspection.Analysis.StructuralFingerprint
 	fixture.releaseReader.release = fixture.release
 	fixture.revision.Plan, fixture.revision.CanonicalDigest = plan, digest
-	fixture.compiler, err = NewCompiler(fixture.releaseReader, compilerPlanReader{revision: fixture.revision}, fixture.config, fixture.artifacts, fixture.temporary, fixture.builder, fixture.runner, CompilerOptions{BuildTimeout: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
-	configurationID := uuid.NewString()
 	component := "api"
 	fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
 		contextDirectory := request.Args[len(request.Args)-1]
@@ -94,7 +87,8 @@ func TestCompilerStagesHostingNotesFixtureWithoutDocker(t *testing.T) {
 		if name == "frontend" {
 			fixture.config.values = []appconfig.ValueInput{{Key: "VITE_BUILD_LABEL", Value: "candidate-A"}}
 		}
-		artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, name, configurationID, 1)
+		fixture.rebind(t, name)
+		artifact, err := fixture.compile(context.Background())
 		if err != nil || artifact.State != ArtifactReady {
 			t.Fatalf("fixture component %s did not stage: artifact=%+v err=%v", name, artifact, err)
 		}

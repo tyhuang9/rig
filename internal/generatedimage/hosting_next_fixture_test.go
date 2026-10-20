@@ -8,9 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/projectanalysis"
@@ -52,10 +50,7 @@ func TestCompilerStagesNextFixtureWithoutDocker(t *testing.T) {
 	fixture.releaseReader.release = fixture.release
 	fixture.revision.Plan, fixture.revision.CanonicalDigest = plan, digest
 	fixture.config.values = []appconfig.ValueInput{{Key: "NEXT_PUBLIC_BUILD_MARKER", Value: "next-public-A"}}
-	fixture.compiler, err = NewCompiler(fixture.releaseReader, compilerPlanReader{revision: fixture.revision}, fixture.config, fixture.artifacts, fixture.temporary, fixture.builder, fixture.runner, CompilerOptions{BuildTimeout: time.Minute})
-	if err != nil {
-		t.Fatal(err)
-	}
+	fixture.rebind(t, "web")
 	fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
 		contextDirectory := request.Args[len(request.Args)-1]
 		for _, name := range []string{"package.json", "package-lock.json", "app/page.jsx", "app/api/runtime/route.js", "public/pixel.png"} {
@@ -82,7 +77,7 @@ func TestCompilerStagesNextFixtureWithoutDocker(t *testing.T) {
 		}
 		return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte("sha256:"+strings.Repeat("4", 64)), 0o600)
 	}
-	artifact, err := fixture.compiler.Compile(context.Background(), fixture.release.AppID, fixture.release.ID, "web", uuid.NewString(), 1)
+	artifact, err := fixture.compile(context.Background())
 	if err != nil || artifact.State != ArtifactReady {
 		t.Fatalf("Next.js fixture did not stage: artifact=%+v err=%v", artifact, err)
 	}

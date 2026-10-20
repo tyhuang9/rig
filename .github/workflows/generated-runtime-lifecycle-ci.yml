@@ -73,6 +73,73 @@ jobs:
           go test -json -v -count=1 -timeout=9m ./internal/generatedimage -run "^${test_name}$" | tee "$output"
           jq -e --arg package_name "$package_name" --arg test_name "$test_name" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
 
+      - name: Verify generated image authority with real Docker
+        id: image-authority
+        timeout-minutes: 10
+        shell: bash
+        env:
+          RIG_RUN_LIVE_GENERATED_RUNTIME: "1"
+          EVENT_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT_PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          evidence="$RUNNER_TEMP/rig-generated-image-authority"
+          mkdir "$evidence"
+          git rev-parse HEAD > "$evidence/checked-out-commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$evidence/checked-out-tree.txt"
+          printf '%s\n' "$EVENT_PR_HEAD" > "$evidence/event-pr-head.txt"
+          printf '%s\n' "$EVENT_PR_BASE" > "$evidence/event-pr-base.txt"
+          go version > "$evidence/go-version.txt"
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          test_name='TestLiveGeneratedImageAuthority'
+          package_name='github.com/hostd/hostd/internal/generatedimage'
+          expected='["TestLiveGeneratedImageAuthority","TestLiveGeneratedImageAuthority/BuildAndReuse","TestLiveGeneratedImageAuthority/AuthorityLostBeforeBuildLoad"]'
+          test_status=0
+          go test -tags live_docker -json -v -count=1 -timeout=9m ./internal/generatedimage -run "^${test_name}$" | tee "$output" || test_status=$?
+          # Retain only fixed test names and numeric results. Raw Output events,
+          # command arguments, daemon output and configuration are not artifacts.
+          jq -s --arg package_name "$package_name" --argjson expected "$expected" --argjson test_status "$test_status" '
+            . as $events |
+            {
+              version: 1,
+              package: $package_name,
+              testExitCode: $test_status,
+              packagePassCount: ([$events[] | select(.Package == $package_name and .Action == "pass" and .Test == null)] | length),
+              failureCount: ([$events[] | select(.Action == "fail")] | length),
+              skipCount: ([$events[] | select(.Action == "skip")] | length),
+              tests: [$expected[] as $name | {
+                test: $name,
+                runCount: ([$events[] | select(.Package == $package_name and .Test == $name and .Action == "run")] | length),
+                passCount: ([$events[] | select(.Package == $package_name and .Test == $name and .Action == "pass")] | length),
+                elapsedSeconds: ([$events[] | select(.Package == $package_name and .Test == $name and .Action == "pass") | .Elapsed | select(type == "number")] | add // 0)
+              }]
+            }
+          ' "$output" > "$evidence/authority-receipt.json"
+          jq -e --arg package_name "$package_name" --argjson expected "$expected" '
+            .version == 1 and .package == $package_name and .testExitCode == 0 and
+            .packagePassCount == 1 and .failureCount == 0 and .skipCount == 0 and
+            [.tests[].test] == $expected and
+            all(.tests[]; .runCount == 1 and .passCount == 1)
+          ' "$evidence/authority-receipt.json" > /dev/null
+
+      - name: Retain sanitized generated image authority evidence
+        if: ${{ always() && steps.image-authority.outcome != 'skipped' }}
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: generated-image-authority-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/rig-generated-image-authority/authority-receipt.json
+            ${{ runner.temp }}/rig-generated-image-authority/checked-out-commit.txt
+            ${{ runner.temp }}/rig-generated-image-authority/checked-out-tree.txt
+            ${{ runner.temp }}/rig-generated-image-authority/event-pr-head.txt
+            ${{ runner.temp }}/rig-generated-image-authority/event-pr-base.txt
+            ${{ runner.temp }}/rig-generated-image-authority/go-version.txt
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Verify manual commands and static output in real containers
         timeout-minutes: 12
         shell: bash

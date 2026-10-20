@@ -51,6 +51,24 @@ composition_suites=(rebind-composition-native rebind-composition-startup rebind-
 suites=("${typed_suites[@]}" "${composition_suites[@]}")
 
 for mode in default race plain; do
+  # Artifact storage moved into its own package. Keep its complete test suite
+  # in both the race and Windows plain lanes alongside the compiler tests.
+  if [[ "$mode" == default ]]; then run runtime-packages; else run runtime-packages "$mode"; fi
+  expected=(test -json)
+  if [[ "$mode" != plain ]]; then expected+=(-race); fi
+  expected+=(-count=1 -timeout=32m
+    ./internal/projectanalysis
+    ./internal/deploymentplans
+    ./internal/generatedimage
+    ./internal/generatedimagestate
+    ./internal/generatedruntime
+    ./internal/generatedexecutor
+    ./internal/generatedruntimestate
+    ./internal/generatedrecovery
+    ./internal/autodeploy)
+  printf '%s\n' "${expected[@]}" > "$temp/expected"
+  cmp "$temp/expected" "$temp/args"
+
   for suite in "${suites[@]}"; do
     if [[ "$mode" == default ]]; then run "$suite"; else run "$suite" "$mode"; fi
     expected=(test -json)
@@ -95,6 +113,7 @@ must_fail run rebind-typed-handover invalid
 must_fail run rebind-typed-runtime race extra
 for output in empty child; do
   export RIG_INGRESS_SELECTOR_OUTPUT="$output"
+  must_fail run runtime-packages
   must_fail run rebind-composition-startup
   must_fail run rebind-typed-handover
   must_fail run rebind-typed-runtime
@@ -106,4 +125,4 @@ unset RIG_INGRESS_SELECTOR_FAIL_GO
 export RIG_INGRESS_SELECTOR_FAIL_TEE=1
 must_fail run rebind-composition-native
 unset RIG_INGRESS_SELECTOR_FAIL_TEE
-printf 'Ingress selector contract passed: 27 invocations, three matrices, fourteen refusal/failure cases.\n'
+printf 'Generated runtime selector contract passed: 30 invocations, three matrices, sixteen refusal/failure cases.\n'

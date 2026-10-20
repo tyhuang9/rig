@@ -217,18 +217,11 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("builder_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		builder, err := generatedimage.NewBuilderManager(options.runner, generatedimage.BuilderManagerOptions{
+		builder, err := generatedimage.NewBuilderManager(runtimeDeployments, options.runner, generatedimage.BuilderManagerOptions{
 			DataRoot: configuration.DataRoot, DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
 		})
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated builder setup: %w", err)
-		}
-		if err := step("compiler_create"); err != nil {
-			return runtimeComposition{}, err
-		}
-		compiler, err := generatedimage.NewCompiler(dependencies.snapshots, dependencies.plans, dependencies.configuration, artifacts, buildTemporary, builder, options.runner, generatedimage.CompilerOptions{})
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("generated compiler setup: %w", err)
 		}
 		if err := step("environment_stager_create"); err != nil {
 			return runtimeComposition{}, err
@@ -278,6 +271,13 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		})
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated runtime engine setup: %w", err)
+		}
+		if err := step("compiler_create"); err != nil {
+			return runtimeComposition{}, err
+		}
+		compiler, err := generatedimage.NewCompiler(dependencies.snapshots, dependencies.plans, dependencies.configuration, runtimeDeployments, buildTemporary, builder, options.runner, engine, generatedimage.CompilerOptions{})
+		if err != nil {
+			return runtimeComposition{}, fmt.Errorf("generated compiler setup: %w", err)
 		}
 		if err := step("migration_runner_create"); err != nil {
 			return runtimeComposition{}, err

@@ -153,6 +153,50 @@ func (p *Pinned) CheckGeneratedNetworkObservationTx(tx *sql.Tx, claim Claim, dep
 	return p.checkTx(tx, claim, deploymentID, generatedNetworkStatus)
 }
 
+func (p *Pinned) CheckGeneratedImageSelectionTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckBeforeBuilderNetworkCreateTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckBeforeBuildkitRunTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckBeforeBuildkitStartTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckBeforeBuildkitRestartTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckBeforeBuildkitUnpauseTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckBeforeBuildxCreateTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckBeforeBuilderBootstrapTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckBeforeBuildLoadTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckGeneratedImageObservationTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
+func (p *Pinned) CheckGeneratedImageResultTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedImageStatus)
+}
+
 func (p *Pinned) checkTx(tx *sql.Tx, claim Claim, deploymentID string, statusAllowed func(string) bool) error {
 	guard, ctx, done, err := p.beginCheck()
 	if err != nil {
@@ -236,6 +280,8 @@ func composeObservationStatus(status string) bool {
 }
 
 func generatedNetworkStatus(status string) bool { return status == "applying" }
+
+func generatedImageStatus(status string) bool { return status == "applying" }
 
 func policyGateStatus(status string) bool {
 	switch status {
