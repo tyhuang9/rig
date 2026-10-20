@@ -21,6 +21,7 @@ import (
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/sourceinspection"
@@ -71,6 +72,10 @@ func runLiveGeneratedImageCompilerMode(t *testing.T, manual bool, mode string) {
 	runner := runtimeprocess.ExecRunner{}
 	buildObservation := &liveGeneratedImageBuildObservation{delegate: runner, status: "not_attempted"}
 	dataRoot := t.TempDir()
+	controllerDirectories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal("live generated runtime controller directory configuration failed")
+	}
 	liveContext, cancelLive := context.WithTimeout(context.Background(), 7*time.Minute)
 	defer cancelLive()
 
@@ -198,7 +203,7 @@ func runLiveGeneratedImageCompilerMode(t *testing.T, manual bool, mode string) {
 	}
 	validator, err := generatedruntime.NewEngine(buildObservation, environment, liveGeneratedImageCapacity{}, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable: dockerExecutable, DockerEndpoint: dockerEndpoint,
-		DockerConfigDirectory: liveDockerConfigDirectory(t, dockerEnvironment), WorkingDirectory: t.TempDir(),
+		DockerConfigDirectory: controllerDirectories.DockerConfigDirectory, WorkingDirectory: controllerDirectories.WorkingDirectory,
 	})
 	if err != nil {
 		t.Fatal("live generated image attestor configuration failed")
@@ -284,17 +289,6 @@ type liveGeneratedImageCapacity struct{}
 
 func (liveGeneratedImageCapacity) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
 	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
-}
-
-func liveDockerConfigDirectory(t *testing.T, environment []string) string {
-	t.Helper()
-	for _, entry := range environment {
-		if value, ok := strings.CutPrefix(entry, "DOCKER_CONFIG="); ok && filepath.IsAbs(value) {
-			return value
-		}
-	}
-	t.Fatal("live generated image Docker configuration was not prepared")
-	return ""
 }
 
 type liveGeneratedImageBuildObservation struct {
