@@ -24,6 +24,7 @@ import (
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
@@ -81,16 +82,6 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := runtimeprocess.ExecRunner{}
-	engine, err := generatedruntime.NewEngine(runner, environment, nextLiveCapacity{}, generatedruntime.EngineOptions{
-		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
-		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
-		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256, TmpfsBytes: 64 << 20, LogSize: "1m", LogFiles: 2},
-		ReplacementDiskBytes: 512 << 20,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := uint16(controllerJourneyPort(t, "127.0.0.1"))
 	db, err := database.Open(dataRoot)
 	if err != nil {
 		t.Fatal("open Next cache controller database")
@@ -100,6 +91,17 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 			t.Error("close Next cache controller database")
 		}
 	})
+	authority := liveauthority.New(t, db, working)
+	engine, err := generatedruntime.NewEngine(runner, environment, nextLiveCapacity{}, authority.Repository(), generatedruntime.EngineOptions{
+		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
+		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
+		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256, TmpfsBytes: 64 << 20, LogSize: "1m", LogFiles: 2},
+		ReplacementDiskBytes: 512 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(controllerJourneyPort(t, "127.0.0.1"))
 	accessRepository := appaccess.New(db)
 	ingress, err := generatedingress.New(runner, generatedingress.Options{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
@@ -122,7 +124,7 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	firstSecret, secondSecret := "next-runtime-"+uuid.NewString(), "next-runtime-"+uuid.NewString()
 	spec.EnvironmentOperationID, spec.EnvironmentOperationAttempt = uuid.NewString(), 1
 	spec.Environment = []byte("RIG_FIXTURE_RUNTIME_SECRET=" + firstSecret + "\nRIG_FIXTURE_SLOT_MARKER=blue\n")
-	blue := nextLiveStart(t, ctx, engine, spec)
+	blue := nextLiveStart(t, ctx, engine, authority, spec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), blue, 0) }()
 	assertNextLiveContainer(t, ctx, docker, blue, firstSecret)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{nextLiveEndpoint(blue)}}); err != nil {
@@ -147,7 +149,7 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	spec.ActiveSlot, spec.DeploymentID = blue.Slot, uuid.NewString()
 	spec.EnvironmentOperationID = uuid.NewString()
 	spec.Environment = []byte("RIG_FIXTURE_RUNTIME_SECRET=" + secondSecret + "\nRIG_FIXTURE_SLOT_MARKER=green\n")
-	green := nextLiveStart(t, ctx, engine, spec)
+	green := nextLiveStart(t, ctx, engine, authority, spec)
 	defer func() { _ = engine.StopAndRemove(context.Background(), green, 0) }()
 	assertNextLiveContainer(t, ctx, docker, green, secondSecret)
 	nextLiveRequest(t, ctx, base, appID, "/api/runtime", http.StatusOK, `"runtimeMarker":"blue"`, firstSecret)
@@ -169,18 +171,20 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	t.Logf("Next cache runtime route passed: app=%s release=%s blue=%s green=%s port=%d", appID, releaseID, blue.Slot, green.Slot, port)
 }
 
-func nextLiveStart(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
+func nextLiveStart(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, authority *liveauthority.Authority, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
 	t.Helper()
-	candidate, err := engine.CreateInactiveCandidate(ctx, spec)
+	boundContext, boundSpec := authority.BindCandidate(t, ctx, spec)
+	candidate, err := engine.CreateInactiveCandidate(boundContext, boundSpec)
 	if err != nil {
 		t.Fatal("create Next candidate:", err)
 	}
-	if err := engine.StartCandidate(ctx, candidate); err != nil {
+	if err := engine.StartCandidate(boundContext, candidate); err != nil {
 		t.Fatal("start Next candidate:", err)
 	}
-	if err := engine.WaitHealthy(ctx, candidate); err != nil {
+	if err := engine.WaitHealthy(boundContext, candidate); err != nil {
 		t.Fatal("Next candidate unhealthy:", err)
 	}
+	authority.FinishCandidate(t, boundSpec.DeploymentID)
 	return candidate
 }
 

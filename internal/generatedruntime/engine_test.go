@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -74,8 +75,8 @@ func (l *runtimeFakeEnvironmentLease) Cleanup() error {
 
 func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *testing.T) {
 	root := t.TempDir()
-	config := filepath.Join(root, "docker-config")
-	if err := os.Mkdir(config, 0o700); err != nil {
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
+	if err != nil {
 		t.Fatal(err)
 	}
 	spec := candidateSpec()
@@ -127,9 +128,11 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 			return runtimeRequestResult{}
 		}
 	}
-	engine, err := NewEngine(runner, environment, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, EngineOptions{
-		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config,
-		WorkingDirectory: root, CommandTimeout: time.Second, HealthTimeout: time.Second,
+	authority := newRuntimeNetworkAuthority(t, directories.WorkingDirectory, spec)
+	spec = authority.spec
+	engine, err := NewEngine(runner, environment, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, authority.repository, EngineOptions{
+		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
+		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
 		HealthPollInterval: time.Millisecond * 100, Limits: limits, ReplacementDiskBytes: 128 << 20,
 	})
 	if err != nil {
@@ -140,7 +143,7 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 		t.Fatal(err)
 	}
 	spec.Reservation = reservation
-	candidate, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	candidate, err := engine.CreateInactiveCandidate(authority.context, spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +192,7 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 		if containsEnvironmentValue(request.Env, "SECRET") || containsEnvironmentValue(request.Env, "value") {
 			t.Fatalf("application configuration escaped into Docker client environment: %#v", request.Env)
 		}
-		if request.Executable != filepath.Join(root, "docker.exe") || request.Directory != root {
+		if request.Executable != filepath.Join(root, "docker.exe") || request.Directory != directories.WorkingDirectory {
 			t.Fatalf("unscoped Docker execution: %+v", request)
 		}
 	}
@@ -199,7 +202,7 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 
 func TestGeneratedRuntimeRejectsImageLabelDriftBeforeDockerMutation(t *testing.T) {
 	expected := candidateSpec()
-	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		if commandKind(request.Args) != "image inspect" {
 			t.Fatalf("unexpected mutation after image drift: %#v", request.Args)
 		}
@@ -209,7 +212,7 @@ func TestGeneratedRuntimeRejectsImageLabelDriftBeforeDockerMutation(t *testing.T
 		image.Labels = labels
 		return runtimeJSON(image)
 	})
-	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
 	if !IsCode(err, DiagnosticImageDriftDetected) {
 		t.Fatalf("expected image drift, got %v", err)
 	}
@@ -219,7 +222,7 @@ func TestGeneratedRuntimeRejectsImageLabelDriftBeforeDockerMutation(t *testing.T
 }
 
 func TestGeneratedRuntimeRejectsImageComponentDriftBeforeDockerMutation(t *testing.T) {
-	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		if commandKind(request.Args) != "image inspect" {
 			t.Fatalf("component drift reached Docker mutation: %#v", request.Args)
 		}
@@ -227,7 +230,7 @@ func TestGeneratedRuntimeRejectsImageComponentDriftBeforeDockerMutation(t *testi
 		image.Labels["io.rig.component"] = "other-component"
 		return runtimeJSON(image)
 	})
-	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
 	if !IsCode(err, DiagnosticImageDriftDetected) {
 		t.Fatalf("expected image drift, got %v", err)
 	}
@@ -237,7 +240,7 @@ func TestGeneratedRuntimeRejectsImageComponentDriftBeforeDockerMutation(t *testi
 }
 
 func TestGeneratedRuntimeRejectsImageRoleDriftBeforeDockerMutation(t *testing.T) {
-	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		if commandKind(request.Args) != "image inspect" {
 			t.Fatalf("role drift reached Docker mutation: %#v", request.Args)
 		}
@@ -245,7 +248,7 @@ func TestGeneratedRuntimeRejectsImageRoleDriftBeforeDockerMutation(t *testing.T)
 		image.Labels["io.rig.role"] = RoleStatic
 		return runtimeJSON(image)
 	})
-	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
 	if !IsCode(err, DiagnosticImageDriftDetected) {
 		t.Fatalf("expected image role drift, got %v", err)
 	}
@@ -257,7 +260,7 @@ func TestGeneratedRuntimeRejectsImageRoleDriftBeforeDockerMutation(t *testing.T)
 func TestGeneratedRuntimeOmitsEnvironmentFileWhenConfigurationIsEmpty(t *testing.T) {
 	var create runtimeprocess.CommandRequest
 	expected := candidateSpec()
-	engine, _, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, _, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "image inspect":
 			return runtimeJSON(validImageInspection(expected))
@@ -280,7 +283,7 @@ func TestGeneratedRuntimeOmitsEnvironmentFileWhenConfigurationIsEmpty(t *testing
 	spec.Environment = nil
 	spec.EnvironmentOperationID = ""
 	spec.EnvironmentOperationAttempt = 0
-	if _, err := engine.CreateInactiveCandidate(context.Background(), spec); err != nil {
+	if _, err := engine.CreateInactiveCandidate(runtimeContext, spec); err != nil {
 		t.Fatal(err)
 	}
 	if environment.staged != 0 || containsExactArgument(create.Args, "--env-file") {
@@ -301,7 +304,7 @@ func TestGeneratedRuntimeRejectsCapacityBeforeDockerMutation(t *testing.T) {
 		}
 		return runtimeJSON(validImageInspection(spec))
 	}}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 1, DiskAvailableBytes: 1}}, EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root, CommandTimeout: time.Second})
+	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 1, DiskAvailableBytes: 1}}, newConfiguredRuntimeDeployments(t, root), EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root, CommandTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,7 +333,7 @@ func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
 	limits := defaultLimits()
 	limits.LogSize = "50m"
 	limits.LogFiles = 10
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 550 << 20}}, EngineOptions{
+	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 550 << 20}}, newConfiguredRuntimeDeployments(t, root), EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
 		CommandTimeout: time.Second, Limits: limits, ReplacementDiskBytes: 64 << 20,
 	})
@@ -376,6 +379,7 @@ func TestGeneratedRuntimeRequiresTwoLocalLogFiles(t *testing.T) {
 		&runtimeFakeRunner{run: func(runtimeprocess.CommandRequest) runtimeRequestResult { return runtimeRequestResult{} }},
 		&runtimeFakeEnvironment{path: filepath.Join(root, "runtime.env")},
 		fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}},
+		newConfiguredRuntimeDeployments(t, root),
 		EngineOptions{
 			DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
 			CommandTimeout: time.Second, HealthTimeout: time.Second, HealthPollInterval: 100 * time.Millisecond,
@@ -484,7 +488,7 @@ func TestGeneratedRuntimeCreatedCandidateAllowsUnavailableNetworkUntilHealthChec
 	created := false
 	started := false
 	removed := false
-	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, authoritativeSpec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "image inspect":
 			return runtimeJSON(validImageInspection(spec))
@@ -516,7 +520,8 @@ func TestGeneratedRuntimeCreatedCandidateAllowsUnavailableNetworkUntilHealthChec
 			return runtimeRequestResult{}
 		}
 	})
-	candidate, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	spec = authoritativeSpec
+	candidate, err := engine.CreateInactiveCandidate(runtimeContext, spec)
 	if err != nil {
 		t.Fatalf("created candidate rejected before runtime state materialized: %v", err)
 	}
@@ -537,7 +542,7 @@ func TestGeneratedRuntimeStopAndRemoveAllowsUnrealizedCreatedCandidate(t *testin
 	spec := candidateSpec()
 	candidate := candidateForSpec(spec)
 	removed := false
-	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
 			if removed {
@@ -600,7 +605,7 @@ func TestGeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork(t *test
 			if matchesCandidateConfiguredHardening(inspection, candidate, defaultLimits()) {
 				t.Fatal("network configuration drift passed configured hardening")
 			}
-			engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+			engine, runner, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 				switch commandKind(request.Args) {
 				case "container inspect":
 					if removed {
@@ -638,8 +643,8 @@ func TestGeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork(t *test
 
 func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testing.T) {
 	root := t.TempDir()
-	config := filepath.Join(root, "docker-config")
-	if err := os.Mkdir(config, 0o700); err != nil {
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
+	if err != nil {
 		t.Fatal(err)
 	}
 	spec := candidateSpec()
@@ -681,11 +686,13 @@ func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testin
 			return runtimeRequestResult{}
 		}
 	}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root, CommandTimeout: time.Second})
+	authority := newRuntimeNetworkAuthority(t, directories.WorkingDirectory, spec)
+	spec = authority.spec
+	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, authority.repository, EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = engine.CreateInactiveCandidate(context.Background(), spec)
+	_, err = engine.CreateInactiveCandidate(authority.context, spec)
 	if !IsCode(err, DiagnosticCandidateHardeningFailed) {
 		t.Fatalf("expected hardening failure, got %v", err)
 	}
@@ -696,7 +703,7 @@ func TestGeneratedRuntimeReconcilesAmbiguousCreateByDeterministicName(t *testing
 	spec := candidateSpec()
 	created := false
 	removed := false
-	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "image inspect":
 			return runtimeJSON(validImageInspection(spec))
@@ -722,7 +729,7 @@ func TestGeneratedRuntimeReconcilesAmbiguousCreateByDeterministicName(t *testing
 			return runtimeRequestResult{}
 		}
 	})
-	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
 	if !IsCode(err, DiagnosticRuntimeTimeout) {
 		t.Fatalf("expected original create timeout after successful reconciliation, got %v", err)
 	}
@@ -735,7 +742,7 @@ func TestGeneratedRuntimeReconcilesAmbiguousCreateByDeterministicName(t *testing
 func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t *testing.T) {
 	spec := candidateSpec()
 	created := false
-	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "image inspect":
 			return runtimeJSON(validImageInspection(spec))
@@ -759,7 +766,7 @@ func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t
 			return runtimeRequestResult{}
 		}
 	})
-	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
 	if !IsCode(err, DiagnosticCandidateCleanupFailed) {
 		t.Fatalf("expected fail-closed cleanup diagnostic, got %v", err)
 	}
@@ -781,7 +788,7 @@ func TestGeneratedRuntimeReconcilesAmbiguousStart(t *testing.T) {
 	candidate := candidateForSpec(spec)
 	started := false
 	removed := false
-	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
 			if removed {
@@ -831,7 +838,7 @@ func TestGeneratedRuntimeHealthWaitFailsClosed(t *testing.T) {
 			spec := candidateSpec()
 			candidate := candidateForSpec(spec)
 			removed := false
-			engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+			engine, runner, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 				switch commandKind(request.Args) {
 				case "container inspect":
 					if removed {
@@ -870,7 +877,7 @@ func TestGeneratedRuntimeHealthWaitFailsClosed(t *testing.T) {
 }
 
 func TestGeneratedRuntimeRefusesNetworkOwnershipDrift(t *testing.T) {
-	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "image inspect":
 			return runtimeJSON(validImageInspection(candidateSpec()))
@@ -881,7 +888,7 @@ func TestGeneratedRuntimeRefusesNetworkOwnershipDrift(t *testing.T) {
 			return runtimeRequestResult{}
 		}
 	})
-	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
 	if !IsCode(err, DiagnosticNetworkDriftDetected) {
 		t.Fatalf("expected network drift, got %v", err)
 	}
@@ -892,22 +899,22 @@ func TestGeneratedRuntimeRefusesNetworkOwnershipDrift(t *testing.T) {
 
 func TestGeneratedRuntimeErrorsNeverIncludeDockerOutput(t *testing.T) {
 	secret := "super-secret-docker-output"
-	engine, _, spec := newRuntimeTestEngine(t, func(runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, _, spec, runtimeContext := newRuntimeTestEngine(t, func(runtimeprocess.CommandRequest) runtimeRequestResult {
 		return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte(secret)}, err: errors.New("exit 1: " + secret)}
 	})
-	_, err := engine.CreateInactiveCandidate(context.Background(), spec)
+	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
 	if err == nil || strings.Contains(err.Error(), secret) || !IsCode(err, DiagnosticImageUnavailable) {
 		t.Fatalf("unsafe error classification: %v", err)
 	}
 }
 
 func TestGeneratedRuntimeRejectsInvalidEnvironmentBeforeInspection(t *testing.T) {
-	engine, runner, spec := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		t.Fatalf("invalid configuration reached Docker: %#v", request.Args)
 		return runtimeRequestResult{}
 	})
 	spec.Environment = []byte{'A', '=', 'x', 0, 'y'}
-	if _, err := engine.CreateInactiveCandidate(context.Background(), spec); !IsCode(err, DiagnosticValidationFailed) {
+	if _, err := engine.CreateInactiveCandidate(runtimeContext, spec); !IsCode(err, DiagnosticValidationFailed) {
 		t.Fatalf("expected validation failure, got %v", err)
 	}
 	if len(runner.requests) != 0 {
@@ -939,7 +946,7 @@ func TestGeneratedRuntimeIdentitiesAndSlotsAreDeterministic(t *testing.T) {
 
 func TestGeneratedRuntimeValidateImageIsReadOnly(t *testing.T) {
 	expected := candidateSpec()
-	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		if commandKind(request.Args) != "image inspect" {
 			t.Fatalf("read-only image validation mutated Docker: %#v", request.Args)
 		}
@@ -982,7 +989,7 @@ func TestGeneratedRuntimeDescriptionsExposeDeterministicPreMutationIdentity(t *t
 func TestGeneratedRuntimeEnsureAppNetworkReusesExactOwnershipChecks(t *testing.T) {
 	spec := candidateSpec()
 	inspections := 0
-	engine, runner, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "network inspect":
 			inspections++
@@ -997,7 +1004,7 @@ func TestGeneratedRuntimeEnsureAppNetworkReusesExactOwnershipChecks(t *testing.T
 			return runtimeRequestResult{}
 		}
 	})
-	if err := engine.EnsureAppNetwork(context.Background(), spec.AppID); err != nil {
+	if err := engine.EnsureAppNetwork(runtimeContext, spec.Network); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := len(runner.requests), 3; got != want {
@@ -1253,17 +1260,18 @@ func containsEnvironmentValue(environment []string, value string) bool {
 	return false
 }
 
-func newRuntimeTestEngine(t *testing.T, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, CandidateSpec) {
+func newRuntimeTestEngine(t *testing.T, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, CandidateSpec, context.Context) {
 	t.Helper()
 	root := t.TempDir()
-	config := filepath.Join(root, "docker-config")
-	if err := os.Mkdir(config, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	runner := &runtimeFakeRunner{run: run}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root, CommandTimeout: time.Second})
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return engine, runner, candidateSpec()
+	runner := &runtimeFakeRunner{run: run}
+	authority := newRuntimeNetworkAuthority(t, directories.WorkingDirectory, candidateSpec())
+	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, authority.repository, EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine, runner, authority.spec, authority.context
 }

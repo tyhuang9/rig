@@ -21,6 +21,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -64,14 +66,17 @@ type Engine struct {
 	runner      runtimeprocess.CommandRunner
 	environment EnvironmentStager
 	capacity    *capacityGate
+	deployments *deployments.Repository
 	options     EngineOptions
 	dockerEnv   []string
 	networkMu   sync.Mutex
 	candidateMu sync.Mutex
+
+	afterNetworkCommandPrepared func()
 }
 
-func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStager, capacity CapacitySource, options EngineOptions) (*Engine, error) {
-	if runner == nil || environment == nil {
+func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStager, capacity CapacitySource, deploymentRepository *deployments.Repository, options EngineOptions) (*Engine, error) {
+	if runner == nil || environment == nil || deploymentRepository == nil || !deploymentRepository.ExecutionConfigured() {
 		return nil, errors.New("generated runtime dependencies are required")
 	}
 	if options.CommandTimeout == 0 {
@@ -106,7 +111,7 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{runner: runner, environment: environment, capacity: gate, options: options, dockerEnv: dockerEnv}, nil
+	return &Engine{runner: runner, environment: environment, capacity: gate, deployments: deploymentRepository, options: options, dockerEnv: dockerEnv}, nil
 }
 
 // ReserveReplacement atomically admits all components required for one
@@ -127,6 +132,19 @@ func (e *Engine) ReserveReplacement(ctx context.Context, componentCount int) (Re
 		owner: e.capacity, lease: lease, limit: componentCount,
 		components: make(map[string]struct{}, componentCount),
 	}, nil
+}
+
+// RetainReplacementCapacity irreversibly keeps a replacement aggregate
+// charged when network uncertainty means candidate absence cannot be proven.
+func (e *Engine) RetainReplacementCapacity(reservation ReplacementReservation) error {
+	if e == nil || e.capacity == nil || reservation == nil {
+		return &Error{Code: DiagnosticInternalError}
+	}
+	concrete, ok := reservation.(*replacementReservation)
+	if !ok || !concrete.retain(e.capacity) {
+		return &Error{Code: DiagnosticInternalError}
+	}
+	return nil
 }
 
 // AdoptCandidate consumes the matching share for a durable candidate during
@@ -189,7 +207,10 @@ func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec
 	}()
 
 	network := networkName(spec.AppID)
-	if err := e.ensureNetwork(ctx, spec.AppID, network); err != nil {
+	if !sameGeneratedNetworkCandidate(spec.Network, spec) {
+		return Candidate{}, networkBoundaryFailure(DiagnosticValidationFailed, deployments.ErrInvalidDeployment)
+	}
+	if err := e.ensureNetwork(ctx, spec.Network, network); err != nil {
 		return Candidate{}, err
 	}
 	name := containerName(spec.AppID, spec.ComponentName, slot)
@@ -443,33 +464,28 @@ func (e *Engine) ValidateImage(ctx context.Context, spec ImageSpec) error {
 }
 
 func DescribeInactiveCandidate(appID, component string, active Slot) (CandidateDescription, error) {
-	if !canonicalUUID(appID) || !validText(component, 256) {
-		return CandidateDescription{}, &Error{Code: DiagnosticValidationFailed}
-	}
-	slot, err := InactiveSlot(active)
+	description, err := generatedidentity.DescribeInactiveCandidate(appID, component, active)
 	if err != nil {
 		return CandidateDescription{}, &Error{Code: DiagnosticValidationFailed}
 	}
-	return CandidateDescription{
-		Slot: slot, ContainerName: containerName(appID, component, slot),
-		NetworkName: networkName(appID), NetworkAlias: containerAlias(component, slot),
-	}, nil
+	return description, nil
 }
 
 func DescribeAppNetwork(appID string) (AppNetworkDescription, error) {
-	if !canonicalUUID(appID) {
+	description, err := generatedidentity.DescribeAppNetwork(appID)
+	if err != nil {
 		return AppNetworkDescription{}, &Error{Code: DiagnosticValidationFailed}
 	}
-	return AppNetworkDescription{Name: networkName(appID)}, nil
+	return description, nil
 }
 
 // EnsureAppNetwork is the explicit mutating counterpart to DescribeAppNetwork.
 // Coordinators call it only after their final policy/approval gate.
-func (e *Engine) EnsureAppNetwork(ctx context.Context, appID string) error {
-	if e == nil || ctx == nil || !canonicalUUID(appID) {
-		return &Error{Code: DiagnosticValidationFailed}
+func (e *Engine) EnsureAppNetwork(ctx context.Context, request deployments.GeneratedNetworkRequest) error {
+	if e == nil || ctx == nil || e.deployments == nil || request.Claim.ApplicationID() == "" {
+		return networkBoundaryFailure(DiagnosticValidationFailed, deployments.ErrInvalidDeployment)
 	}
-	return e.ensureNetwork(ctx, appID, networkName(appID))
+	return e.ensureNetwork(ctx, request, networkName(request.Claim.ApplicationID()))
 }
 
 func (e *Engine) inspectImage(ctx context.Context, spec CandidateSpec) (imageInspection, error) {
@@ -517,35 +533,66 @@ func (e *Engine) inspectImageSpec(ctx context.Context, spec ImageSpec) (imageIns
 	return image, nil
 }
 
-func (e *Engine) ensureNetwork(ctx context.Context, appID, name string) error {
+func (e *Engine) ensureNetwork(ctx context.Context, request deployments.GeneratedNetworkRequest, name string) error {
+	execution, err := e.deployments.PinGeneratedNetwork(ctx, request)
+	if err != nil {
+		return networkBoundaryFailure(networkDiagnostic(ctx, err, DiagnosticRuntimeUnavailable), err)
+	}
+	defer execution.Leave()
+	appID := request.Claim.ApplicationID()
 	e.networkMu.Lock()
 	defer e.networkMu.Unlock()
 	if network, found, err := e.inspectNetwork(ctx, name); err != nil {
-		return err
+		return networkBoundaryFailure(networkDiagnostic(ctx, err, DiagnosticNetworkProvisionFailed), err)
 	} else if found {
-		if matchesNetwork(network, appID, name) {
-			return nil
+		if !matchesNetwork(network, appID, name) {
+			return networkBoundaryFailure(DiagnosticNetworkDriftDetected, contextCause(ctx))
 		}
-		return &Error{Code: DiagnosticNetworkDriftDetected}
+		if err := execution.CheckObservation(); err != nil {
+			return networkBoundaryFailure(networkDiagnostic(ctx, err, DiagnosticRuntimeUnavailable), err)
+		}
+		return nil
 	}
 	args := []string{"network", "create", "--driver", "bridge", "--label", "io.rig.managed=" + NetworkOwnershipLabelValue, "--label", "io.rig.application=" + appID, name}
-	result, runErr := e.run(ctx, args, e.options.CommandTimeout)
+	command, err := e.prepareCommand(args, e.options.CommandTimeout)
+	if err != nil {
+		return networkBoundaryFailure(DiagnosticRuntimeUnavailable, err)
+	}
+	if e.afterNetworkCommandPrepared != nil {
+		e.afterNetworkCommandPrepared()
+	}
+	if err := execution.CheckBeforeCreate(); err != nil {
+		return networkBoundaryFailure(networkDiagnostic(ctx, err, DiagnosticRuntimeUnavailable), err)
+	}
+	if err := ctx.Err(); err != nil {
+		return networkBoundaryFailure(networkDiagnostic(ctx, err, DiagnosticCancelled), err)
+	}
+	result, runErr := e.runner.Run(ctx, command)
 	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticNetworkProvisionFailed)
 	clearResult(&result)
 	if diagnostic != "" {
+		createCause := errors.Join(runErr, contextCause(ctx))
 		// A concurrent controller operation may have won the name race. Adopt
 		// only the exact labeled network, never merely the same name.
 		if network, found, inspectErr := e.inspectNetwork(ctx, name); inspectErr == nil && found && matchesNetwork(network, appID, name) {
+			if observationErr := execution.CheckObservation(); observationErr != nil {
+				return networkBoundaryFailure(networkDiagnostic(ctx, observationErr, DiagnosticRuntimeUnavailable), errors.Join(createCause, observationErr))
+			}
 			return nil
+		} else if inspectErr != nil {
+			return networkBoundaryFailure(diagnostic, errors.Join(createCause, inspectErr))
 		}
-		return &Error{Code: diagnostic}
+		return networkBoundaryFailure(diagnostic, errors.Join(createCause, contextCause(ctx)))
 	}
 	network, found, err := e.inspectNetwork(ctx, name)
 	if err != nil {
-		return err
+		return networkBoundaryFailure(networkDiagnostic(ctx, err, DiagnosticNetworkProvisionFailed), err)
 	}
 	if !found || !matchesNetwork(network, appID, name) {
-		return &Error{Code: DiagnosticNetworkDriftDetected}
+		return networkBoundaryFailure(DiagnosticNetworkDriftDetected, contextCause(ctx))
+	}
+	if err := execution.CheckObservation(); err != nil {
+		return networkBoundaryFailure(networkDiagnostic(ctx, err, DiagnosticRuntimeUnavailable), err)
 	}
 	return nil
 }
@@ -556,20 +603,23 @@ func (e *Engine) inspectNetwork(ctx context.Context, name string) (networkInspec
 		notFound := dockerNotFound(result)
 		diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticNetworkProvisionFailed)
 		clearResult(&result)
+		if canceled := contextCause(ctx); canceled != nil {
+			return networkInspection{}, false, errors.Join(&Error{Code: diagnostic}, runErr, canceled)
+		}
 		if notFound {
 			return networkInspection{}, false, nil
 		}
-		return networkInspection{}, false, &Error{Code: diagnostic}
+		return networkInspection{}, false, errors.Join(&Error{Code: diagnostic}, runErr)
 	}
 	var network networkInspection
 	decodeErr := json.Unmarshal(result.Stdout, &network)
 	truncated := result.StdoutTruncated || result.StderrTruncated
 	clearResult(&result)
 	if truncated {
-		return networkInspection{}, false, &Error{Code: DiagnosticRuntimeOutputTruncated}
+		return networkInspection{}, false, errors.Join(&Error{Code: DiagnosticRuntimeOutputTruncated}, contextCause(ctx))
 	}
 	if decodeErr != nil {
-		return networkInspection{}, false, &Error{Code: DiagnosticNetworkDriftDetected}
+		return networkInspection{}, false, errors.Join(&Error{Code: DiagnosticNetworkDriftDetected}, decodeErr, contextCause(ctx))
 	}
 	return network, true, nil
 }
@@ -648,14 +698,55 @@ func (e *Engine) cleanupOwnedCandidate(parent context.Context, candidate Candida
 }
 
 func (e *Engine) run(ctx context.Context, args []string, timeout time.Duration) (runtimeprocess.CommandResult, error) {
-	if err := validateEmptyDockerConfig(e.options.DockerConfigDirectory); err != nil {
+	request, err := e.prepareCommand(args, timeout)
+	if err != nil {
 		return runtimeprocess.CommandResult{}, err
 	}
-	return e.runner.Run(ctx, runtimeprocess.CommandRequest{
+	return e.runner.Run(ctx, request)
+}
+
+func (e *Engine) prepareCommand(args []string, timeout time.Duration) (runtimeprocess.CommandRequest, error) {
+	if err := validateEmptyDockerConfig(e.options.DockerConfigDirectory); err != nil {
+		return runtimeprocess.CommandRequest{}, err
+	}
+	request := runtimeprocess.CommandRequest{
 		Executable: e.options.DockerExecutable,
 		Args:       append([]string(nil), args...), Directory: e.options.WorkingDirectory,
 		Env: append([]string(nil), e.dockerEnv...), Timeout: timeout, OutputLimit: e.options.OutputLimit,
-	})
+	}
+	if request.Executable == "" || request.Directory == "" || request.Timeout <= 0 || request.OutputLimit <= 0 || len(request.Args) == 0 {
+		return runtimeprocess.CommandRequest{}, errors.New("invalid generated runtime command")
+	}
+	return request, nil
+}
+
+func networkBoundaryFailure(code DiagnosticCode, cause error) error {
+	return &networkBoundaryError{diagnostic: &Error{Code: code}, cause: cause}
+}
+
+func networkDiagnostic(ctx context.Context, err error, fallback DiagnosticCode) DiagnosticCode {
+	if (ctx != nil && errors.Is(ctx.Err(), context.Canceled)) || errors.Is(err, context.Canceled) {
+		return DiagnosticCancelled
+	}
+	if (ctx != nil && errors.Is(ctx.Err(), context.DeadlineExceeded)) || errors.Is(err, context.DeadlineExceeded) {
+		return DiagnosticRuntimeTimeout
+	}
+	return fallback
+}
+
+func contextCause(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	return ctx.Err()
+}
+
+func sameGeneratedNetworkCandidate(request deployments.GeneratedNetworkRequest, spec CandidateSpec) bool {
+	return request.Claim.ApplicationID() == spec.AppID && request.DeploymentID == spec.DeploymentID &&
+		request.ReleaseID == spec.ReleaseID && request.ConfigurationRevisionID == spec.ConfigurationRevisionID &&
+		request.ConfigurationRevisionNumber == spec.ConfigurationRevisionNumber &&
+		request.DeploymentPlanRevisionID == spec.DeploymentPlanRevisionID &&
+		request.DeploymentPlanRevisionNumber == spec.DeploymentPlanRevisionNumber
 }
 
 func (e *Engine) commandDiagnostic(ctx context.Context, result runtimeprocess.CommandResult, err error, fallback DiagnosticCode) DiagnosticCode {
@@ -911,11 +1002,8 @@ func lowerHex(value string, length int) bool {
 	return true
 }
 
-func networkName(appID string) string { return "rig-a-" + strings.ReplaceAll(appID, "-", "") }
-
-func componentDigest(component string) string {
-	sum := sha256.Sum256([]byte(component))
-	return hex.EncodeToString(sum[:])[:12]
+func networkName(appID string) string {
+	return generatedidentity.NetworkName(appID)
 }
 
 func sha256Hex(value string) string {
@@ -924,11 +1012,11 @@ func sha256Hex(value string) string {
 }
 
 func containerName(appID, component string, slot Slot) string {
-	return networkName(appID) + "-c-" + componentDigest(component) + "-" + string(slot)
+	return generatedidentity.ContainerName(appID, component, slot)
 }
 
 func containerAlias(component string, slot Slot) string {
-	return "rig-c-" + componentDigest(component) + "-" + string(slot)
+	return generatedidentity.ContainerAlias(component, slot)
 }
 
 func runtimeLabels(spec CandidateSpec, slot Slot) map[string]string {

@@ -224,7 +224,8 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
-	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, generatedruntime.EngineOptions{
+	authority := liveGeneratedDeployments(t, working)
+	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
@@ -266,7 +267,7 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	} else {
 		appSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, image.tag, appSpec, spec.applicationReply, "0.0.0.0")
 	}
-	candidate := startLiveCandidate(t, ctx, engine, appSpec)
+	candidate := startLiveCandidate(t, ctx, engine, authority, appSpec)
 	fixture.candidates = append(fixture.candidates, candidate)
 	route := generatedruntime.RouteSwitchRequest{
 		AppID: spec.appID, ToSlot: candidate.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(candidate)},

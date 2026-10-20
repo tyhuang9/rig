@@ -1045,7 +1045,8 @@ func TestCapacitySnapshotPreservesGenuinelyLowCapacity(t *testing.T) {
 func TestLowIngressCapacityBecomesReplacementCapacityDiagnostic(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.capacityOutput = []byte("1024 2048\n")
-	engine, err := generatedruntime.NewEngine(runner, unusedEnvironmentStager{}, manager, generatedruntime.EngineOptions{
+	authority := liveGeneratedDeployments(t, manager.options.WorkingDirectory)
+	engine, err := generatedruntime.NewEngine(runner, unusedEnvironmentStager{}, manager, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable:      manager.options.DockerExecutable,
 		DockerConfigDirectory: manager.options.DockerConfigDirectory,
 		WorkingDirectory:      manager.options.WorkingDirectory,

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -315,16 +316,22 @@ func (f *fakeRuntimeState) component(name string) *generatedruntimestate.Compone
 }
 
 type fakeRuntime struct {
-	events        *[]string
-	validateErrs  []error
-	validateCalls int
-	healthErr     error
-	createdSpecs  []generatedruntime.CandidateSpec
-	started       []generatedruntime.Candidate
-	adoptedValues []generatedruntime.Candidate
-	adopted       int
-	stopped       int
-	stopErrs      []error
+	events          *[]string
+	validateErrs    []error
+	validateCalls   int
+	healthErr       error
+	createdSpecs    []generatedruntime.CandidateSpec
+	started         []generatedruntime.Candidate
+	adoptedValues   []generatedruntime.Candidate
+	adopted         int
+	stopped         int
+	stopErrs        []error
+	networkRequests []deployments.GeneratedNetworkRequest
+	networkErrs     []error
+	networkCalls    int
+	createErrs      []error
+	createCalls     int
+	retained        int
 }
 
 type fakeReplacementReservation struct{ releases int }
@@ -333,6 +340,10 @@ func (r *fakeReplacementReservation) Release() { r.releases++ }
 
 func (f *fakeRuntime) ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error) {
 	return &fakeReplacementReservation{}, nil
+}
+func (f *fakeRuntime) RetainReplacementCapacity(generatedruntime.ReplacementReservation) error {
+	f.retained++
+	return nil
 }
 
 func (f *fakeRuntime) ValidateImage(context.Context, generatedruntime.ImageSpec) error {
@@ -344,13 +355,24 @@ func (f *fakeRuntime) ValidateImage(context.Context, generatedruntime.ImageSpec)
 	}
 	return nil
 }
-func (f *fakeRuntime) EnsureAppNetwork(context.Context, string) error {
+func (f *fakeRuntime) EnsureAppNetwork(_ context.Context, request deployments.GeneratedNetworkRequest) error {
 	*f.events = append(*f.events, "ensure_network")
+	f.networkRequests = append(f.networkRequests, request)
+	index := f.networkCalls
+	f.networkCalls++
+	if index < len(f.networkErrs) {
+		return f.networkErrs[index]
+	}
 	return nil
 }
 func (f *fakeRuntime) CreateInactiveCandidate(_ context.Context, spec generatedruntime.CandidateSpec) (generatedruntime.Candidate, error) {
 	*f.events = append(*f.events, "create")
 	f.createdSpecs = append(f.createdSpecs, spec)
+	index := f.createCalls
+	f.createCalls++
+	if index < len(f.createErrs) && f.createErrs[index] != nil {
+		return generatedruntime.Candidate{}, f.createErrs[index]
+	}
 	description, _ := generatedruntime.DescribeInactiveCandidate(spec.AppID, spec.ComponentName, spec.ActiveSlot)
 	return generatedruntime.Candidate{
 		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID, ArtifactID: spec.ArtifactID,
@@ -939,6 +961,22 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 	if len(fixture.runtime.createdSpecs) != 1 || fixture.runtime.createdSpecs[0].RunCommand != fixture.plan.Plan.Components[0].RunCommand || fixture.runtime.createdSpecs[0].Role != generatedruntime.RoleServer || fixture.runtime.createdSpecs[0].Reservation == nil {
 		t.Fatal("accepted run command was not preserved exactly")
 	}
+	wantNetwork := deployments.GeneratedNetworkRequest{
+		Claim: fixture.claim, DeploymentID: testDeploymentID, ReleaseID: testReleaseID,
+		ConfigurationRevisionID: testConfigID, ConfigurationRevisionNumber: 3,
+		DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
+	}
+	if len(fixture.runtime.networkRequests) != 3 {
+		t.Fatalf("network requests=%d", len(fixture.runtime.networkRequests))
+	}
+	for index, request := range fixture.runtime.networkRequests {
+		if !reflect.DeepEqual(request, wantNetwork) {
+			t.Fatalf("network request %d=%#v want=%#v", index, request, wantNetwork)
+		}
+	}
+	if !reflect.DeepEqual(fixture.runtime.createdSpecs[0].Network, wantNetwork) {
+		t.Fatalf("hidden network request=%#v want=%#v", fixture.runtime.createdSpecs[0].Network, wantNetwork)
+	}
 	if len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
 		t.Fatal("successful deployment did not release its aggregate reservation exactly once")
 	}
@@ -948,6 +986,128 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 	if endpoints := fixture.routes.requests[0].Endpoints; len(endpoints) != 1 || endpoints[0].Role != generatedruntime.RoleServer {
 		t.Fatalf("route endpoints=%+v", endpoints)
 	}
+}
+
+func TestGeneratedExecutorNetworkRefusalRetainsDurableStateWithoutFailureCleanup(t *testing.T) {
+	boundary := generatedNetworkBoundaryTestError()
+	for _, test := range []struct {
+		name           string
+		migration      bool
+		phase          generatedruntimestate.Phase
+		migrationState generatedruntimestate.MigrationState
+	}{
+		{name: "building", phase: generatedruntimestate.PhaseBuilding, migrationState: generatedruntimestate.MigrationNotRequired},
+		{name: "migrating", migration: true, phase: generatedruntimestate.PhaseMigrating, migrationState: generatedruntimestate.MigrationPending},
+		{name: "starting candidate", phase: generatedruntimestate.PhaseStartingCandidate, migrationState: generatedruntimestate.MigrationNotRequired},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, test.migration)
+			fixture.deployments.deployment = initializedDeployment(deployments.Applying)
+			fixture.state.deployment = generatedruntimestate.Deployment{
+				DeploymentID: testDeploymentID, AppID: testAppID, ReleaseID: testReleaseID,
+				DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
+				CandidateSlot: "blue", Phase: test.phase, MigrationState: test.migrationState,
+				Components: []generatedruntimestate.Component{{DeploymentID: testDeploymentID, Name: "api", Slot: "blue", ImageArtifactID: testArtifactID, State: generatedruntimestate.ComponentImageReady}},
+			}
+			fixture.runtime.networkErrs = []error{boundary}
+			beforeDeployment := fixture.deployments.deployment
+			beforeRuntime := fixture.state.deployment
+			beforeRuntime.Components = append([]generatedruntimestate.Component(nil), beforeRuntime.Components...)
+			result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+			var executionErr *jobs.ExecutionError
+			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deployments.ErrInvalidDeployment) {
+				t.Fatalf("result=%#v error=%v", result, err)
+			}
+			if !reflect.DeepEqual(fixture.deployments.deployment, beforeDeployment) || !reflect.DeepEqual(fixture.state.deployment, beforeRuntime) {
+				t.Fatalf("network refusal changed durable state: deployment=%#v runtime=%#v", fixture.deployments.deployment, fixture.state.deployment)
+			}
+			if fixture.runtime.stopped != 0 || fixture.runtime.retained != 0 {
+				t.Fatalf("unattempted refusal cleanup=%d retention=%d", fixture.runtime.stopped, fixture.runtime.retained)
+			}
+		})
+	}
+}
+
+func TestGeneratedExecutorSeedsResumedCandidateRiskBeforeNetworkRefusal(t *testing.T) {
+	boundary := generatedNetworkBoundaryTestError()
+	for _, test := range []struct {
+		name          string
+		state         generatedruntimestate.ComponentState
+		containerName string
+		containerID   string
+		wantRetained  int
+	}{
+		{name: "all unattempted pending", state: generatedruntimestate.ComponentPending},
+		{name: "all unattempted image ready", state: generatedruntimestate.ComponentImageReady},
+		{name: "name only", state: generatedruntimestate.ComponentStarting, containerName: "rig-candidate", wantRetained: 1},
+		{name: "running", state: generatedruntimestate.ComponentRunning, containerName: "rig-candidate", containerID: strings.Repeat("a", 64), wantRetained: 1},
+		{name: "healthy", state: generatedruntimestate.ComponentHealthy, containerName: "rig-candidate", containerID: strings.Repeat("a", 64), wantRetained: 1},
+		{name: "active", state: generatedruntimestate.ComponentActive, containerName: "rig-candidate", containerID: strings.Repeat("a", 64), wantRetained: 1},
+		{name: "unknown state", state: generatedruntimestate.ComponentState("unknown"), wantRetained: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			fixture.deployments.deployment = initializedDeployment(deployments.Applying)
+			fixture.state.deployment = generatedruntimestate.Deployment{
+				DeploymentID: testDeploymentID, AppID: testAppID, ReleaseID: testReleaseID,
+				DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
+				CandidateSlot: "blue", Phase: generatedruntimestate.PhaseStartingCandidate, MigrationState: generatedruntimestate.MigrationNotRequired,
+				Components: []generatedruntimestate.Component{{DeploymentID: testDeploymentID, Name: "api", Slot: "blue", ImageArtifactID: testArtifactID, State: test.state, ContainerName: test.containerName, ContainerID: test.containerID}},
+			}
+			fixture.runtime.networkErrs = []error{boundary}
+			beforeDeployment := fixture.deployments.deployment
+			beforeRuntime := fixture.state.deployment
+			beforeRuntime.Components = append([]generatedruntimestate.Component(nil), beforeRuntime.Components...)
+			_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+			if !errors.Is(err, deployments.ErrInvalidDeployment) {
+				t.Fatalf("network refusal=%v", err)
+			}
+			if fixture.runtime.retained != test.wantRetained || fixture.runtime.stopped != 0 {
+				t.Fatalf("retention=%d want=%d cleanup=%d", fixture.runtime.retained, test.wantRetained, fixture.runtime.stopped)
+			}
+			if !reflect.DeepEqual(fixture.deployments.deployment, beforeDeployment) || !reflect.DeepEqual(fixture.state.deployment, beforeRuntime) {
+				t.Fatal("resumed network refusal changed durable state")
+			}
+		})
+	}
+}
+
+func TestGeneratedExecutorRetainsWholeAggregateAfterSecondHiddenNetworkRefusal(t *testing.T) {
+	fixture := newExecutorFixture(t, false)
+	secondComponent := fixture.plan.Plan.Components[0]
+	secondComponent.Name = "web"
+	secondComponent.RootDirectory = "apps/web"
+	fixture.plan.Plan.Components = append(fixture.plan.Plan.Components, secondComponent)
+	fixture.executor.plans = &fakePlans{revision: fixture.plan}
+	secondArtifact := readyArtifact(testArtifactID2)
+	secondArtifact.ComponentID = "web"
+	fixture.compiler.artifacts = append(fixture.compiler.artifacts, secondArtifact)
+	fixture.artifacts.values[secondArtifact.ID] = secondArtifact
+	fixture.runtime.createErrs = []error{nil, generatedNetworkBoundaryTestError()}
+
+	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	var executionErr *jobs.ExecutionError
+	if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deployments.ErrInvalidDeployment) {
+		t.Fatalf("result=%#v error=%v", result, err)
+	}
+	if fixture.runtime.retained != 1 || fixture.runtime.stopped != 0 {
+		t.Fatalf("retention=%d cleanup=%d", fixture.runtime.retained, fixture.runtime.stopped)
+	}
+	if fixture.deployments.deployment.Status != deployments.Applying || fixture.state.deployment.Phase != generatedruntimestate.PhaseStartingCandidate {
+		t.Fatalf("network refusal changed lifecycle: deployment=%#v runtime=%#v", fixture.deployments.deployment, fixture.state.deployment)
+	}
+	api, web := fixture.state.component("api"), fixture.state.component("web")
+	if api.State != generatedruntimestate.ComponentRunning || api.ContainerID == "" || web.State != generatedruntimestate.ComponentStarting || web.ContainerName == "" || web.ContainerID != "" {
+		t.Fatalf("partial candidate evidence was not retained: api=%#v web=%#v", api, web)
+	}
+	if len(fixture.runtime.createdSpecs) != 2 || !reflect.DeepEqual(fixture.runtime.createdSpecs[0].Network, fixture.runtime.createdSpecs[1].Network) {
+		t.Fatalf("hidden network authority changed between components: %#v", fixture.runtime.createdSpecs)
+	}
+}
+
+func generatedNetworkBoundaryTestError() error {
+	var engine *generatedruntime.Engine
+	return engine.EnsureAppNetwork(context.Background(), deployments.GeneratedNetworkRequest{})
 }
 
 func TestGeneratedExecutorPassesAcceptedTechnologyToRuntime(t *testing.T) {

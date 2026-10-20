@@ -111,11 +111,12 @@ type Approval struct {
 }
 
 type Repository struct {
-	db                       *sql.DB
-	executionGuard           *deploymentexecution.Guard
-	now                      func() time.Time
-	afterGatePolicyRead      func()
-	afterComposeIdentityRead func()
+	db                                *sql.DB
+	executionGuard                    *deploymentexecution.Guard
+	now                               func() time.Time
+	afterGatePolicyRead               func()
+	afterComposeIdentityRead          func()
+	afterGeneratedNetworkIdentityRead func()
 }
 
 func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }

@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/generatedimage"
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -154,7 +155,7 @@ func (e *Executor) runMigration(ctx context.Context, resolved resolvedDeployment
 	return updated, nil
 }
 
-func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {
+func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, claim deploymentexecution.Claim, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {
 	result := make(map[string]generatedruntime.Candidate, len(runtimeDeployment.Components))
 	activeSlot := generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot)
 	for _, persisted := range sortedComponents(runtimeDeployment.Components) {
@@ -185,12 +186,14 @@ func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, resolved r
 			}
 			candidate, createErr := e.runtime.CreateInactiveCandidate(ctx, generatedruntime.CandidateSpec{
 				AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-				ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, ComponentName: component.Name, Role: component.Role, Technology: component.Technology,
+				ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
+				ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
+				ComponentName: component.Name, Role: component.Role, Technology: component.Technology,
 				RootDirectory: component.RootDirectory, RunCommand: component.RunCommand, InternalPort: component.InternalPort,
 				HealthProbe: component.HealthProbe, ImageContentID: artifact.ImageContentID,
 				BuildDefinitionDigest: artifact.BuildDefinitionDigest, ActiveSlot: activeSlot,
 				EnvironmentOperationID: artifact.ID, EnvironmentOperationAttempt: job.Attempt, Environment: configuration.Environment,
-				Reservation: reservation,
+				Reservation: reservation, Network: generatedNetworkRequest(claim, resolved),
 			})
 			configuration.Environment = nil
 			configuration.Clear()

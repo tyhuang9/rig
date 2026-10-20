@@ -8,13 +8,16 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedidentity"
 )
 
-type Slot string
+type Slot = generatedidentity.Slot
 
 const (
-	SlotBlue  Slot = "blue"
-	SlotGreen Slot = "green"
+	SlotBlue  Slot = generatedidentity.SlotBlue
+	SlotGreen Slot = generatedidentity.SlotGreen
 
 	RoleServer = "server"
 	RoleStatic = "static"
@@ -27,14 +30,7 @@ const (
 // InactiveSlot deterministically selects the replacement slot. An empty active
 // slot represents an application's first generated deployment.
 func InactiveSlot(active Slot) (Slot, error) {
-	switch active {
-	case "", SlotGreen:
-		return SlotBlue, nil
-	case SlotBlue:
-		return SlotGreen, nil
-	default:
-		return "", errors.New("invalid generated runtime slot")
-	}
+	return generatedidentity.InactiveSlot(active)
 }
 
 type DiagnosticCode string
@@ -73,6 +69,27 @@ func IsCode(err error, code DiagnosticCode) bool {
 	return errors.As(err, &target) && target.Code == code
 }
 
+type networkBoundaryError struct {
+	diagnostic *Error
+	cause      error
+}
+
+func (e *networkBoundaryError) Error() string { return e.diagnostic.Error() }
+
+func (e *networkBoundaryError) Unwrap() []error {
+	if e.cause == nil {
+		return []error{e.diagnostic}
+	}
+	return []error{e.diagnostic, e.cause}
+}
+
+func (e *networkBoundaryError) generatedNetworkBoundaryFailure() {}
+
+func IsGeneratedNetworkBoundaryFailure(err error) bool {
+	var failure interface{ generatedNetworkBoundaryFailure() }
+	return errors.As(err, &failure)
+}
+
 type ContainerLimits struct {
 	MemoryBytes int64
 	MilliCPUs   int64
@@ -83,40 +100,49 @@ type ContainerLimits struct {
 }
 
 type CandidateSpec struct {
-	AppID                       string
-	ReleaseID                   string
-	DeploymentID                string
-	ArtifactID                  string
-	DeploymentPlanRevisionID    string
-	ComponentName               string
-	Role                        string
-	Technology                  string
-	RootDirectory               string
-	RunCommand                  string
-	InternalPort                uint16
-	HealthProbe                 string
-	ImageContentID              string
-	BuildDefinitionDigest       string
-	ActiveSlot                  Slot
-	EnvironmentOperationID      string
-	EnvironmentOperationAttempt int
+	AppID                        string
+	ReleaseID                    string
+	DeploymentID                 string
+	ArtifactID                   string
+	DeploymentPlanRevisionID     string
+	DeploymentPlanRevisionNumber int64
+	ConfigurationRevisionID      string
+	ConfigurationRevisionNumber  int64
+	ComponentName                string
+	Role                         string
+	Technology                   string
+	RootDirectory                string
+	RunCommand                   string
+	InternalPort                 uint16
+	HealthProbe                  string
+	ImageContentID               string
+	BuildDefinitionDigest        string
+	ActiveSlot                   Slot
+	EnvironmentOperationID       string
+	EnvironmentOperationAttempt  int
 	// Environment is protected configuration exported for this exact release.
 	// CreateInactiveCandidate takes ownership and clears it before returning.
 	Environment []byte
 	// Reservation is an opaque, process-local aggregate admission acquired
 	// before the final deployment gate. Direct callers may leave it nil.
 	Reservation ReplacementReservation
+	// Network carries the original immutable deployment authority for the
+	// hidden application-network boundary inside candidate creation.
+	Network deployments.GeneratedNetworkRequest
 }
 
 type ImageSpec struct {
-	AppID                    string
-	ReleaseID                string
-	ArtifactID               string
-	DeploymentPlanRevisionID string
-	ComponentName            string
-	Role                     string
-	ImageContentID           string
-	BuildDefinitionDigest    string
+	AppID                        string
+	ReleaseID                    string
+	ArtifactID                   string
+	DeploymentPlanRevisionID     string
+	DeploymentPlanRevisionNumber int64
+	ConfigurationRevisionID      string
+	ConfigurationRevisionNumber  int64
+	ComponentName                string
+	Role                         string
+	ImageContentID               string
+	BuildDefinitionDigest        string
 }
 
 type Candidate struct {
@@ -151,16 +177,11 @@ type ReplacementReservation interface {
 // CandidateDescription exposes only deterministic, non-secret resource
 // identity. Coordinators persist it before Docker mutation so recovery never
 // has to infer intent from an existing container.
-type CandidateDescription struct {
-	Slot          Slot
-	ContainerName string
-	NetworkName   string
-	NetworkAlias  string
-}
+type CandidateDescription = generatedidentity.CandidateDescription
 
 // AppNetworkDescription lets migration and ingress implementations join the
 // exact app-private network without duplicating the naming algorithm.
-type AppNetworkDescription struct{ Name string }
+type AppNetworkDescription = generatedidentity.AppNetworkDescription
 
 type CapacitySnapshot struct {
 	MemoryAvailableBytes uint64

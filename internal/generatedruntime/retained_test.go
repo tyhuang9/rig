@@ -402,7 +402,7 @@ func newRetainedRuntimeEngine(t *testing.T, capacity CapacitySource, run func(ru
 		t.Fatal(err)
 	}
 	runner := &runtimeFakeRunner{run: run}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "unused.env")}, capacity, EngineOptions{
+	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "unused.env")}, capacity, newConfiguredRuntimeDeployments(t, directories.WorkingDirectory), EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
 		HealthPollInterval: 100 * time.Millisecond, Limits: defaultLimits(), ReplacementDiskBytes: 128 << 20,
@@ -476,7 +476,7 @@ func newRetainedRuntimeEngineWithRunner(t *testing.T, runner runtimeprocess.Comm
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "unused.env")}, capacity, EngineOptions{
+	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "unused.env")}, capacity, newConfiguredRuntimeDeployments(t, directories.WorkingDirectory), EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
 		HealthPollInterval: 100 * time.Millisecond, Limits: defaultLimits(), ReplacementDiskBytes: 128 << 20,

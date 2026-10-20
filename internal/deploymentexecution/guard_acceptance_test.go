@@ -24,6 +24,7 @@ func TestGuardPolicyGateAcceptsExactLegacyAndRunningAuthority(t *testing.T) {
 	for _, running := range []bool{false, true} {
 		t.Run(map[bool]string{false: "legacy", true: "running"}[running], func(t *testing.T) {
 			fixture := newExecutionFixture(t, running)
+			fixture.exec(t, `UPDATE deployments SET status='applying' WHERE id=?`, fixture.deploymentID)
 			pin, claim := fixture.pin(t)
 			defer pin.Leave()
 			tx, err := fixture.db.Begin()
@@ -33,6 +34,12 @@ func TestGuardPolicyGateAcceptsExactLegacyAndRunningAuthority(t *testing.T) {
 			defer tx.Rollback()
 			if err := pin.CheckPolicyGateTx(tx, claim, fixture.deploymentID); err != nil {
 				t.Fatalf("policy gate: %v", err)
+			}
+			if err := pin.CheckGeneratedNetworkCreateTx(tx, claim, fixture.deploymentID); err != nil {
+				t.Fatalf("generated network create: %v", err)
+			}
+			if err := pin.CheckGeneratedNetworkObservationTx(tx, claim, fixture.deploymentID); err != nil {
+				t.Fatalf("generated network observation: %v", err)
 			}
 		})
 	}
@@ -254,6 +261,9 @@ func TestGuardPolicyGatePreservesInvalidHistoricalAuthorityBeforeDrift(t *testin
 	defer tx.Rollback()
 	if err := pin.CheckPolicyGateTx(tx, claim, fixture.deploymentID); !errors.Is(err, deploymentexecution.ErrAuthorityInvalid) || errors.Is(err, deploymentexecution.ErrAuthorityStale) {
 		t.Fatalf("corrupt historical authority error=%v", err)
+	}
+	if err := pin.CheckGeneratedNetworkCreateTx(tx, claim, fixture.deploymentID); !errors.Is(err, deploymentexecution.ErrAuthorityInvalid) || errors.Is(err, deploymentexecution.ErrAuthorityStale) {
+		t.Fatalf("corrupt historical network authority error=%v", err)
 	}
 }
 
@@ -523,8 +533,10 @@ func TestGuardPolicyGateUsesCanonicalGlobalPendingStartFence(t *testing.T) {
 		fixture := newExecutionFixture(t, true)
 		pending := fixture.beginOtherStart(t, true)
 		fixture.check(t, deploymentexecution.ErrPositiveFence)
+		fixture.checkGeneratedNetwork(t, deploymentexecution.ErrPositiveFence)
 		pending.observeStart(t, fixture)
 		fixture.check(t, nil)
+		fixture.checkGeneratedNetwork(t, nil)
 	})
 	t.Run("terminal operation behind later head still blocks", func(t *testing.T) {
 		fixture := newExecutionFixture(t, true)
@@ -709,6 +721,34 @@ func (f *executionFixture) check(t *testing.T, want error) {
 	}
 	if want != nil && !errors.Is(err, want) {
 		t.Fatalf("policy gate error=%v want=%v", err, want)
+	}
+}
+
+func (f *executionFixture) checkGeneratedNetwork(t *testing.T, want error) {
+	t.Helper()
+	f.exec(t, `UPDATE deployments SET status='applying' WHERE id=?`, f.deploymentID)
+	pin, claim, release := f.pinWithRelease(t)
+	defer func() {
+		pin.Leave()
+		if err := release(); err != nil {
+			t.Errorf("release generated network scope: %v", err)
+		}
+	}()
+	for _, check := range []func(*sql.Tx, deploymentexecution.Claim, string) error{
+		pin.CheckGeneratedNetworkCreateTx, pin.CheckGeneratedNetworkObservationTx,
+	} {
+		tx, err := f.db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = check(tx, claim, f.deploymentID)
+		_ = tx.Rollback()
+		if want == nil && err != nil {
+			t.Fatalf("generated network check error=%v", err)
+		}
+		if want != nil && !errors.Is(err, want) {
+			t.Fatalf("generated network check error=%v want=%v", err, want)
+		}
 	}
 }
 

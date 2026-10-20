@@ -141,6 +141,18 @@ func (p *Pinned) CheckComposeObservationTx(tx *sql.Tx, claim Claim, deploymentID
 	return p.checkTx(tx, claim, deploymentID, composeObservationStatus)
 }
 
+// CheckGeneratedNetworkCreateTx revalidates the original execution authority
+// at the fixed generated application-network create boundary.
+func (p *Pinned) CheckGeneratedNetworkCreateTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedNetworkStatus)
+}
+
+// CheckGeneratedNetworkObservationTx revalidates the original execution
+// authority before accepting an exact generated application network.
+func (p *Pinned) CheckGeneratedNetworkObservationTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedNetworkStatus)
+}
+
 func (p *Pinned) checkTx(tx *sql.Tx, claim Claim, deploymentID string, statusAllowed func(string) bool) error {
 	guard, ctx, done, err := p.beginCheck()
 	if err != nil {
@@ -222,6 +234,8 @@ func composeUpStatus(status string) bool { return status == "applying" }
 func composeObservationStatus(status string) bool {
 	return status == "applying" || status == "waiting_health"
 }
+
+func generatedNetworkStatus(status string) bool { return status == "applying" }
 
 func policyGateStatus(status string) bool {
 	switch status {

@@ -74,6 +74,7 @@ type replacementReservation struct {
 	mu         sync.Mutex
 	components map[string]struct{}
 	released   bool
+	retained   bool
 }
 
 func (r *replacementReservation) Release() {
@@ -81,7 +82,7 @@ func (r *replacementReservation) Release() {
 		return
 	}
 	r.mu.Lock()
-	if r.released {
+	if r.released || r.retained {
 		r.mu.Unlock()
 		return
 	}
@@ -97,7 +98,7 @@ func (r *replacementReservation) consume(owner *capacityGate, component string) 
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.released {
+	if r.released || r.retained {
 		return false, false
 	}
 	if _, exists := r.components[component]; exists {
@@ -116,7 +117,20 @@ func (r *replacementReservation) unconsume(component string) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if !r.released {
+	if !r.released && !r.retained {
 		delete(r.components, component)
 	}
+}
+
+func (r *replacementReservation) retain(owner *capacityGate) bool {
+	if r == nil || owner == nil || r.owner != owner {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.released {
+		return false
+	}
+	r.retained = true
+	return true
 }

@@ -75,8 +75,9 @@ type runtimeState interface {
 
 type runtimeEngine interface {
 	ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error)
+	RetainReplacementCapacity(generatedruntime.ReplacementReservation) error
 	ValidateImage(context.Context, generatedruntime.ImageSpec) error
-	EnsureAppNetwork(context.Context, string) error
+	EnsureAppNetwork(context.Context, deployments.GeneratedNetworkRequest) error
 	CreateInactiveCandidate(context.Context, generatedruntime.CandidateSpec) (generatedruntime.Candidate, error)
 	AdoptCandidate(generatedruntime.Candidate, generatedruntime.ReplacementReservation) (generatedruntime.Candidate, error)
 	StartCandidate(context.Context, generatedruntime.Candidate) error

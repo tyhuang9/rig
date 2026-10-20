@@ -78,7 +78,8 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
-	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, generatedruntime.EngineOptions{
+	authority := liveGeneratedDeployments(t, working)
+	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
@@ -105,7 +106,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 
 	blueSpec := liveCandidateSpec("blue", appA, plan)
 	blueSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[0].tag, blueSpec, "blue", "0.0.0.0")
-	blue := startLiveCandidate(t, ctx, engine, blueSpec)
+	blue := startLiveCandidate(t, ctx, engine, authority, blueSpec)
 	candidates = append(candidates, blue)
 	blueRoute := generatedruntime.RouteSwitchRequest{
 		AppID: appA, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(blue)},
@@ -123,7 +124,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	loopbackSpec := liveCandidateSpec("green", appA, plan)
 	loopbackSpec.ActiveSlot = blue.Slot
 	loopbackSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[1].tag, loopbackSpec, "loopback", "127.0.0.1")
-	loopback := createAndStartLiveCandidate(t, ctx, engine, loopbackSpec)
+	loopback := createAndStartLiveCandidate(t, ctx, engine, authority, loopbackSpec)
 	candidates = append(candidates, loopback)
 	if err := engine.WaitHealthy(ctx, loopback); err != nil {
 		failLiveGatewayRuntime(t, "loopback candidate did not pass Docker health", err)
@@ -153,11 +154,16 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	if liveGatewayResourceExists(t, ctx, runner, docker, root, dockerConfig, "container", loopback.ContainerName) {
 		t.Fatal("loopback candidate remains after exact removal")
 	}
+	authority.rejectCandidateAuthority(t, loopbackSpec.DeploymentID, blueSpec.DeploymentID)
 
 	replacementSpec := liveCandidateSpec("green", appA, plan)
+	replacementSpec.ReleaseID = "d1111111-1111-4111-8111-111111111111"
+	replacementSpec.DeploymentID = "d2222222-2222-4222-8222-222222222222"
+	replacementSpec.ArtifactID = "d3333333-3333-4333-8333-333333333333"
+	replacementSpec.BuildDefinitionDigest = strings.Repeat("d", 64)
 	replacementSpec.ActiveSlot = blue.Slot
 	replacementSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[2].tag, replacementSpec, "replacement", "0.0.0.0")
-	replacement := startLiveCandidate(t, ctx, engine, replacementSpec)
+	replacement := startLiveCandidate(t, ctx, engine, authority, replacementSpec)
 	candidates = append(candidates, replacement)
 	replacementRoute := generatedruntime.RouteSwitchRequest{
 		AppID: appA, FromSlot: blue.Slot, ToSlot: replacement.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(replacement)},
@@ -170,7 +176,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 
 	firstSpec := liveCandidateSpec("other", appB, plan)
 	firstSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[3].tag, firstSpec, "first-loopback", "127.0.0.1")
-	firstLoopback := createAndStartLiveCandidate(t, ctx, engine, firstSpec)
+	firstLoopback := createAndStartLiveCandidate(t, ctx, engine, authority, firstSpec)
 	candidates = append(candidates, firstLoopback)
 	if err := engine.WaitHealthy(ctx, firstLoopback); err != nil {
 		failLiveGatewayRuntime(t, "first loopback candidate did not pass Docker health", err)
