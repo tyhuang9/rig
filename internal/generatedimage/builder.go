@@ -220,6 +220,10 @@ type BuilderManager struct {
 	// afterCommandPrepared is a deterministic test barrier. Production leaves
 	// it nil; it never grants authority or receives a mutable repository handle.
 	afterCommandPrepared func(runtimeprocess.CommandRequest)
+	// beforePrepareLock is a deterministic test barrier after the command
+	// authority is pinned and before process-local builder serialization.
+	// Production leaves it nil.
+	beforePrepareLock func()
 
 	mu      sync.Mutex
 	session *BuilderSession
@@ -271,6 +275,9 @@ func (m *BuilderManager) prepare(ctx context.Context, selection deployments.Gene
 		return BuilderSession{}, err
 	}
 	defer authority.Leave()
+	if m.beforePrepareLock != nil {
+		m.beforePrepareLock()
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if err := ctx.Err(); err != nil {

@@ -2,11 +2,13 @@ package generatedimage
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -466,6 +468,174 @@ func TestCompilerPreservesBuildingWhenKnownFailureObservationDoesNotCommit(t *te
 	component, componentErr := generatedruntimestate.New(fixture.authority.db).Component(context.Background(), fixture.authority.claim.ApplicationID(), fixture.request.DeploymentID, fixture.request.ComponentName)
 	if componentErr != nil || persisted.State != ArtifactBuilding || persisted.DiagnosticCode != "" || component.State != generatedruntimestate.ComponentPending {
 		t.Fatalf("failed observation changed evidence: artifact=%#v component=%#v error=%v", persisted, component, componentErr)
+	}
+}
+
+func TestCompilerCancellationWhileWaitingForBuildSlotPreservesBuildingEvidence(t *testing.T) {
+	fixture := newCompilerFixture(t)
+	fixture.compiler.buildSlot <- struct{}{}
+	slotHeld := true
+	defer func() {
+		if slotHeld {
+			<-fixture.compiler.buildSlot
+		}
+	}()
+
+	sentinel := errors.New("build-slot-cancelled")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	compileDone := make(chan struct {
+		artifact Artifact
+		err      error
+	}, 1)
+	go func() {
+		artifact, err := fixture.compile(ctx)
+		compileDone <- struct {
+			artifact Artifact
+			err      error
+		}{artifact: artifact, err: err}
+	}()
+
+	observeCtx, stopObserve := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopObserve()
+	for {
+		var state ArtifactState
+		err := fixture.authority.db.QueryRowContext(observeCtx, `SELECT state FROM generated_image_artifacts WHERE release_id=? AND component_id=? ORDER BY attempt_number DESC LIMIT 1`, fixture.release.ID, fixture.request.ComponentName).Scan(&state)
+		if err == nil && state == ArtifactBuilding {
+			break
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			t.Fatal(err)
+		}
+		select {
+		case <-observeCtx.Done():
+			t.Fatal("compiler did not persist Building before waiting for the build slot")
+		default:
+			runtime.Gosched()
+		}
+	}
+
+	writerCtx, stopWriter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopWriter()
+	writerDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.authority.db.ExecContext(writerCtx, `UPDATE applications SET updated_at=updated_at WHERE id=?`, fixture.request.Claim.ApplicationID())
+		writerDone <- err
+	}()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("independent writer failed while compiler waited for build slot: %v", err)
+		}
+	case <-writerCtx.Done():
+		t.Fatal("independent writer blocked behind build slot wait")
+	}
+
+	cancel(sentinel)
+	var result struct {
+		artifact Artifact
+		err      error
+	}
+	select {
+	case result = <-compileDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("compiler did not observe cancellation while build slot remained full")
+	}
+	if result.artifact != (Artifact{}) || !IsCompileCode(result.err, string(DiagnosticBuildCancelled)) || !IsCompileUncertain(result.err) ||
+		!errors.Is(result.err, sentinel) || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("build-slot cancellation artifact=%#v error=%v", result.artifact, result.err)
+	}
+	if fixture.builderPrepareCalls() != 0 || len(fixture.runner.request.Args) != 0 {
+		t.Fatalf("build-slot cancellation entered builder/process: builder=%d build=%#v", fixture.builderPrepareCalls(), fixture.runner.request.Args)
+	}
+	persisted := fixture.latestArtifact(t)
+	component, err := generatedruntimestate.New(fixture.authority.db).Component(context.Background(), fixture.request.Claim.ApplicationID(), fixture.request.DeploymentID, fixture.request.ComponentName)
+	if err != nil || persisted.State != ArtifactBuilding || persisted.AttemptNumber != 1 || persisted.DiagnosticCode != "" || component.State != generatedruntimestate.ComponentPending || component.ImageArtifactID != "" {
+		t.Fatalf("build-slot cancellation changed durable evidence: artifact=%#v component=%#v error=%v", persisted, component, err)
+	}
+	<-fixture.compiler.buildSlot
+	slotHeld = false
+}
+
+func TestCompilerCancellationWhileWaitingForBuilderMutexReleasesPinnedAuthority(t *testing.T) {
+	fixture := newCompilerFixture(t)
+	fixture.builder.mu.Lock()
+	mutexHeld := true
+	defer func() {
+		if mutexHeld {
+			fixture.builder.mu.Unlock()
+		}
+	}()
+	entered := make(chan struct{})
+	fixture.builder.beforePrepareLock = func() { close(entered) }
+
+	sentinel := errors.New("builder-mutex-cancelled")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	compileDone := make(chan struct {
+		artifact Artifact
+		err      error
+	}, 1)
+	go func() {
+		artifact, err := fixture.compile(ctx)
+		compileDone <- struct {
+			artifact Artifact
+			err      error
+		}{artifact: artifact, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("compiler did not pin command authority before builder mutex")
+	}
+
+	writerCtx, stopWriter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stopWriter()
+	writerDone := make(chan error, 1)
+	go func() {
+		_, err := fixture.authority.db.ExecContext(writerCtx, `UPDATE applications SET updated_at=updated_at WHERE id=?`, fixture.request.Claim.ApplicationID())
+		writerDone <- err
+	}()
+	select {
+	case err := <-writerDone:
+		if err != nil {
+			t.Fatalf("independent writer failed while builder mutex was held: %v", err)
+		}
+	case <-writerCtx.Done():
+		t.Fatal("independent writer blocked behind builder mutex")
+	}
+
+	cancel(sentinel)
+	select {
+	case result := <-compileDone:
+		t.Fatalf("sync.Mutex wait returned before unlock: artifact=%#v error=%v", result.artifact, result.err)
+	default:
+	}
+	fixture.builder.mu.Unlock()
+	mutexHeld = false
+	var result struct {
+		artifact Artifact
+		err      error
+	}
+	select {
+	case result = <-compileDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("compiler did not return after builder mutex unlock")
+	}
+	if result.artifact != (Artifact{}) || !IsCompileCode(result.err, string(DiagnosticBuildCancelled)) || !IsCompileUncertain(result.err) ||
+		!errors.Is(result.err, sentinel) || !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("builder-mutex cancellation artifact=%#v error=%v", result.artifact, result.err)
+	}
+	if len(fixture.daemon.requests()) != 0 || len(fixture.runner.request.Args) != 0 {
+		t.Fatalf("builder-mutex cancellation entered Docker: builder=%#v build=%#v", commandKinds(fixture.daemon.requests()), fixture.runner.request.Args)
+	}
+	persisted := fixture.latestArtifact(t)
+	component, err := generatedruntimestate.New(fixture.authority.db).Component(context.Background(), fixture.request.Claim.ApplicationID(), fixture.request.DeploymentID, fixture.request.ComponentName)
+	if err != nil || persisted.State != ArtifactBuilding || persisted.DiagnosticCode != "" || component.State != generatedruntimestate.ComponentPending || component.ImageArtifactID != "" {
+		t.Fatalf("builder-mutex cancellation changed durable evidence: artifact=%#v component=%#v error=%v", persisted, component, err)
+	}
+	if err := fixture.authority.releaseScope(); err != nil {
+		t.Fatalf("builder-mutex cancellation leaked command pin: %v", err)
 	}
 }
 

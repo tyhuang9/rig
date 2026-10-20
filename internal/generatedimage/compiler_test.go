@@ -478,6 +478,12 @@ type compilerFixture struct {
 }
 
 func newCompilerFixture(t *testing.T) compilerFixture {
+	return newCompilerFixtureWithAuthority(t, func(t *testing.T, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision) *generatedImageTestAuthority {
+		return newGeneratedImageTestAuthority(t, release, revision, "app")
+	})
+}
+
+func newCompilerFixtureWithAuthority(t *testing.T, createAuthority func(*testing.T, releasesnapshot.Release, deploymentplans.DeploymentPlanRevision) *generatedImageTestAuthority) compilerFixture {
 	t.Helper()
 	workspace := t.TempDir()
 	writeTestFile(t, filepath.Join(workspace, "package.json"), `{"name":"demo","scripts":{"build":"npm run compile","start":"node server.js"},"dependencies":{"express":"1.0.0"}}`)
@@ -505,7 +511,7 @@ func newCompilerFixture(t *testing.T) compilerFixture {
 		},
 	}
 	releaseReader := &compilerReleaseReader{release: release}
-	authority := newGeneratedImageTestAuthority(t, release, revision, "app")
+	authority := createAuthority(t, release, revision)
 	runner := &compilerRunner{}
 	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
 	commandRunner := &compilerCommandRunner{build: runner, daemon: daemon}

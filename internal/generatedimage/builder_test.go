@@ -1025,6 +1025,112 @@ func TestBuilderManagerStopsBeforeNextMutationWhenAuthorityChangesAfterPriorComm
 	}
 }
 
+func TestBuilderManagerSharesPhysicalResourcesWithoutSharingApplicationAuthority(t *testing.T) {
+	releaseA, revisionA := defaultGeneratedImageTestSource()
+	authorityA := newGeneratedImageTestAuthority(t, releaseA, revisionA, "app")
+	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
+	manager, err := NewBuilderManager(authorityA.repository, daemon, BuilderManagerOptions{
+		DataRoot: t.TempDir(), DockerExecutable: filepath.Join(t.TempDir(), "docker.exe"), PrepareTimeout: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionA, selectionA := authorityA.selectBuild(t)
+	defer executionA.Leave()
+	artifactA, created := executionA.SelectedArtifact()
+	if !created {
+		t.Fatal("application A build selection was not newly created")
+	}
+	componentA, err := generatedruntimestate.New(authorityA.db).Component(context.Background(), authorityA.claim.ApplicationID(), authorityA.request.DeploymentID, authorityA.request.ComponentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionA, err := manager.prepare(authorityA.context, selectionA)
+	if err != nil || !validBuilderSession(sessionA) {
+		t.Fatalf("prepare application A: session=%#v error=%v", sessionA, err)
+	}
+	executionA.Leave()
+	if err := authorityA.releaseScope(); err != nil {
+		t.Fatalf("release application A scope: %v", err)
+	}
+
+	releaseB, revisionB := defaultGeneratedImageTestSource()
+	authorityB := newGeneratedImageTestAuthorityWithDependencies(t, authorityA.db, authorityA.repository, authorityA.bindings, authorityA.workingDirectory, releaseB, revisionB, "app", "", 0)
+	executionB, selectionB := authorityB.selectBuild(t)
+	defer executionB.Leave()
+	artifactB, created := executionB.SelectedArtifact()
+	if !created {
+		t.Fatal("application B build selection was not newly created")
+	}
+	componentB, err := generatedruntimestate.New(authorityB.db).Component(context.Background(), authorityB.claim.ApplicationID(), authorityB.request.DeploymentID, authorityB.request.ComponentName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeB := daemon.requests()
+	sessionB, err := manager.prepare(authorityB.context, selectionB)
+	if err != nil || !validBuilderSession(sessionB) || sessionB.BuilderName != sessionA.BuilderName {
+		t.Fatalf("prepare application B with shared identity: A=%#v B=%#v error=%v", sessionA, sessionB, err)
+	}
+	for _, request := range daemon.requests()[len(beforeB):] {
+		switch commandKindForBuilderTest(request) {
+		case "network create", "container run", "buildx create":
+			t.Fatalf("application B recreated shared physical resource: %#v", request.Args)
+		}
+	}
+
+	bootstrapBefore := 0
+	for _, request := range daemon.requests() {
+		if commandKindForBuilderTest(request) == "buildx inspect" {
+			bootstrapBefore++
+		}
+	}
+	barriers := 0
+	manager.afterCommandPrepared = func(request runtimeprocess.CommandRequest) {
+		if commandKindForBuilderTest(request) != "buildx inspect" {
+			return
+		}
+		barriers++
+		invalidateGeneratedImageJobAttempt(t, authorityB)
+	}
+	_, err = manager.prepare(authorityB.context, selectionB)
+	if !errors.Is(err, deploymentexecution.ErrIdentityLost) || barriers != 1 {
+		t.Fatalf("application B bootstrap authority refusal barriers=%d error=%v", barriers, err)
+	}
+	bootstrapAfter := 0
+	for _, request := range daemon.requests() {
+		if commandKindForBuilderTest(request) == "buildx inspect" {
+			bootstrapAfter++
+		}
+	}
+	if bootstrapAfter != bootstrapBefore {
+		t.Fatalf("revoked application B entered bootstrap: before=%d after=%d", bootstrapBefore, bootstrapAfter)
+	}
+	afterB, err := NewArtifactRepository(authorityB.db).Get(context.Background(), artifactB.ID)
+	if err != nil || afterB != artifactB {
+		t.Fatalf("application B refusal changed artifact: before=%#v after=%#v error=%v", artifactB, afterB, err)
+	}
+	afterComponentB, err := generatedruntimestate.New(authorityB.db).Component(context.Background(), authorityB.claim.ApplicationID(), authorityB.request.DeploymentID, authorityB.request.ComponentName)
+	if err != nil || afterComponentB != componentB {
+		t.Fatalf("application B refusal changed component: before=%#v after=%#v error=%v", componentB, afterComponentB, err)
+	}
+
+	processCalls := len(daemon.requests())
+	if _, err := manager.prepare(authorityA.context, selectionA); err == nil {
+		t.Fatal("expired application A authority reused cached builder session")
+	}
+	if len(daemon.requests()) != processCalls {
+		t.Fatalf("expired application A entered process runner: before=%d after=%d", processCalls, len(daemon.requests()))
+	}
+	afterA, err := NewArtifactRepository(authorityA.db).Get(context.Background(), artifactA.ID)
+	if err != nil || afterA != artifactA {
+		t.Fatalf("shared manager changed application A artifact: before=%#v after=%#v error=%v", artifactA, afterA, err)
+	}
+	afterComponentA, err := generatedruntimestate.New(authorityA.db).Component(context.Background(), authorityA.claim.ApplicationID(), authorityA.request.DeploymentID, authorityA.request.ComponentName)
+	if err != nil || afterComponentA != componentA {
+		t.Fatalf("shared manager changed application A component: before=%#v after=%#v error=%v", componentA, afterComponentA, err)
+	}
+}
+
 func TestBuilderManagerCommandPinKeepsOriginalScopeWithoutHoldingSQL(t *testing.T) {
 	daemon := &builderDaemonFake{builders: make(map[string]buildxBuilder)}
 	blocking := &blockingBuilderRunner{delegate: daemon, target: "network create", entered: make(chan struct{}), release: make(chan struct{})}

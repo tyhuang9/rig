@@ -25,15 +25,17 @@ import (
 )
 
 type generatedImageTestAuthority struct {
-	db           *sql.DB
-	repository   *deployments.Repository
-	context      context.Context
-	scope        deploymenteffects.Scope
-	releaseScope func() error
-	claim        deploymentexecution.Claim
-	request      deployments.GeneratedImageRequest
-	release      releasesnapshot.Release
-	revision     deploymentplans.DeploymentPlanRevision
+	db               *sql.DB
+	repository       *deployments.Repository
+	bindings         *deploymentbinding.Repository
+	context          context.Context
+	scope            deploymenteffects.Scope
+	releaseScope     func() error
+	claim            deploymentexecution.Claim
+	request          deployments.GeneratedImageRequest
+	release          releasesnapshot.Release
+	revision         deploymentplans.DeploymentPlanRevision
+	workingDirectory string
 }
 
 func newGeneratedImageTestAuthority(t *testing.T, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, component string) *generatedImageTestAuthority {
@@ -41,6 +43,10 @@ func newGeneratedImageTestAuthority(t *testing.T, release releasesnapshot.Releas
 }
 
 func newGeneratedImageTestAuthorityWithConfiguration(t *testing.T, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, component, configurationID string, configurationNumber int64) *generatedImageTestAuthority {
+	return newGeneratedImageTestAuthorityWithDependencies(t, nil, nil, nil, "", release, revision, component, configurationID, configurationNumber)
+}
+
+func newGeneratedImageTestAuthorityWithDependencies(t *testing.T, db *sql.DB, repository *deployments.Repository, bindings *deploymentbinding.Repository, workingDirectory string, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, component, configurationID string, configurationNumber int64) *generatedImageTestAuthority {
 	t.Helper()
 	if release.AppID == "" {
 		release.AppID = uuid.NewString()
@@ -92,30 +98,35 @@ func newGeneratedImageTestAuthorityWithConfiguration(t *testing.T, release relea
 		revision.Plan.Source.ResolvedDigest = release.ResolvedSHA
 	}
 
-	db, err := database.Open(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	var err error
+	if db == nil {
+		db, err = database.Open(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
 	}
-	t.Cleanup(func() { _ = db.Close() })
 	actorID, machineID := uuid.NewString(), uuid.NewString()
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?, ?,?)`, actorID, "image-owner", "hash", stamp, stamp); err != nil {
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?, ?,?)`, actorID, "image-owner-"+release.AppID, "hash", stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,?,'local','ready','test','test','test','test',?,?)`, machineID, "local", stamp, stamp); err != nil {
+	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,?,'local','ready','test','test','test','test',?,?)`, machineID, "local-"+release.AppID, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?, 'draft',?,?)`, release.AppID, release.AppID, "Image Test", machineID, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
 	lifecycle := applifecycle.New(db)
-	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bindings, err := deploymentbinding.New(db, validator)
-	if err != nil {
-		t.Fatal(err)
+	if bindings == nil {
+		validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		bindings, err = deploymentbinding.New(db, validator)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
 	if err != nil {
@@ -147,23 +158,28 @@ func newGeneratedImageTestAuthorityWithConfiguration(t *testing.T, release relea
 		release.ID, release.AppID, stamp, release.SourceProvider, release.RepositoryID, release.ResolvedSHA, nullableTestText(release.ArchiveSHA256), release.WorkspaceTreeSHA256, release.ConfigurationRevisionID, release.ConfigurationRevisionNumber, revision.ID, revision.RevisionNumber); err != nil {
 		t.Fatal(err)
 	}
-	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
-	if err != nil {
-		t.Fatal(err)
+	if repository == nil {
+		positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
+		if err != nil {
+			t.Fatal(err)
+		}
+		directories, err := runtimedocker.PrepareControllerDirectories(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		workingDirectory = directories.WorkingDirectory
+		guard, err := deploymentexecution.NewGuard(db, bindings, positive, workingDirectory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		repository, err = deployments.NewWithExecutionGuard(db, guard)
+		if err != nil {
+			t.Fatal(err)
+		}
+	} else if workingDirectory == "" {
+		t.Fatal("shared generated image authority requires its repository working directory")
 	}
-	directories, err := runtimedocker.PrepareControllerDirectories(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repository, err := deployments.NewWithExecutionGuard(db, guard)
-	if err != nil {
-		t.Fatal(err)
-	}
-	scope, releaseEffectScope, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
+	scope, releaseEffectScope, err := deploymenteffects.AcquireScoped(context.Background(), workingDirectory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +234,7 @@ func newGeneratedImageTestAuthorityWithConfiguration(t *testing.T, release relea
 		SourceProvider: release.SourceProvider, SourceRepositoryID: release.RepositoryID, SourceResolvedDigest: release.ResolvedSHA,
 		PlanSourceProvider: revision.Plan.Source.Provider, PlanSourceRepositoryID: revision.Plan.Source.RepositoryID, PlanSourceResolvedDigest: revision.Plan.Source.ResolvedDigest,
 		ArchiveSHA256: release.ArchiveSHA256, WorkspaceTreeSHA256: release.WorkspaceTreeSHA256}
-	return &generatedImageTestAuthority{db: db, repository: repository, context: ctx, scope: scope, releaseScope: releaseScope, claim: claim, request: request, release: release, revision: revision}
+	return &generatedImageTestAuthority{db: db, repository: repository, bindings: bindings, context: ctx, scope: scope, releaseScope: releaseScope, claim: claim, request: request, release: release, revision: revision, workingDirectory: workingDirectory}
 }
 
 func (f *generatedImageTestAuthority) selectBuild(t *testing.T) (*deployments.GeneratedImageExecution, deployments.GeneratedImageBuildSelection) {
