@@ -220,6 +220,12 @@ func New(db *sql.DB, dataRoot string) (*Store, error) {
 	return &Store{db: db, root: filepath.Join(dataRoot, "apps"), now: time.Now, appLocks: map[string]*appLock{}}, nil
 }
 
+// ConfiguredFor reports whether this store is bound to the exact database
+// handle used by a caller's guarded transaction boundary.
+func (s *Store) ConfiguredFor(db *sql.DB) bool {
+	return s != nil && db != nil && s.db == db
+}
+
 func (s *Store) lock(appID string) func() {
 	s.mu.Lock()
 	entry := s.appLocks[appID]

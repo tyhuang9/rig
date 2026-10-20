@@ -86,6 +86,181 @@ func TestMigrationAttemptCannotBeSilentlyRepeated(t *testing.T) {
 	value = advance(t, fixture.repository, value, PhaseStartingCandidate)
 }
 
+func TestMigrationTransactionHelpersAreAtomicAndSingleUse(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t, []string{"api"}, true, true)
+	value, _, err := fixture.repository.Begin(ctx, fixture.beginInput([]string{"api"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value = advance(t, fixture.repository, value, PhaseBuilding)
+	_ = advance(t, fixture.repository, value, PhaseMigrating)
+
+	tx, err := fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.BeginMigrationTx(ctx, tx, fixture.appID, fixture.deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	var inTransaction MigrationState
+	if err = tx.QueryRowContext(ctx, `SELECT migration_state FROM generated_runtime_deployments WHERE deployment_id=?`, fixture.deploymentID).Scan(&inTransaction); err != nil {
+		t.Fatal(err)
+	}
+	if inTransaction != MigrationRunning {
+		t.Fatalf("transaction migration state = %q", inTransaction)
+	}
+	if err = tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	rolledBack, err := fixture.repository.Get(ctx, fixture.appID, fixture.deploymentID)
+	if err != nil || rolledBack.MigrationState != MigrationPending || !rolledBack.MigrationStartedAt.IsZero() {
+		t.Fatalf("rolled back migration = %#v err=%v", rolledBack, err)
+	}
+
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.BeginMigrationTx(ctx, tx, fixture.appID, fixture.deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	started, err := fixture.repository.Get(ctx, fixture.appID, fixture.deploymentID)
+	if err != nil || started.MigrationState != MigrationRunning || started.MigrationStartedAt.IsZero() {
+		t.Fatalf("committed migration start = %#v err=%v", started, err)
+	}
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.BeginMigrationTx(ctx, tx, fixture.appID, fixture.deploymentID); !errors.Is(err, ErrInvalidTransition) {
+		_ = tx.Rollback()
+		t.Fatalf("repeated transactional begin = %v", err)
+	}
+	_ = tx.Rollback()
+
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.RecordMigrationSucceededTx(ctx, tx, fixture.appID, fixture.deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	var completedInTransaction MigrationState
+	if err = tx.QueryRowContext(ctx, `SELECT migration_state FROM generated_runtime_deployments WHERE deployment_id=?`, fixture.deploymentID).Scan(&completedInTransaction); err != nil {
+		t.Fatal(err)
+	}
+	if completedInTransaction != MigrationSucceeded {
+		t.Fatalf("transaction migration result = %q", completedInTransaction)
+	}
+	if err = tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	rolledBack, err = fixture.repository.Get(ctx, fixture.appID, fixture.deploymentID)
+	if err != nil || rolledBack.MigrationState != MigrationRunning || !rolledBack.MigrationFinishedAt.IsZero() {
+		t.Fatalf("rolled back migration result = %#v err=%v", rolledBack, err)
+	}
+
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.RecordMigrationSucceededTx(ctx, tx, fixture.appID, fixture.deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	succeeded, err := fixture.repository.Get(ctx, fixture.appID, fixture.deploymentID)
+	if err != nil || succeeded.MigrationState != MigrationSucceeded || succeeded.MigrationFinishedAt.IsZero() {
+		t.Fatalf("committed migration success = %#v err=%v", succeeded, err)
+	}
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.RecordMigrationFailedTx(ctx, tx, fixture.appID, fixture.deploymentID); !errors.Is(err, ErrInvalidTransition) {
+		_ = tx.Rollback()
+		t.Fatalf("completed migration result changed: %v", err)
+	}
+	_ = tx.Rollback()
+
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := fixture.repository.FinishMigrationPreparationTx(ctx, tx, fixture.appID, fixture.deploymentID)
+	if err != nil || next != PhaseStartingCandidate {
+		_ = tx.Rollback()
+		t.Fatalf("finish migration preparation = %q err=%v", next, err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := fixture.repository.Get(ctx, fixture.appID, fixture.deploymentID)
+	if err != nil || finished.Phase != PhaseStartingCandidate || finished.MigrationState != MigrationSucceeded {
+		t.Fatalf("finished migration preparation = %#v err=%v", finished, err)
+	}
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = fixture.repository.FinishMigrationPreparationTx(ctx, tx, fixture.appID, fixture.deploymentID); !errors.Is(err, ErrInvalidTransition) {
+		_ = tx.Rollback()
+		t.Fatalf("migration preparation advanced twice: %v", err)
+	}
+	_ = tx.Rollback()
+}
+
+func TestMigrationFailureTransactionCannotAdvancePreparation(t *testing.T) {
+	ctx := context.Background()
+	fixture := newFixture(t, []string{"api"}, true, true)
+	value, _, err := fixture.repository.Begin(ctx, fixture.beginInput([]string{"api"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value = advance(t, fixture.repository, value, PhaseBuilding)
+	_ = advance(t, fixture.repository, value, PhaseMigrating)
+
+	tx, err := fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.BeginMigrationTx(ctx, tx, fixture.appID, fixture.deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = fixture.repository.RecordMigrationFailedTx(ctx, tx, fixture.appID, fixture.deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	failed, err := fixture.repository.Get(ctx, fixture.appID, fixture.deploymentID)
+	if err != nil || failed.MigrationState != MigrationFailed || failed.MigrationFinishedAt.IsZero() || failed.Phase != PhaseMigrating {
+		t.Fatalf("failed migration = %#v err=%v", failed, err)
+	}
+	tx, err = fixture.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = fixture.repository.FinishMigrationPreparationTx(ctx, tx, fixture.appID, fixture.deploymentID); !errors.Is(err, ErrInvalidTransition) {
+		_ = tx.Rollback()
+		t.Fatalf("failed migration advanced preparation: %v", err)
+	}
+	_ = tx.Rollback()
+}
+
 func TestComponentLifecycleAndActiveHeadCAS(t *testing.T) {
 	fixture := newFixture(t, []string{"api"}, false, false)
 	value, _, err := fixture.repository.Begin(context.Background(), fixture.beginInput([]string{"api"}))

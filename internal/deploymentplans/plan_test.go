@@ -16,6 +16,33 @@ import (
 
 const planTestApp = "11111111-1111-1111-1111-111111111111"
 
+func TestStoreConfiguredForRequiresExactDatabase(t *testing.T) {
+	db := planDB(t)
+	store, err := New(db, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := database.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = foreign.Close() })
+
+	if !store.ConfiguredFor(db) {
+		t.Fatal("store rejected its exact database")
+	}
+	if store.ConfiguredFor(foreign) {
+		t.Fatal("store accepted a different database handle")
+	}
+	if store.ConfiguredFor(nil) {
+		t.Fatal("store accepted a nil database")
+	}
+	var missing *Store
+	if missing.ConfiguredFor(db) {
+		t.Fatal("nil store reported configured")
+	}
+}
+
 func TestValidateCommand(t *testing.T) {
 	for _, command := range []string{"", " \t", "npm run build\nrm -rf /", "echo\x00bad", "echo\x1bbad", strings.Repeat("x", maxCommandBytes+1)} {
 		if err := ValidateCommand(command); err == nil {
