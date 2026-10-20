@@ -85,7 +85,6 @@ func candidateCapacityTestSpec(
 			candidateSlot:                "green",
 			previousDeploymentID:         "deployment-previous",
 			previousSlot:                 "blue",
-			previousGeneration:           2,
 		},
 		components: components,
 		limits: generatedcapacity.Limits{

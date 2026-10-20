@@ -60,7 +60,6 @@ type candidateImmutablePins struct {
 	candidateSlot                string
 	previousDeploymentID         string
 	previousSlot                 string
-	previousGeneration           int64
 }
 
 type candidateCapacityGroup struct {

@@ -128,17 +128,26 @@ type Repository struct {
 	migrationProcess                           runtimeprocess.CommandRunner
 	migrationOptions                           GeneratedMigrationProcessOptions
 	migrationDockerEnv                         []string
+	candidateAuthorityRegistry                 *generatedCandidateAuthorityRegistry
 	afterGeneratedMigrationBeginCommit         func()
 	afterGeneratedMigrationConfigurationExport func(*appconfig.ExecutionConfiguration)
 }
 
-func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }
+func New(db *sql.DB) *Repository {
+	return &Repository{
+		db: db, now: time.Now,
+		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+	}
+}
 
 func NewWithExecutionGuard(db *sql.DB, guard *deploymentexecution.Guard) (*Repository, error) {
 	if db == nil || guard == nil || !guard.UsesDatabase(db) {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
-	return &Repository{db: db, executionGuard: guard, now: time.Now}, nil
+	return &Repository{
+		db: db, executionGuard: guard, now: time.Now,
+		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+	}, nil
 }
 
 // NewWithExecutionGuardAndGeneratedMigration composes the guarded repository
@@ -162,6 +171,7 @@ func NewWithExecutionGuardAndGeneratedMigration(
 		db: db, executionGuard: guard, now: time.Now,
 		migrationPlans: plans, migrationConfiguration: configuration,
 		migrationEnvironment: environment, migrationProcess: process, migrationOptions: options,
+		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
 	}
 	if err := repository.initializeGeneratedMigrationProcess(); err != nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration

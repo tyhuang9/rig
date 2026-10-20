@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"sync"
 )
 
@@ -52,10 +53,30 @@ type budgetState struct {
 // New creates a raw budget around source. Consumers that contend for the same
 // host capacity must use the same Budget instance.
 func New(source Source) (*Budget, error) {
-	if source == nil {
+	if !configuredSource(source) {
 		return nil, ErrSourceRequired
 	}
 	return &Budget{state: &budgetState{source: source}}, nil
+}
+
+// Configured reports whether the budget has an initialized capacity source.
+// The source is immutable after New, so this check performs no snapshot or
+// other external operation.
+func (b *Budget) Configured() bool {
+	return b != nil && b.state != nil && configuredSource(b.state.source)
+}
+
+func configuredSource(source Source) bool {
+	if source == nil {
+		return false
+	}
+	reflected := reflect.ValueOf(source)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return !reflected.IsNil()
+	default:
+		return true
+	}
 }
 
 // Acquire atomically reserves count equal shares. It returns one opaque lease

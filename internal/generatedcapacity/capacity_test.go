@@ -192,6 +192,39 @@ func TestNewRequiresSource(t *testing.T) {
 	if _, err := New(nil); !errors.Is(err, ErrSourceRequired) {
 		t.Fatalf("New(nil) error = %v", err)
 	}
+	var typedNil *fixedSource
+	if _, err := New(typedNil); !errors.Is(err, ErrSourceRequired) {
+		t.Fatalf("New(typed nil) error = %v", err)
+	}
+}
+
+func TestConfiguredIsReadOnlyAndSurvivesBudgetCopy(t *testing.T) {
+	snapshots := 0
+	budget, err := New(sourceFunc(func(context.Context) (Snapshot, error) {
+		snapshots++
+		return Snapshot{MemoryAvailableBytes: 1, DiskAvailableBytes: 1}, nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !budget.Configured() {
+		t.Fatal("new budget is not configured")
+	}
+	copied := *budget
+	if !copied.Configured() {
+		t.Fatal("copied budget lost its shared configuration")
+	}
+	if snapshots != 0 {
+		t.Fatalf("Configured called Snapshot %d times", snapshots)
+	}
+	var zero Budget
+	if zero.Configured() {
+		t.Fatal("zero budget is configured")
+	}
+	var missing *Budget
+	if missing.Configured() {
+		t.Fatal("nil budget is configured")
+	}
 }
 
 func TestZeroValuesFailOrReleaseSafely(t *testing.T) {
