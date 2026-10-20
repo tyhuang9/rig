@@ -5,8 +5,9 @@
 This unit extends original deployment authority to generated migration
 containers and durable migration results. Its base is the image authority
 draft at `db2b0c161635a899b2c4f303da1c8fddaf4dc557` (PR #193).
-Implementation and acceptance are in progress; the requirements below do not
-constitute completed verification.
+Implementation and local verification are complete at code commit
+`07f2bce19ecb79a736f0b361b14f02ae3df6be4b`. Actual hosted Docker and race
+acceptance remain pending; local results do not establish M4 completion.
 
 External databases remain application-owned and configured through scoped
 runtime secrets. Rig does not provision databases or manage application schemas.
@@ -101,108 +102,111 @@ termination. Deadline expiry does not release authority while a process is
 still running. Without durable container intent, this child does not grant
 cold-process cleanup or recovery; that remains E6 work.
 
-## Baseline and verification in progress
+## Local verification
 
-The clean base passed the four existing `internal/generatedmigration` parent
-tests and a package build on Windows with pinned Go 1.26.7,
-`GOTOOLCHAIN=local`, `GOFLAGS="-mod=readonly -p=1 -buildvcs=false"` and
-`CGO_ENABLED=0`.
+Verified code commit: `07f2bce19ecb79a736f0b361b14f02ae3df6be4b`.
+The later evidence-document update changes no code, test or workflow bytes.
+Logical commits preserve the primitive, private-authority, controller-adapter
+and hosted-fixture units without rewriting history.
+
+Both platform runs selected 275 top-level tests and 451 subtests across the
+complete appconfig, deploymentplans, deploymentexecution, deployments,
+generatedexecutor, generatedmigration, generatedruntime and generatedruntimestate
+packages, plus the 15 controller-composition parents.
+
+- Windows: 725 passed, one skipped, zero failed. The sole skip was
+  `TestRecoverRejectsSymlinkedOrUnrecognizedCleanupTargets`, reporting
+  `directory symlinks unavailable`.
+- Native Linux: all 726 passed, no skips or failures. This includes the case
+  unavailable on Windows.
+- Supplemental: all 14 steps passed, covering exact immutable-provider
+  discovery/execution on Windows and Linux, four-package live-tag compilation,
+  affected-package and live-tag vet, hostd build, canonical generation,
+  committed-blob gofmt and aggregate diff checks.
+
+The toolchain was pinned to Go 1.26.7, with readonly modules, serial package
+execution, `-buildvcs=false`, `-count=1` and `CGO_ENABLED=0`. Windows used
+10-minute package limits; native Linux used cross-compiled test binaries under
+WSL with five-minute limits and the pinned Node 24.19.0 binary where needed.
+These runs did not include race instrumentation.
 
 Evidence paths below are relative to
 `temp/m3-lan-external-db-20261015/m4-generated-migration-authority-verification/`.
-Receipts record exact commands, raw-log hashes and source identity.
+Harness receipts retain exact command arrays, required/discovered test names,
+source hashes and raw-log hashes. Every selected named test must have one run
+and one terminal event; missing tests or unexpected skips fail acceptance.
 
-| Evidence | Result | Receipt SHA-256 |
+| Evidence | Result | SHA-256 |
 | --- | --- | --- |
-| `baseline/receipt.json` | Four parent tests and package build passed on the clean base | `0b51882af163c3683eb18af004b7a7b0183b19fcfa458651ee650b8b04d30d54` |
-| `migration-ci-baseline/receipt.json` | Existing selector contract passed before the package addition | `57a485f1f940f5f5c3082261356db2d26b32b7008487d9e71c00dd1fcf7b5d5f` |
-| `migration-ci-final/receipt.json` | Selector contract passed with generated migration included | `81278d18e21ee297551de86bb38c338b9232745078d11dbff62d27f3dfd3c3b5` |
+| `final-native/freeze.json` | Exact commit, 30 changed paths and supporting test files frozen | `7759e8f4232d4f4f1dd275edfa224d2f58cf58f622fc0da5fccd329d42d51ae8` |
+| `final-windows-reviewed-07f2bce/receipt.json` | 725 passes, one explicit platform skip | `9e78c34aa0763a767d327fbcc899123ab13063b068454a6ba78f8b456e620672` |
+| `final-native/linux/receipt.json` | All 726 pass; no skips | `7e8ffa6f366dbff38fca05de6cb24abd64ba8c9d2bee5309703e3a034e1163f4` |
+| `final-supplemental-reviewed-07f2bce/receipt.json` | All 14 static/build/pure-integration steps pass | `d921695cec844d8a5924adcfc123f30efb48973b2be44d15172af2464e6ef55d` |
 
-The shared selector includes generated migration in Windows tests and Linux
-race tests. Each selector-contract run exercised 30 invocations, three matrices
-and 16 refusal/failure cases using the existing fake-Go harness. Those checks
-verify selection and failure behavior; they do not execute Go or establish
-race-test acceptance.
+The executable harness entry points were `run_final_windows.py run`,
+`run_final_linux.py freeze` / `run`, and `run_final_supplemental.py run`.
+Windows and supplemental commands used the exact code commit above and the
+same `final-native/freeze.json`; their output directories are listed in the
+table. Canonical generation ran
+`pwsh -NoProfile -File scripts/check-generation.ps1`.
 
-Implementation verification must include identity and same-database refusal,
-historical protected-plan behavior, copied/consumed invocation refusal,
-cancellation and scope release, lost acknowledgements, real commit followed by
-lost acknowledgement, and refusal of fabricated outcome evidence. The existing
-live migration approval and uncertainty journey remains mandatory. Additional
-actual-Docker cases must prove resumed-attempt provenance and authority loss
-between creation and start without an external database increment.
+### Review and earlier checkpoints
 
-No new migration Docker or Linux race acceptance is recorded yet.
+Independent security and aggregate integration reviews cleared the source.
+Review found and corrected ambiguity in absence evidence, missing/null or
+duplicate inspection fields, incomplete component sets, permit validation,
+fresh authority checks, parent-closing cleanup, uncertain-removal proof and
+physical image/network attestation. Passing early tests were not treated as
+proof that these gaps were absent.
 
-### Review and integration checkpoints
+Final focused observer coverage passed 24 parents and 115 subtests, including
+actual SQLite commit-then-error cases that preserve the landed result. Receipt
+`phase2/security-final-repair-receipt.json` has SHA-256
+`be03602734ad800b1fb7de989234316506a8d8a6f101e9feebaa24665fa0973c`.
+The independent raw-log/source audit is
+`phase2/security-final-root-audit.json`, SHA-256
+`ace88eabd1a8429bfd95167cc6b0707b633cb32a0e17fcf95ce9a029b0a61a3d`.
 
-The initial private-observer checkpoint passed 10 focused parents and two
-subtests, and its full deployment package passed 50 parents and 102 subtests.
-Security review nevertheless found gaps in absence classification, required
-inspection fields, physical checks before mutations, permit validation,
-component membership and observation authorization. These are being repaired;
-the initial passing tests do not establish delivery readiness.
+The clean base passed four migration parents and a package build. Primitive
+coverage passed 14 parents and 13 subtests. Controller composition passed
+15 parents and 57 subtests; the final focused executor check passed eight
+parents and 12 subtests. These are checkpoints within the complete final runs,
+not additional unique coverage.
 
-The thin runner passed nine parents and three subtests. After correcting the
-executor's durable fixture pins, eight selected executor parents and 12
-subtests passed. A new regression verifies that an uncertain runtime-state read
-preserves existing migration state and causes instead of permitting generic
-terminalization. Full integration checks must follow the observer repairs.
+Failed intermediate logs remain retained. They include an immutable-trigger
+fixture setup failure and cleanup-ordering issue, outdated executor fixture
+pins/projections, and missing test imports. The last import-only repair was
+verified by the reviewer against its previous hash. The subsequent final
+platform runs cover the corrected source. No limits were increased to make
+these checks pass.
 
-| Checkpoint evidence | SHA-256 |
-| --- | --- |
-| Initial observer `phase2/receipt.json` | `aa26f1ff2263bf68d60ea714525ca8629a8be50f7d64d5edc0e5519c4c7c92f7` |
-| Independent observer log/source audit `phase2/root-audit.json` | `a9c654a8818d13a74ea7aaac0695a81804dfa549320b7381a7775bb00080e98e` |
-| Runner checkpoint and first executor compile failure `integration-attempt-01/receipt.json` | `27d36e13403da966e2c994c055f2c167d8bf2d614fcbb065aa18794ae3a18710` |
-| Focused executor raw log `integration-attempt-05/generatedexecutor/tests.json` | `fce5e2bde8b46294e8962b60b9d1b636a901b6e7d6529197ba4a0fe18eadd859` |
-| Independent executor audit `integration-attempt-05/generatedexecutor/root-audit.json` | `780dcf4ef6214cf5fd142a89eceb2db012e3c03ff9b947de37ae11c578489f48` |
+## Hosted acceptance still required
 
-Source review cleared the executor, thin runner and controller wiring, and the
-two live-fixture files after four test-fixture fixes. The live fixture now uses
-full IDs for retained-container cleanup exclusion, canonical absence evidence,
-a context-liveness observation at executor return and snapshot copies that
-preserve empty slices. Compilation and real Docker execution remain pending.
+The migration workflow has two fixed Docker matrix entries: the existing
+approval/RUN-08 journey and authority revocation before start. Both retain the
+existing 45-minute job, 32-minute step and 31-minute Go limits and run the
+immutable-provider parent. The workflow requires exactly one run/pass for each
+required parent and rejects skipped or failed test evidence.
 
-### Primitive checkpoint
+The revocation fixture resumes at the original attempt, observes actual
+container creation, then changes the durable job attempt while the original
+context remains live. It requires no subsequent start, wait or removal call,
+no external database increment, unchanged deployment/runtime/component
+snapshots and an unstarted owned container before explicit fixture teardown.
+The existing RUN-08 interruption remains after production runner return and
+before durable result persistence; reopening must perform zero further
+migration runner calls and preserve the external ledger.
 
-Local commit `b3da2ff1b17989fe94de2132dc4a26397c1ee6d3` contains the exact-database
-store checks, fixed cleanup child and migration transaction helpers. Its
-selected Windows tests passed 14 parents and 13 child tests with Go 1.26.7
-(`GOTOOLCHAIN=go1.26.7`, readonly modules, serial package execution, CGO disabled).
-This is focused primitive coverage, not full-package or hosted acceptance.
+A Bash/fake-Go replay using actual jq 1.7.1 passed 34 selector cases: two valid
+and 32 expected refusals. Receipt `live-workflow-contract/receipt.json` has
+SHA-256 `3ebb0b5b230922ed3cc70cf220232bfd3b93070b23c91e6390d11f1263cfef66`.
+The runtime selector contract passed 30 invocations, three matrices and
+16 refusal/failure cases, including the added migration package. These
+contract checks executed neither Go nor Docker. The final supplemental run
+compiled the live fixtures but did not execute actual Docker.
 
-The evidence receipt is `phase1/receipt.json`, SHA-256
-`8818b76be59fd9134a5a7d263991bbf6ccb1e4e3dbe803d5a78ab6f794191703`.
-An independent raw-log/source audit confirmed every selected parent ran and
-passed exactly once, with no skips/failures, and all evidence hashes matched:
-`phase1/root-audit.json`, SHA-256
-`72705ce189ae41849362a955a8f26365deec7dcb14328bd69ecfda536b6d3ba1`.
-
-Earlier guard test attempts are retained. A deliberate missing-provenance
-fixture initially hit the immutable-identity trigger before reaching the guard;
-its first attempt also exposed incorrect test cleanup ordering and was stopped.
-The fixture was corrected using the existing corruption-test pattern, and
-cleanup ordering was fixed before the passing runs. Later tests cover expiry
-without renewal and an existing child working while only its parent closes.
-
-Security review cleared this primitive scope. It does not establish the
-phase-two owner's actual process join, full policy/runtime checks, or outcome
-evidence.
-
-### Hosted gate selection checkpoint
-
-The migration workflow has separate fixed matrix entries for RUN-08 and
-authority revocation before start. Each keeps the existing job, step and Go
-timeouts, runs the immutable-provider parent and selected journey, and requires
-exactly one run/pass per parent with no package skip or failure.
-
-A Bash/fake-Go contract replay using actual jq 1.7.1 passed 34 cases: two valid
-selections and 32 expected refusals, including missing/duplicate test events,
-wrong packages, skipped/failed children, nonzero Go status and malformed output.
-Receipt: `live-workflow-contract/receipt.json`, SHA-256
-`3ebb0b5b230922ed3cc70cf220232bfd3b93070b23c91e6390d11f1263cfef66`.
-This check executed neither Go nor Docker. The new live parent and actual
-hosted acceptance remain pending.
+Actual Docker execution, Linux race results and hosted review must be checked
+against the published head. No live controller was activated for these checks.
 
 ## Rollback and remaining limits
 
