@@ -1,0 +1,304 @@
+name: Hostd Compose apply CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: "true"
+  CGO_ENABLED: "0"
+  GOFLAGS: -mod=readonly -p=1 -buildvcs=false
+  GOTOOLCHAIN: local
+
+jobs:
+  ordinary-compose-apply:
+    name: Disposable ordinary Compose apply verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out source
+        timeout-minutes: 2
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        timeout-minutes: 3
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6.1.0
+        with:
+          go-version: 1.26.7
+          cache: false
+
+      - name: Prepare safe evidence and revision provenance
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/hosting-compose-apply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          install -d -m 700 "$evidence"
+          git rev-parse HEAD > "$evidence/checked-out-commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$evidence/checked-out-tree.txt"
+          go version > "$evidence/go-version.txt"
+          printf '%s\n' '${{ github.event.pull_request.head.sha }}' > "$evidence/event-pr-head.txt"
+          printf '%s\n' '${{ github.event.pull_request.base.sha }}' > "$evidence/event-pr-base.txt"
+          printf '%s\n' 'checked-out commit/tree may be the pull-request merge tree; event-pr-head is recorded separately.' > "$evidence/checkout-provenance.txt"
+          printf 'RIG_LIVE_COMPOSE_APPLY_EVIDENCE_DIR=%s\n' "$evidence" >> "$GITHUB_ENV"
+          printf 'RIG_LIVE_COMPOSE_APPLY_RUN_TOKEN=%s-%s\n' "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_ENV"
+
+      - name: Record Docker and reviewed fixture image metadata
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RIG_LIVE_COMPOSE_APPLY_EVIDENCE_DIR"
+          image='node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5'
+          if [[ -n "${DOCKER_HOST:-}" || -n "${DOCKER_CONTEXT:-}" || -n "${DOCKER_CONFIG:-}" || -n "${DOCKER_TLS:-}" || -n "${DOCKER_TLS_VERIFY:-}" || -n "${DOCKER_CERT_PATH:-}" || -n "${DOCKER_API_VERSION:-}" ]]; then
+            printf '%s\n' 'Docker endpoint override is not permitted for ordinary Compose acceptance' >&2
+            exit 1
+          fi
+          if [[ "$(docker context show)" != "default" ]] || [[ "$(docker context inspect default --format '{{.Endpoints.docker.Host}}')" != unix:///* ]]; then
+            printf '%s\n' 'ordinary Compose acceptance requires the default local Unix Docker context' >&2
+            exit 1
+          fi
+          docker version --format 'Docker CLI={{.Client.Version}} Engine={{.Server.Version}} API={{.Server.APIVersion}}' > "$evidence/docker-version.txt"
+          docker compose version > "$evidence/docker-compose-version.txt"
+          docker image pull "$image" > "$evidence/image-pull.txt"
+          docker image inspect --format '{{.Id}} {{range .RepoDigests}}{{.}}{{end}}' "$image" > "$evidence/image-identity.txt"
+
+      - name: Verify pure Compose evidence contracts with exact discovery
+        timeout-minutes: 4
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RIG_LIVE_COMPOSE_APPLY_EVIDENCE_DIR"
+          output="$evidence/pure-contracts.json"
+          package_name='github.com/hostd/hostd/cmd/hostd'
+          test_names='["TestHostdComposeLiveObserverClassification","TestHostdComposeLiveEvidenceRedaction","TestHostdComposeLiveOwnershipManifest"]'
+          set +e
+          go test -json -v -count=1 -timeout=3m ./cmd/hostd -run '^TestHostdComposeLive(ObserverClassification|EvidenceRedaction|OwnershipManifest)$' | tee "$output"
+          status=("${PIPESTATUS[@]}")
+          set -e
+          if (( ${status[0]:-1} != 0 || ${status[1]:-1} != 0 )); then
+            printf '%s\n' 'pure Compose evidence contract command failed' >&2
+            exit 1
+          fi
+          jq -e -s --arg package_name "$package_name" --argjson test_names "$test_names" '
+            . as $events |
+            def hits($action; $test): [ $events[] | select(.Action == $action and .Package == $package_name and .Test == $test) ] | length;
+            ($test_names | all(.[]; . as $test | hits("run"; $test) == 1 and hits("pass"; $test) == 1 and hits("fail"; $test) == 0 and hits("skip"; $test) == 0)) and
+            ([ $events[] | select(.Package == $package_name and (.Action == "fail" or .Action == "skip")) ] | length == 0) and
+            ([ $events[] | select(.Package == $package_name and .Action == "pass" and .Test == null) ] | length == 1)
+          ' "$output" > /dev/null
+
+      - name: Exercise ordinary Compose apply with exact live discovery
+        timeout-minutes: 16
+        shell: bash
+        env:
+          RIG_RUN_LIVE_COMPOSE_APPLY: "1"
+        run: |
+          set -euo pipefail
+          evidence="$RIG_LIVE_COMPOSE_APPLY_EVIDENCE_DIR"
+          output="$evidence/live-journey.json"
+          package_name='github.com/hostd/hostd/cmd/hostd'
+          test_names='["TestLiveHostdComposeApplyJourney","TestLiveHostdComposeApplyJourney/Success","TestLiveHostdComposeApplyJourney/UnhealthyRetainsRuntime","TestLiveHostdComposeApplyJourney/AttemptLostBeforeUp","TestLiveHostdComposeApplyJourney/AttemptLostAfterUp"]'
+          set +e
+          go test -tags live_docker -json -v -count=1 -timeout=15m ./cmd/hostd -run '^TestLiveHostdComposeApplyJourney$' | tee "$output"
+          status=("${PIPESTATUS[@]}")
+          set -e
+          if (( ${status[0]:-1} != 0 || ${status[1]:-1} != 0 )); then
+            printf '%s\n' 'ordinary Compose live journey command failed' >&2
+            exit 1
+          fi
+          jq -e -s --arg package_name "$package_name" --argjson test_names "$test_names" '
+            . as $events |
+            def hits($action; $test): [ $events[] | select(.Action == $action and .Package == $package_name and .Test == $test) ] | length;
+            ($test_names | all(.[]; . as $test | hits("run"; $test) == 1 and hits("pass"; $test) == 1 and hits("fail"; $test) == 0 and hits("skip"; $test) == 0)) and
+            ([ $events[] | select(.Package == $package_name and (.Action == "fail" or .Action == "skip")) ] | length == 0) and
+            ([ $events[] | select(.Package == $package_name and .Action == "pass" and .Test == null) ] | length == 1)
+          ' "$output" > /dev/null
+
+      - name: Verify ordinary Compose receipts
+        if: ${{ !cancelled() }}
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RIG_LIVE_COMPOSE_APPLY_EVIDENCE_DIR"
+          shopt -s nullglob
+          receipts=("$evidence"/receipt-*.json)
+          (( ${#receipts[@]} == 4 ))
+          jq -e -s --arg run_token "$RIG_LIVE_COMPOSE_APPLY_RUN_TOKEN" '
+            length == 4 and
+            ([.[] | select(
+              .version == 1 and .runToken == $run_token and .cleanupSucceeded == true and
+              .requestSecretSeen == false and .outputSecretSeen == false and .executorCalled == true and
+              .completionDisposition == "completed" and .pauseDisposition == "none" and
+              .deploymentDiagnosticCode == "none"
+            )] | length == 4) and
+            ([.[] | select(
+              .case == "Success" and .configCalls == 1 and .upCalls == 1 and
+              .upExited == false and (.upExitCode // 0) == 0 and .upTimedOut == false and .upOutputTruncated == false and
+              .completionCode == "deployment_completed" and .jobStatus == "succeeded" and .jobAttempt == 1 and .jobErrorCode == "none" and
+              .deploymentStatus == "succeeded" and .containerObserved == true and .networkObserved == true and
+              (.configModelSha256 | test("^[0-9a-f]{64}$")) and .configModelSha256 == .effectiveSha256
+            )] | length == 1) and
+            ([.[] | select(
+              .case == "UnhealthyRetainsRuntime" and .configCalls == 1 and .upCalls == 1 and
+              .upExited == true and .upExitCode > 0 and .upTimedOut == false and .upOutputTruncated == false and
+              .completionCode == "none" and .jobStatus == "failed" and .jobAttempt == 1 and .jobErrorCode == "compose_apply_failed" and
+              .deploymentStatus == "applying" and .containerObserved == true and .networkObserved == true and
+              (.configModelSha256 | test("^[0-9a-f]{64}$")) and .configModelSha256 == .effectiveSha256
+            )] | length == 1) and
+            ([.[] | select(
+              .case == "AttemptLostBeforeUp" and .configCalls == 1 and .upCalls == 0 and
+              .upExited == false and (.upExitCode // 0) == 0 and .upTimedOut == false and .upOutputTruncated == false and
+              .completionCode == "none" and .jobStatus == "failed" and .jobAttempt == 2 and .jobErrorCode == "runtime_unavailable" and
+              .deploymentStatus == "applying" and .containerObserved == false and .networkObserved == false and .attemptAdvanceSeen == false
+            )] | length == 1) and
+            ([.[] | select(
+              .case == "AttemptLostAfterUp" and .configCalls == 1 and .upCalls == 1 and
+              .upExited == false and (.upExitCode // 0) == 0 and .upTimedOut == false and .upOutputTruncated == false and
+              .completionCode == "none" and .jobStatus == "failed" and .jobAttempt == 2 and .jobErrorCode == "runtime_unavailable" and
+              .deploymentStatus == "applying" and .containerObserved == true and .networkObserved == true and .attemptAdvanceSeen == true and
+              (.configModelSha256 | test("^[0-9a-f]{64}$")) and .configModelSha256 == .effectiveSha256
+            )] | length == 1)
+          ' "${receipts[@]}" > /dev/null
+
+      - name: Remove only verified ordinary Compose resources
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RIG_LIVE_COMPOSE_APPLY_EVIDENCE_DIR"
+          run_token="$RIG_LIVE_COMPOSE_APPLY_RUN_TOKEN"
+          ownership='io.rig.hostd-compose-live'
+          run_label='io.rig.hostd-compose-live-run'
+          case_label='io.rig.hostd-compose-live-case'
+          app_label='io.rig.hostd-compose-live-app'
+          cleanup_failed=0
+          if [[ -n "${DOCKER_HOST:-}" || -n "${DOCKER_CONTEXT:-}" || -n "${DOCKER_CONFIG:-}" || -n "${DOCKER_TLS:-}" || -n "${DOCKER_TLS_VERIFY:-}" || -n "${DOCKER_CERT_PATH:-}" || -n "${DOCKER_API_VERSION:-}" ]]; then
+            printf '%s\n' 'Docker endpoint override is not permitted for ordinary Compose cleanup' >&2
+            exit 1
+          fi
+          if ! current_context="$(docker context show 2>/dev/null)" || ! endpoint="$(docker context inspect default --format '{{.Endpoints.docker.Host}}' 2>/dev/null)" || [[ "$current_context" != "default" || "$endpoint" != unix:///* ]]; then
+            printf '%s\n' 'ordinary Compose cleanup requires the default local Unix Docker context' >&2
+            exit 1
+          fi
+          shopt -s nullglob
+          manifests=("$evidence"/manifest-*.json)
+          containers="$(docker ps -aq --no-trunc --filter "label=${ownership}=1" --filter "label=${run_label}=${run_token}")"
+          networks="$(docker network ls -q --no-trunc --filter "label=${ownership}=1" --filter "label=${run_label}=${run_token}")"
+          if (( ${#manifests[@]} == 0 )); then
+            if [[ -n "$containers" || -n "$networks" ]]; then
+              printf '%s\n' 'ordinary Compose manifests are absent; retaining exact-run resources' >&2
+              exit 1
+            fi
+            exit 0
+          fi
+          manifest_matches_container() {
+            local expected_id="$1" resource="$2" manifest
+            for manifest in "${manifests[@]}"; do
+              if jq -e --arg run "$run_token" --arg ownership "$ownership" --arg run_label "$run_label" --arg case_label "$case_label" --arg app_label "$app_label" --arg expected_id "$expected_id" --argjson resource "$resource" '
+                .version == 1 and (.runToken | type == "string" and test("^[0-9]+-[0-9]+$")) and .runToken == $run and
+                (.case | type == "string" and test("^[A-Za-z][A-Za-z0-9]*$")) and
+                (.appID | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")) and
+                .project == ("rig-" + (.appID | gsub("-"; ""))) and .service == "app" and .networkName == (.project + "_default") and
+                $resource.id == $expected_id and $resource.labels[$ownership] == "1" and $resource.labels[$run_label] == .runToken and
+                $resource.labels[$case_label] == .case and $resource.labels[$app_label] == .appID and
+                $resource.labels["com.docker.compose.project"] == .project and $resource.labels["com.docker.compose.service"] == .service
+              ' "$manifest" > /dev/null; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          manifest_matches_network() {
+            local expected_id="$1" resource="$2" manifest
+            for manifest in "${manifests[@]}"; do
+              if jq -e --arg run "$run_token" --arg ownership "$ownership" --arg run_label "$run_label" --arg case_label "$case_label" --arg app_label "$app_label" --arg expected_id "$expected_id" --argjson resource "$resource" '
+                .version == 1 and (.runToken | type == "string" and test("^[0-9]+-[0-9]+$")) and .runToken == $run and
+                (.case | type == "string" and test("^[A-Za-z][A-Za-z0-9]*$")) and
+                (.appID | type == "string" and test("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")) and
+                .project == ("rig-" + (.appID | gsub("-"; ""))) and .service == "app" and .networkName == (.project + "_default") and
+                $resource.id == $expected_id and $resource.name == .networkName and ($resource.containers | type == "object" and length == 0) and
+                $resource.labels[$ownership] == "1" and $resource.labels[$run_label] == .runToken and $resource.labels[$case_label] == .case and
+                $resource.labels[$app_label] == .appID and $resource.labels["com.docker.compose.project"] == .project and $resource.labels["com.docker.compose.network"] == "default"
+              ' "$manifest" > /dev/null; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          while IFS= read -r id; do
+            [[ -z "$id" ]] && continue
+            if [[ ! "$id" =~ ^[0-9a-f]{64}$ ]]; then
+              printf '%s\n' 'ordinary Compose container has a noncanonical ID; retaining resource' >&2
+              cleanup_failed=1
+              continue
+            fi
+            resource="$(docker container inspect --format '{"id":{{json .Id}},"labels":{{json .Config.Labels}}}' "$id" 2>/dev/null || true)"
+            if [[ -z "$resource" ]] || ! manifest_matches_container "$id" "$resource"; then
+              printf '%s\n' 'ordinary Compose container ownership is uncertain; retaining resource' >&2
+              cleanup_failed=1
+              continue
+            fi
+            if ! docker container rm --force "$id" > /dev/null; then
+              printf '%s\n' 'remove exact ordinary Compose container failed' >&2
+              cleanup_failed=1
+            fi
+          done <<< "$containers"
+          while IFS= read -r id; do
+            [[ -z "$id" ]] && continue
+            if [[ ! "$id" =~ ^[0-9a-f]{64}$ ]]; then
+              printf '%s\n' 'ordinary Compose network has a noncanonical ID; retaining resource' >&2
+              cleanup_failed=1
+              continue
+            fi
+            resource="$(docker network inspect --format '{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Labels}},"containers":{{json .Containers}}}' "$id" 2>/dev/null || true)"
+            if [[ -z "$resource" ]] || ! manifest_matches_network "$id" "$resource"; then
+              printf '%s\n' 'ordinary Compose network ownership is uncertain or nonempty; retaining resource' >&2
+              cleanup_failed=1
+              continue
+            fi
+            if ! docker network rm "$id" > /dev/null; then
+              printf '%s\n' 'remove exact empty ordinary Compose network failed' >&2
+              cleanup_failed=1
+            fi
+          done <<< "$networks"
+          remaining_containers="$(docker ps -aq --no-trunc --filter "label=${ownership}=1" --filter "label=${run_label}=${run_token}")"
+          remaining_networks="$(docker network ls -q --no-trunc --filter "label=${ownership}=1" --filter "label=${run_label}=${run_token}")"
+          if (( cleanup_failed != 0 )) || [[ -n "$remaining_containers" || -n "$remaining_networks" ]]; then
+            printf '%s\n' 'ordinary Compose exact-run cleanup is incomplete' >&2
+            exit 1
+          fi
+
+      - name: Upload safe ordinary Compose evidence
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/checked-out-commit.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/checked-out-tree.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/event-pr-head.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/event-pr-base.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/checkout-provenance.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/go-version.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/docker-version.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/docker-compose-version.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/image-pull.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/image-identity.txt
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/pure-contracts.json
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/live-journey.json
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/manifest-*.json
+            ${{ runner.temp }}/hosting-compose-apply-${{ github.run_id }}-${{ github.run_attempt }}/receipt-*.json
+          if-no-files-found: error
+          retention-days: 7
