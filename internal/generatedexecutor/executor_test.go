@@ -225,8 +225,8 @@ func (f *fakeCompiler) Compile(ctx context.Context, request generatedimage.Compi
 		if err != nil {
 			return generatedimage.Artifact{}, err
 		}
-		selected, ok := execution.SelectedArtifact()
-		if !ok {
+		selected, _ = execution.SelectedArtifact()
+		if selected.ID == "" {
 			return generatedimage.Artifact{}, deployments.ErrInvalidDeployment
 		}
 		return selected, nil
