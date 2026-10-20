@@ -7,11 +7,16 @@ package liveauthority
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/applifecycle"
@@ -38,9 +43,10 @@ type Authority struct {
 }
 
 type boundCandidate struct {
-	spec     generatedruntime.CandidateSpec
-	jobID    string
-	finished bool
+	spec           generatedruntime.CandidateSpec
+	componentNames []string
+	jobID          string
+	finished       bool
 }
 
 // New constructs a concrete guarded deployments repository on db and keeps a
@@ -105,11 +111,24 @@ func (a *Authority) Repository() *deployments.Repository { return a.repository }
 // returns the original scoped context and typed network request for spec.
 func (a *Authority) BindCandidate(t *testing.T, parent context.Context, spec generatedruntime.CandidateSpec) (context.Context, generatedruntime.CandidateSpec) {
 	t.Helper()
+	return a.BindCandidateAggregate(t, parent, spec, []string{spec.ComponentName})
+}
+
+// BindCandidateAggregate persists the same direct-live authority as
+// BindCandidate while binding runtime state to every component in the accepted
+// plan. spec.ComponentName identifies the concrete candidate exercised by the
+// caller and must be a member of componentNames.
+func (a *Authority) BindCandidateAggregate(t *testing.T, parent context.Context, spec generatedruntime.CandidateSpec, componentNames []string) (context.Context, generatedruntime.CandidateSpec) {
+	t.Helper()
+	components, ok := canonicalCandidateComponents(spec, componentNames)
+	if !ok {
+		t.Fatal("direct live candidate component is not an exact member of the accepted runtime aggregate")
+	}
 	if existing := a.bound[spec.DeploymentID]; existing != nil {
 		expected, supplied := existing.spec, spec
 		expected.Network = deployments.GeneratedNetworkRequest{}
 		supplied.Network = deployments.GeneratedNetworkRequest{}
-		if !reflect.DeepEqual(expected, supplied) {
+		if !reflect.DeepEqual(expected, supplied) || !reflect.DeepEqual(existing.componentNames, components) {
 			t.Fatal("direct live deployment identity was reused with different immutable candidate authority")
 		}
 		return deploymenteffects.WithScope(parent, a.scope), existing.spec
@@ -139,7 +158,7 @@ func (a *Authority) BindCandidate(t *testing.T, parent context.Context, spec gen
 	if _, err := a.db.Exec(`INSERT OR IGNORE INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES(?,?,?,?,?,?,0,0)`, spec.ConfigurationRevisionID, spec.AppID, spec.ConfigurationRevisionNumber, "direct-live:"+spec.ConfigurationRevisionID, a.actorID, stamp); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.db.Exec(`INSERT OR IGNORE INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at) VALUES(?,?,?,?,'generated_node','direct-live','1',?,'local',0,?,?,1,0,'',?,?,'accepted',?,?)`, spec.DeploymentPlanRevisionID, spec.AppID, spec.DeploymentPlanRevisionNumber, "direct-live:"+spec.DeploymentPlanRevisionID, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64), a.actorID, stamp, a.actorID, stamp); err != nil {
+	if _, err := a.db.Exec(`INSERT OR IGNORE INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at) VALUES(?,?,?,?,'generated_node','direct-live','1',?,'local',0,?,?,?,0,'',?,?,'accepted',?,?)`, spec.DeploymentPlanRevisionID, spec.AppID, spec.DeploymentPlanRevisionNumber, "direct-live:"+spec.DeploymentPlanRevisionID, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64), len(components), a.actorID, stamp, a.actorID, stamp); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.db.Exec(`INSERT OR IGNORE INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,?,?,?)`, spec.ReleaseID, spec.AppID, stamp, strings.Repeat("4", 64), strings.Repeat("5", 64), spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber); err != nil {
@@ -174,7 +193,7 @@ func (a *Authority) BindCandidate(t *testing.T, parent context.Context, spec gen
 		ReleaseID:                    spec.ReleaseID,
 		DeploymentPlanRevisionID:     spec.DeploymentPlanRevisionID,
 		DeploymentPlanRevisionNumber: spec.DeploymentPlanRevisionNumber,
-		ComponentNames:               []string{spec.ComponentName},
+		ComponentNames:               components,
 	})
 	if err != nil || !createdRuntime {
 		t.Fatalf("begin direct live generated runtime: created=%t error=%v", createdRuntime, err)
@@ -197,7 +216,7 @@ func (a *Authority) BindCandidate(t *testing.T, parent context.Context, spec gen
 		DeploymentPlanRevisionID:     spec.DeploymentPlanRevisionID,
 		DeploymentPlanRevisionNumber: spec.DeploymentPlanRevisionNumber,
 	}
-	bound := &boundCandidate{spec: spec, jobID: created.Job.ID}
+	bound := &boundCandidate{spec: spec, componentNames: components, jobID: created.Job.ID}
 	a.bound[spec.DeploymentID] = bound
 	a.currentByApp[spec.AppID] = bound
 	return boundContext, spec
@@ -214,29 +233,51 @@ func (a *Authority) FinishCandidate(t *testing.T, deploymentID string) {
 	if bound.finished {
 		return
 	}
+	if len(bound.componentNames) != 1 || bound.componentNames[0] != bound.spec.ComponentName {
+		t.Fatal("direct live aggregate candidate requires explicit synthetic-unstarted component history")
+	}
+	a.finishCandidate(t, bound, nil)
+}
+
+// FinishCandidateWithSyntheticUnstartedComponents finalizes direct-engine
+// replacement history when the live fixture intentionally starts only the
+// concrete component named by CandidateSpec. Every other accepted component
+// must be listed explicitly. Their canonical runtime rows are synthetic test
+// history and do not attest that those components ran in Docker.
+func (a *Authority) FinishCandidateWithSyntheticUnstartedComponents(t *testing.T, deploymentID string, unstartedComponentNames []string) {
+	t.Helper()
+	bound := a.bound[deploymentID]
+	if bound == nil {
+		t.Fatal("direct live generated deployment is not bound")
+	}
+	if bound.finished {
+		return
+	}
+	expected := make([]string, 0, len(bound.componentNames)-1)
+	for _, componentName := range bound.componentNames {
+		if componentName != bound.spec.ComponentName {
+			expected = append(expected, componentName)
+		}
+	}
+	provided := append([]string(nil), unstartedComponentNames...)
+	sort.Strings(provided)
+	if len(expected) == 0 || !reflect.DeepEqual(expected, provided) {
+		t.Fatal("synthetic direct live component history does not exactly cover the unstarted accepted components")
+	}
+	a.finishCandidate(t, bound, provided)
+}
+
+func (a *Authority) finishCandidate(t *testing.T, bound *boundCandidate, syntheticComponentNames []string) {
+	t.Helper()
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
 	spec := bound.spec
-	if _, err := a.db.Exec(`INSERT OR IGNORE INTO generated_image_artifacts(id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,'direct-live',?,1,?,'ready',?,?,?)`, spec.ArtifactID, spec.ReleaseID, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber, spec.ComponentName, spec.BuildDefinitionDigest, spec.ImageContentID, stamp, stamp, stamp); err != nil {
-		t.Fatal(err)
-	}
-	component, err := a.runtime.SetImageReady(context.Background(), spec.AppID, spec.DeploymentID, spec.ComponentName, spec.ArtifactID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	description, err := generatedruntime.DescribeInactiveCandidate(spec.AppID, spec.ComponentName, spec.ActiveSlot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	component, err = a.runtime.SetContainerStarting(context.Background(), spec.AppID, spec.DeploymentID, spec.ComponentName, description.ContainerName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	component, err = a.runtime.SetContainerRunning(context.Background(), spec.AppID, spec.DeploymentID, spec.ComponentName, strings.Repeat("8", 64))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.runtime.AdvanceComponent(context.Background(), spec.AppID, spec.DeploymentID, spec.ComponentName, component.State, generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatal(err)
+	a.finishComponent(t, spec, spec.ComponentName, spec.ArtifactID, spec.BuildDefinitionDigest, spec.ImageContentID, strings.Repeat("8", 64), stamp)
+	for _, componentName := range syntheticComponentNames {
+		artifactID := uuid.NewString()
+		definitionDigest := fmt.Sprintf("%x", sha256.Sum256([]byte("direct-live-definition:"+spec.DeploymentID+":"+componentName)))
+		imageContentID := "sha256:" + fmt.Sprintf("%x", sha256.Sum256([]byte("direct-live-image:"+spec.DeploymentID+":"+componentName)))
+		containerID := fmt.Sprintf("%x", sha256.Sum256([]byte("direct-live-container:"+spec.DeploymentID+":"+componentName)))
+		a.finishComponent(t, spec, componentName, artifactID, definitionDigest, imageContentID, containerID, stamp)
 	}
 	runtimeDeployment, err := a.runtime.Get(context.Background(), spec.AppID, spec.DeploymentID)
 	if err != nil {
@@ -265,6 +306,62 @@ func (a *Authority) FinishCandidate(t *testing.T, deploymentID string) {
 		t.Fatal(err)
 	}
 	bound.finished = true
+}
+
+func (a *Authority) finishComponent(t *testing.T, spec generatedruntime.CandidateSpec, componentName, artifactID, definitionDigest, imageContentID, containerID, stamp string) {
+	t.Helper()
+	if _, err := a.db.Exec(`INSERT OR IGNORE INTO generated_image_artifacts(id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,'direct-live',?,1,?,'ready',?,?,?)`, artifactID, spec.ReleaseID, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber, componentName, definitionDigest, imageContentID, stamp, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	component, err := a.runtime.SetImageReady(context.Background(), spec.AppID, spec.DeploymentID, componentName, artifactID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	description, err := generatedruntime.DescribeInactiveCandidate(spec.AppID, componentName, spec.ActiveSlot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	component, err = a.runtime.SetContainerStarting(context.Background(), spec.AppID, spec.DeploymentID, componentName, description.ContainerName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	component, err = a.runtime.SetContainerRunning(context.Background(), spec.AppID, spec.DeploymentID, componentName, containerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.runtime.AdvanceComponent(context.Background(), spec.AppID, spec.DeploymentID, componentName, component.State, generatedruntimestate.ComponentHealthy); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func canonicalCandidateComponents(spec generatedruntime.CandidateSpec, componentNames []string) ([]string, bool) {
+	if spec.ComponentName == "" || len(componentNames) < 1 || len(componentNames) > 64 {
+		return nil, false
+	}
+	components := append([]string(nil), componentNames...)
+	sort.Strings(components)
+	foundCandidate := false
+	for index, componentName := range components {
+		if !validCandidateComponentName(componentName) || (index > 0 && components[index-1] == componentName) {
+			return nil, false
+		}
+		if componentName == spec.ComponentName {
+			foundCandidate = true
+		}
+	}
+	return components, foundCandidate
+}
+
+func validCandidateComponentName(value string) bool {
+	if !utf8.ValidString(value) || value == "" || len(value) > 256 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if character == 0 || unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
 }
 
 // RejectCandidate records a failed candidate and restores the accepted
