@@ -61,6 +61,37 @@ The local result covers pure contracts and live-tag compilation/vetting. Actual 
 
 ## Running and rollback
 
+### Hosted result and Windows fixture correction, 2026-10-20
+
+At draft head `7873f7e895658b790afaf11710cbb15fb11b3b08`, the
+[ordinary Compose Docker job](https://github.com/tyhuang9/rig/actions/runs/39176960805/job/117821490478)
+passed all four journey cases and the three pure contracts. Its actual checkout
+was `bdb2ee54e58b2a72496e90df1864708d582cab6a`, with the same tree as the draft
+head (`cad0c606dfaefb3c7757ed6bd174cb02925ed940`). The negative cases intentionally
+fail their controller jobs; their passing tests establish the expected refusal
+and retention behavior. Exact ownership cleanup and the zero-resource census
+passed. Retained log SHA-256:
+`742b6a36564e7a8c5cd304232a8dfe4c65afbe846cc3cc7c47363e90214499e4`.
+
+The separate Windows core job failed the pure ownership-manifest test. Windows
+runner temporary paths can use short aliases, while the strict writer requires
+a canonical directory. The test now resolves its own temporary directory before
+calling that writer. Writer validation, create-only writes, and symlink rejection
+are unchanged. The failure log is retained with SHA-256
+`1b72b75845f58925528f219c5813bf7af502bd24f67825e6774568d9bc2a8263`.
+
+The corrected pure contracts passed on Windows with Go 1.26.7:
+`go test -json -count=1 -timeout=2m ./cmd/hostd -run '^TestHostdComposeLive(ObserverClassification|EvidenceRedaction|OwnershipManifest)$'`.
+Exactly three parents ran and passed without skips. Log SHA-256:
+`5cddd53c7bc436d2487406bc8af54318d166f3243cde3d5208a20190fdca8817`.
+The same three parents passed under native Linux using a cross-compiled binary
+and `go tool test2json`; log SHA-256:
+`53d89b4268504707823f48e7b7a89e90374087da964bca90c1541f2576faedb8`.
+Independent source review passed. Hosted Windows verification of the correction
+is still required. Two unrelated repository-race packages also exhausted their
+40-minute package budgets during fresh database migration setup; that repair is
+separate. This is not an all-CI or full-lifecycle acceptance claim.
+
 The dedicated workflow is `.github/workflows/hosting-compose-apply-ci.yml`. Its Go toolchain is pinned to 1.26.7 with readonly modules and CGO disabled. Reproduction requires a disposable Linux Docker host and the preflight described above; do not run against an active controller's data or runtime. The workflow itself specifies setup, exact test selectors, assertions and cleanup.
 
 Before the first hosted pass, this branch remains an acceptance-gate candidate. Retain failed receipts and exact checkout provenance when repairing it. Disabling the new workflow removes this acceptance signal without changing production behavior. Any cleanup after interrupted execution must still verify the manifest and exact ownership; uncertainty means retain resources.

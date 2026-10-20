@@ -165,7 +165,12 @@ func TestHostdComposeLiveEvidenceRedaction(t *testing.T) {
 }
 
 func TestHostdComposeLiveOwnershipManifest(t *testing.T) {
-	directory := t.TempDir()
+	// Windows may spell the runner's temporary parent with an 8.3 alias.
+	// Give the strict writer a canonical fixture path.
+	directory, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal("resolve fixture evidence directory")
+	}
 	value := composeLiveManifest{
 		Version: 1, RunToken: "123-4", Case: "Success",
 		AppID:   "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
@@ -174,7 +179,7 @@ func TestHostdComposeLiveOwnershipManifest(t *testing.T) {
 	}
 	path, err := composeLiveWriteManifest(directory, value)
 	if err != nil {
-		t.Fatal("write ownership manifest")
+		t.Fatalf("write ownership manifest: %v", err)
 	}
 	if _, err := composeLiveWriteManifest(directory, value); err == nil {
 		t.Fatal("manifest reuse was accepted")
