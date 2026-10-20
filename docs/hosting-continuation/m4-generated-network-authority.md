@@ -65,6 +65,34 @@ Repair evidence is in `m4-lifecycle-coordinator-verification/network-live-caller
 
 ## Limits and rollback
 
+### Hosted fixture scope correction, 2026-10-20
+
+At draft head `52237ff47b70b358cf53e6525cf78bcf23b5dedf`, the rebind fixtures
+retained a deployment-effects lease until test cleanup. A second authority or
+later rebind operation then waited for the same controller lock.
+The [cross-store proposal job](https://github.com/tyhuang9/rig/actions/runs/39176943527/job/117822637547)
+timed out in `AcquireScoped` called by `liveGeneratedDeployments`; its retained
+log SHA-256 is `ccf9182daa7ebcecfb4d71f12423e790ef1c06a315a4efb038ecf19a65bbb1a6`.
+The successor-network stage also exhausted its bounded context.
+
+Only the test helper changes: authority construction no longer acquires a lease.
+Candidate creation and start acquire a real scope using the caller's context and
+release it on return, including test failure. Health observations use the
+original context afterward. The same concrete guarded repository, original
+Claim and persisted provenance remain required.
+
+Pinned Go 1.26.7 Windows verification passed exactly two parents without skips:
+`go test -json -count=1 -timeout=2m ./internal/generatedingress -run '^(TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes|TestLowIngressCapacityBecomesReplacementCapacityDiagnostic)$'`.
+The regression covers construction while a lease is already held, invalidation
+after release, and a subsequent real scope preserving the original Claim.
+Log SHA-256: `d9abaea73f466f7040ad731d33a6f60b3ebe3144a784194dbd34bb17de68fde3`.
+The same two parents passed under native Linux using a cross-compiled binary
+and `go tool test2json`; log SHA-256:
+`3f528176c5c91441ff2724e921b186019a31ebad08babbe9236f0fbe0c55b427`.
+Independent source review passed; actual Docker rebind acceptance remains a
+hosted check. The separate TLS database fixture still has an accepted-plan
+component-count mismatch and is not claimed fixed by this scope correction.
+
 This unit governs the application-network command family only. Image builds, migrations, other candidate commands, route/restoration/drain authority, startup completion repair and full Compose ownership/restart lifecycle remain separate work. It adds no managed database or Neon provisioning; external databases remain application-owned and use scoped runtime secrets.
 
 Retaining the entire aggregate is intentionally conservative and can hold capacity until controller restart. No fine-grained capacity recovery or exactly-once Docker guarantee is claimed. A refused or uncertain network operation preserves runtime evidence rather than deleting resources to reclaim capacity.

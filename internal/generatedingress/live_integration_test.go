@@ -85,7 +85,6 @@ type liveGeneratedAuthority struct {
 	runtime          *generatedruntimestate.Repository
 	workingDirectory string
 	actorID          string
-	scope            deploymenteffects.Scope
 	bound            map[string]*liveGeneratedBoundCandidate
 	currentByApp     map[string]*liveGeneratedBoundCandidate
 }
@@ -128,19 +127,10 @@ func liveGeneratedDeployments(t *testing.T, workingDirectory string) *liveGenera
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), workingDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := release(); err != nil {
-			t.Errorf("release live generated authority: %v", err)
-		}
-	})
 	authority := &liveGeneratedAuthority{
 		db: db, repository: repository, bindings: bindings, jobs: jobService,
 		runtime: generatedruntimestate.New(db), workingDirectory: workingDirectory,
-		actorID: uuid.NewString(), scope: scope, bound: make(map[string]*liveGeneratedBoundCandidate),
+		actorID: uuid.NewString(), bound: make(map[string]*liveGeneratedBoundCandidate),
 		currentByApp: make(map[string]*liveGeneratedBoundCandidate),
 	}
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
@@ -159,7 +149,7 @@ func (a *liveGeneratedAuthority) bindCandidate(t *testing.T, parent context.Cont
 		if !reflect.DeepEqual(expected, supplied) {
 			t.Fatal("live generated deployment identity was reused with different immutable candidate authority")
 		}
-		return deploymenteffects.WithScope(parent, a.scope), existing.spec
+		return parent, existing.spec
 	}
 	previous := a.currentByApp[spec.AppID]
 	if previous != nil {
@@ -209,7 +199,7 @@ func (a *liveGeneratedAuthority) bindCandidate(t *testing.T, parent context.Cont
 	if err != nil {
 		t.Fatal(err)
 	}
-	boundContext := deploymenteffects.WithScope(parent, a.scope)
+	boundContext := parent
 	if err := a.repository.Gate(boundContext, deployments.GateRequest{Claim: claim, DeploymentID: spec.DeploymentID}); err != nil {
 		t.Fatal(err)
 	}
@@ -621,6 +611,19 @@ func TestLiveFixtureBuildKeepsRuntimeDockerConfigurationEmpty(t *testing.T) {
 
 func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, authority *liveGeneratedAuthority, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
 	t.Helper()
+	// Release the effects lease when this candidate's commands finish. Later
+	// rebind operations and other fixture authorities use the same controller
+	// directory and must be able to acquire their own original scope.
+	scope, release, err := deploymenteffects.AcquireScoped(ctx, authority.workingDirectory)
+	if err != nil {
+		t.Fatal("acquire live candidate effects scope")
+	}
+	defer func() {
+		if err := release(); err != nil {
+			t.Error("release live candidate effects scope")
+		}
+	}()
+	ctx = deploymenteffects.WithScope(ctx, scope)
 	ctx, spec = authority.bindCandidate(t, ctx, spec)
 	candidate, err := engine.CreateInactiveCandidate(ctx, spec)
 	if err != nil {
@@ -634,7 +637,6 @@ func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *gene
 
 func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, authority *liveGeneratedAuthority, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
 	t.Helper()
-	ctx, spec = authority.bindCandidate(t, ctx, spec)
 	candidate := createAndStartLiveCandidate(t, ctx, engine, authority, spec)
 	if err := engine.WaitHealthy(ctx, candidate); err != nil {
 		t.Fatalf("wait for candidate: runtime=%s", liveRuntimeDiagnostic(err))
