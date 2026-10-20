@@ -477,16 +477,16 @@ func (s *generatedImageExecutionState) validateTx(tx *sql.Tx, componentState gen
 	if phase != generatedruntimestate.PhaseBuilding {
 		return generatedimagestate.Artifact{}, imageSemanticError(s.ctx, deploymentexecution.ErrStageInvalid)
 	}
-	var provider, resolved, archive, tree, configID, planID, state string
-	var repositoryID, configNumber, planNumber int64
-	err := tx.QueryRowContext(s.ctx, `SELECT source_provider,repository_id,resolved_sha,COALESCE(archive_sha256,''),COALESCE(workspace_tree_sha256,''),workspace_state,COALESCE(configuration_revision_id,''),configuration_revision_number,COALESCE(deployment_plan_revision_id,''),COALESCE(deployment_plan_revision_number,0) FROM releases WHERE id=? AND app_id=?`, s.request.ReleaseID, s.request.Claim.ApplicationID()).Scan(&provider, &repositoryID, &resolved, &archive, &tree, &state, &configID, &configNumber, &planID, &planNumber)
+	var provider, resolved, archive, tree, planID, state string
+	var repositoryID, planNumber int64
+	err := tx.QueryRowContext(s.ctx, `SELECT source_provider,repository_id,resolved_sha,COALESCE(archive_sha256,''),COALESCE(workspace_tree_sha256,''),workspace_state,COALESCE(deployment_plan_revision_id,''),COALESCE(deployment_plan_revision_number,0) FROM releases WHERE id=? AND app_id=?`, s.request.ReleaseID, s.request.Claim.ApplicationID()).Scan(&provider, &repositoryID, &resolved, &archive, &tree, &state, &planID, &planNumber)
 	if err != nil {
 		return generatedimagestate.Artifact{}, gateDatabaseError(s.ctx, err)
 	}
 	if s.repo.afterGeneratedImageIdentityRead != nil {
 		s.repo.afterGeneratedImageIdentityRead()
 	}
-	if provider != s.request.SourceProvider || repositoryID != s.request.SourceRepositoryID || resolved != s.request.SourceResolvedDigest || archive != s.request.ArchiveSHA256 || tree != s.request.WorkspaceTreeSHA256 || state != "ready" || configID != s.request.ConfigurationRevisionID || configNumber != s.request.ConfigurationRevisionNumber || planID != s.request.DeploymentPlanRevisionID || planNumber != s.request.DeploymentPlanRevisionNumber {
+	if provider != s.request.SourceProvider || repositoryID != s.request.SourceRepositoryID || resolved != s.request.SourceResolvedDigest || archive != s.request.ArchiveSHA256 || tree != s.request.WorkspaceTreeSHA256 || state != "ready" || planID != s.request.DeploymentPlanRevisionID || planNumber != s.request.DeploymentPlanRevisionNumber {
 		return generatedimagestate.Artifact{}, imageSemanticError(s.ctx, ErrInvalidDeployment)
 	}
 	var canonical, planProvider, planResolved string

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -177,6 +178,88 @@ func TestGeneratedImageConstructorsRequireConcreteConfiguredDependencies(t *test
 	}
 	if compiler, err := NewCompiler(fixture.releaseReader, compilerPlanReader{revision: fixture.revision}, fixture.config, fixture.authority.repository, fixture.temporary, foreignBuilder, fixture.commandRunner, fixture.validator, CompilerOptions{BuildTimeout: time.Minute}); compiler != nil || err == nil {
 		t.Fatalf("foreign manager compiler=%#v error=%v", compiler, err)
+	}
+}
+
+func TestCompilerBindsCurrentConfigurationWithoutRewritingImmutableReleaseCapture(t *testing.T) {
+	t.Run("preexisting ready artifact is reused across config-only deployment", func(t *testing.T) {
+		fixture := newCompilerFixture(t)
+		capturedID, capturedNumber := fixture.release.ConfigurationRevisionID, fixture.release.ConfigurationRevisionNumber
+		selectedID, selectedNumber := uuid.NewString(), capturedNumber+1
+		fixture.rebindWithConfiguration(t, "app", selectedID, selectedNumber)
+		ready := seedReadyCompilerArtifact(t, &fixture)
+
+		reused, err := fixture.compile(context.Background())
+		if err != nil || reused.ID != ready.ID || reused.ImageContentID != ready.ImageContentID || reused.State != ArtifactReady {
+			t.Fatalf("config-only reuse artifact=%#v ready=%#v error=%v", reused, ready, err)
+		}
+		if fixture.runner.calls != 0 || fixture.builderPrepareCalls() != 0 || fixture.config.lastRevisionID != selectedID || fixture.config.lastRevisionNumber != selectedNumber {
+			t.Fatalf("config-only reuse built or exported wrong pin: build calls=%d builder calls=%d selected=%s/%d", fixture.runner.calls, fixture.builderPrepareCalls(), fixture.config.lastRevisionID, fixture.config.lastRevisionNumber)
+		}
+		var storedReleaseConfigID string
+		var storedReleaseConfigNumber int64
+		if err := fixture.authority.db.QueryRow(`SELECT configuration_revision_id,configuration_revision_number FROM releases WHERE id=?`, fixture.release.ID).Scan(&storedReleaseConfigID, &storedReleaseConfigNumber); err != nil {
+			t.Fatal(err)
+		}
+		if storedReleaseConfigID != capturedID || storedReleaseConfigNumber != capturedNumber {
+			t.Fatalf("reuse rewrote immutable release capture: stored=%s/%d want=%s/%d", storedReleaseConfigID, storedReleaseConfigNumber, capturedID, capturedNumber)
+		}
+		component, err := generatedruntimestate.New(fixture.authority.db).Component(context.Background(), fixture.authority.claim.ApplicationID(), fixture.request.DeploymentID, fixture.request.ComponentName)
+		if err != nil || component.State != generatedruntimestate.ComponentImageReady || component.ImageArtifactID != ready.ID {
+			t.Fatalf("reused component=%#v error=%v", component, err)
+		}
+	})
+
+	fixture := newCompilerFixture(t)
+	capturedID, capturedNumber := fixture.release.ConfigurationRevisionID, fixture.release.ConfigurationRevisionNumber
+	selectedID, selectedNumber := uuid.NewString(), capturedNumber+1
+	fixture.rebindWithConfiguration(t, "app", selectedID, selectedNumber)
+	imageID := "sha256:" + strings.Repeat("7", 64)
+	fixture.runner.run = func(request runtimeprocess.CommandRequest) error {
+		return os.WriteFile(flagValue(t, request.Args, "--iidfile"), []byte(imageID), 0o600)
+	}
+
+	first, err := fixture.compile(context.Background())
+	if err != nil || first.State != ArtifactReady || first.ImageContentID != imageID {
+		t.Fatalf("config-only compile artifact=%#v error=%v", first, err)
+	}
+	if fixture.config.lastRevisionID != selectedID || fixture.config.lastRevisionNumber != selectedNumber || fixture.runner.calls != 1 {
+		t.Fatalf("selected configuration=%s/%d build calls=%d", fixture.config.lastRevisionID, fixture.config.lastRevisionNumber, fixture.runner.calls)
+	}
+	var storedReleaseConfigID string
+	var storedReleaseConfigNumber int64
+	if err := fixture.authority.db.QueryRow(`SELECT configuration_revision_id,configuration_revision_number FROM releases WHERE id=?`, fixture.release.ID).Scan(&storedReleaseConfigID, &storedReleaseConfigNumber); err != nil {
+		t.Fatal(err)
+	}
+	if storedReleaseConfigID != capturedID || storedReleaseConfigNumber != capturedNumber || fixture.release.ConfigurationRevisionID != capturedID || fixture.release.ConfigurationRevisionNumber != capturedNumber {
+		t.Fatalf("immutable release capture changed: memory=%s/%d stored=%s/%d", fixture.release.ConfigurationRevisionID, fixture.release.ConfigurationRevisionNumber, storedReleaseConfigID, storedReleaseConfigNumber)
+	}
+	var storedDeploymentConfigID string
+	var storedDeploymentConfigNumber int64
+	if err := fixture.authority.db.QueryRow(`SELECT actual_configuration_revision_id,actual_configuration_revision_number FROM deployments WHERE id=?`, fixture.request.DeploymentID).Scan(&storedDeploymentConfigID, &storedDeploymentConfigNumber); err != nil {
+		t.Fatal(err)
+	}
+	if storedDeploymentConfigID != selectedID || storedDeploymentConfigNumber != selectedNumber {
+		t.Fatalf("selected deployment configuration=%s/%d", storedDeploymentConfigID, storedDeploymentConfigNumber)
+	}
+	component, err := generatedruntimestate.New(fixture.authority.db).Component(context.Background(), fixture.authority.claim.ApplicationID(), fixture.request.DeploymentID, fixture.request.ComponentName)
+	if err != nil || component.State != generatedruntimestate.ComponentImageReady || component.ImageArtifactID != first.ID {
+		t.Fatalf("component=%#v error=%v", component, err)
+	}
+
+	reused, err := fixture.compile(context.Background())
+	if err != nil || reused.ID != first.ID || reused.ImageContentID != first.ImageContentID || fixture.runner.calls != 1 {
+		t.Fatalf("same deployment did not resume exact artifact: first=%#v reused=%#v calls=%d error=%v", first, reused, fixture.runner.calls, err)
+	}
+	beforeComponent := component
+	fixture.request.ConfigurationRevisionID = uuid.NewString()
+	fixture.request.ConfigurationRevisionNumber = selectedNumber + 1
+	if artifact, err := fixture.compile(context.Background()); artifact != (Artifact{}) || !errors.Is(err, deployments.ErrInvalidDeployment) {
+		t.Fatalf("unselected configuration artifact=%#v error=%v", artifact, err)
+	}
+	afterComponent, err := generatedruntimestate.New(fixture.authority.db).Component(context.Background(), fixture.authority.claim.ApplicationID(), fixture.request.DeploymentID, fixture.request.ComponentName)
+	if err != nil || afterComponent != beforeComponent || fixture.runner.calls != 1 {
+		t.Fatalf("wrong configuration changed evidence: before=%#v after=%#v calls=%d error=%v", beforeComponent, afterComponent, fixture.runner.calls, err)
 	}
 }
 

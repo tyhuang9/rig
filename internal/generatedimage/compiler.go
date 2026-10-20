@@ -153,7 +153,7 @@ func (c *Compiler) Compile(ctx context.Context, request CompileRequest) (Artifac
 	if err != nil {
 		return Artifact{}, compileReadFailure(ctx, "source_integrity_failed", err)
 	}
-	if release.ID != request.ReleaseID || release.AppID != appID || release.ConfigurationRevisionID != request.ConfigurationRevisionID || release.ConfigurationRevisionNumber != request.ConfigurationRevisionNumber || release.DeploymentPlanRevisionID != request.DeploymentPlanRevisionID || release.DeploymentPlanRevisionNumber != request.DeploymentPlanRevisionNumber {
+	if release.ID != request.ReleaseID || release.AppID != appID || release.DeploymentPlanRevisionID != request.DeploymentPlanRevisionID || release.DeploymentPlanRevisionNumber != request.DeploymentPlanRevisionNumber {
 		return Artifact{}, compileBoundary("source_integrity_failed", false, errors.Join(deployments.ErrInvalidDeployment, compileContextCause(ctx)))
 	}
 	revision, err := c.plans.GetRevision(ctx, appID, request.DeploymentPlanRevisionID, request.DeploymentPlanRevisionNumber)

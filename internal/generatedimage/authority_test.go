@@ -37,6 +37,10 @@ type generatedImageTestAuthority struct {
 }
 
 func newGeneratedImageTestAuthority(t *testing.T, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, component string) *generatedImageTestAuthority {
+	return newGeneratedImageTestAuthorityWithConfiguration(t, release, revision, component, "", 0)
+}
+
+func newGeneratedImageTestAuthorityWithConfiguration(t *testing.T, release releasesnapshot.Release, revision deploymentplans.DeploymentPlanRevision, component, configurationID string, configurationNumber int64) *generatedImageTestAuthority {
 	t.Helper()
 	if release.AppID == "" {
 		release.AppID = uuid.NewString()
@@ -47,6 +51,10 @@ func newGeneratedImageTestAuthority(t *testing.T, release releasesnapshot.Releas
 	if release.ConfigurationRevisionID == "" {
 		release.ConfigurationRevisionID = uuid.NewString()
 		release.ConfigurationRevisionNumber = 1
+	}
+	if configurationID == "" {
+		configurationID = release.ConfigurationRevisionID
+		configurationNumber = release.ConfigurationRevisionNumber
 	}
 	if release.DeploymentPlanRevisionID == "" {
 		release.DeploymentPlanRevisionID = revision.ID
@@ -126,6 +134,11 @@ func newGeneratedImageTestAuthority(t *testing.T, release releasesnapshot.Releas
 	if _, err := db.Exec(`INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES(?,?,?,?,?,?,0,0)`, release.ConfigurationRevisionID, release.AppID, release.ConfigurationRevisionNumber, "image-test:"+release.ConfigurationRevisionID, actorID, stamp); err != nil {
 		t.Fatal(err)
 	}
+	if configurationID != release.ConfigurationRevisionID || configurationNumber != release.ConfigurationRevisionNumber {
+		if _, err := db.Exec(`INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES(?,?,?,?,?,?,0,0)`, configurationID, release.AppID, configurationNumber, "image-test:"+configurationID, actorID, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,'',?,?,'accepted',?,?)`,
 		revision.ID, release.AppID, revision.RevisionNumber, "image-test:"+revision.ID, revision.Plan.Strategy, revision.Plan.Detector.Name, revision.Plan.Detector.Version, revision.Plan.Detector.SourceStructuralFingerprint, revision.Plan.Source.Provider, revision.Plan.Source.RepositoryID, revision.Plan.Source.ResolvedDigest, revision.CanonicalDigest, len(revision.Plan.Components), actorID, stamp, actorID, stamp); err != nil {
 		t.Fatal(err)
@@ -170,7 +183,7 @@ func newGeneratedImageTestAuthority(t *testing.T, release releasesnapshot.Releas
 	if err != nil {
 		t.Fatal(err)
 	}
-	deployment, err = repository.InitializeRuntime(context.Background(), release.AppID, deployment.ID, release.ID, release.ConfigurationRevisionID, release.ConfigurationRevisionNumber, deployments.RuntimeGeneratedNode, revision.ID, revision.RevisionNumber)
+	deployment, err = repository.InitializeRuntime(context.Background(), release.AppID, deployment.ID, release.ID, configurationID, configurationNumber, deployments.RuntimeGeneratedNode, revision.ID, revision.RevisionNumber)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +212,7 @@ func newGeneratedImageTestAuthority(t *testing.T, release releasesnapshot.Releas
 	}
 	_ = definition
 	request := deployments.GeneratedImageRequest{Claim: claim, DeploymentID: deployment.ID, ReleaseID: release.ID,
-		ConfigurationRevisionID: release.ConfigurationRevisionID, ConfigurationRevisionNumber: release.ConfigurationRevisionNumber,
+		ConfigurationRevisionID: configurationID, ConfigurationRevisionNumber: configurationNumber,
 		DeploymentPlanRevisionID: revision.ID, DeploymentPlanRevisionNumber: revision.RevisionNumber,
 		ComponentName: component, CompilerVersion: CompilerVersion, BuildDefinitionDigest: definitionDigest, PlanCanonicalDigest: revision.CanonicalDigest,
 		SourceProvider: release.SourceProvider, SourceRepositoryID: release.RepositoryID, SourceResolvedDigest: release.ResolvedSHA,

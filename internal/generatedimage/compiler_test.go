@@ -73,6 +73,7 @@ type compilerRunner struct {
 	result  runtimeprocess.CommandResult
 	err     error
 	run     func(runtimeprocess.CommandRequest) error
+	calls   int
 }
 
 type compilerCommandRunner struct {
@@ -98,6 +99,7 @@ func (v *compilerImageValidator) ValidateImage(_ context.Context, spec generated
 }
 
 func (r *compilerRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	r.calls++
 	r.request = request
 	if r.run != nil {
 		if err := r.run(request); err != nil {
@@ -532,8 +534,12 @@ func (f *compilerFixture) compile(ctx context.Context) (Artifact, error) {
 }
 
 func (f *compilerFixture) rebind(t *testing.T, component string) {
+	f.rebindWithConfiguration(t, component, f.release.ConfigurationRevisionID, f.release.ConfigurationRevisionNumber)
+}
+
+func (f *compilerFixture) rebindWithConfiguration(t *testing.T, component, configurationID string, configurationNumber int64) {
 	t.Helper()
-	f.authority = newGeneratedImageTestAuthority(t, f.release, f.revision, component)
+	f.authority = newGeneratedImageTestAuthorityWithConfiguration(t, f.release, f.revision, component, configurationID, configurationNumber)
 	var err error
 	f.builder, err = NewBuilderManager(f.authority.repository, f.commandRunner, BuilderManagerOptions{DataRoot: t.TempDir(), DockerExecutable: filepath.Join(t.TempDir(), "docker.exe"), PrepareTimeout: time.Minute})
 	if err != nil {
@@ -544,7 +550,7 @@ func (f *compilerFixture) rebind(t *testing.T, component string) {
 		t.Fatal(err)
 	}
 	f.request = CompileRequest{Claim: f.authority.claim, DeploymentID: f.authority.request.DeploymentID, ReleaseID: f.release.ID,
-		ConfigurationRevisionID: f.release.ConfigurationRevisionID, ConfigurationRevisionNumber: f.release.ConfigurationRevisionNumber,
+		ConfigurationRevisionID: configurationID, ConfigurationRevisionNumber: configurationNumber,
 		DeploymentPlanRevisionID: f.revision.ID, DeploymentPlanRevisionNumber: f.revision.RevisionNumber, ComponentName: component}
 }
 
