@@ -90,8 +90,71 @@ The same two parents passed under native Linux using a cross-compiled binary
 and `go tool test2json`; log SHA-256:
 `3f528176c5c91441ff2724e921b186019a31ebad08babbe9236f0fbe0c55b427`.
 Independent source review passed; actual Docker rebind acceptance remains a
-hosted check. The separate TLS database fixture still has an accepted-plan
-component-count mismatch and is not claimed fixed by this scope correction.
+hosted check. This scope correction does not address the separate TLS database
+fixture's accepted-plan component-count mismatch; the next section records that
+follow-up.
+
+### Hosted TLS fixture aggregate correction, 2026-10-20
+
+The [hosting and blue-green job](https://github.com/tyhuang9/rig/actions/runs/39176943515/job/117822836572)
+on head `52237ff47b70b358cf53e6525cf78bcf23b5dedf` reached
+`TestLiveHostingNotesDatabaseRoundtrip` and failed while beginning a one-component
+runtime against an accepted two-component plan. Retained failure-log SHA-256:
+`180c99bd7a1d496181e65de066378bf5f8175376672725155fdb4ed64782e54c`.
+
+The direct-live helper now binds the exact accepted component names, retaining
+the existing plan and its component count. The TLS fixture still starts only
+the API container. It explicitly records synthetic history for the unstarted
+frontend to exercise API replacement; this is not frontend Docker acceptance
+or full controller aggregate execution. The ordinary one-component completion
+helper refuses implicit aggregate completion.
+
+Before network setup, the fixture creates an empty version-2 configuration
+through the real protected configuration store and binds that exact revision.
+Runtime revision 2 seeds the required secrets; revisions 3 and 4 preserve them
+while changing the CA and runtime marker. The accepted frontend and its public
+build configuration remain present. Existing TLS rejection, retained blue
+runtime, replacement, and image-secret-isolation assertions remain required.
+
+Pinned Go 1.26.7 executed these tests on Windows and native Linux:
+
+- `go test -json -count=1 -timeout=3m ./internal/generatedruntime/liveauthority -tags=live_docker -run '^(TestAuthority|TestCanonicalCandidate)'`: three parents passed.
+- `go test -json -count=1 -timeout=3m ./internal/generatedimage -tags=live_docker -run '^TestHostingLiveConfigurationBootstrapAndRevisionChain$'`: one parent passed.
+- Native Linux used the corresponding cross-compiled test binaries under WSL
+  with `go tool test2json`. All four parents passed on each platform without
+  failure or skip.
+- `go test -json -count=1 -timeout=3m ./cmd/hostd ./internal/generatedimage ./internal/generatedingress ./internal/generatedruntime/liveauthority -tags=live_docker -run '^$'` compiled all four packages. Zero selected tests is intentional compile-only evidence.
+
+Regression coverage includes immutable accepted-plan metadata, both pending
+runtime rows, explicit synthetic completion and replacement history, the
+protected configuration bundle and head, the four-revision chain, preserved
+runtime secrets, redacted metadata, and frontend-build/API-runtime isolation.
+No actual Docker test ran locally. Hosted execution of the repaired TLS parent
+and the rebind gates remains required.
+
+Formatting and diff checks passed. `go vet -tags=live_docker` passed for the
+same four compiled packages; `pwsh -NoProfile -File scripts/check-generation.ps1`
+and `pnpm --dir docs build` passed. The static receipt is
+`tls-static-20261020T180014Z.receipt.json`; its source snapshot predates only
+this literal evidence paragraph.
+
+Raw evidence is retained under
+`m4-lifecycle-coordinator-verification/ci-followups-20261020/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `tls-authority-20261020T175741Z.jsonl` | `8dc61b3f802c797333f2ddb3ea810e19e0592f6120d394bf78f6a4343b2221fd` |
+| `tls-config-20261020T175751Z.jsonl` | `e3afe093c453d9e975c279a5a499e65706848eceb1204ebe8eec66667ae98fe6` |
+| `tls-authority-linux-20261020T175832Z.jsonl` | `51ad64d2c4710e2a92d21a85cfa2ac33842bccf436b1737eafe5ad63723df6dc` |
+| `tls-config-linux-20261020T175908Z.jsonl` | `6ea6529e32ae4e65c1cc47ed867c349dd6f70309c57a7d0d462305334ae72124` |
+| `tls-compile-20261020T175805Z.jsonl` | `f3107bb2e36a97cd589a6c1cb51d35e6b6bdd94726221d4a82008300151612a7` |
+
+The earlier controller TLS, migration and process-restart Docker jobs passed on
+the old head, independently of these failing direct fixtures. Their retained
+audit verifies required test discovery and matching checkout tree:
+`live-ci-repair-draft-updates/pr190-repaired-caller-audit/receipt.json`, SHA-256
+`65a65e75e39e6e496e999e3af147cfb9c10efa33944851a9e7947c0e79c3c746`.
+Those results do not establish acceptance of this follow-up head.
 
 This unit governs the application-network command family only. Image builds, migrations, other candidate commands, route/restoration/drain authority, startup completion repair and full Compose ownership/restart lifecycle remain separate work. It adds no managed database or Neon provisioning; external databases remain application-owned and use scoped runtime secrets.
 
