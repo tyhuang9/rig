@@ -20,6 +20,7 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 type repositoryFixture struct {
@@ -108,7 +109,7 @@ func TestGetOrCreateByJobIsAtomicAndRejectsReplayMismatch(t *testing.T) {
 func newRepositoryFixture(t *testing.T) repositoryFixture {
 	t.Helper()
 	dataRoot := filepath.Join(t.TempDir(), "state")
-	db, err := database.Open(dataRoot)
+	db, err := databasefixture.Open(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

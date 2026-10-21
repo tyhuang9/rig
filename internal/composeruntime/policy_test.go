@@ -17,13 +17,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 const (
@@ -1009,7 +1009,7 @@ func findingByCapability(t *testing.T, findings []PolicyFinding, capability stri
 
 func assertRepositoryParity(t *testing.T, f PolicyFinding) {
 	t.Helper()
-	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	db, err := databasefixture.Open(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
 	}
