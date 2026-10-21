@@ -526,12 +526,28 @@ func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneySce
 		})
 		return
 	}
+	if err := executionObserver.Arm(v2Mutation.Job.ID); err != nil {
+		t.Fatal("arm approved migration execution return observer")
+	}
+	resumeFailureDiagnostic, resumeDiagnosticComplete := migrationJourneyResumeFailureDiagnostic(t, migrationJourneyResumeFailureDiagnosticInput{
+		Parent:      ctx,
+		Application: application.ID,
+		Job:         v2Mutation.Job.ID,
+		GetJob:      jobStore.Get,
+		Deployments: deploymentStore.List,
+		Runtime:     composition.state.Get,
+		Runner:      migrationRunner.DiagnosticSnapshot,
+		Execution:   executionObserver.DiagnosticSnapshot,
+		Process:     migrationProcess.DiagnosticSnapshot,
+	})
+	defer resumeFailureDiagnostic()
 	var v2Resumed apicontract.JobResponse
 	request(http.MethodPost, "/api/v1/jobs/"+v2Mutation.Job.ID+"/resume", nil, http.StatusOK, &v2Resumed)
 	v2Finished := migrationJourneyWaitForJob(t, ctx, jobStore, v2Mutation.Job.ID, jobs.Succeeded)
 	if migrationRunner.Calls() != 1 {
 		t.Fatalf("approved v2 migration runner calls=%d, want 1", migrationRunner.Calls())
 	}
+	resumeDiagnosticComplete()
 	var v2History apicontract.DeploymentList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &v2History)
 	v2Deployment := migrationJourneyDeploymentForJob(t, v2History, v2Mutation.Job.ID)
@@ -993,6 +1009,15 @@ func (runner *migrationJourneyRunner) Results() []error {
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 	return append([]error(nil), runner.results...)
+}
+
+func (runner *migrationJourneyRunner) DiagnosticSnapshot() migrationJourneyRunnerDiagnosticSnapshot {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return migrationJourneyRunnerDiagnosticSnapshot{
+		Calls:   runner.calls,
+		Results: append([]error(nil), runner.results...),
+	}
 }
 
 func migrationJourneyAssertInvocation(t *testing.T, identities []deployments.GeneratedMigrationIdentity, index int, appID string, job jobs.Job, deployment apicontract.Deployment) {
