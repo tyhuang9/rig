@@ -14,6 +14,7 @@ import (
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 type operationFixture struct {
@@ -1088,7 +1089,7 @@ func assertResolutionFailsClosed(t *testing.T, fixture *operationFixture) {
 func newOperationFixture(t *testing.T, componentCount int) *operationFixture {
 	t.Helper()
 	dataRoot := filepath.Join(t.TempDir(), "state")
-	db, err := database.Open(dataRoot)
+	db, err := databasefixture.Open(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

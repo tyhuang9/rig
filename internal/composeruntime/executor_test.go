@@ -17,7 +17,6 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
@@ -27,6 +26,7 @@ import (
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 type fakeApplications struct {
@@ -781,7 +781,7 @@ func newExecutorFixture(t *testing.T, mode jobs.ConfigurationMode, releaseID str
 
 func newBoundComposeJob(t *testing.T, appID, dataRoot string) (*sql.DB, jobs.Job, deploymentexecution.Claim, *deployments.Repository, context.Context, string, func() error) {
 	t.Helper()
-	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	db, err := databasefixture.Open(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
 	}
