@@ -103,9 +103,20 @@ is an intermediate construction path; this checkpoint is not a completed E5
 domain API or permission for live activation.
 
 Source inspection also found a pre-existing default-daemon runner identity
-mismatch in published baseline `445dccf`. Its independent repair is tracked on
-`feature/hosting-m4-daemon-runner-identity`; the passing injected-runner suites
-above do not establish default-daemon startup acceptance.
+mismatch in published baseline `445dccf`. Its independent repair was published
+in draft PR #199 at `21bc87cf0e9f559bc6e1fb9b737de15e57f15183` and integrated
+locally at `424e6c81e3bba0475cfdd81fe34014532bfc903b`, preserving history.
+The published route-contract prerequisite from PR #197 at
+`de083a5ee8f99b6c1d0150dbed596fd2cd5353db` is also included.
+
+Combined verification at `m4-daemon-runner-identity-verification/combined-domain-20261021T020422Z/`
+passed 16 parent tests and 75 cases on each of Windows and native Linux, with
+no failures or skips. A temporary Go overlay restoring the old value default
+failed at the real generated-runtime constructor as expected; the fixed default
+and injected-runner cases passed. Both targets passed controller live-tag
+compilation, vet and builds, and the canonical generation check passed. Source
+hashes remained unchanged. This proves constructor compatibility on the combined
+source; it does not establish live Docker startup acceptance.
 
 Hosted Docker and race acceptance remain separate from local tests and live-tag
 compilation. Local CodeRabbit authentication is unavailable; independent reviews
