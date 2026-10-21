@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"net/url"
 	"os"
 	"os/exec"
@@ -67,7 +68,7 @@ type Engine struct {
 	runner      runtimeprocess.CommandRunner
 	capacity    *capacityGate
 	deployments *deployments.Repository
-	candidates  *deployments.GeneratedCandidateAuthority
+	candidates  *generatedingress.GeneratedCandidateAuthority
 	options     EngineOptions
 	dockerEnv   []string
 	networkMu   sync.Mutex
@@ -111,11 +112,15 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 	if err != nil {
 		return nil, err
 	}
-	candidateEnvironment, ok := environment.(deployments.GeneratedCandidateEnvironmentStager)
+	candidateEnvironment, ok := environment.(generatedingress.GeneratedCandidateEnvironmentStager)
 	if !ok {
 		return nil, errors.New("generated candidate environment owner is required")
 	}
-	candidates, err := deploymentRepository.GeneratedCandidateAuthority(runner, candidateEnvironment, gate.budget, deployments.GeneratedCandidateProcessOptions{
+	stores, err := deploymentRepository.GeneratedOwnerStores()
+	if err != nil {
+		return nil, err
+	}
+	candidates, err := generatedingress.NewGeneratedCandidateAuthority(stores, runner, candidateEnvironment, gate.budget, generatedingress.GeneratedCandidateProcessOptions{
 		DockerExecutable: options.DockerExecutable, DockerEndpoint: options.DockerEndpoint,
 		DockerConfigDirectory: options.DockerConfigDirectory, WorkingDirectory: options.WorkingDirectory,
 		CommandTimeout: options.CommandTimeout, HealthTimeout: options.HealthTimeout,
@@ -132,7 +137,7 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 
 // ReserveReplacement derives the complete protected roster through the
 // repository owner before the deployment gate and image preparation.
-func (e *Engine) ReserveReplacement(ctx context.Context, request deployments.GeneratedReplacementRequest) (ReplacementReservation, error) {
+func (e *Engine) ReserveReplacement(ctx context.Context, request generatedingress.GeneratedReplacementRequest) (ReplacementReservation, error) {
 	if e == nil || e.candidates == nil {
 		return nil, &Error{Code: DiagnosticValidationFailed}
 	}
@@ -148,7 +153,7 @@ func (e *Engine) RetainReplacementCapacity(reservation ReplacementReservation) e
 
 // PinCandidates forwards only immutable identities and sealed accounting.
 // Candidate commands, secret staging and result transactions stay in the owner.
-func (e *Engine) PinCandidates(ctx context.Context, request deployments.GeneratedCandidateRequest, reservation ReplacementReservation) (*deployments.GeneratedCandidateExecution, error) {
+func (e *Engine) PinCandidates(ctx context.Context, request generatedingress.GeneratedCandidateRequest, reservation ReplacementReservation) (*generatedingress.GeneratedCandidateExecution, error) {
 	if e == nil || e.candidates == nil {
 		return nil, &Error{Code: DiagnosticValidationFailed}
 	}

@@ -3,7 +3,11 @@ package deployments
 import (
 	"context"
 	"database/sql"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 )
 
@@ -12,8 +16,8 @@ import (
 // A successful check describes only a legacy target; it grants no authority
 // over a receipt-owned candidate and never changes capacity or durable state.
 func (r *Repository) CheckLegacyGeneratedCandidateRemoval(ctx context.Context, appID, deploymentID, component, containerName, containerID string) error {
-	if r == nil || r.db == nil || ctx == nil || !candidatePolicyUUID(appID) || !candidatePolicyUUID(deploymentID) ||
-		!candidatePolicyText(component, 256) || containerName == "" || containerID == "" {
+	if r == nil || r.db == nil || ctx == nil || !legacyGeneratedCandidateUUID(appID) || !legacyGeneratedCandidateUUID(deploymentID) ||
+		!legacyGeneratedCandidateText(component, 256) || containerName == "" || containerID == "" {
 		return deploymentexecution.ErrInvalidConfiguration
 	}
 	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -40,4 +44,21 @@ func (r *Repository) CheckLegacyGeneratedCandidateRemoval(ctx context.Context, a
 		return gateDatabaseError(ctx, err)
 	}
 	return nil
+}
+
+func legacyGeneratedCandidateUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
+}
+
+func legacyGeneratedCandidateText(value string, maximum int) bool {
+	if !utf8.ValidString(value) || value == "" || len(value) > maximum || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if character == 0 || unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
 }

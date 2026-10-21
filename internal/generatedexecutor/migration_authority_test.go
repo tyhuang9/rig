@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,7 +125,7 @@ func (s *executorMigrationStager) Stage(operationID string, attempt int, content
 	return lease.(*executorMigrationLease), nil
 }
 
-func (s *executorMigrationStager) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+func (s *executorMigrationStager) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
 	lease, err := s.StageGeneratedMigration(operationID, attempt, contents)
 	if err != nil {
 		return nil, err

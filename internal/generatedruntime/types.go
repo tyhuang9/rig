@@ -11,6 +11,7 @@ import (
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedroute"
 )
 
@@ -67,11 +68,15 @@ func (e *Error) Error() string { return "generated runtime: " + string(e.Code) }
 
 func IsCode(err error, code DiagnosticCode) bool {
 	var target *Error
-	if errors.As(err, &target) && target.Code == code {
+	if errors.As(err, &target) && target != nil && target.Code == code {
 		return true
 	}
-	var candidate *deployments.GeneratedCandidateError
-	return errors.As(err, &candidate) && candidate.Code == string(code)
+	var candidate *generatedingress.GeneratedCandidateError
+	if errors.As(err, &candidate) && candidate != nil && candidate.Code == string(code) {
+		return true
+	}
+	var legacy *deployments.GeneratedCandidateError
+	return errors.As(err, &legacy) && legacy != nil && legacy.Code == string(code)
 }
 
 type networkBoundaryError struct {
@@ -171,7 +176,7 @@ type Candidate struct {
 }
 
 // ReplacementReservation is the repository's sealed protected-roster handle.
-type ReplacementReservation = deployments.GeneratedReplacementReservation
+type ReplacementReservation = generatedingress.GeneratedReplacementReservation
 
 // CandidateDescription exposes only deterministic, non-secret resource
 // identity. Coordinators persist it before Docker mutation so recovery never

@@ -3,6 +3,7 @@ package generatedexecutor
 import (
 	"context"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"sort"
 
 	"github.com/hostd/hostd/internal/deploymentexecution"
@@ -169,10 +170,10 @@ func generatedMigrationFailed(cause error) error {
 	return errors.Join(executionError("apply_failed"), cause)
 }
 
-func (e *Executor) startCandidates(execution *deployments.GeneratedCandidateExecution, runtimeDeployment generatedruntimestate.Deployment) (map[string]deployments.GeneratedCandidateInvocation, error) {
-	result := make(map[string]deployments.GeneratedCandidateInvocation, len(runtimeDeployment.Components))
+func (e *Executor) startCandidates(execution *generatedingress.GeneratedCandidateExecution, runtimeDeployment generatedruntimestate.Deployment) (map[string]generatedingress.GeneratedCandidateInvocation, error) {
+	result := make(map[string]generatedingress.GeneratedCandidateInvocation, len(runtimeDeployment.Components))
 	for _, persisted := range sortedComponents(runtimeDeployment.Components) {
-		var invocation deployments.GeneratedCandidateInvocation
+		var invocation generatedingress.GeneratedCandidateInvocation
 		var err error
 		switch persisted.State {
 		case generatedruntimestate.ComponentImageReady:
@@ -203,7 +204,7 @@ func (e *Executor) startCandidates(execution *deployments.GeneratedCandidateExec
 	return result, nil
 }
 
-func (e *Executor) healthyCandidates(execution *deployments.GeneratedCandidateExecution, runtimeDeployment generatedruntimestate.Deployment, existing map[string]deployments.GeneratedCandidateInvocation) error {
+func (e *Executor) healthyCandidates(execution *generatedingress.GeneratedCandidateExecution, runtimeDeployment generatedruntimestate.Deployment, existing map[string]generatedingress.GeneratedCandidateInvocation) error {
 	for _, persisted := range sortedComponents(runtimeDeployment.Components) {
 		if persisted.State != generatedruntimestate.ComponentRunning && persisted.State != generatedruntimestate.ComponentHealthy {
 			return staticError("candidate health requires reconciliation")
@@ -225,7 +226,7 @@ func (e *Executor) healthyCandidates(execution *deployments.GeneratedCandidateEx
 	return nil
 }
 
-func observeRouteCandidates(execution *deployments.GeneratedCandidateExecution, appID string, runtimeDeployment generatedruntimestate.Deployment) (map[string]generatedruntime.Candidate, error) {
+func observeRouteCandidates(execution *generatedingress.GeneratedCandidateExecution, appID string, runtimeDeployment generatedruntimestate.Deployment) (map[string]generatedruntime.Candidate, error) {
 	result := make(map[string]generatedruntime.Candidate, len(runtimeDeployment.Components))
 	for _, persisted := range sortedComponents(runtimeDeployment.Components) {
 		identity, err := execution.ObserveRouteCandidate(persisted.Name)
@@ -245,8 +246,8 @@ func observeRouteCandidates(execution *deployments.GeneratedCandidateExecution, 
 	return result, nil
 }
 
-func candidateRequest(claim deploymentexecution.Claim, resolved resolvedDeployment, slot string) deployments.GeneratedCandidateRequest {
-	return deployments.GeneratedCandidateRequest{
+func candidateRequest(claim deploymentexecution.Claim, resolved resolvedDeployment, slot string) generatedingress.GeneratedCandidateRequest {
+	return generatedingress.GeneratedCandidateRequest{
 		Claim: claim, DeploymentID: resolved.deployment.ID, ReleaseID: resolved.release.ID,
 		ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
 		DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
@@ -257,7 +258,7 @@ func candidateRequest(claim deploymentexecution.Claim, resolved resolvedDeployme
 // candidateFailure requests cleanup explicitly, then asks the owner whether
 // its private observations prove a terminal failure. An empty map, an adopted
 // handle, cleanup uncertainty or a closed route handoff cannot supply proof.
-func (e *Executor) candidateFailure(ctx context.Context, execution *deployments.GeneratedCandidateExecution, reservation generatedruntime.ReplacementReservation, invocations map[string]deployments.GeneratedCandidateInvocation, cause error) error {
+func (e *Executor) candidateFailure(ctx context.Context, execution *generatedingress.GeneratedCandidateExecution, reservation generatedruntime.ReplacementReservation, invocations map[string]generatedingress.GeneratedCandidateInvocation, cause error) error {
 	var cleanupErr error
 	for _, invocation := range invocations {
 		cleanupErr = errors.Join(cleanupErr, execution.RemoveInactive(invocation))

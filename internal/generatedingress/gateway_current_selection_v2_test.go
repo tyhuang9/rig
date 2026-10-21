@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/applifecycle"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func gatewayCurrentRebindSnapshotForV2Test(fixture gatewayCurrentStateFixture) appaccess.GatewayRebindRecoverySnapshot {
@@ -323,8 +323,8 @@ func TestGatewayCurrentProtectedSelectionV2(t *testing.T) {
 		beforeCommands := len(fixture.runner.commands)
 		appID := gatewayCurrentRouteStateV2FirstApp(t, baseline)
 		app := baseline.Apps[appID]
-		request := generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: app.Route.Slot,
-			Endpoints: append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)}
+		request := generatedroute.RouteSwitchRequest{AppID: appID, ToSlot: app.Route.Slot,
+			Endpoints: append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)}
 		if err := fixture.manager.Switch(context.Background(), request); err == nil {
 			t.Fatal("ordinary route entry accepted a current V2 sidecar")
 		}

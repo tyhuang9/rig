@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedcapacity"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func TestLegacyV1FenceRejectsCommittedV2PairBeforeAllLegacyWork(t *testing.T) {
@@ -95,8 +97,8 @@ func TestLegacyV1FenceChecksMarkerAfterGatewayLockContention(t *testing.T) {
 
 	select {
 	case err := <-result:
-		if !IsCode(err, DiagnosticRouteUnresolved) || !generatedruntime.RouteCandidateMayBeLive(err) {
-			t.Fatalf("switch error = %v, candidate may be live = %t", err, generatedruntime.RouteCandidateMayBeLive(err))
+		if !IsCode(err, DiagnosticRouteUnresolved) || !testRouteCandidateMayBeLive(err) {
+			t.Fatalf("switch error = %v, candidate may be live = %t", err, testRouteCandidateMayBeLive(err))
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("contending switch did not finish")
@@ -143,7 +145,7 @@ func TestLegacyV1FenceAllowsLegacyPathsWithoutMarkers(t *testing.T) {
 func assertLegacyV1Blocked(t *testing.T, manager *Manager, runner *ingressRunner) {
 	t.Helper()
 	callbackRan := false
-	var capacitySnapshot generatedruntime.CapacitySnapshot
+	var capacitySnapshot generatedcapacity.Snapshot
 	actions := []struct {
 		name             string
 		candidateMayLive bool
@@ -177,7 +179,7 @@ func assertLegacyV1Blocked(t *testing.T, manager *Manager, runner *ingressRunner
 			if !IsCode(err, DiagnosticRouteUnresolved) {
 				t.Fatalf("error = %v, want %s", err, DiagnosticRouteUnresolved)
 			}
-			if action.candidateMayLive && !generatedruntime.RouteCandidateMayBeLive(err) {
+			if action.candidateMayLive && !testRouteCandidateMayBeLive(err) {
 				t.Fatalf("switch error did not retain candidate: %v", err)
 			}
 			if len(runner.commands) != before {
@@ -188,7 +190,7 @@ func assertLegacyV1Blocked(t *testing.T, manager *Manager, runner *ingressRunner
 	if callbackRan {
 		t.Fatal("observation callback ran behind v1 fence")
 	}
-	if capacitySnapshot != (generatedruntime.CapacitySnapshot{}) {
+	if capacitySnapshot != (generatedcapacity.Snapshot{}) {
 		t.Fatalf("blocked capacity snapshot = %+v", capacitySnapshot)
 	}
 }
@@ -241,10 +243,10 @@ func installCommittedV2Pair(t *testing.T, manager *Manager) {
 }
 
 func pendingV1State(runner *ingressRunner) routeState {
-	previous := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	previous := routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", runner.network, "web-green", 3000, 'c'),
 	}}
-	proposed := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}
+	proposed := routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}
 	return routeState{
 		Version: stateVersion,
 		Active:  map[string]routeRecord{runner.appID: previous},

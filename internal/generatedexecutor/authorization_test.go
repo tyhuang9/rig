@@ -3,6 +3,7 @@ package generatedexecutor
 import (
 	"context"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"reflect"
 	"testing"
 
@@ -40,7 +41,7 @@ type authorizationFixtureCapacity struct {
 	reservation generatedruntime.ReplacementReservation
 }
 
-func (c *authorizationFixtureCapacity) ReserveReplacement(ctx context.Context, request deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error) {
+func (c *authorizationFixtureCapacity) ReserveReplacement(ctx context.Context, request generatedingress.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error) {
 	c.calls++
 	if c.events != nil {
 		*c.events = append(*c.events, "reserve")

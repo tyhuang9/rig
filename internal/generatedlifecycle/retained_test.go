@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -727,7 +728,7 @@ func (*noEnvironmentStager) Stage(string, int, []byte) (generatedruntime.Environ
 	return nil, errors.New("retained adapter must not stage environment")
 }
 
-func (*noEnvironmentStager) StageGeneratedCandidate(string, int, []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+func (*noEnvironmentStager) StageGeneratedCandidate(string, int, []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
 	return nil, errors.New("retained adapter must not stage candidate environment")
 }
 

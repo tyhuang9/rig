@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -435,7 +436,7 @@ type fakeRuntime struct {
 	retained        int
 }
 
-func (f *fakeRuntime) ReserveReplacement(ctx context.Context, request deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error) {
+func (f *fakeRuntime) ReserveReplacement(ctx context.Context, request generatedingress.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error) {
 	if f.delegate != nil {
 		return f.delegate.ReserveReplacement(ctx, request)
 	}
@@ -462,7 +463,7 @@ func (f *fakeRuntime) EnsureAppNetwork(ctx context.Context, request deployments.
 	}
 	return nil
 }
-func (f *fakeRuntime) PinCandidates(ctx context.Context, request deployments.GeneratedCandidateRequest, reservation generatedruntime.ReplacementReservation) (*deployments.GeneratedCandidateExecution, error) {
+func (f *fakeRuntime) PinCandidates(ctx context.Context, request generatedingress.GeneratedCandidateRequest, reservation generatedruntime.ReplacementReservation) (*generatedingress.GeneratedCandidateExecution, error) {
 	if f.delegate != nil {
 		return f.delegate.PinCandidates(ctx, request, reservation)
 	}

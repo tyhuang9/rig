@@ -8,7 +8,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func TestGatewayCurrentStateMachineBuildsExactDurableTransitions(t *testing.T) {
@@ -33,9 +34,9 @@ func TestGatewayCurrentStateMachineBuildsExactDurableTransitions(t *testing.T) {
 
 	appID := uuid.NewString()
 	seed := transferred.Route
-	create, err := gatewayCurrentSwitchTransition(before, generatedruntime.RouteSwitchRequest{
-		AppID: appID, ToSlot: generatedruntime.SlotBlue,
-		Endpoints: append([]generatedruntime.RouteEndpoint(nil), seed.Endpoints...),
+	create, err := gatewayCurrentSwitchTransition(before, generatedroute.RouteSwitchRequest{
+		AppID: appID, ToSlot: generatedidentity.SlotBlue,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), seed.Endpoints...),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -169,8 +170,8 @@ func TestGatewayCurrentStateMachineGrantCommitsAndQuarantinesFailedResolution(t 
 	appID := uuid.NewString()
 	transferredAppID, seed := routeOperationTransferredApp(t, fixture.baseline)
 	baseline := cloneGatewayCurrentOperationState(fixture.baseline)
-	baseline.Apps[appID] = gatewayCurrentAppRoute{Route: routeRecord{Slot: generatedruntime.SlotBlue,
-		Endpoints: append([]generatedruntime.RouteEndpoint(nil), seed.Route.Endpoints...)}}
+	baseline.Apps[appID] = gatewayCurrentAppRoute{Route: routeRecord{Slot: generatedidentity.SlotBlue,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), seed.Route.Endpoints...)}}
 	baseline.Digest, _ = gatewayCurrentRouteStateDigest(baseline)
 	if !validGatewayCurrentRouteState(baseline) || fixture.store.installBaseline(baseline) != nil {
 		t.Fatal("install current grant baseline")
@@ -248,8 +249,8 @@ func TestGatewayCurrentStateMachineGrantActivationFailureRestoresBeforeAndRetain
 	appID := uuid.NewString()
 	_, seed := routeOperationTransferredApp(t, fixture.baseline)
 	baseline := cloneGatewayCurrentOperationState(fixture.baseline)
-	baseline.Apps[appID] = gatewayCurrentAppRoute{Route: routeRecord{Slot: generatedruntime.SlotBlue,
-		Endpoints: append([]generatedruntime.RouteEndpoint(nil), seed.Route.Endpoints...)}}
+	baseline.Apps[appID] = gatewayCurrentAppRoute{Route: routeRecord{Slot: generatedidentity.SlotBlue,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), seed.Route.Endpoints...)}}
 	baseline.Digest, _ = gatewayCurrentRouteStateDigest(baseline)
 	if fixture.store.installBaseline(baseline) != nil {
 		t.Fatal("install current grant rollback baseline")
@@ -588,8 +589,8 @@ func newGatewayCurrentGrantOperationFixture(t *testing.T) (
 	appID := uuid.NewString()
 	_, seed := routeOperationTransferredApp(t, fixture.baseline)
 	baseline := cloneGatewayCurrentOperationState(fixture.baseline)
-	baseline.Apps[appID] = gatewayCurrentAppRoute{Route: routeRecord{Slot: generatedruntime.SlotBlue,
-		Endpoints: append([]generatedruntime.RouteEndpoint(nil), seed.Route.Endpoints...)}}
+	baseline.Apps[appID] = gatewayCurrentAppRoute{Route: routeRecord{Slot: generatedidentity.SlotBlue,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), seed.Route.Endpoints...)}}
 	baseline.Digest = ""
 	baseline.Digest, _ = gatewayCurrentRouteStateDigest(baseline)
 	if !validGatewayCurrentRouteState(baseline) || fixture.store.installBaseline(baseline) != nil {

@@ -10,7 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func TestGatewayCurrentProjectionV2(t *testing.T) {
@@ -454,7 +455,7 @@ func gatewayCurrentProjectionV2TwoAppFixture(t *testing.T, baseV1 gatewayCurrent
 	if appB == appA {
 		appB = "33333333-3333-4333-8333-333333333333"
 	}
-	routeB := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	routeB := routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("api", "server", "projection-b-network", "api-green", 3000, '8'),
 		endpoint("frontend", "static", "projection-b-network", "frontend-green", 4173, '9'),
 	}}

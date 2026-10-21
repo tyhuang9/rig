@@ -31,8 +31,9 @@ import (
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deployments"
-	"github.com/hostd/hostd/internal/generatedruntime"
-	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
+	"github.com/hostd/hostd/internal/generatedcapacity"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -46,18 +47,14 @@ const (
 
 type liveEnvironmentStager struct{}
 
-func (*liveEnvironmentStager) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
+func (*liveEnvironmentStager) StageGeneratedCandidate(string, int, []byte) (GeneratedCandidateEnvironmentLease, error) {
 	return nil, errors.New("live lifecycle test does not stage configuration")
-}
-
-func (s *liveEnvironmentStager) StageGeneratedCandidate(operation string, attempt int, contents []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
-	return s.Stage(operation, attempt, contents)
 }
 
 type liveCapacitySource struct{}
 
-func (liveCapacitySource) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
-	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
+func (liveCapacitySource) Snapshot(context.Context) (generatedcapacity.Snapshot, error) {
+	return generatedcapacity.Snapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
 }
 
 func liveGatewayAccessRepository(t *testing.T, dataRoot string) *appaccess.Repository {
@@ -77,10 +74,10 @@ func liveGatewayAccessRepository(t *testing.T, dataRoot string) *appaccess.Repos
 // The shared fixture uses the real protected stores and candidate owner. It
 // never manufactures successful container history after Docker execution.
 type liveGeneratedAuthority struct {
-	*liveauthority.Authority
+	LiveRuntimeTestAuthority
 	repository       *deployments.Repository
 	workingDirectory string
-	sessions         map[string]*liveauthority.CandidateSession
+	sessions         map[string]liveRuntimeSession
 }
 
 func liveGeneratedDeployments(t *testing.T, workingDirectory string) *liveGeneratedAuthority {
@@ -90,17 +87,17 @@ func liveGeneratedDeployments(t *testing.T, workingDirectory string) *liveGenera
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	authority := liveauthority.New(t, db, workingDirectory)
-	return &liveGeneratedAuthority{Authority: authority, repository: authority.Repository(),
-		workingDirectory: workingDirectory, sessions: make(map[string]*liveauthority.CandidateSession)}
+	authority := newLiveRuntimeAuthority(t, db, workingDirectory)
+	return &liveGeneratedAuthority{LiveRuntimeTestAuthority: authority, repository: authority.Repository(),
+		workingDirectory: workingDirectory, sessions: make(map[string]liveRuntimeSession)}
 }
 
-func (a *liveGeneratedAuthority) bindCandidate(t *testing.T, ctx context.Context, spec generatedruntime.CandidateSpec) (context.Context, generatedruntime.CandidateSpec) {
+func (a *liveGeneratedAuthority) bindCandidate(t *testing.T, ctx context.Context, spec liveRuntimeCandidateSpec) (context.Context, liveRuntimeCandidateSpec) {
 	t.Helper()
 	return ctx, a.BindNetwork(t, ctx, spec)
 }
 
-func (a *liveGeneratedAuthority) published(t *testing.T, ctx context.Context, ingress *Manager, candidate generatedruntime.Candidate) {
+func (a *liveGeneratedAuthority) published(t *testing.T, ctx context.Context, ingress *Manager, candidate liveRuntimeCandidate) {
 	t.Helper()
 	session := a.sessions[candidate.DeploymentID]
 	if session == nil {
@@ -116,7 +113,7 @@ func (a *liveGeneratedAuthority) published(t *testing.T, ctx context.Context, in
 	session.Close()
 }
 
-func (a *liveGeneratedAuthority) waitHealthy(candidate generatedruntime.Candidate) error {
+func (a *liveGeneratedAuthority) waitHealthy(candidate liveRuntimeCandidate) error {
 	session := a.sessions[candidate.DeploymentID]
 	if session == nil {
 		return errors.New("missing original candidate session")
@@ -169,11 +166,11 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	appID := "11111111-1111-4111-8111-111111111111"
 	otherAppID := "99999999-9999-4999-8999-999999999999"
 	planID := "22222222-2222-4222-8222-222222222222"
-	network, err := generatedruntime.DescribeAppNetwork(appID)
+	network, err := generatedidentity.DescribeAppNetwork(appID)
 	if err != nil {
 		t.Fatal("describe application network")
 	}
-	otherNetwork, err := generatedruntime.DescribeAppNetwork(otherAppID)
+	otherNetwork, err := generatedidentity.DescribeAppNetwork(otherAppID)
 	if err != nil {
 		t.Fatal("describe other application network")
 	}
@@ -181,12 +178,12 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	imageTags := []string{"rig-generated-live-test:blue", "rig-generated-live-test:green-unhealthy", "rig-generated-live-test:other", "rig-generated-live-test:green"}
 	defer cleanupLiveDocker(runner, docker, root, dockerConfig, []string{network.Name, otherNetwork.Name}, imageTags)
 
-	limits := generatedruntime.ContainerLimits{
+	limits := liveRuntimeContainerLimits{
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
 	authority := liveGeneratedDeployments(t, working)
-	engine, err := generatedruntime.NewEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
+	engine, err := newLiveRuntimeEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
@@ -216,8 +213,8 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 			liveGatewayRemoveOwnedCandidate(t, context.Background(), runner, docker, root, dockerConfig, blue)
 		}
 	}()
-	blueRoute := generatedruntime.RouteSwitchRequest{
-		AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(blue)},
+	blueRoute := generatedroute.RouteSwitchRequest{
+		AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(blue)},
 	}
 	if err := ingress.Switch(ctx, blueRoute); err != nil {
 		failLiveIngress(t, "route first slot", err)
@@ -234,11 +231,11 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	defer func() {
 		liveGatewayRemoveOwnedCandidate(t, context.Background(), runner, docker, root, dockerConfig, other)
 	}()
-	if other.Slot != generatedruntime.SlotBlue || other.NetworkAlias != blue.NetworkAlias || other.NetworkName == blue.NetworkName {
+	if other.Slot != generatedidentity.SlotBlue || other.NetworkAlias != blue.NetworkAlias || other.NetworkName == blue.NetworkName {
 		t.Fatal("two-application alias-isolation fixture is invalid")
 	}
-	otherRoute := generatedruntime.RouteSwitchRequest{
-		AppID: otherAppID, ToSlot: other.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(other)},
+	otherRoute := generatedroute.RouteSwitchRequest{
+		AppID: otherAppID, ToSlot: other.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(other)},
 	}
 	if err := ingress.Switch(ctx, otherRoute); err != nil {
 		failLiveIngress(t, "route other application", err)
@@ -261,7 +258,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	unhealthy := createAndStartLiveCandidate(t, ctx, engine, authority, unhealthySpec)
 	assertLiveOneShot(t, ctx, hostPort, appID, "/", "blue", "active slot did not serve during unhealthy replacement")
 	assertLiveOneShot(t, ctx, hostPort, otherAppID, "/", "other", "other application changed during unhealthy replacement")
-	if err := authority.waitHealthy(unhealthy); !generatedruntime.IsCode(err, generatedruntime.DiagnosticCandidateUnhealthy) {
+	if err := authority.waitHealthy(unhealthy); !liveRuntimeIsCode(err, liveRuntimeDiagnosticCandidateUnhealthy) {
 		t.Fatal("unhealthy candidate did not report candidate_unhealthy")
 	}
 	assertLiveOneShot(t, ctx, hostPort, appID, "/", "blue", "active slot did not serve after unhealthy replacement")
@@ -298,9 +295,9 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	default:
 	}
 
-	greenRoute := generatedruntime.RouteSwitchRequest{
+	greenRoute := generatedroute.RouteSwitchRequest{
 		AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot,
-		Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(green)}, DrainPeriod: time.Second,
+		Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(green)}, DrainPeriod: time.Second,
 	}
 	if err := ingress.Switch(ctx, greenRoute); err != nil {
 		failLiveIngress(t, "switch to replacement slot", err)
@@ -327,7 +324,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	authority.published(t, ctx, ingress, green)
 }
 
-func liveCandidateSpec(version, appID, planID string) generatedruntime.CandidateSpec {
+func liveCandidateSpec(version, appID, planID string) liveRuntimeCandidateSpec {
 	identities := map[string][]string{
 		"blue":  {"33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444", "55555555-5555-4555-8555-555555555555"},
 		"green": {"66666666-6666-4666-8666-666666666666", "77777777-7777-4777-8777-777777777777", "88888888-8888-4888-8888-888888888888"},
@@ -337,15 +334,15 @@ func liveCandidateSpec(version, appID, planID string) generatedruntime.Candidate
 	if namespace, err := uuid.Parse(planID); err == nil {
 		planID = uuid.NewSHA1(namespace, []byte(appID)).String()
 	}
-	return generatedruntime.CandidateSpec{
+	return liveRuntimeCandidateSpec{
 		AppID: appID, ReleaseID: values[0], DeploymentID: values[1], ArtifactID: values[2],
-		DeploymentPlanRevisionID: planID, ComponentName: "api", Role: generatedruntime.RoleServer,
+		DeploymentPlanRevisionID: planID, ComponentName: "api", Role: liveRuntimeRoleServer,
 		RootDirectory: ".", RunCommand: "node server.mjs", InternalPort: 3000, HealthProbe: "/health",
 		BuildDefinitionDigest: strings.Repeat(map[string]string{"blue": "a", "green": "b", "other": "c"}[version], 64),
 	}
 }
 
-func buildLiveImage(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, tag string, spec generatedruntime.CandidateSpec, version string) string {
+func buildLiveImage(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, tag string, spec liveRuntimeCandidateSpec, version string) string {
 	t.Helper()
 	// Buildx writes state beneath DOCKER_CONFIG/buildx by default. Fixture
 	// builds must never share the runtime engine's deliberately empty config.
@@ -437,7 +434,7 @@ func TestLiveFixtureBuildKeepsRuntimeDockerConfigurationEmpty(t *testing.T) {
 	}
 }
 
-func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, authority *liveGeneratedAuthority, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
+func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine liveRuntimeEngine, authority *liveGeneratedAuthority, spec liveRuntimeCandidateSpec) liveRuntimeCandidate {
 	t.Helper()
 	session := authority.Begin(t, ctx, engine, spec)
 	t.Cleanup(session.Close)
@@ -449,7 +446,7 @@ func createAndStartLiveCandidate(t *testing.T, ctx context.Context, engine *gene
 	return candidate
 }
 
-func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, authority *liveGeneratedAuthority, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
+func startLiveCandidate(t *testing.T, ctx context.Context, engine liveRuntimeEngine, authority *liveGeneratedAuthority, spec liveRuntimeCandidateSpec) liveRuntimeCandidate {
 	t.Helper()
 	candidate := createAndStartLiveCandidate(t, ctx, engine, authority, spec)
 	if err := authority.waitHealthy(candidate); err != nil {
@@ -458,8 +455,8 @@ func startLiveCandidate(t *testing.T, ctx context.Context, engine *generatedrunt
 	return candidate
 }
 
-func liveEndpoint(candidate generatedruntime.Candidate) generatedruntime.RouteEndpoint {
-	return generatedruntime.RouteEndpoint{
+func liveEndpoint(candidate liveRuntimeCandidate) generatedroute.RouteEndpoint {
+	return generatedroute.RouteEndpoint{
 		Component: candidate.Component, Role: candidate.Role, ContainerID: candidate.ContainerID,
 		NetworkName: candidate.NetworkName, NetworkAlias: candidate.NetworkAlias, InternalPort: candidate.InternalPort,
 	}
@@ -517,7 +514,7 @@ type liveApplicationMount struct {
 }
 
 type liveAttestedApplication struct {
-	candidate generatedruntime.Candidate
+	candidate liveRuntimeCandidate
 	address   netip.Addr
 	gateway   netip.Addr
 	network   netip.Prefix
@@ -550,7 +547,7 @@ const (
 	liveApplicationProbeUnknown   liveApplicationProbeDisposition = "unknown"
 )
 
-func assertLiveApplicationNetworkIsolation(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, ingress *Manager, first, second generatedruntime.Candidate, hostPort uint16, firstAppID, firstVersion, secondAppID, secondVersion string, external liveExternalTLSFixture) {
+func assertLiveApplicationNetworkIsolation(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, ingress *Manager, first, second liveRuntimeCandidate, hostPort uint16, firstAppID, firstVersion, secondAppID, secondVersion string, external liveExternalTLSFixture) {
 	t.Helper()
 	firstAttested := attestLiveApplication(t, ctx, runner, docker, working, dockerConfig, first)
 	secondAttested := attestLiveApplication(t, ctx, runner, docker, working, dockerConfig, second)
@@ -580,7 +577,7 @@ func assertLiveApplicationNetworkIsolation(t *testing.T, ctx context.Context, ru
 	assertLiveOneShot(t, ctx, hostPort, secondAppID, "/", secondVersion, "second public route did not remain available after application-origin probes")
 }
 
-func attestLiveApplication(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, candidate generatedruntime.Candidate) liveAttestedApplication {
+func attestLiveApplication(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, candidate liveRuntimeCandidate) liveAttestedApplication {
 	t.Helper()
 	if ctx.Err() != nil || !validContainerID(candidate.ContainerID) {
 		t.Fatal("application candidate attestation was invalid")
@@ -607,7 +604,7 @@ func attestLiveApplication(t *testing.T, ctx context.Context, runner runtimeproc
 	return liveAttestedApplication{candidate: candidate, address: address, gateway: network.gateway, network: network.prefix}
 }
 
-func validLiveApplicationInspection(value liveApplicationInspection, candidate generatedruntime.Candidate) bool {
+func validLiveApplicationInspection(value liveApplicationInspection, candidate liveRuntimeCandidate) bool {
 	if normalizeID(value.ID) != normalizeID(candidate.ContainerID) || strings.TrimPrefix(value.Name, "/") != candidate.ContainerName || !value.Running || value.Health != "healthy" || value.NetworkMode != candidate.NetworkName || value.PIDMode != "" || (value.IPCMode != "" && value.IPCMode != "private") || !value.ReadOnly || value.Privileged || len(value.Binds) != 0 || len(value.PortBindings) != 0 || len(value.Networks) != 1 || !liveContainsLabels(value.Labels, liveCandidateLabels(candidate)) {
 		return false
 	}
@@ -620,7 +617,7 @@ func validLiveApplicationInspection(value liveApplicationInspection, candidate g
 	return attachment != nil && liveContainsString(attachment.Aliases, candidate.NetworkAlias)
 }
 
-func liveCandidateLabels(candidate generatedruntime.Candidate) map[string]string {
+func liveCandidateLabels(candidate liveRuntimeCandidate) map[string]string {
 	return map[string]string{
 		"io.rig.managed": "generated-runtime", "io.rig.application": candidate.AppID,
 		"io.rig.release": candidate.ReleaseID, "io.rig.deployment": candidate.DeploymentID,
@@ -652,7 +649,7 @@ type liveApplicationBridge struct {
 	gateway netip.Addr
 }
 
-func attestLiveApplicationBridge(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, candidate generatedruntime.Candidate) liveApplicationBridge {
+func attestLiveApplicationBridge(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, candidate liveRuntimeCandidate) liveApplicationBridge {
 	t.Helper()
 	result, err := runLiveDocker(ctx, runner, docker, working, dockerConfig, 10*time.Second, "network", "inspect", "--format", networkInspectFormat, candidate.NetworkName)
 	defer clearLiveResult(&result)
@@ -676,7 +673,7 @@ func attestLiveApplicationBridge(t *testing.T, ctx context.Context, runner runti
 
 func attestLiveCaddyForApplication(t *testing.T, ctx context.Context, ingress *Manager, application liveAttestedApplication) liveAttestedCaddy {
 	t.Helper()
-	caddyID, err := ingress.attestedCaddyForGateway(ctx, routeRecord{Slot: application.candidate.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(application.candidate)}})
+	caddyID, err := ingress.attestedCaddyForGateway(ctx, routeRecord{Slot: application.candidate.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(application.candidate)}})
 	if err != nil {
 		failLiveIngress(t, "attest Caddy for application-origin probe", err)
 	}
@@ -737,7 +734,7 @@ async function unconnected(){
 }
 (async()=>{await control('',403);await control('expected',401);await unconnected();process.stdout.write('3',()=>process.exit(0));})().catch(()=>process.exit(1));`
 
-func assertLiveHTTPResponseProbeControl(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate) {
+func assertLiveHTTPResponseProbeControl(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source liveRuntimeCandidate) {
 	t.Helper()
 	result, err := runLiveDocker(ctx, runner, docker, working, dockerConfig, 10*time.Second,
 		"container", "exec", source.ContainerID, "node", "-e", liveHTTPResponseProbeControlCommand, liveApplicationHTTPProbeCommand)
@@ -747,7 +744,7 @@ func assertLiveHTTPResponseProbeControl(t *testing.T, ctx context.Context, runne
 	}
 }
 
-func assertLiveApplicationProbeSuccess(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, target netip.Addr, port uint16, failure string) {
+func assertLiveApplicationProbeSuccess(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source liveRuntimeCandidate, target netip.Addr, port uint16, failure string) {
 	t.Helper()
 	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, target, port, "", "", failure)
 	if liveApplicationProbeClassification(result) != liveApplicationProbeReachable || result.Status < http.StatusOK || result.Status >= http.StatusMultipleChoices {
@@ -755,7 +752,7 @@ func assertLiveApplicationProbeSuccess(t *testing.T, ctx context.Context, runner
 	}
 }
 
-func assertLiveApplicationProbeDenied(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, target netip.Addr, port uint16, failure string) {
+func assertLiveApplicationProbeDenied(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source liveRuntimeCandidate, target netip.Addr, port uint16, failure string) {
 	t.Helper()
 	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPProbeCommand, target, port, "", "", failure)
 	if liveApplicationProbeClassification(result) != liveApplicationProbeBlocked {
@@ -763,7 +760,7 @@ func assertLiveApplicationProbeDenied(t *testing.T, ctx context.Context, runner 
 	}
 }
 
-func assertLiveApplicationAliasSuccess(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, alias, expected, failure string) {
+func assertLiveApplicationAliasSuccess(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source liveRuntimeCandidate, alias, expected, failure string) {
 	t.Helper()
 	if !validName(alias, 96) {
 		t.Fatal("application-origin alias probe had an invalid owned alias")
@@ -774,7 +771,7 @@ func assertLiveApplicationAliasSuccess(t *testing.T, ctx context.Context, runner
 	}
 }
 
-func assertLiveApplicationAliasDenied(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, alias string, port uint16, failure string) {
+func assertLiveApplicationAliasDenied(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source liveRuntimeCandidate, alias string, port uint16, failure string) {
 	t.Helper()
 	if !strings.Contains(alias, ".") {
 		t.Fatal("application-origin alias probe did not use a qualified private alias")
@@ -785,7 +782,7 @@ func assertLiveApplicationAliasDenied(t *testing.T, ctx context.Context, runner 
 	}
 }
 
-func assertLiveApplicationHTTPSProbeSuccess(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, gateway netip.Addr, external liveExternalTLSFixture, failure string) {
+func assertLiveApplicationHTTPSProbeSuccess(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source liveRuntimeCandidate, gateway netip.Addr, external liveExternalTLSFixture, failure string) {
 	t.Helper()
 	result := runLiveApplicationProbe(t, ctx, runner, docker, working, dockerConfig, source, liveApplicationHTTPSProbeCommand, gateway, external.port, "", external.ca, failure)
 	if liveApplicationProbeClassification(result) != liveApplicationProbeReachable || result.Status < http.StatusOK || result.Status >= http.StatusMultipleChoices {
@@ -793,7 +790,7 @@ func assertLiveApplicationHTTPSProbeSuccess(t *testing.T, ctx context.Context, r
 	}
 }
 
-func runLiveApplicationProbe(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, command string, target netip.Addr, port uint16, expected, ca, failure string) liveApplicationProbeResult {
+func runLiveApplicationProbe(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source liveRuntimeCandidate, command string, target netip.Addr, port uint16, expected, ca, failure string) liveApplicationProbeResult {
 	t.Helper()
 	if !target.Is4() {
 		t.Fatal("application-origin probe had an invalid attested target")
@@ -801,7 +798,7 @@ func runLiveApplicationProbe(t *testing.T, ctx context.Context, runner runtimepr
 	return runLiveApplicationProbeTarget(t, ctx, runner, docker, working, dockerConfig, source, command, target.String(), port, expected, ca, failure)
 }
 
-func runLiveApplicationProbeTarget(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source generatedruntime.Candidate, command, target string, port uint16, expected, ca, failure string) liveApplicationProbeResult {
+func runLiveApplicationProbeTarget(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, working, dockerConfig string, source liveRuntimeCandidate, command, target string, port uint16, expected, ca, failure string) liveApplicationProbeResult {
 	t.Helper()
 	if ctx.Err() != nil || !validContainerID(source.ContainerID) || target == "" || port == 0 {
 		t.Fatal("application-origin probe had an invalid attested target")
@@ -1200,22 +1197,22 @@ func failLiveIngress(t *testing.T, phase string, err error) {
 }
 
 func liveRuntimeDiagnostic(err error) string {
-	var diagnostic *generatedruntime.Error
-	if !errors.As(err, &diagnostic) || diagnostic == nil {
+	code, ok := liveRuntimeErrorCode(err)
+	if !ok {
 		return "unclassified"
 	}
-	switch diagnostic.Code {
-	case generatedruntime.DiagnosticValidationFailed, generatedruntime.DiagnosticRuntimeUnavailable,
-		generatedruntime.DiagnosticRuntimeTimeout, generatedruntime.DiagnosticProcessTerminationFailed,
-		generatedruntime.DiagnosticRuntimeOutputTruncated, generatedruntime.DiagnosticImageUnavailable,
-		generatedruntime.DiagnosticImageDriftDetected, generatedruntime.DiagnosticNetworkDriftDetected,
-		generatedruntime.DiagnosticNetworkProvisionFailed, generatedruntime.DiagnosticCandidateSlotOccupied,
-		generatedruntime.DiagnosticCandidateCreateFailed, generatedruntime.DiagnosticCandidateStartFailed,
-		generatedruntime.DiagnosticCandidateHardeningFailed, generatedruntime.DiagnosticCandidateUnhealthy,
-		generatedruntime.DiagnosticCandidateExited, generatedruntime.DiagnosticCandidateCleanupFailed,
-		generatedruntime.DiagnosticInsufficientReplacementSpace, generatedruntime.DiagnosticConfigurationUnavailable,
-		generatedruntime.DiagnosticInternalError, generatedruntime.DiagnosticCancelled:
-		return string(diagnostic.Code)
+	switch code {
+	case liveRuntimeDiagnosticValidationFailed, liveRuntimeDiagnosticRuntimeUnavailable,
+		liveRuntimeDiagnosticRuntimeTimeout, liveRuntimeDiagnosticProcessTerminationFailed,
+		liveRuntimeDiagnosticRuntimeOutputTruncated, liveRuntimeDiagnosticImageUnavailable,
+		liveRuntimeDiagnosticImageDriftDetected, liveRuntimeDiagnosticNetworkDriftDetected,
+		liveRuntimeDiagnosticNetworkProvisionFailed, liveRuntimeDiagnosticCandidateSlotOccupied,
+		liveRuntimeDiagnosticCandidateCreateFailed, liveRuntimeDiagnosticCandidateStartFailed,
+		liveRuntimeDiagnosticCandidateHardeningFailed, liveRuntimeDiagnosticCandidateUnhealthy,
+		liveRuntimeDiagnosticCandidateExited, liveRuntimeDiagnosticCandidateCleanupFailed,
+		liveRuntimeDiagnosticInsufficientReplacementSpace, liveRuntimeDiagnosticConfigurationUnavailable,
+		liveRuntimeDiagnosticInternalError, liveRuntimeDiagnosticCancelled:
+		return code
 	default:
 		return "unclassified"
 	}
@@ -1226,8 +1223,8 @@ func TestLiveRuntimeDiagnosticOmitsRawAndUnknownErrors(t *testing.T) {
 		err  error
 		want string
 	}{
-		{fmt.Errorf("sensitive output: %w", &generatedruntime.Error{Code: generatedruntime.DiagnosticCandidateHardeningFailed}), "candidate_hardening_failed"},
-		{&generatedruntime.Error{Code: "sensitive_command"}, "unclassified"},
+		{fmt.Errorf("sensitive output: %w", newLiveRuntimeError(liveRuntimeDiagnosticCandidateHardeningFailed)), "candidate_hardening_failed"},
+		{newLiveRuntimeError("sensitive_command"), "unclassified"},
 		{errors.New("sensitive output"), "unclassified"},
 		{nil, "unclassified"},
 	} {
@@ -1327,11 +1324,11 @@ func TestLiveApplicationProbeClassificationFailsClosed(t *testing.T) {
 }
 
 func TestLiveApplicationInspectionRetainsOwnedIsolation(t *testing.T) {
-	candidate := generatedruntime.Candidate{
+	candidate := liveRuntimeCandidate{
 		ContainerID: strings.Repeat("a", 64), ContainerName: "owned-api-blue",
 		AppID: "11111111-1111-4111-8111-111111111111", NetworkName: "owned-network", NetworkAlias: "api-blue",
 		ReleaseID: "release", DeploymentID: "deployment", ArtifactID: "artifact", DeploymentPlanRevisionID: "plan",
-		Component: "api", Slot: generatedruntime.SlotBlue, Role: generatedruntime.RoleServer,
+		Component: "api", Slot: generatedidentity.SlotBlue, Role: liveRuntimeRoleServer,
 	}
 	for _, test := range []struct {
 		name   string

@@ -25,7 +25,8 @@ import (
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/database"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/hostnetwork"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -57,7 +58,7 @@ type liveGatewayV2Fixture struct {
 	db           *sql.DB
 	repository   *appaccess.Repository
 	ingress      *Manager
-	candidates   []generatedruntime.Candidate
+	candidates   []liveRuntimeCandidate
 	spec         liveGatewayV2FixtureSpec
 	interfaceIP  string
 	port         uint16
@@ -111,7 +112,7 @@ func TestLiveGatewayV2UpgradeCommitAndRestart(t *testing.T) {
 	observation, err := restarted.Observe(fixture.ctx, fixture.spec.appID)
 	wantURL := "http://" + fixture.spec.appID + ".rig.localhost:" + strconv.FormatUint(uint64(fixture.ingress.options.HostPort), 10)
 	if err != nil || observation.URL != wantURL || observation.Slot != fixture.candidates[0].Slot ||
-		!reflect.DeepEqual(observation.Endpoints, []generatedruntime.RouteEndpoint{liveEndpoint(fixture.candidates[0])}) {
+		!reflect.DeepEqual(observation.Endpoints, []generatedroute.RouteEndpoint{liveEndpoint(fixture.candidates[0])}) {
 		t.Fatalf("restarted application observation = %+v, err=%v", observation, err)
 	}
 	assertLiveOneShot(t, fixture.ctx, fixture.ingress.options.HostPort, fixture.spec.appID, "/", fixture.spec.applicationReply,
@@ -212,7 +213,7 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	liveGatewayRequireLocalDocker(t, ctx, runner, docker, root, dockerConfig)
 	selected, port := liveGatewayV2SelectHostBinding(t)
 
-	appNetwork, err := generatedruntime.DescribeAppNetwork(spec.appID)
+	appNetwork, err := generatedidentity.DescribeAppNetwork(spec.appID)
 	if err != nil {
 		t.Fatal("describe gateway-v2 application network")
 	}
@@ -220,12 +221,12 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	liveGatewayRequireCleanPreflight(t, ctx, runner, docker, root, dockerConfig, []string{appNetwork.Name}, []liveGatewayImage{image})
 	liveGatewayV2RequireCleanPreflight(t, ctx, runner, docker, root, dockerConfig, spec.operationID)
 
-	limits := generatedruntime.ContainerLimits{
+	limits := liveRuntimeContainerLimits{
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
 	authority := liveGeneratedDeployments(t, working)
-	engine, err := generatedruntime.NewEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
+	engine, err := newLiveRuntimeEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
@@ -270,8 +271,8 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	}
 	candidate := startLiveCandidate(t, ctx, engine, authority, appSpec)
 	fixture.candidates = append(fixture.candidates, candidate)
-	route := generatedruntime.RouteSwitchRequest{
-		AppID: spec.appID, ToSlot: candidate.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(candidate)},
+	route := generatedroute.RouteSwitchRequest{
+		AppID: spec.appID, ToSlot: candidate.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(candidate)},
 	}
 	if err := ingress.Switch(ctx, route); err != nil {
 		failLiveIngress(t, "install gateway-v2 source route", err)

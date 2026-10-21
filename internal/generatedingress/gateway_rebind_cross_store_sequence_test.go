@@ -11,7 +11,8 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
@@ -222,7 +223,7 @@ func TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy(t *test
 	head := gatewayRebindSequenceRedeploy(t, f, *selection.State, entry)
 	redeployed, err := selection.Store.load()
 	if err != nil || redeployed.Revision != selection.State.Revision+2 || redeployed.Pending != nil ||
-		redeployed.Apps[entry.AppID].Route.Slot != generatedruntime.Slot(head.Slot) ||
+		redeployed.Apps[entry.AppID].Route.Slot != generatedidentity.Slot(head.Slot) ||
 		!reflect.DeepEqual(redeployed.Apps[entry.AppID].LAN, selection.State.Apps[entry.AppID].LAN) ||
 		physical.applyCalls != 1 || physical.attestCalls != 1 || physical.restoreCalls+physical.stopCalls != 0 {
 		t.Fatalf("ordinary redeploy did not preserve transferred binding: %v", err)
@@ -338,7 +339,7 @@ func gatewayRebindSequenceRedeploy(t *testing.T, f gatewayRebindPredecessorFixtu
 		}
 	}
 	request := routeOperationSwitchRequest(t, entry.AppID, state.Apps[entry.AppID].Route)
-	request.Endpoints = []generatedruntime.RouteEndpoint{endpoint("api", "server", "rebind-app-network", "rebind-app-green", 3000, '5')}
+	request.Endpoints = []generatedroute.RouteEndpoint{endpoint("api", "server", "rebind-app-network", "rebind-app-green", 3000, '5')}
 	if err := f.manager.Switch(ctx, request); err != nil {
 		t.Fatalf("ordinary ingress switch: %v", err)
 	}

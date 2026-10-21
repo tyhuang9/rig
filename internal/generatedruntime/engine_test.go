@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcontainer"
+	"github.com/hostd/hostd/internal/generatedingress"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -65,7 +67,7 @@ func (s *runtimeFakeEnvironment) Stage(_ string, _ int, contents []byte) (Enviro
 	return &runtimeFakeEnvironmentLease{path: s.path, cleanup: func() { s.cleaned++ }}, nil
 }
 
-func (s *runtimeFakeEnvironment) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+func (s *runtimeFakeEnvironment) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
 	lease, err := s.Stage(operationID, attempt, contents)
 	return lease, err
 }
@@ -239,7 +241,7 @@ func TestGeneratedRuntimeRejectsCapacityBeforeDockerMutation(t *testing.T) {
 		t.Fatalf("capacity rejection reached Docker: %#v", request.Args)
 		return runtimeRequestResult{}
 	})
-	_, err := session.engine.ReserveReplacement(session.authority.context, deployments.GeneratedReplacementRequest(session.request))
+	_, err := session.engine.ReserveReplacement(session.authority.context, generatedingress.GeneratedReplacementRequest(session.request))
 	if !IsCode(err, DiagnosticInsufficientReplacementSpace) {
 		t.Fatalf("expected replacement capacity rejection, got %v", err)
 	}
@@ -256,7 +258,7 @@ func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
 		t.Fatalf("under-reserved replacement reached Docker: %#v", request.Args)
 		return runtimeRequestResult{}
 	})
-	if _, err := session.engine.ReserveReplacement(session.authority.context, deployments.GeneratedReplacementRequest(session.request)); !IsCode(err, DiagnosticInsufficientReplacementSpace) {
+	if _, err := session.engine.ReserveReplacement(session.authority.context, generatedingress.GeneratedReplacementRequest(session.request)); !IsCode(err, DiagnosticInsufficientReplacementSpace) {
 		t.Fatalf("expected derived disk capacity rejection, got %v", err)
 	}
 	if session.engine.options.ReplacementDiskBytes != 564<<20 {
@@ -460,8 +462,12 @@ func TestGeneratedRuntimeStopAndRemoveRefusesReceiptOwnedCandidateBeforeDocker(t
 	if candidate.ContainerName != containerName(session.authority.spec.AppID, session.authority.spec.ComponentName, SlotGreen) || invocation.Identity().ReceiptID == "" {
 		t.Fatalf("test setup did not create a receipt-bound candidate: %+v", candidate)
 	}
-	if err := session.engine.StopAndRemove(session.authority.context, candidate, time.Second); !errors.Is(err, deployments.ErrGeneratedCandidateRetirementUnavailable) {
+	err := session.engine.StopAndRemove(session.authority.context, candidate, time.Second)
+	if !errors.Is(err, deployments.ErrGeneratedCandidateRetirementUnavailable) {
 		t.Fatalf("legacy removal accepted durable candidate receipt: %v", err)
+	}
+	if wrapped := fmt.Errorf("retirement barrier: %w", err); !IsCode(wrapped, DiagnosticCode("retirement_unavailable")) {
+		t.Fatalf("wrapped retirement barrier lost its diagnostic: %v", wrapped)
 	}
 	if len(session.runner.requests) != 0 {
 		t.Fatalf("legacy receipt refusal reached Docker: %#v", session.runner.requests)

@@ -19,7 +19,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func TestGatewayRebindFinalConfigRoutePlanPreservesAllAppsAndRawBindings(t *testing.T) {
@@ -595,8 +596,8 @@ func installGatewayRebindFinalConfigLoopbackServingProgress(t *testing.T) (gatew
 		break
 	}
 	source.LAN = nil
-	source.Route.Slot = generatedruntime.Slot(head.Slot)
-	source.Route.Endpoints = []generatedruntime.RouteEndpoint{
+	source.Route.Slot = generatedidentity.Slot(head.Slot)
+	source.Route.Endpoints = []generatedroute.RouteEndpoint{
 		endpoint("api", "server", "rebind-loopback-network", "rebind-loopback-"+head.Slot, 3000, '7'),
 	}
 	state.Apps[loopbackID] = source

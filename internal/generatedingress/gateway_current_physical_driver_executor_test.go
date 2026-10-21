@@ -15,7 +15,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -91,7 +91,7 @@ func (r *gatewayCurrentPhysicalExecutor) installRouteNetworks(t *testing.T,
 		network := r.networks[name]
 		if network.Name == "" {
 			network = caddyNetworkInspection{Name: name, Driver: "bridge", Scope: "local", Options: map[string]string{},
-				Labels: map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue,
+				Labels: map[string]string{"io.rig.managed": generatedidentity.NetworkOwnershipLabelValue,
 					"io.rig.application": owners[name]}, Containers: make(map[string]caddyNetworkContainerInspection)}
 		}
 		if attachFinal {

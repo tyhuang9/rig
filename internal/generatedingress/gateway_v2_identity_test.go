@@ -17,7 +17,8 @@ import (
 	"testing"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -171,7 +172,7 @@ func TestClassifyGatewayV2MixedRestartRequiresProposedLiveAndCommittedRestartCon
 	journal.Phase = gatewayPhaseCommitted
 	proposed := cloneGatewayV2RouteState(committed)
 	app := proposed.Apps[upgradeTestAppA]
-	app.Route = routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	app.Route = routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
 		endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
 	}}
@@ -181,7 +182,7 @@ func TestClassifyGatewayV2MixedRestartRequiresProposedLiveAndCommittedRestartCon
 	}
 	multiple := cloneGatewayV2RouteState(proposed)
 	other := multiple.Apps[upgradeTestAppB]
-	other.Route = routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+	other.Route = routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", "net-b", "web-blue", 3000, 'f'),
 	}}
 	multiple.Apps[upgradeTestAppB] = other
@@ -249,7 +250,7 @@ func TestClassifyGatewayV2MixedRestartAcceptsOnlyExactLANGrantTransition(t *test
 
 	changedRoute := cloneGatewayV2RouteState(proposed)
 	app := changedRoute.Apps[upgradeTestAppA]
-	app.Route.Slot = generatedruntime.SlotGreen
+	app.Route.Slot = generatedidentity.SlotGreen
 	changedRoute.Apps[upgradeTestAppA] = app
 	if validGatewayV2MixedRestartInputs(source, committed, changedRoute, journal) {
 		t.Fatal("combined route switch and LAN grant was accepted")
@@ -282,7 +283,7 @@ func TestClassifyGatewayV2TopologyRejectsDurablePendingRoute(t *testing.T) {
 	journal.Resources = gatewayV2IdentityTestBoundResources(t)
 	journal.Phase = gatewayPhaseCommitted
 	previous := cloneGatewayV2AppRoute(state.Apps[upgradeTestAppA])
-	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
 		endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
 	}}}
@@ -615,7 +616,7 @@ func TestGatewayV2ConfigProofBoundCoversNearCapacityV1State(t *testing.T) {
 		appID := fmt.Sprintf("%08x-0000-4000-8000-%012x", index+1, index+1)
 		network := fmt.Sprintf("net-%02d-%s", index, strings.Repeat("n", 89))
 		alias := fmt.Sprintf("alias-%02d-%s", index, strings.Repeat("a", 86))
-		routes[appID] = routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		routes[appID] = routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			{Component: strings.Repeat("s", 64), Role: "server", ContainerID: strings.Repeat("a", 64), NetworkName: network, NetworkAlias: alias, InternalPort: 65535},
 			{Component: strings.Repeat("t", 64), Role: "static", ContainerID: strings.Repeat("b", 64), NetworkName: network, NetworkAlias: alias, InternalPort: 65534},
 		}}
@@ -1190,7 +1191,7 @@ func gatewayV2IdentityTestApplicationNetworks(routes map[string]routeRecord, con
 		attachment := container.Networks[name]
 		result[name] = caddyNetworkInspection{
 			Name: name, Driver: "bridge", Scope: "local", Options: map[string]string{},
-			Labels: map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": appID},
+			Labels: map[string]string{"io.rig.managed": generatedidentity.NetworkOwnershipLabelValue, "io.rig.application": appID},
 			Containers: map[string]caddyNetworkContainerInspection{container.ID: {
 				Name: strings.TrimPrefix(container.Name, "/"), IPv4Address: attachment.IPAddress + "/24",
 			}},
@@ -1270,8 +1271,8 @@ func gatewayV2EndpointIdentityFixture() (map[string]routeRecord, map[string]cadd
 	endpointID := "sha256:" + strings.Repeat("1", 64)
 	otherID := "sha256:" + strings.Repeat("2", 64)
 	routes := map[string]routeRecord{appID: {
-		Slot: generatedruntime.SlotBlue,
-		Endpoints: []generatedruntime.RouteEndpoint{{
+		Slot: generatedidentity.SlotBlue,
+		Endpoints: []generatedroute.RouteEndpoint{{
 			Component: "frontend", Role: "static", ContainerID: endpointID, NetworkName: "net-a", NetworkAlias: "frontend-blue", InternalPort: 4173,
 		}},
 	}}
@@ -1287,7 +1288,7 @@ func gatewayV2EndpointIdentityFixture() (map[string]routeRecord, map[string]cadd
 			ID: endpointID, Running: true, Health: "healthy",
 			Labels: map[string]string{
 				"io.rig.managed": "generated-runtime", "io.rig.application": appID, "io.rig.component": "frontend",
-				"io.rig.slot": string(generatedruntime.SlotBlue), "io.rig.role": "static",
+				"io.rig.slot": string(generatedidentity.SlotBlue), "io.rig.role": "static",
 			},
 			Networks: map[string]*networkAttachment{"net-a": {Aliases: []string{"frontend-blue"}, IPAddress: "172.30.0.2"}},
 		},

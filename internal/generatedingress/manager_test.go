@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hostd/hostd/internal/deployments"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -27,7 +27,7 @@ type ingressRunner struct {
 	restartAfterStart        bool
 	appID                    string
 	network                  string
-	endpoint                 generatedruntime.RouteEndpoint
+	endpoint                 generatedroute.RouteEndpoint
 	caddyNetworks            map[string]*networkAttachment
 	connectedGatewayPriority int
 	connectedIPv6Gateway     string
@@ -106,7 +106,7 @@ func (r *ingressRunner) Run(_ context.Context, request runtimeprocess.CommandReq
 			}
 			return jsonResult(identity), nil
 		}
-		return jsonResult(networkInspection{Name: r.network, Driver: "bridge", Scope: "local", Options: map[string]string{}, Labels: map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": r.appID}}), nil
+		return jsonResult(networkInspection{Name: r.network, Driver: "bridge", Scope: "local", Options: map[string]string{}, Labels: map[string]string{"io.rig.managed": generatedidentity.NetworkOwnershipLabelValue, "io.rig.application": r.appID}}), nil
 	}
 	if len(args) >= 3 && args[0] == "network" && args[1] == "create" {
 		r.ingressMissing = false
@@ -274,7 +274,7 @@ func TestSwitchPersistsAcceptedRouteAfterValidatedReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if state.Pending != nil || state.Active[runner.appID].Slot != generatedruntime.SlotBlue {
+	if state.Pending != nil || state.Active[runner.appID].Slot != generatedidentity.SlotBlue {
 		t.Fatalf("state = %#v", state)
 	}
 	if !commandBefore(runner.commands, "validate", "reload") {
@@ -371,7 +371,7 @@ func TestGatewayReadinessRequiresExactReachableStatusAndRollsBack(t *testing.T) 
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			manager, runner := newManagerFixture(t, false)
-			previous := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+			previous := routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 				endpoint("web", "server", runner.network, "web-green", 3000, 'c'),
 			}}
 			if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: previous}}); err != nil {
@@ -381,10 +381,10 @@ func TestGatewayReadinessRequiresExactReachableStatusAndRollsBack(t *testing.T) 
 			runner.gatewayProbeErr = test.err
 			runner.gatewayProbeTruncated = test.truncated
 			request := switchRequest(runner)
-			request.FromSlot = generatedruntime.SlotGreen
+			request.FromSlot = generatedidentity.SlotGreen
 			err := manager.Switch(context.Background(), request)
-			if !IsCode(err, DiagnosticGatewayReadinessFailed) || generatedruntime.RouteCandidateMayBeLive(err) || !generatedruntime.RouteGatewayReadinessFailed(err) {
-				t.Fatalf("error=%v mayBeLive=%t readiness=%t", err, generatedruntime.RouteCandidateMayBeLive(err), generatedruntime.RouteGatewayReadinessFailed(err))
+			if !IsCode(err, DiagnosticGatewayReadinessFailed) || testRouteCandidateMayBeLive(err) || !testRouteGatewayReadinessFailed(err) {
+				t.Fatalf("error=%v mayBeLive=%t readiness=%t", err, testRouteCandidateMayBeLive(err), testRouteGatewayReadinessFailed(err))
 			}
 			state, loadErr := manager.store.load()
 			if loadErr != nil || state.Pending != nil || !sameRoute(state.Active[runner.appID], previous) {
@@ -406,7 +406,7 @@ func TestGatewayReadinessAllowsTransportStatusAndChecksEveryEndpoint(t *testing.
 			manager, runner := newManagerFixture(t, false)
 			runner.caddyNetworks[runner.network] = &networkAttachment{}
 			runner.gatewayProbeOutput = status
-			if err := manager.verifyGatewayReadiness(context.Background(), routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}); err != nil {
+			if err := manager.verifyGatewayReadiness(context.Background(), routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}); err != nil {
 				t.Fatalf("status %s: %v", status, err)
 			}
 		})
@@ -414,7 +414,7 @@ func TestGatewayReadinessAllowsTransportStatusAndChecksEveryEndpoint(t *testing.
 	manager, runner := newManagerFixture(t, false)
 	runner.caddyNetworks[runner.network] = &networkAttachment{}
 	runner.gatewayProbeOutputs = [][]byte{[]byte("200"), []byte("000")}
-	route := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+	route := routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 		runner.endpoint,
 		endpoint("api", "static", runner.network, "api-blue", 3001, 'e'),
 	}}
@@ -427,8 +427,8 @@ func TestGatewayReadinessCancellationCompensatesTemporaryNetworkAttachment(t *te
 	manager, runner := newManagerFixture(t, false)
 	runner.gatewayProbeErr = context.Canceled
 	err := manager.Switch(context.Background(), switchRequest(runner))
-	if !IsCode(err, DiagnosticCancelled) || generatedruntime.RouteCandidateMayBeLive(err) {
-		t.Fatalf("error=%v mayBeLive=%t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	if !IsCode(err, DiagnosticCancelled) || testRouteCandidateMayBeLive(err) {
+		t.Fatalf("error=%v mayBeLive=%t", err, testRouteCandidateMayBeLive(err))
 	}
 	state, loadErr := manager.store.load()
 	if loadErr != nil || state.Pending != nil || len(state.Active) != 0 {
@@ -446,16 +446,16 @@ func TestGatewayReadinessTerminationUncertaintyAndRollbackUncertaintyRemainSafe(
 	manager, runner := newManagerFixture(t, false)
 	runner.gatewayProbeErr = runtimeprocess.ErrTerminationFailed
 	err := manager.Switch(context.Background(), switchRequest(runner))
-	if !IsCode(err, DiagnosticIngressUnavailable) || generatedruntime.RouteGatewayReadinessFailed(err) {
-		t.Fatalf("termination error=%v readiness=%t", err, generatedruntime.RouteGatewayReadinessFailed(err))
+	if !IsCode(err, DiagnosticIngressUnavailable) || testRouteGatewayReadinessFailed(err) {
+		t.Fatalf("termination error=%v readiness=%t", err, testRouteGatewayReadinessFailed(err))
 	}
 
 	manager, runner = newManagerFixture(t, false)
 	runner.gatewayProbeOutput = []byte("000")
 	runner.failRollbackReload = true
 	err = manager.Switch(context.Background(), switchRequest(runner))
-	if !IsCode(err, DiagnosticRouteUnresolved) || !generatedruntime.RouteCandidateMayBeLive(err) {
-		t.Fatalf("uncertain compensation error=%v mayBeLive=%t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	if !IsCode(err, DiagnosticRouteUnresolved) || !testRouteCandidateMayBeLive(err) {
+		t.Fatalf("uncertain compensation error=%v mayBeLive=%t", err, testRouteCandidateMayBeLive(err))
 	}
 	state, loadErr := manager.store.load()
 	if loadErr != nil || state.Pending == nil || len(state.Active) != 0 {
@@ -497,8 +497,8 @@ func TestGatewayReadinessFailureOnCommittedRouteMarksCandidateMayBeLive(t *testi
 	}
 	runner.gatewayProbeOutput = []byte("000")
 	err := manager.Switch(context.Background(), request)
-	if !IsCode(err, DiagnosticGatewayReadinessFailed) || !generatedruntime.RouteCandidateMayBeLive(err) || !generatedruntime.RouteGatewayReadinessFailed(err) {
-		t.Fatalf("error=%v mayBeLive=%t readiness=%t", err, generatedruntime.RouteCandidateMayBeLive(err), generatedruntime.RouteGatewayReadinessFailed(err))
+	if !IsCode(err, DiagnosticGatewayReadinessFailed) || !testRouteCandidateMayBeLive(err) || !testRouteGatewayReadinessFailed(err) {
+		t.Fatalf("error=%v mayBeLive=%t readiness=%t", err, testRouteCandidateMayBeLive(err), testRouteGatewayReadinessFailed(err))
 	}
 }
 
@@ -521,8 +521,8 @@ func TestObserveAttestsLiveCommittedRouteWithoutMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation.URL != "http://"+runner.appID+".rig.localhost:8080" || observation.Slot != generatedruntime.SlotBlue ||
-		!reflect.DeepEqual(observation.Endpoints, []generatedruntime.RouteEndpoint{runner.endpoint}) ||
+	if observation.URL != "http://"+runner.appID+".rig.localhost:8080" || observation.Slot != generatedidentity.SlotBlue ||
+		!reflect.DeepEqual(observation.Endpoints, []generatedroute.RouteEndpoint{runner.endpoint}) ||
 		observation.ObservedAt.IsZero() || observation.ObservedAt.Location() != time.UTC {
 		t.Fatalf("observation = %#v", observation)
 	}
@@ -768,7 +768,7 @@ func TestObserveWithholdsURLOnUncertainOrDriftedIngress(t *testing.T) {
 				t.Fatal(err)
 			}
 			previous := state.Active[runner.appID]
-			state.Pending = &pendingRoute{AppID: runner.appID, Previous: &previous, Proposed: routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: previous.Endpoints}}
+			state.Pending = &pendingRoute{AppID: runner.appID, Previous: &previous, Proposed: routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: previous.Endpoints}}
 			if err := manager.store.save(state); err != nil {
 				t.Fatal(err)
 			}
@@ -876,7 +876,7 @@ func TestSwitchIdempotentRepairFailureMarksCandidateLive(t *testing.T) {
 	runner.failRestartInstall = runner.restartInstalls + 1
 
 	err := manager.Switch(context.Background(), request)
-	if !generatedruntime.RouteCandidateMayBeLive(err) {
+	if !testRouteCandidateMayBeLive(err) {
 		t.Fatalf("error = %v, candidate may be live = false", err)
 	}
 	state, loadErr := manager.store.load()
@@ -895,8 +895,8 @@ func TestSwitchIdempotentRepairAttestsCandidateBeforePublishing(t *testing.T) {
 	runner.endpointRoleLabel = "static"
 
 	err := manager.Switch(context.Background(), request)
-	if !IsCode(err, DiagnosticIngressDrift) || !generatedruntime.RouteCandidateMayBeLive(err) {
-		t.Fatalf("error = %v, candidate may be live = %t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	if !IsCode(err, DiagnosticIngressDrift) || !testRouteCandidateMayBeLive(err) {
+		t.Fatalf("error = %v, candidate may be live = %t", err, testRouteCandidateMayBeLive(err))
 	}
 	for _, command := range runner.commands[commandCount:] {
 		if containsArgument(command, "/config/reconcile.json") {
@@ -939,7 +939,7 @@ func TestSwitchReloadFailureRollsBackFirstDeploymentAndClearsPendingState(t *tes
 
 func TestSwitchRestartInstallFailureCompensatesBeforeCleanupSafeError(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	previous := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	previous := routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", runner.network, "web-green", 3000, 'c'),
 	}}
 	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: previous}}); err != nil {
@@ -947,11 +947,11 @@ func TestSwitchRestartInstallFailureCompensatesBeforeCleanupSafeError(t *testing
 	}
 	runner.failRestartInstall = 2
 	request := switchRequest(runner)
-	request.FromSlot = generatedruntime.SlotGreen
+	request.FromSlot = generatedidentity.SlotGreen
 
 	err := manager.Switch(context.Background(), request)
-	if !IsCode(err, DiagnosticRouteUnresolved) || generatedruntime.RouteCandidateMayBeLive(err) {
-		t.Fatalf("error = %v, candidate may be live = %t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	if !IsCode(err, DiagnosticRouteUnresolved) || testRouteCandidateMayBeLive(err) {
+		t.Fatalf("error = %v, candidate may be live = %t", err, testRouteCandidateMayBeLive(err))
 	}
 	state, loadErr := manager.store.load()
 	if loadErr != nil {
@@ -974,7 +974,7 @@ func TestSwitchRestartInstallFailureCompensatesBeforeCleanupSafeError(t *testing
 
 func TestSwitchFailedCompensationMarksCandidateLiveAndRemainsRecoverable(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	previous := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	previous := routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", runner.network, "web-green", 3000, 'c'),
 	}}
 	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: previous}}); err != nil {
@@ -983,11 +983,11 @@ func TestSwitchFailedCompensationMarksCandidateLiveAndRemainsRecoverable(t *test
 	runner.failRestartInstall = 2
 	runner.failRollbackReload = true
 	request := switchRequest(runner)
-	request.FromSlot = generatedruntime.SlotGreen
+	request.FromSlot = generatedidentity.SlotGreen
 
 	err := manager.Switch(context.Background(), request)
-	if !IsCode(err, DiagnosticRouteUnresolved) || !generatedruntime.RouteCandidateMayBeLive(err) {
-		t.Fatalf("error = %v, candidate may be live = %t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	if !IsCode(err, DiagnosticRouteUnresolved) || !testRouteCandidateMayBeLive(err) {
+		t.Fatalf("error = %v, candidate may be live = %t", err, testRouteCandidateMayBeLive(err))
 	}
 	proposed := routeRecord{Slot: request.ToSlot, Endpoints: request.Endpoints}
 	state, loadErr := manager.store.load()
@@ -1049,7 +1049,7 @@ func TestLowIngressCapacityBecomesReplacementCapacityDiagnostic(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.capacityOutput = []byte("1024 2048\n")
 	authority := liveGeneratedDeployments(t, manager.options.WorkingDirectory)
-	engine, err := generatedruntime.NewEngine(runner, &unusedEnvironmentStager{}, manager, authority.repository, generatedruntime.EngineOptions{
+	engine, err := newLiveRuntimeEngine(runner, &unusedEnvironmentStager{}, manager, authority.repository, liveRuntimeEngineOptions{
 		DockerExecutable:      manager.options.DockerExecutable,
 		DockerConfigDirectory: manager.options.DockerConfigDirectory,
 		WorkingDirectory:      manager.options.WorkingDirectory,
@@ -1069,14 +1069,14 @@ func TestLowIngressCapacityBecomesReplacementCapacityDiagnostic(t *testing.T) {
 	ctx := deploymenteffects.WithScope(context.Background(), scope)
 	spec := authority.PrepareCandidate(t, ctx, liveCandidateSpec("blue", uuid.NewString(), uuid.NewString()))
 	spec = authority.BindNetwork(t, ctx, spec)
-	request := deployments.GeneratedReplacementRequest{
+	request := GeneratedReplacementRequest{
 		Claim: spec.Network.Claim, DeploymentID: spec.DeploymentID, ReleaseID: spec.ReleaseID,
 		ConfigurationRevisionID: spec.ConfigurationRevisionID, ConfigurationRevisionNumber: spec.ConfigurationRevisionNumber,
 		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: spec.DeploymentPlanRevisionNumber,
-		CandidateSlot: string(generatedruntime.SlotBlue), Findings: spec.Network.Findings,
+		CandidateSlot: string(generatedidentity.SlotBlue), Findings: spec.Network.Findings,
 	}
 	commandsBefore := len(runner.commands)
-	if _, err := engine.ReserveReplacement(ctx, request); !generatedruntime.IsCode(err, generatedruntime.DiagnosticInsufficientReplacementSpace) {
+	if _, err := engine.ReserveReplacement(ctx, request); !liveRuntimeIsCode(err, liveRuntimeDiagnosticInsufficientReplacementSpace) {
 		t.Fatalf("error = %v", err)
 	}
 	for _, command := range runner.commands[commandsBefore:] {
@@ -1304,7 +1304,7 @@ func TestProvisionRepairsStoppedCaddyBeforeReconnectingApplicationNetwork(t *tes
 	manager, runner := newManagerFixture(t, false)
 	runner.stopped = true
 	runner.caddyNetworks[runner.network] = &networkAttachment{}
-	route := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}
+	route := routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}
 	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: route}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1324,7 +1324,7 @@ func TestProvisionRepairsStoppedCaddyBeforeReconnectingApplicationNetwork(t *tes
 
 func TestProvisionReconcilesMissingAndStaleApplicationNetworks(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	route := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}
+	route := routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}
 	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: route}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1507,7 +1507,7 @@ func TestCaddyGatewayPriorityIsReattestedAfterApplicationConnect(t *testing.T) {
 		} else {
 			runner.connectedGatewayPriority = 1
 		}
-		routes := map[string]routeRecord{runner.appID: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}}
+		routes := map[string]routeRecord{runner.appID: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}}
 		if err := manager.reconcileCaddyNetworks(context.Background(), routes); !IsCode(err, DiagnosticIngressDrift) {
 			t.Fatalf("post-connect gateway drift error = %v", err)
 		}
@@ -1692,8 +1692,8 @@ func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner)
 	return manager, runner
 }
 
-func switchRequest(runner *ingressRunner) generatedruntime.RouteSwitchRequest {
-	return generatedruntime.RouteSwitchRequest{AppID: runner.appID, ToSlot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}
+func switchRequest(runner *ingressRunner) generatedroute.RouteSwitchRequest {
+	return generatedroute.RouteSwitchRequest{AppID: runner.appID, ToSlot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}
 }
 
 func expectedConfig(t *testing.T, runner *ingressRunner, routes map[string]routeRecord) []byte {
@@ -1919,10 +1919,6 @@ func clonePortBindings(values map[string][]map[string]string) map[string][]map[s
 
 type unusedEnvironmentStager struct{}
 
-func (*unusedEnvironmentStager) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
-	return nil, errors.New("environment staging must not run during capacity admission")
-}
-
-func (*unusedEnvironmentStager) StageGeneratedCandidate(string, int, []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+func (*unusedEnvironmentStager) StageGeneratedCandidate(string, int, []byte) (GeneratedCandidateEnvironmentLease, error) {
 	return nil, errors.New("candidate environment staging must not run during capacity admission")
 }

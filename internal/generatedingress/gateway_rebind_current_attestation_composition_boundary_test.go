@@ -11,7 +11,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 // gatewayRebindCurrentAttestationCompositionBoundaryDriver observes the
@@ -167,7 +168,7 @@ func newGatewayRebindCurrentAttestationTwoAppCompositionFixture(t *testing.T) (g
 	if err != nil || deploymentRows != 1 {
 		t.Fatal("two-app composition fixture did not settle exactly one loopback deployment")
 	}
-	network, err := generatedruntime.DescribeAppNetwork(loopbackID)
+	network, err := generatedidentity.DescribeAppNetwork(loopbackID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,8 +180,8 @@ func newGatewayRebindCurrentAttestationTwoAppCompositionFixture(t *testing.T) (g
 	}
 	loopbackRoute := cloneGatewayV2AppRoute(lanRoute)
 	loopbackRoute.LAN = nil
-	loopbackRoute.Route.Slot = generatedruntime.Slot(head.Slot)
-	loopbackRoute.Route.Endpoints = []generatedruntime.RouteEndpoint{
+	loopbackRoute.Route.Slot = generatedidentity.Slot(head.Slot)
+	loopbackRoute.Route.Endpoints = []generatedroute.RouteEndpoint{
 		endpoint("api", "server", network.Name, "rebind-loopback-"+head.Slot, 3000, '7'),
 	}
 	state.Apps[loopbackID] = loopbackRoute

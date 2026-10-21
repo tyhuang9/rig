@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
 )
 
 func TestGatewayHistoryScannerSelectsCommittedGenerationZero(t *testing.T) {
@@ -237,7 +237,7 @@ func TestGatewayV2InitialStateMustExactlyMirrorSourceRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	app := state.Apps[upgradeTestAppA]
-	app.Route.Slot = generatedruntime.SlotGreen
+	app.Route.Slot = generatedidentity.SlotGreen
 	state.Apps[upgradeTestAppA] = app
 	if !validGatewayV2RouteState(state) {
 		t.Fatal("route-divergent test state should remain structurally valid")

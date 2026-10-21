@@ -7,7 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func TestBuildCaddyConfigV2HostProbeIsBoundToApprovedHost(t *testing.T) {
@@ -44,7 +45,7 @@ func TestBuildCaddyConfigV2HostProbeIsBoundToApprovedHost(t *testing.T) {
 func TestBuildCaddyConfigV2AddsStateBoundLocalAppProbesBeforeProxyRoutes(t *testing.T) {
 	appID := "11111111-1111-4111-8111-111111111111"
 	token := strings.Repeat("a", 64)
-	routes := map[string]routeRecord{appID: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+	routes := map[string]routeRecord{appID: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
 	}}}
 	body, err := buildCaddyConfigV2(routes, "10.203.0.2:8080", caddyV2Profile{
@@ -69,7 +70,7 @@ func TestBuildCaddyConfigV2AddsAssignedLANAppProofBeforeProxyAndKeepsUnassigned4
 	appID := "11111111-1111-4111-8111-111111111111"
 	token := strings.Repeat("b", 64)
 	profile := caddyV2Profile{SelectedIPv4: "192.168.50.20", PortStart: 8100, PortEnd: 8101, ProbeToken: token}
-	routes := map[string]routeRecord{appID: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+	routes := map[string]routeRecord{appID: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
 	}}}
 	assignment := caddyV2TestAssignment(appID, false)
@@ -106,10 +107,10 @@ func TestBuildCaddyConfigV2KeepsLocalRoutesAndIsolatesLANPorts(t *testing.T) {
 	appB := "22222222-2222-4222-8222-222222222222"
 	selectedIPv4 := "192.168.50.20"
 	routes := map[string]routeRecord{
-		appB: {Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+		appB: {Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("web", "server", "net-b", "web-green", 3000, 'b'),
 		}},
-		appA: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		appA: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "net-a", "frontend-blue", 4173, 'a'),
 			endpoint("api", "server", "net-a", "api-blue", 3000, 'c'),
 		}},
@@ -231,10 +232,10 @@ func TestBuildCaddyConfigV2KeepsLocalRoutesAndIsolatesLANPorts(t *testing.T) {
 func TestBuildCaddyConfigV2IsDeterministic(t *testing.T) {
 	appA := "11111111-1111-4111-8111-111111111111"
 	appB := "22222222-2222-4222-8222-222222222222"
-	routeA := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+	routeA := routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("api", "server", "net-a", "api-blue", 3000, 'a'),
 	}}
-	routeB := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	routeB := routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", "net-b", "web-green", 3000, 'b'),
 	}}
 	profile := caddyV2Profile{SelectedIPv4: "10.20.30.40", PortStart: 8100, PortEnd: 8119}
@@ -264,7 +265,7 @@ func TestBuildCaddyConfigV2IsDeterministic(t *testing.T) {
 func TestBuildCaddyConfigV2RejectsInvalidOrConflictingInput(t *testing.T) {
 	appID := "11111111-1111-4111-8111-111111111111"
 	otherAppID := "22222222-2222-4222-8222-222222222222"
-	validRoute := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+	validRoute := routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
 	}}
 	validRoutes := map[string]routeRecord{appID: validRoute}
@@ -303,7 +304,7 @@ func TestBuildCaddyConfigV2RejectsInvalidOrConflictingInput(t *testing.T) {
 		{name: "invalid app id", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]caddyV2LANAssignment{8100: caddyV2TestAssignment("not-an-app", false)}},
 		{name: "missing assignment identity without probe token", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]caddyV2LANAssignment{8100: {AppID: appID}}},
 		{name: "same app on two ports", routes: validRoutes, listen: "10.203.0.2:8080", profile: validProfile, assignments: map[uint16]caddyV2LANAssignment{8100: caddyV2TestAssignment(appID, false), 8101: caddyV2TestAssignment(appID, false)}},
-		{name: "invalid active route", routes: map[string]routeRecord{appID: {Slot: generatedruntime.SlotBlue}}, listen: "10.203.0.2:8080", profile: validProfile},
+		{name: "invalid active route", routes: map[string]routeRecord{appID: {Slot: generatedidentity.SlotBlue}}, listen: "10.203.0.2:8080", profile: validProfile},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

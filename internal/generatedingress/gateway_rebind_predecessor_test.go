@@ -15,7 +15,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
@@ -110,7 +111,7 @@ func TestGatewayRebindPredecessorRejectsExactBindingMismatches(t *testing.T) {
 		}},
 		{"route slot", func(_ *appaccess.GatewayRebindStartupSnapshot, state *gatewayV2RouteState, _ *gatewayMigrationJournal) {
 			app := state.Apps[fixture.stateAppID()]
-			app.Route.Slot = generatedruntime.SlotGreen
+			app.Route.Slot = generatedidentity.SlotGreen
 			state.Apps[fixture.stateAppID()] = app
 		}},
 		{"missing roster", func(snapshot *appaccess.GatewayRebindStartupSnapshot, _ *gatewayV2RouteState, _ *gatewayMigrationJournal) {
@@ -395,8 +396,8 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 
 	source := routeState{Version: stateVersion, Active: map[string]routeRecord{
 		appID: {
-			Slot: generatedruntime.Slot(active.Slot),
-			Endpoints: []generatedruntime.RouteEndpoint{
+			Slot: generatedidentity.Slot(active.Slot),
+			Endpoints: []generatedroute.RouteEndpoint{
 				endpoint("api", "server", "rebind-app-network", "rebind-app-blue", 3000, endpointID),
 			},
 		},

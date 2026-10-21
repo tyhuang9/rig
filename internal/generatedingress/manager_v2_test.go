@@ -9,7 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -160,9 +161,9 @@ func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous := before.Apps[upgradeTestAppA]
-	request := generatedruntime.RouteSwitchRequest{
-		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedruntime.SlotGreen,
-		Endpoints: []generatedruntime.RouteEndpoint{
+	request := generatedroute.RouteSwitchRequest{
+		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedidentity.SlotGreen,
+		Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
 			endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
 		},
@@ -174,7 +175,7 @@ func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Pending != nil || after.Apps[upgradeTestAppA].Route.Slot != generatedruntime.SlotGreen || afterJournal.Phase != gatewayPhaseCommitted {
+	if after.Pending != nil || after.Apps[upgradeTestAppA].Route.Slot != generatedidentity.SlotGreen || afterJournal.Phase != gatewayPhaseCommitted {
 		t.Fatalf("committed v2 state = %#v journal = %#v", after, afterJournal)
 	}
 	if _, ok := runner.files[journal.Resources.FinalContainerID+":"+"/config/active.json"]; !ok {
@@ -185,7 +186,7 @@ func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if observation.Slot != generatedruntime.SlotGreen || observation.URL != "http://"+upgradeTestAppA+".rig.localhost:8080" {
+	if observation.Slot != generatedidentity.SlotGreen || observation.URL != "http://"+upgradeTestAppA+".rig.localhost:8080" {
 		t.Fatalf("observation = %#v", observation)
 	}
 	if err := manager.Recover(context.Background()); err != nil {
@@ -224,15 +225,15 @@ func TestCommittedV2UnknownTopologyStopsBeforeDockerMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous := state.Apps[upgradeTestAppA]
-	err = manager.Switch(context.Background(), generatedruntime.RouteSwitchRequest{
-		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedruntime.SlotGreen,
-		Endpoints: []generatedruntime.RouteEndpoint{
+	err = manager.Switch(context.Background(), generatedroute.RouteSwitchRequest{
+		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedidentity.SlotGreen,
+		Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
 			endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
 		},
 	})
-	if !IsCode(err, DiagnosticRouteUnresolved) || !generatedruntime.RouteCandidateMayBeLive(err) {
-		t.Fatalf("switch error = %v candidate may be live = %t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	if !IsCode(err, DiagnosticRouteUnresolved) || !testRouteCandidateMayBeLive(err) {
+		t.Fatalf("switch error = %v candidate may be live = %t", err, testRouteCandidateMayBeLive(err))
 	}
 	if len(runner.commands) != 0 {
 		t.Fatalf("unknown topology caused Docker mutation: %v", runner.commands)
@@ -257,7 +258,7 @@ func TestCommittedV2RecoveryRollsBackDurableProposedRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous := cloneGatewayV2AppRoute(state.Apps[upgradeTestAppA])
-	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
 		endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
 	}}}
@@ -273,15 +274,15 @@ func TestCommittedV2RecoveryRollsBackDurableProposedRoute(t *testing.T) {
 		slot := candidate.Apps[upgradeTestAppA].Route.Slot
 		switch observations {
 		case 1:
-			if slot == generatedruntime.SlotBlue {
+			if slot == generatedidentity.SlotBlue {
 				return gatewayTopologyUnknownOrDrift
 			}
 		case 2:
-			if slot == generatedruntime.SlotGreen {
+			if slot == generatedidentity.SlotGreen {
 				return gatewayTopologyExactFinalV2
 			}
 		default:
-			if slot == generatedruntime.SlotBlue {
+			if slot == generatedidentity.SlotBlue {
 				return gatewayTopologyExactFinalV2
 			}
 		}
@@ -316,7 +317,7 @@ func TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous := cloneGatewayV2AppRoute(state.Apps[upgradeTestAppA])
-	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
 		endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
 	}}}
@@ -329,14 +330,14 @@ func TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow(t *testing.T) {
 	mixedCalls := 0
 	manager.gatewayMixedRestartObserver = func(_ context.Context, _ routeState, committed, candidate gatewayV2RouteState, _ gatewayMigrationJournal) bool {
 		mixedCalls++
-		if committed.Apps[upgradeTestAppA].Route.Slot != generatedruntime.SlotBlue || candidate.Apps[upgradeTestAppA].Route.Slot != generatedruntime.SlotGreen {
+		if committed.Apps[upgradeTestAppA].Route.Slot != generatedidentity.SlotBlue || candidate.Apps[upgradeTestAppA].Route.Slot != generatedidentity.SlotGreen {
 			t.Fatal("mixed recovery did not derive the exact committed and proposed states")
 		}
 		return true
 	}
 	manager.gatewayTopologyObserver = func(_ context.Context, _ routeState, candidate gatewayV2RouteState, _ gatewayMigrationJournal) gatewayObservedTopology {
 		_, rollbackInstalled := runner.files[journal.Resources.FinalContainerID+":"+"/config/rollback.json"]
-		if rollbackInstalled && candidate.Apps[upgradeTestAppA].Route.Slot == generatedruntime.SlotBlue {
+		if rollbackInstalled && candidate.Apps[upgradeTestAppA].Route.Slot == generatedidentity.SlotBlue {
 			return gatewayTopologyExactFinalV2
 		}
 		return gatewayTopologyUnknownOrDrift
@@ -384,15 +385,15 @@ func TestCommittedV2RejectsRogueCandidateBeforePendingOrReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous := before.Apps[upgradeTestAppA]
-	routeErr := manager.Switch(context.Background(), generatedruntime.RouteSwitchRequest{
-		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedruntime.SlotGreen,
-		Endpoints: []generatedruntime.RouteEndpoint{
+	routeErr := manager.Switch(context.Background(), generatedroute.RouteSwitchRequest{
+		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedidentity.SlotGreen,
+		Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'f'),
 			endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
 		},
 	})
-	if !IsCode(routeErr, DiagnosticIngressDrift) || generatedruntime.RouteCandidateMayBeLive(routeErr) {
-		t.Fatalf("switch error = %v candidate may be live = %t", routeErr, generatedruntime.RouteCandidateMayBeLive(routeErr))
+	if !IsCode(routeErr, DiagnosticIngressDrift) || testRouteCandidateMayBeLive(routeErr) {
+		t.Fatalf("switch error = %v candidate may be live = %t", routeErr, testRouteCandidateMayBeLive(routeErr))
 	}
 	if preflightCalls != 1 {
 		t.Fatalf("candidate preflight calls = %d", preflightCalls)
@@ -427,15 +428,15 @@ func TestCommittedV2RejectsUnattachedApplicationNetworkBeforePendingOrReload(t *
 		t.Fatal(err)
 	}
 	previous := before.Apps[upgradeTestAppA]
-	routeErr := manager.Switch(context.Background(), generatedruntime.RouteSwitchRequest{
-		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedruntime.SlotGreen,
-		Endpoints: []generatedruntime.RouteEndpoint{
+	routeErr := manager.Switch(context.Background(), generatedroute.RouteSwitchRequest{
+		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedidentity.SlotGreen,
+		Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "new-net-a", "frontend-green", 4173, 'd'),
 			endpoint("api", "server", "new-net-a", "api-green", 3000, 'e'),
 		},
 	})
-	if !IsCode(routeErr, DiagnosticRouteUnresolved) || generatedruntime.RouteCandidateMayBeLive(routeErr) {
-		t.Fatalf("switch error = %v candidate may be live = %t", routeErr, generatedruntime.RouteCandidateMayBeLive(routeErr))
+	if !IsCode(routeErr, DiagnosticRouteUnresolved) || testRouteCandidateMayBeLive(routeErr) {
+		t.Fatalf("switch error = %v candidate may be live = %t", routeErr, testRouteCandidateMayBeLive(routeErr))
 	}
 	if len(runner.commands) != 0 {
 		t.Fatalf("unattached network caused Docker work: %v", runner.commands)

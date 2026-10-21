@@ -11,7 +11,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/secretfile"
 )
 
@@ -111,7 +112,7 @@ func TestPrepareGatewayV2StateRejectsStaleBindingsAndPendingV1(t *testing.T) {
 		}},
 		{name: "pending v1 route", mutate: func(source *routeState, _ *gatewayUpgradePreparation) {
 			proposed := source.Active[upgradeTestAppA]
-			proposed.Slot = generatedruntime.SlotGreen
+			proposed.Slot = generatedidentity.SlotGreen
 			source.Pending = &pendingRoute{AppID: upgradeTestAppA, Previous: cloneRouteRecordPointer(source.Active[upgradeTestAppA]), Proposed: proposed}
 		}},
 	}
@@ -615,10 +616,10 @@ func upgradeTestPreparation(t *testing.T) (routeState, gatewayUpgradePreparation
 
 func upgradeTestSourceState() routeState {
 	return routeState{Version: stateVersion, Active: map[string]routeRecord{
-		upgradeTestAppB: {Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+		upgradeTestAppB: {Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("web", "server", "net-b", "web-green", 3000, 'b'),
 		}},
-		upgradeTestAppA: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		upgradeTestAppA: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "net-a", "frontend-blue", 4173, 'a'),
 			endpoint("api", "server", "net-a", "api-blue", 3000, 'c'),
 		}},
@@ -732,10 +733,10 @@ func cloneRouteStateForTest(state routeState) routeState {
 	result := routeState{Version: state.Version, Active: cloneRoutes(state.Active)}
 	if state.Pending != nil {
 		pending := *state.Pending
-		pending.Proposed.Endpoints = append([]generatedruntime.RouteEndpoint(nil), pending.Proposed.Endpoints...)
+		pending.Proposed.Endpoints = append([]generatedroute.RouteEndpoint(nil), pending.Proposed.Endpoints...)
 		if pending.Previous != nil {
 			previous := *pending.Previous
-			previous.Endpoints = append([]generatedruntime.RouteEndpoint(nil), previous.Endpoints...)
+			previous.Endpoints = append([]generatedroute.RouteEndpoint(nil), previous.Endpoints...)
 			pending.Previous = &previous
 		}
 		result.Pending = &pending
@@ -745,6 +746,6 @@ func cloneRouteStateForTest(state routeState) routeState {
 
 func cloneRouteRecordPointer(route routeRecord) *routeRecord {
 	result := route
-	result.Endpoints = append([]generatedruntime.RouteEndpoint(nil), route.Endpoints...)
+	result.Endpoints = append([]generatedroute.RouteEndpoint(nil), route.Endpoints...)
 	return &result
 }
