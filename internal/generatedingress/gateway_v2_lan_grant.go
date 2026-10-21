@@ -140,6 +140,11 @@ func (m *Manager) grantGatewayV2LAN(ctx context.Context, request gatewayV2LANGra
 	if m == nil || ctx == nil || err != nil || authorize == nil {
 		return gatewayV2LANGrantResult{}, &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return gatewayV2LANGrantResult{}, err
+	}
+	defer leaveDomain()
 	release, err := m.lockGateway(ctx)
 	if err != nil {
 		return gatewayV2LANGrantResult{}, err
@@ -339,6 +344,11 @@ func (m *Manager) withGatewayV2LANCommitResolution(ctx context.Context, request 
 	if _, err := gatewayV2LANBindingForRequest(request); m == nil || ctx == nil || err != nil || resolve == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)
@@ -463,6 +473,11 @@ func (m *Manager) WithGatewayV2LANAbsenceResolution(ctx context.Context, request
 	if _, err := gatewayV2LANBindingForRequest(request); m == nil || ctx == nil || err != nil || fn == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)
@@ -592,6 +607,11 @@ func (m *Manager) WithGatewayV2LANCommitRecovery(ctx context.Context, request Ga
 	if _, err := gatewayV2LANBindingForRequest(request); m == nil || ctx == nil || err != nil || validateCommitted == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)
@@ -740,6 +760,11 @@ func (m *Manager) WithGatewayV2LANRollbackResolution(ctx context.Context, reques
 	if _, err := gatewayV2LANBindingForRequest(request); m == nil || ctx == nil || err != nil || fn == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)
@@ -807,6 +832,11 @@ func (m *Manager) RecoverGatewayV2LAN(ctx context.Context, request GatewayV2LANG
 	if _, err := gatewayV2LANBindingForRequest(request); m == nil || ctx == nil || err != nil {
 		return GatewayV2LANGrantRecovery{}, &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return GatewayV2LANGrantRecovery{}, err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)

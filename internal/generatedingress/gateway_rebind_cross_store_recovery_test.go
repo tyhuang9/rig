@@ -106,7 +106,7 @@ func (d *gatewayRebindRecoveryFailAttestationDriver) attestCommittedCurrentLocke
 func freshGatewayRebindRecoveryManager(source *Manager) *Manager {
 	return &Manager{runner: source.runner, store: source.store, options: source.options,
 		dockerEnv:                append([]string(nil), source.dockerEnv...),
-		workingDirectoryIdentity: source.workingDirectoryIdentity, mu: newContextMutex(),
+		workingDirectoryIdentity: source.workingDirectoryIdentity, domainView: source.domainView, mu: newContextMutex(),
 		gatewayRebindFailStop:      source.gatewayRebindFailStopLatch(),
 		gatewayRebindCommitBarrier: source.gatewayRebindCommitBarrierLatch()}
 }

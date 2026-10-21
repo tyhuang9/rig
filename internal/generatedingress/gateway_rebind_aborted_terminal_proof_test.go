@@ -99,7 +99,7 @@ func newGatewayRebindAbortedTerminalFixture(t *testing.T) gatewayRebindAbortedTe
 	options := fixture.predecessor.manager.options
 	options.RebindFenceCheck = repository.CheckGatewayRebindFence
 	options.RebindCurrentStateRepository = repository
-	manager, err := newManager(fixture.runner, options)
+	manager, err := New(fixture.runner, options)
 	if err != nil {
 		t.Fatal(err)
 	}

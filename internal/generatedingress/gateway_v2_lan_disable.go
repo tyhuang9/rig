@@ -283,6 +283,11 @@ func (m *Manager) DisableGatewayV2LAN(ctx context.Context, request GatewayV2LAND
 	if m == nil || ctx == nil || !validGatewayV2LANDisableRequest(request) || authorize == nil {
 		return GatewayV2LANDisableResult{}, &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return GatewayV2LANDisableResult{}, err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)
@@ -451,6 +456,11 @@ func (m *Manager) withGatewayV2LANDisableResolution(ctx context.Context, request
 	if m == nil || ctx == nil || !validGatewayV2LANDisableRequest(request) || authorize == nil || resolve == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)

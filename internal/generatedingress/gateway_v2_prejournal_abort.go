@@ -23,6 +23,11 @@ func (m *Manager) FinalizeGatewayV2PreparationAbort(ctx context.Context, request
 	if _, err := gatewayV2UpgradePreparation(request); err != nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	release, err := m.lockGateway(ctx)
 	if err != nil {
 		return err

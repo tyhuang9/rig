@@ -120,6 +120,11 @@ func (m *Manager) WithGatewayV2LANRecoveryGrantFinalization(ctx context.Context,
 	if _, err := gatewayV2LANBindingForRequest(request); m == nil || ctx == nil || err != nil || resolve == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	return m.withGatewayV2LANRecoveryHead(ctx, func(workCtx context.Context) (bool, error) {
 		return m.withGatewayCurrentLANRecoveryGrantFinalizationLocked(workCtx, request, resolve)
 	}, gatewayV2PendingLANGrant, request.AttemptID, request.AppID,
@@ -151,6 +156,11 @@ func (m *Manager) WithGatewayV2LANRecoveryDisableFinalization(ctx context.Contex
 	if m == nil || ctx == nil || !validGatewayV2LANDisableRequest(request) || resolve == nil || acknowledge == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	return m.withGatewayV2LANRecoveryHead(ctx, func(workCtx context.Context) (bool, error) {
 		return m.withGatewayCurrentLANRecoveryDisableFinalizationLocked(workCtx, request, resolve, acknowledge)
 	}, gatewayV2PendingLANDisable, request.OperationID, request.AppID,
@@ -270,6 +280,11 @@ func (m *Manager) RetireGatewayV2LANRecoveryBatch(ctx context.Context,
 	if m == nil || ctx == nil || err != nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)

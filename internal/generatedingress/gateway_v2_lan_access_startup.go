@@ -501,6 +501,17 @@ func gatewayV2LANRecoveryCandidatesAreLegacyPair(
 func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 	grants []GatewayV2LANStartupClaim, disables []GatewayV2LANDisableStartupClaim,
 ) (resultErr error) {
+	if m == nil || ctx == nil {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	if _, err := validateGatewayV2LANAccessStartupClaims(grants, disables); err != nil {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	inspection, err := m.InspectGatewayV2LANAccessStartup(ctx, grants, disables)
 	if err != nil || inspection.Disposition == GatewayV2LANStartupNormal {
 		return err
@@ -524,7 +535,11 @@ func (m *Manager) QuarantineGatewayV2LANAccessStartup(ctx context.Context,
 				filtered = append(filtered, grant)
 			}
 		}
-		return m.QuarantineGatewayV2LANStartup(ctx, filtered)
+		claimSet, err := validateGatewayV2LANStartupClaims(filtered)
+		if err != nil {
+			return &Error{Code: DiagnosticValidationFailed}
+		}
+		return m.quarantineGatewayV2LANStartupEntered(ctx, claimSet)
 	}
 	claims, err := validateGatewayV2LANAccessStartupClaims(grants, disables)
 	if err != nil {

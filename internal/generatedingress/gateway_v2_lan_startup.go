@@ -206,6 +206,18 @@ func (m *Manager) QuarantineGatewayV2LANStartup(ctx context.Context, claims []Ga
 	if m == nil || ctx == nil || err != nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
+	return m.quarantineGatewayV2LANStartupEntered(ctx, claimSet)
+}
+
+func (m *Manager) quarantineGatewayV2LANStartupEntered(
+	ctx context.Context,
+	claimSet gatewayV2LANStartupClaimSet,
+) (resultErr error) {
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)

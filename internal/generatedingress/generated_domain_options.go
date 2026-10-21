@@ -26,6 +26,25 @@ type generatedDomainOptions struct {
 	ReplacementDiskBytes  uint64
 }
 
+// normalizeGeneratedDomainOptions resolves only the zero-value aliases already
+// accepted by Manager construction. Candidate capacity, health, filesystem,
+// executable and replacement-disk settings remain explicit inputs.
+func normalizeGeneratedDomainOptions(options generatedDomainOptions) (generatedDomainOptions, bool) {
+	if options.HostPort == 0 {
+		options.HostPort = defaultHostPort
+	}
+	if options.CommandTimeout == 0 {
+		options.CommandTimeout = defaultTimeout
+	}
+	if options.PullTimeout == 0 {
+		options.PullTimeout = defaultPullTimeout
+	}
+	if options.OutputLimit == 0 {
+		options.OutputLimit = defaultOutputLimit
+	}
+	return options, validGeneratedDomainIdentityOptions(options)
+}
+
 func validGeneratedDomainIdentityOptions(options generatedDomainOptions) bool {
 	return validAbsoluteDirectory(options.DataRoot) && validOptions(Options{
 		DockerExecutable: options.DockerExecutable, DockerEndpoint: options.DockerEndpoint,

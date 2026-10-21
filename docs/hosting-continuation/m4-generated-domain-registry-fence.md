@@ -1,0 +1,146 @@
+# M4 private generated domain registry and legacy mutation fence
+
+Recorded 2026-10-21. Base:
+`63e38af590d75e318a544da82fdfcf4abeb6b0c2`
+([draft PR #200](https://github.com/tyhuang9/rig/pull/200)).
+
+## Purpose and boundary
+
+The physical provenance foundation can identify a controller database, protected
+root and Docker daemon. This unit adds the private registry and activity accounting
+needed to keep existing Manager instances from continuing typed mutations when a
+future generated domain reserves conflicting resources.
+
+There is no production reservation caller or ready generated domain in this unit.
+The domain factory, startup classifier, route authority and consumer cutover remain
+separate work. Successful fencing does not prove Caddy stopped, routes withdrawn,
+protected state empty or the gateway absent. Existing `Switch`, `Provision` and
+`Recover` behavior and emergency withdrawal construction remain outside this change.
+
+## Registry and construction invariants
+
+- Exact retries join the same retained reservation, including sticky failure.
+  No reset or fresh retry state is exposed. Physical root/database collision and
+  verified daemon plus fixed namespace collision are evaluated independently.
+- A construction ticket is admitted before protected state creation and spans the
+  complete `New` assembly, including both physical driver adapters. Publication
+  atomically replaces the ticket with the permanent Manager record immediately
+  before return. Every failed construction completes its ticket once.
+- A pairing epoch closes the constructor roster, waits for already admitted
+  constructors, rescans published Managers, observes identities, and drains entered
+  inspection/typed activity. The epoch stays closed until final stale publication
+  or retained failure. New constructors cannot extend the roster indefinitely.
+- Manager value copies share the same view and activity accounting. Observation
+  requires the record's original expected view; overwriting the original Manager
+  pointer with another value cannot make an older copy disappear from accounting.
+- Lock order is registry then shared view. No filesystem operation, Docker command,
+  callback, SQL operation or wait runs while those locks are held. Leave is once-only.
+
+## Typed mutation entry
+
+All 27 accepted exported typed mutation entries enter the shared gate before
+existing effect/Manager/gateway locks. Related wrappers share gated implementations;
+the nested access-startup path uses a private already-entered helper.
+
+With no reservation, the gate performs short activity bookkeeping only. It adds
+no filesystem/Docker observation, wait, callback or context validation. Existing
+empty-history startup, quarantine and recovery behavior retain this path.
+
+With a reservation, stale or pairing views refuse before effects. Other views
+record inspection activity, observe root/ingress and daemon identity outside
+locks, then rescan reservations atomically before entering typed activity.
+Ambiguous identity, observation failure or cancellation causes conservative refusal.
+This private process registry is not a cross-process ownership lock or protection
+against a malicious process running as the same operating-system owner.
+
+## Review corrections
+
+Source review identified and resolved:
+
+1. Optional absent ingress identities were not equal on exact retry. Equality now
+   handles absent/absent while collision tests retain strict physical comparison.
+2. A retained Manager pointer could be overwritten with another Manager, causing
+   observation of the wrong shared view. Exact expected-view validation now makes
+   that uncertainty a sticky refusal.
+3. Publication rejected the constructor's existing protective chmod. Only the same
+   retained ingress directory's transition to 0700 is allowed; other path/mode
+   transitions remain refused.
+4. The pairing epoch ended before all activity drained. It now spans the complete
+   drain and final stale publication.
+
+Initial Windows test expectation failures are retained separately from successor
+evidence. Tests account for Windows permission semantics and cancellation before
+the runner receives buffers. Subprocess scenarios use bounded child execution
+and preserve child output; the process-wide registry is never reset for tests.
+
+Static analysis also rejected four new test assignments that copied a lock-bearing
+Manager value. The test-only correction copies all 23 non-lock fields explicitly,
+including the shared view, and preserves the target lock during retargeting.
+Those tests exercise shared references and view accounting; they do not establish
+that copying an acquired synchronization primitive is supported. Production code
+and existing regression assertions are unchanged by this correction.
+
+## Acceptance status
+
+Independent bounded source/security review is accepted. Report SHA256:
+`253324c36f257bd7a36646e3f623c0c35c681b93f0e2de7e1d40ff82d7122afa`.
+The original reviewed 26-file manifest SHA256 is
+`0afeed3255c35c25882817d47aff210aaee8cf57e4a0400ca692f3548a734226`.
+The test-only vet correction has successor manifest
+`2eb6c1870f7a08e14bc8a896797164fbb555d736e4ba21b08cef6c92c8563175`
+and independent source/security review
+`a89669443dea513c566409af9e3fc83c829db6a8a50aa598ba46458d550308f6`.
+
+The focused Windows and native Linux checks each passed 10 unique parents and
+15 subcases, with zero failure or skip. The constructor subprocess launcher is
+not counted twice. The 27-method source inventory supplements four representative
+stale-mutation tests; it is not 27 independent behavior proofs. An immediate
+nonblocking assertion in the second-coordinator case does not prove the second
+goroutine had reached its wait. Physical symlink coverage belongs to the earlier
+provenance foundation, not a new test in this unit.
+
+The Windows run selecting 192 existing affected parents **failed at its unchanged
+45-minute package timeout**. It started 34 parents and completed 33; 50 of 54
+started subcases completed. No assertion failure or skip was emitted before the
+timeout. The remaining 158 parents never started. The active stack was in the
+existing Windows protected-path/state-history scan; it contained no registry gate
+wait. That single observation does not explain all elapsed time or prove zero
+aggregate overhead from this change.
+
+The preserved timeout log SHA256 is
+`558a1a26a6ed3f000b7344911689dde22bc51ae992458e9ea315bca0cecd81a6`;
+the partial result is
+`13ed0a0702595455d0fd0d16839d8afe92647034a8451759c111e9a5553d5214`.
+The exact native Linux affected suite passed all 192 parents and 174 subtests,
+with no failure or skip. Three supplemental fixture consumers and their two
+subtests passed on both platforms. After the test-only vet correction, its two
+affected focused parents passed again on both platforms; the unchanged production
+and existing-test evidence was retained without repeating the broad suites.
+
+Pinned Go 1.26.7 checks passed: formatting; Windows/Linux ingress vet and five
+affected production package builds; Windows no-run and Linux compile-only
+`live_docker` checks for ingress and hostd; canonical
+`pwsh -NoProfile -File scripts/check-generation.ps1`; and `git diff --check`.
+The final 1,053-file Go/module source closure had no additions, removals or edits.
+Its SHA256 is
+`0b52273feb5500a1b434d55d7de62162844ad08999f0771017d136321b2e9c42`.
+The first complete manifest preceded the Linux affected/supplemental checks but
+followed the earlier focused checks and Windows timeout. The successor closure
+brackets the test repair and final static checks; it does not retroactively
+surround those earlier runs. Their original source checkpoints remain separate.
+
+The execution receipt is
+`a783fd89a9e75040f98735754b3a933290ebd548c76f7565f457832b7ce6221c`
+under `temp/m3-lan-external-db-20261015/m4-domain-registry-fence-verification/`.
+It retains the initial wrong-directory Linux harness failure, the Windows
+timeout and the initial copylock vet failure separately from corrected checks.
+Hosted Docker/race acceptance, exhaustive Windows regression acceptance and M4
+completion remain open.
+No live controller activation or deployment has been performed.
+
+## Rollback
+
+Before a production reservation caller is introduced, rollback is a source revert
+of this private registry and gate wiring. No persisted schema or user-history
+rewrite is introduced. Any later factory/cutover change must define its own
+rollback and physical-state acceptance; this unit cannot authorize that action.

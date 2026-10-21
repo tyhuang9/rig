@@ -70,6 +70,11 @@ func (m *Manager) recoverGatewayRebindStartupWithDriver(ctx context.Context,
 	if m == nil || ctx == nil || repository == nil || driver == nil {
 		return GatewayRebindStartupRecoveryResult{}, &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return GatewayRebindStartupRecoveryResult{}, err
+	}
+	defer leaveDomain()
 	releaseEffects, err := gatewayRebindAcquireDeploymentEffects(ctx, m.options.WorkingDirectory)
 	if err != nil {
 		return GatewayRebindStartupRecoveryResult{}, gatewayRebindEffectBoundaryError(ctx)

@@ -41,10 +41,15 @@ func (m *Manager) reconcileGatewayRebindWithRuntime(ctx context.Context,
 	if !ok {
 		return GatewayRebindReconcileResponse{}, &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return GatewayRebindReconcileResponse{}, err
+	}
+	defer leaveDomain()
 
 	var response GatewayRebindReconcileResponse
 	driver = driver.withRecoveryRepository(typedRepository)
-	err := m.runGatewayRebindCommitLocked(ctx, func() (bool, error) {
+	err = m.runGatewayRebindCommitLocked(ctx, func() (bool, error) {
 		review, err := m.inspectGatewayRebindRecoveryReviewWithCurrentProofLocked(ctx, repository,
 			request.OperationID, actorID, liveSession, readCurrent)
 		if err != nil {

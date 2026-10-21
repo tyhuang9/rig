@@ -68,6 +68,11 @@ func (m *Manager) AttestGatewayV2LANDisableSuccessor(ctx context.Context,
 		current.DisableIntentOperationID != "" {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)
