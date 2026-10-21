@@ -111,3 +111,86 @@ performed. This test-only change does not close M4 or the broader continuation.
 
 Rollback consists of reverting the seven test opener/import changes. It restores
 fresh schema migration per fixture, without changing user data or runtime behavior.
+
+## Follow-up: generated-image authority fixture
+
+PR #196 runtime race job `118971706219` reached the unchanged 32-minute
+`generatedimage` package deadline. Its 62 completed top-level tests consumed
+1876.82 seconds; the active recipe parent was only 43 seconds old and its Vite
+subtest 21 seconds old. The sampled runnable stack was in fresh database migration
+through `newGeneratedImageTestAuthorityWithDependencies`. No earlier assertion
+failure or race warning was observed. The stack identifies avoidable setup work,
+without attributing every test's elapsed time to migration.
+
+The follow-up adds one fresh constructor to the seven above: only its `db == nil`
+branch now calls the unchanged `databasefixture.Open`. Every caller-supplied
+database, repository and binding remains intact. In particular, the commit-
+acknowledgement fixture retains its custom `sql.OpenDB` connector and explicit
+`database.Migrate` call. Production, assertions, schema, CI selection and deadlines
+remain unchanged.
+
+The exact PR #204 baseline `f4995fce991303522d17d42ce164d858b848f6a9` and this
+one-file candidate each passed the same 17 parent/subtest cases three times
+(51 PASS events) as native Linux binaries, without race detection or skips.
+
+| Representative parent | Baseline median (s) | Candidate median (s) |
+| --- | ---: | ---: |
+| Ambiguous missing builder inspections | 5.61 | 0.26 |
+| Standalone recipe staging | 2.00 | 0.30 |
+| Committed-ready result after lost acknowledgement (custom DB control) | 0.47 | 0.54 |
+
+The first candidate builder sample was 0.75 seconds; later samples were 0.26 and
+0.25 seconds. Cold template migration remains visible. The custom database control
+continues to pay its real migration cost. No timing threshold was added, and these
+measurements do not establish hosted performance.
+
+Follow-up evidence is under
+`m4-runtime-test-fixtures-verification/image-followup-20261021/` within the
+local evidence directory above. Baseline receipt SHA256:
+`9596d760da14708ba34e9437ed421be68e7e6c6da428409eee182f06ffafb431`;
+candidate receipt:
+`1e57028d8e964bca64dcd9bf4152aa783e73e8228596c3c76233d244d1d1cfd7`.
+The candidate's 967-file source inventory is
+`80bbcfef701eec5ea822fcaf66424456f1ce9c4bce89ac9b4205d5deb4de3952`.
+The full package was discovered and executed once per platform with
+`-test.run=^Test -test.count=1 -test.timeout=32m`:
+
+| Platform | Discovered/run parents | RUN events | PASS | FAIL | SKIP |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Windows amd64 | 82/82 | 238 | 227 | 0 | 11 |
+| Native WSL Linux amd64 | 82/82 | 218 | 211 | 2 | 5 |
+
+Each RUN event has one terminal event. Windows had four conditional live-Docker
+skips and seven symlink-capability skips; all eleven remain unverified.
+The full Linux run **failed** because WSL has no Node executable:
+`TestStaticBuildOutputCheckExecutesAgainstPresentMissingAndUnsafeDirectories`
+and `TestNextCacheCheckRejectsMissingAndSymlinkedDirectories` stopped at their
+existing Node prerequisites before running subcases. Linux also skipped the
+Node-dependent static-server test and four conditional live-Docker cases.
+Those missing subcases are not counted as passes.
+
+The final static stage passed all 14 commands: generatedimage vet, production
+build, test-binary compilation and production/test dependency inventories for
+both targets; pinned read-only formatting, canonical generation and diff checks.
+The helper remained absent from production CLI dependencies. All 967 Go/module
+hashes remained unchanged. These static results do not replace the failed Linux
+package result. No Node installation, test removal, assertion change or package
+rerun was used to hide the failure.
+
+| Follow-up artifact | SHA256 |
+| --- | --- |
+| Windows full run | `d19e11cfc2be433603e21357cb8bf7656cf1ee3bf2245924fdf40a06d9c28f4c` |
+| Failed Linux completion receipt | `9eb203cdd9b68ffc15474017014915c76b3ef567e250e5387ab6620fb7e2110a` |
+| Failed Linux full run | `7e05a70442473281252b403dbf0d91391f50412f13350763753dc7e5ae69fc26` |
+| Successful static completion | `e6dacf79c1eac65dbce83b75f191ce986613e23e6793c623676e6e792ef42573` |
+| Independent source and evidence review | `13c620b042495ebf0a0d82e014dc771f461b4d17d283ddd8a3c8abce754c565e` |
+
+The original Windows audit and first static audit rejected incomplete expected
+skip lists. Their failed receipts remain preserved; successor audits classify
+the existing source-gated skips explicitly without rerunning package tests.
+The original seven-fixture results above remain their historical accepted
+boundary and were not rerun for this one-file follow-up. Hosted race/Docker and
+Node-capable Linux execution remain required for complete follow-up acceptance.
+
+Reverting the additional opener/import restores fresh migration for image
+authority fixtures; no user data or runtime behavior changes.

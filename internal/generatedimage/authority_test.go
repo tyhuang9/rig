@@ -11,7 +11,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/applifecycle"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -22,6 +21,7 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 type generatedImageTestAuthority struct {
@@ -100,7 +100,7 @@ func newGeneratedImageTestAuthorityWithDependencies(t *testing.T, db *sql.DB, re
 
 	var err error
 	if db == nil {
-		db, err = database.Open(t.TempDir())
+		db, err = databasefixture.Open(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
 		}
