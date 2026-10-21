@@ -74,8 +74,31 @@ verification artifacts live in
 | `docs-install-offline.log` | `6020b2e36e97d208bad3b9de7865ec7ca7cbf4524110d845826efd32bb978098` |
 | `docs-build.log` | `99e54b233d82d2a5d1c6e91b8b097f1090b1e462eb1cd3887cf4148a7b26194e` |
 
-Hosted CI must still run the unchanged race command,
-`bash scripts/check-repository-race.sh repository-remainder`, to establish
-Linux race behavior, the actual remainder duration, and complete matrix
-results. This repair does not complete M4, establish all race behavior, or
-authorize merge, deployment, or activation.
+## Hosted acceptance on 2026-10-20
+
+PR #192's [PostgreSQL and repository race job](https://github.com/tyhuang9/rig/actions/runs/39471265286/job/118795633138)
+passed at exact source head `095816dda246ad03b3bbe71863f52f8576d68faa`.
+The synthetic checkout `ca49d30f776ed15d003f877ef6a878d0340318e8` has the same
+tree, `060ab6a0099653cacbc968c0c10d4feecf690ba6`, as that published head.
+
+The unchanged `bash scripts/check-repository-race.sh repository-remainder`
+gate ran with `-race -count=1 -timeout=40m`:
+
+- `applifecycle`: all 43 parents and 111 children passed in 359.423 seconds.
+- `composeruntime`: all 31 parents and 108 children passed in 156.075 seconds.
+- Entire remainder: 2,608 named cases passed, seven skipped, zero failed;
+  45 packages passed and two packages contained no tests.
+- The seven skips were two Docker image tests and five PostgreSQL duplicates
+  without database configuration in this remainder step. Dedicated PostgreSQL
+  store and relay-convergence steps passed separately. The relay JSON was
+  redirected, so its acceptance is established by the successful command and
+  required parent-pass gate rather than retained terminal JSON events.
+
+The remainder step ran from 20:36:42Z to 21:35:18Z. Individual package limits
+were unchanged. The retained log has no race report or timeout, and independent
+source discovery matched every lifecycle and Compose parent. Raw evidence:
+`temp/m3-lan-external-db-20261015/m4-lifecycle-coordinator-verification/ci-followups-20261020/pr192-job-118795633138/raw.log`,
+SHA-256 `8d1704d115c8617905ebd4e181377e4e457230e61bd0b65084515c70809b9874`.
+
+This establishes that job at the recorded head. Other workflow jobs, Docker
+acceptance and complete M4 acceptance remain separate requirements.
