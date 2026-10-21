@@ -136,11 +136,12 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	settings := config.Defaults()
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
+	commandObserver := newLanTwoAppBuildCommandDiagnosticRunner(runtimeprocess.ExecRunner{})
 	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
+	}, runtimeCompositionOptions{dockerExecutable: docker, runner: commandObserver})
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
 	}
@@ -176,11 +177,14 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 		t.Fatal("controlled source connection did not become authorized")
 	}
 	githubSource := apicontract.GitHubSource{ConnectionID: connection.ID, InstallationID: 7, RepositoryID: 17, Branch: "main"}
+	workerObserver := &lanTwoAppWorkerReturnObserver{}
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	done, err := prepareRuntimeWorker(workerCtx, runtimeRecovery{
 		recoverState: jobStore.RecoverRuntimeContext,
 	}, composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
-		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
+		runErr := jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
+		workerObserver.Record(runErr, workerContext.Err())
+		return runErr
 	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
@@ -193,8 +197,30 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 			t.Error("runtime worker did not stop")
 		}
 	}()
-	appA := lanTwoAppDeploy(t, &request, jobStore, deploymentStore, composition.state, githubSource, setup, "LAN A", "lan-a-v1", &appIDs)
-	appB := lanTwoAppDeploy(t, &request, jobStore, deploymentStore, composition.state, githubSource, setup, "LAN B", "lan-b-v1", &appIDs)
+	diagnostics := lanTwoAppBuildFailureDiagnosticDependencies{
+		Release: func(diagnosticCtx context.Context, applicationID, releaseID string) (lanTwoAppBuildReleaseSnapshot, error) {
+			release, releaseErr := snapshots.ReadyWorkspace(diagnosticCtx, applicationID, releaseID)
+			return lanTwoAppBuildReleaseSnapshot{ID: release.ID, AppID: release.AppID, PlanID: release.DeploymentPlanRevisionID, PlanNumber: release.DeploymentPlanRevisionNumber,
+				Ready: release.WorkspaceState == releasesnapshot.WorkspaceStateReady}, releaseErr
+		},
+		Plan: func(diagnosticCtx context.Context, applicationID, planID string, planNumber int64) (lanTwoAppBuildPlanSnapshot, error) {
+			revision, revisionErr := plans.GetRevision(diagnosticCtx, applicationID, planID, planNumber)
+			if revisionErr != nil {
+				return lanTwoAppBuildPlanSnapshot{}, revisionErr
+			}
+			components := make([]string, 0, len(revision.Plan.Components))
+			for _, component := range revision.Plan.Components {
+				components = append(components, component.Name)
+			}
+			return lanTwoAppBuildPlanSnapshot{ID: revision.ID, AppID: revision.AppID, RevisionNumber: revision.RevisionNumber, ComponentNames: components,
+				Accepted: revision.State == deploymentplans.RevisionAccepted}, nil
+		},
+		Artifacts: lanTwoAppBuildArtifactReaderFor(db),
+		Commands:  commandObserver.Snapshot,
+		Worker:    workerObserver.Snapshot,
+	}
+	appA := lanTwoAppDeploy(t, &request, jobStore, deploymentStore, composition.state, diagnostics, githubSource, setup, "LAN A", "lan-a-v1", &appIDs)
+	appB := lanTwoAppDeploy(t, &request, jobStore, deploymentStore, composition.state, diagnostics, githubSource, setup, "LAN B", "lan-b-v1", &appIDs)
 	if appA.id == appB.id || appA.deploymentID == appB.deploymentID {
 		t.Fatal("two distinct application deployments are required")
 	}
@@ -268,7 +294,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	if configA.RevisionID == appA.config.RevisionID || configA.RevisionNumber != appA.config.RevisionNumber+1 {
 		t.Fatal("redeploy A did not save a distinct configuration revision")
 	}
-	lanTwoAppDeployJob(t, &request, jobStore, deploymentStore, composition.state, appA.id, appA.plan, configA)
+	lanTwoAppDeployJob(t, &request, jobStore, deploymentStore, composition.state, appA.id, appA.plan, configA, diagnostics)
 	lanTwoAppProbeMatrix(t, ctx, selected.IPv4, portA, portB, ports[2], "lan-a-v2", "lan-b-v1")
 	lanTwoAppNamespaceProbe(t, ctx, docker, selected.IPv4, portA, portB, ports[2], controllerPort,
 		appA.id, appB.id, transportClient, "lan-a-v2", "lan-b-v1")
@@ -550,7 +576,7 @@ func lanTwoAppConfig(marker string) []apicontract.ScopedConfigurationValueInput 
 }
 
 func lanTwoAppDeploy(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, deploymentStore *deployments.Repository,
-	state *generatedruntimestate.Repository, source apicontract.GitHubSource, setup apicontract.DeploymentSetupInput,
+	state *generatedruntimestate.Repository, diagnostics lanTwoAppBuildFailureDiagnosticDependencies, source apicontract.GitHubSource, setup apicontract.DeploymentSetupInput,
 	name, marker string, appIDs *[]string,
 ) lanTwoAppDeployment {
 	t.Helper()
@@ -562,7 +588,7 @@ func lanTwoAppDeploy(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, de
 		Remove: []apicontract.ScopedConfigurationKey{},
 	}, http.StatusOK, &saved)
 	deployment.config = saved
-	deployment.deploymentID = lanTwoAppDeployJob(t, api, jobStore, deploymentStore, state, deployment.id, deployment.plan, saved)
+	deployment.deploymentID = lanTwoAppDeployJob(t, api, jobStore, deploymentStore, state, deployment.id, deployment.plan, saved, diagnostics)
 	return deployment
 }
 
@@ -597,11 +623,26 @@ func lanTwoAppCreateApplication(t *testing.T, api *lanTwoAppAPI, source apicontr
 
 func lanTwoAppDeployJob(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service, deploymentStore *deployments.Repository,
 	state *generatedruntimestate.Repository, appID string, plan apicontract.DeploymentPlanRevision,
-	configuration apicontract.ApplicationConfiguration,
+	configuration apicontract.ApplicationConfiguration, diagnosticInputs ...lanTwoAppBuildFailureDiagnosticDependencies,
 ) string {
 	t.Helper()
 	path := "/api/v1/apps/" + appID + "/deployments"
 	var mutation apicontract.JobMutationResponse
+	var observed jobs.Job
+	var diagnostics lanTwoAppBuildFailureDiagnosticDependencies
+	if len(diagnosticInputs) > 0 {
+		diagnostics = diagnosticInputs[0]
+	}
+	failureDiagnostic, diagnosticComplete := lanTwoAppBuildFailureOnlyDiagnostic(func() {
+		t.Log(lanTwoAppBuildFailureObservationLine(lanTwoAppBuildFailureObservationFor(lanTwoAppBuildFailureDiagnosticInput{
+			Parent: api.ctx, Application: appID, Job: observed,
+			ExpectedPlanID: plan.RevisionID, ExpectedPlanNumber: plan.RevisionNumber,
+			Deployments: deploymentStore.List, Runtime: state.Get,
+			Release: diagnostics.Release, Plan: diagnostics.Plan, Artifacts: diagnostics.Artifacts,
+			Commands: diagnostics.Commands, Worker: diagnostics.Worker,
+		})))
+	})
+	defer failureDiagnostic()
 	// The ordinary controller request helper supplies session and CSRF. The
 	// operation is unique because its exact plan/config pair changes on A.
 	api.do(http.MethodPost, path, apicontract.DeployApplicationRequest{
@@ -617,13 +658,13 @@ func lanTwoAppDeployJob(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service,
 		if err != nil {
 			t.Fatal(err)
 		}
+		observed = job
 		if job.Status == string(jobs.Succeeded) {
 			break
 		}
 		if job.Status == string(jobs.Failed) || job.Status == string(jobs.NeedsAttention) ||
 			job.Status == string(jobs.WaitingUser) || time.Now().After(deadline) || api.ctx.Err() != nil {
-			lanTwoAppLogDeploymentFailure(t, api.ctx, appID, mutation.Job.ID, job, deploymentStore.List, state.Get)
-			t.Fatal("generated deployment did not succeed; safe diagnostic logged")
+			t.Fatal("generated deployment did not succeed; bounded diagnostic will be logged")
 		}
 	}
 	var history apicontract.DeploymentList
@@ -632,6 +673,7 @@ func lanTwoAppDeployJob(t *testing.T, api *lanTwoAppAPI, jobStore *jobs.Service,
 		history.Items[0].ActualConfigurationRevisionID != configuration.RevisionID || history.Items[0].Status != "succeeded" {
 		t.Fatal("durable deployment history does not match the completed job")
 	}
+	diagnosticComplete()
 	return history.Items[0].ID
 }
 
