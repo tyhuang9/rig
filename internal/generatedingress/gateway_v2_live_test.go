@@ -208,7 +208,7 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)
 	t.Cleanup(cancel)
-	runner := runtimeprocess.ExecRunner{}
+	runner := &runtimeprocess.ExecRunner{}
 	liveGatewayRequireLocalDocker(t, ctx, runner, docker, root, dockerConfig)
 	selected, port := liveGatewayV2SelectHostBinding(t)
 
@@ -225,7 +225,7 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
 	authority := liveGeneratedDeployments(t, working)
-	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
+	engine, err := generatedruntime.NewEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
@@ -262,6 +262,7 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	})
 
 	appSpec := liveCandidateSpec("blue", spec.appID, spec.planID)
+	appSpec = authority.PrepareCandidate(t, ctx, appSpec)
 	if spec.countRequests {
 		appSpec.ImageContentID = buildLiveGatewayCountedImage(t, ctx, runner, docker, root, dockerConfig, image.tag, appSpec, spec.applicationReply)
 	} else {
@@ -277,7 +278,7 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	}
 	assertLiveOneShot(t, ctx, ingress.options.HostPort, spec.appID, "/", spec.applicationReply,
 		"gateway-v2 source route did not serve through v1")
-	engine.ReleaseAdmission(candidate)
+	authority.published(t, ctx, ingress, candidate)
 	fixture.source, err = ingress.store.load()
 	if err != nil || fixture.source.Pending != nil {
 		t.Fatal("load gateway-v2 source state")

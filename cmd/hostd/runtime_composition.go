@@ -144,7 +144,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		return runtimeComposition{}, errors.New("generated runtime Docker executable is invalid")
 	}
 	if options.runner == nil {
-		options.runner = runtimeprocess.ExecRunner{}
+		options.runner = &runtimeprocess.ExecRunner{}
 	}
 	recoveryContext := context.WithoutCancel(ctx)
 	fenceCheck := rebindFenceCheck(dependencies.db)

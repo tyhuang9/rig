@@ -14,7 +14,10 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -1046,7 +1049,7 @@ func TestLowIngressCapacityBecomesReplacementCapacityDiagnostic(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.capacityOutput = []byte("1024 2048\n")
 	authority := liveGeneratedDeployments(t, manager.options.WorkingDirectory)
-	engine, err := generatedruntime.NewEngine(runner, unusedEnvironmentStager{}, manager, authority.repository, generatedruntime.EngineOptions{
+	engine, err := generatedruntime.NewEngine(runner, &unusedEnvironmentStager{}, manager, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable:      manager.options.DockerExecutable,
 		DockerConfigDirectory: manager.options.DockerConfigDirectory,
 		WorkingDirectory:      manager.options.WorkingDirectory,
@@ -1054,8 +1057,32 @@ func TestLowIngressCapacityBecomesReplacementCapacityDiagnostic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := engine.ReserveReplacement(context.Background(), 1); !generatedruntime.IsCode(err, generatedruntime.DiagnosticInsufficientReplacementSpace) {
+	scope, releaseScope, err := deploymenteffects.AcquireScoped(context.Background(), manager.options.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := releaseScope(); err != nil {
+			t.Error(err)
+		}
+	}()
+	ctx := deploymenteffects.WithScope(context.Background(), scope)
+	spec := authority.PrepareCandidate(t, ctx, liveCandidateSpec("blue", uuid.NewString(), uuid.NewString()))
+	spec = authority.BindNetwork(t, ctx, spec)
+	request := deployments.GeneratedReplacementRequest{
+		Claim: spec.Network.Claim, DeploymentID: spec.DeploymentID, ReleaseID: spec.ReleaseID,
+		ConfigurationRevisionID: spec.ConfigurationRevisionID, ConfigurationRevisionNumber: spec.ConfigurationRevisionNumber,
+		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: spec.DeploymentPlanRevisionNumber,
+		CandidateSlot: string(generatedruntime.SlotBlue), Findings: spec.Network.Findings,
+	}
+	commandsBefore := len(runner.commands)
+	if _, err := engine.ReserveReplacement(ctx, request); !generatedruntime.IsCode(err, generatedruntime.DiagnosticInsufficientReplacementSpace) {
 		t.Fatalf("error = %v", err)
+	}
+	for _, command := range runner.commands[commandsBefore:] {
+		if len(command) >= 2 && ((command[0] == "container" && (command[1] == "create" || command[1] == "start" || command[1] == "rm")) || (command[0] == "network" && command[1] == "create")) {
+			t.Fatalf("capacity rejection mutated Docker: %#v", command)
+		}
 	}
 }
 
@@ -1892,6 +1919,10 @@ func clonePortBindings(values map[string][]map[string]string) map[string][]map[s
 
 type unusedEnvironmentStager struct{}
 
-func (unusedEnvironmentStager) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
+func (*unusedEnvironmentStager) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
 	return nil, errors.New("environment staging must not run during capacity admission")
+}
+
+func (*unusedEnvironmentStager) StageGeneratedCandidate(string, int, []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+	return nil, errors.New("candidate environment staging must not run during capacity admission")
 }

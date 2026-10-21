@@ -2,6 +2,8 @@ package generatedexecutor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
@@ -24,6 +27,7 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 const (
@@ -128,6 +132,21 @@ func (f *fakeDeployments) Get(context.Context, string, string) (deployments.Depl
 		return deployments.Deployment{}, f.getErr
 	}
 	return f.deployment, nil
+}
+func (f *fakeDeployments) Gate(_ context.Context, request deployments.GateRequest) error {
+	if request.DeploymentID != f.deployment.ID || request.Claim.ApplicationID() != f.deployment.AppID {
+		return deployments.ErrInvalidDeployment
+	}
+	switch f.deployment.Status {
+	case deployments.Preparing, deployments.NeedsAttention:
+		f.deployment.Status = deployments.Applying
+		f.deployment.DiagnosticCode = ""
+		return nil
+	case deployments.Applying, deployments.WaitingHealth:
+		return nil
+	default:
+		return deployments.ErrInvalidTransition
+	}
 }
 func (f *fakeDeployments) InitializeRuntime(_ context.Context, _, _, releaseID, configurationID string, configurationNumber int64, strategy deployments.RuntimeStrategy, planID string, planNumber int64) (deployments.Deployment, error) {
 	f.deployment.ReleaseID = releaseID
@@ -406,46 +425,31 @@ func (f *fakeRuntimeState) component(name string) *generatedruntimestate.Compone
 }
 
 type fakeRuntime struct {
+	delegate        runtimeEngine
 	events          *[]string
-	validateErrs    []error
-	validateCalls   int
-	healthErr       error
-	createdSpecs    []generatedruntime.CandidateSpec
-	started         []generatedruntime.Candidate
-	adoptedValues   []generatedruntime.Candidate
-	adopted         int
 	stopped         int
 	stopErrs        []error
 	networkRequests []deployments.GeneratedNetworkRequest
 	networkErrs     []error
 	networkCalls    int
-	createErrs      []error
-	createCalls     int
 	retained        int
 }
 
-type fakeReplacementReservation struct{ releases int }
-
-func (r *fakeReplacementReservation) Release() { r.releases++ }
-
-func (f *fakeRuntime) ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error) {
-	return &fakeReplacementReservation{}, nil
+func (f *fakeRuntime) ReserveReplacement(ctx context.Context, request deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error) {
+	if f.delegate != nil {
+		return f.delegate.ReserveReplacement(ctx, request)
+	}
+	return nil, errors.New("fake runtime cannot mint a generated replacement reservation")
 }
-func (f *fakeRuntime) RetainReplacementCapacity(generatedruntime.ReplacementReservation) error {
+func (f *fakeRuntime) RetainReplacementCapacity(reservation generatedruntime.ReplacementReservation) error {
 	f.retained++
-	return nil
-}
-
-func (f *fakeRuntime) ValidateImage(context.Context, generatedruntime.ImageSpec) error {
-	*f.events = append(*f.events, "validate_image")
-	index := f.validateCalls
-	f.validateCalls++
-	if index < len(f.validateErrs) {
-		return f.validateErrs[index]
+	if f.delegate != nil {
+		return f.delegate.RetainReplacementCapacity(reservation)
 	}
 	return nil
 }
-func (f *fakeRuntime) EnsureAppNetwork(_ context.Context, request deployments.GeneratedNetworkRequest) error {
+
+func (f *fakeRuntime) EnsureAppNetwork(ctx context.Context, request deployments.GeneratedNetworkRequest) error {
 	*f.events = append(*f.events, "ensure_network")
 	f.networkRequests = append(f.networkRequests, request)
 	index := f.networkCalls
@@ -453,59 +457,41 @@ func (f *fakeRuntime) EnsureAppNetwork(_ context.Context, request deployments.Ge
 	if index < len(f.networkErrs) {
 		return f.networkErrs[index]
 	}
-	return nil
-}
-func (f *fakeRuntime) CreateInactiveCandidate(_ context.Context, spec generatedruntime.CandidateSpec) (generatedruntime.Candidate, error) {
-	*f.events = append(*f.events, "create")
-	f.createdSpecs = append(f.createdSpecs, spec)
-	index := f.createCalls
-	f.createCalls++
-	if index < len(f.createErrs) && f.createErrs[index] != nil {
-		return generatedruntime.Candidate{}, f.createErrs[index]
+	if f.delegate != nil {
+		return f.delegate.EnsureAppNetwork(ctx, request)
 	}
-	description, _ := generatedruntime.DescribeInactiveCandidate(spec.AppID, spec.ComponentName, spec.ActiveSlot)
-	return generatedruntime.Candidate{
-		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID, ArtifactID: spec.ArtifactID,
-		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, Component: spec.ComponentName, Role: spec.Role, Technology: spec.Technology, Slot: description.Slot,
-		ContainerID: "a" + string(make([]byte, 63)), ContainerName: description.ContainerName,
-		NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias, InternalPort: spec.InternalPort,
-		ImageContentID: spec.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(spec.RootDirectory), RunCommandDigest: commandDigest(spec.RunCommand),
-	}, nil
-}
-func (f *fakeRuntime) AdoptCandidate(candidate generatedruntime.Candidate, _ generatedruntime.ReplacementReservation) (generatedruntime.Candidate, error) {
-	f.adopted++
-	f.adoptedValues = append(f.adoptedValues, candidate)
-	return candidate, nil
-}
-func (f *fakeRuntime) StartCandidate(_ context.Context, candidate generatedruntime.Candidate) error {
-	*f.events = append(*f.events, "start")
-	f.started = append(f.started, candidate)
 	return nil
 }
-func (f *fakeRuntime) WaitHealthy(context.Context, generatedruntime.Candidate) error {
-	*f.events = append(*f.events, "health")
-	return f.healthErr
+func (f *fakeRuntime) PinCandidates(ctx context.Context, request deployments.GeneratedCandidateRequest, reservation generatedruntime.ReplacementReservation) (*deployments.GeneratedCandidateExecution, error) {
+	if f.delegate != nil {
+		return f.delegate.PinCandidates(ctx, request, reservation)
+	}
+	return nil, errors.New("fake runtime cannot mint a generated candidate execution")
 }
-func (f *fakeRuntime) StopAndRemove(context.Context, generatedruntime.Candidate, time.Duration) error {
+func (f *fakeRuntime) StopAndRemove(ctx context.Context, candidate generatedruntime.Candidate, timeout time.Duration) error {
 	call := f.stopped
 	f.stopped++
 	if call < len(f.stopErrs) {
 		return f.stopErrs[call]
 	}
+	if f.delegate != nil {
+		return f.delegate.StopAndRemove(ctx, candidate, timeout)
+	}
 	return nil
 }
-func (f *fakeRuntime) ReleaseAdmission(generatedruntime.Candidate) {}
 
 type fakeAuthorization struct {
+	delegate     AuthorizationGate
 	events       *[]string
 	err          error
 	deployments  *fakeDeployments
 	calls        int
 	after        func()
-	reservations []*fakeReplacementReservation
+	reservation  generatedruntime.ReplacementReservation
+	reservations []generatedruntime.ReplacementReservation
 }
 
-func (f *fakeAuthorization) Authorize(context.Context, AuthorizationRequest) (generatedruntime.ReplacementReservation, error) {
+func (f *fakeAuthorization) Authorize(ctx context.Context, request AuthorizationRequest) (generatedruntime.ReplacementReservation, error) {
 	f.calls++
 	*f.events = append(*f.events, "authorize")
 	if f.after != nil {
@@ -514,12 +500,21 @@ func (f *fakeAuthorization) Authorize(context.Context, AuthorizationRequest) (ge
 	if f.err != nil {
 		return nil, f.err
 	}
+	if f.delegate != nil {
+		reservation, err := f.delegate.Authorize(ctx, request)
+		if reservation != nil {
+			f.reservations = append(f.reservations, reservation)
+		}
+		return reservation, err
+	}
 	if f.deployments.deployment.Status == deployments.Preparing || f.deployments.deployment.Status == deployments.NeedsAttention {
 		f.deployments.deployment.Status = deployments.Applying
 	}
-	reservation := &fakeReplacementReservation{}
-	f.reservations = append(f.reservations, reservation)
-	return reservation, nil
+	if f.reservation == nil {
+		return nil, errors.New("fake authorization cannot mint a generated replacement reservation")
+	}
+	f.reservations = append(f.reservations, f.reservation)
+	return f.reservation, nil
 }
 
 type fakeRoutes struct {
@@ -635,6 +630,15 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	artifacts := &fakeArtifacts{values: map[string]generatedimage.Artifact{artifact.ID: artifact}}
 	runtime := &fakeRuntime{events: &events}
 	authorization := &fakeAuthorization{events: &events, deployments: deploymentsFake}
+	planReader := &fakePlans{revision: plan}
+	if authority != nil {
+		runtime.delegate = authority.engine
+		gate, err := NewAuthorizationGate(deploymentsFake, planReader, authority.engine)
+		if err != nil {
+			t.Fatal(err)
+		}
+		authorization.delegate = gate
+	}
 	routes := &fakeRoutes{events: &events}
 	migrations := &fakeMigrations{events: &events}
 	if authority != nil {
@@ -643,7 +647,7 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	executor, err := NewExecutor(
 		&fakeApplications{app: apps.Application{ID: testAppID, Source: apps.Source{Type: apps.SourceLocal, Path: `C:\source`}}},
 		&fakeReleases{release: release}, configuration, deploymentsFake,
-		&fakePlans{revision: plan}, compiler, artifacts, state, runtime, authorization, routes, migrations, Options{},
+		planReader, compiler, artifacts, state, runtime, authorization, routes, migrations, Options{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -652,6 +656,9 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 }
 
 func (f *executorFixture) execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+	if f.migrationAuthority != nil {
+		ctx = f.migrationAuthority.withScope(ctx)
+	}
 	return f.executor.ExecuteBound(ctx, job, f.claim, reporter)
 }
 
@@ -727,8 +734,7 @@ func TestExecutorPreservesAuthorizationRefusalAndCancellationWithoutFailureMutat
 			if fixture.deployments.deployment.Status != deployments.Preparing || fixture.deployments.deployment.DiagnosticCode != "" ||
 				fixture.state.deployment.Phase != generatedruntimestate.PhaseBuilding || fixture.state.deployment.DiagnosticCode != "" ||
 				len(fixture.state.deployment.Components) != 1 || fixture.state.deployment.Components[0].State != generatedruntimestate.ComponentPending ||
-				fixture.compiler.calls != 0 || fixture.authorization.calls != 1 || fixture.runtime.validateCalls != 0 || len(fixture.runtime.createdSpecs) != 0 ||
-				len(fixture.runtime.started) != 0 || fixture.runtime.adopted != 0 || fixture.runtime.stopped != 0 {
+				fixture.compiler.calls != 0 || fixture.authorization.calls != 1 || fixture.runtime.networkCalls != 0 || fixture.runtime.stopped != 0 {
 				t.Fatalf("deployment=%#v runtime=%#v compiler=%d authorization=%d runtime calls=%#v", fixture.deployments.deployment, fixture.state.deployment, fixture.compiler.calls, fixture.authorization.calls, fixture.runtime)
 			}
 		})
@@ -848,142 +854,184 @@ func TestGeneratedExecutorRejectsUnpinnedLatestJobBeforeRuntimeSideEffects(t *te
 }
 
 func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	finding := deployments.Finding{PolicyVersion: "v1", Capability: "network", Scope: "app", Fingerprint: strings.Repeat("a", 64), Disposition: "allowed"}
-	fixture.deployments.deployment.Findings = []deployments.Finding{finding}
-	result, err := fixture.execute(context.Background(), reviewedDeploymentJob(), fixture.reporter)
+	fixture := newSealedExecutorFixture(t)
+	prepared, _ := fixture.prepareAuthorization(t)
+	canonical := []byte(`{"policyVersion":"compose-runtime-v1","capability":"network","scope":"app"}`)
+	fingerprint := sha256.Sum256(canonical)
+	finding := deployments.Finding{PolicyVersion: "compose-runtime-v1", Capability: "network", Scope: "app", Fingerprint: hex.EncodeToString(fingerprint[:]), Disposition: "allowed"}
+	if err := fixture.repository.Gate(fixture.context, deployments.GateRequest{Claim: fixture.claim, DeploymentID: prepared.ID, Findings: []deployments.Finding{finding}}); err != nil {
+		t.Fatal(err)
+	}
+	expectedFindings := fixture.deployment(t).Findings
+	if len(expectedFindings) != 1 || expectedFindings[0].Fingerprint != finding.Fingerprint {
+		t.Fatalf("policy gate did not persist the finding: %+v", expectedFindings)
+	}
+	result, err := fixture.execute()
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	deployment := fixture.deployments.deployment
-	if deployment.Status != deployments.Succeeded || deployment.DeploymentPlanRevisionID != testPlanID || deployment.DeploymentPlanRevisionNumber != 2 ||
-		deployment.ActualConfigurationRevisionID != testConfigID || deployment.ActualConfigurationRevisionNumber != 3 || fixture.compiler.calls != 1 ||
-		fixture.compiler.pins[0].RevisionID != testConfigID || fixture.compiler.pins[0].RevisionNumber != 3 {
+	deployment := fixture.deployment(t)
+	if deployment.Status != deployments.Succeeded || deployment.DeploymentPlanRevisionID != fixture.plan.ID || deployment.DeploymentPlanRevisionNumber != fixture.plan.RevisionNumber ||
+		deployment.ActualConfigurationRevisionID != fixture.configuration.RevisionID || deployment.ActualConfigurationRevisionNumber != fixture.configuration.RevisionNumber || fixture.compiler.calls != 1 ||
+		fixture.compiler.pins[0].RevisionID != fixture.configuration.RevisionID || fixture.compiler.pins[0].RevisionNumber != fixture.configuration.RevisionNumber {
 		t.Fatalf("reviewed deployment=%+v compiler pins=%+v", deployment, fixture.compiler.pins)
 	}
-	if len(fixture.compiler.requests) != 1 || len(fixture.deployments.finishRequests) != 1 {
-		t.Fatalf("compiler requests=%+v finish requests=%+v", fixture.compiler.requests, fixture.deployments.finishRequests)
+	if len(fixture.compiler.requests) != 1 || len(fixture.deployments.finishRequests) != 1 || fixture.runner.createCalls != 1 || fixture.runner.startCalls != 1 || fixture.environment.stageCalls != 1 || fixture.environment.cleanupCalls != 1 {
+		t.Fatalf("compiler=%d creates=%d starts=%d stage=%d cleanup=%d", len(fixture.compiler.requests), fixture.runner.createCalls, fixture.runner.startCalls, fixture.environment.stageCalls, fixture.environment.cleanupCalls)
 	}
 	compileRequest := fixture.compiler.requests[0]
-	if !reflect.DeepEqual(compileRequest.Claim, fixture.claim) || compileRequest.DeploymentID != testDeploymentID || compileRequest.ReleaseID != testReleaseID ||
-		compileRequest.ConfigurationRevisionID != testConfigID || compileRequest.ConfigurationRevisionNumber != 3 ||
-		compileRequest.DeploymentPlanRevisionID != testPlanID || compileRequest.DeploymentPlanRevisionNumber != 2 || compileRequest.ComponentName != "api" || !reflect.DeepEqual(compileRequest.Findings, []deployments.Finding{finding}) {
+	if !reflect.DeepEqual(compileRequest.Claim, fixture.claim) || compileRequest.DeploymentID != deployment.ID || compileRequest.ReleaseID != fixture.release.ID ||
+		compileRequest.ConfigurationRevisionID != fixture.configuration.RevisionID || compileRequest.ConfigurationRevisionNumber != fixture.configuration.RevisionNumber ||
+		compileRequest.DeploymentPlanRevisionID != fixture.plan.ID || compileRequest.DeploymentPlanRevisionNumber != fixture.plan.RevisionNumber || compileRequest.ComponentName != "api" || !reflect.DeepEqual(compileRequest.Findings, expectedFindings) {
 		t.Fatalf("compiler request=%+v", compileRequest)
 	}
-	wantFinish := generatedNetworkRequest(fixture.claim, resolvedDeployment{deployment: deployment, configurationID: testConfigID, configurationNumber: 3, plan: fixture.plan})
-	if !reflect.DeepEqual(fixture.deployments.finishRequests[0], wantFinish) {
-		t.Fatalf("finish request=%+v want=%+v", fixture.deployments.finishRequests[0], wantFinish)
+	wantFinish := deployments.GeneratedNetworkRequest{
+		Claim: fixture.claim, DeploymentID: deployment.ID, ReleaseID: fixture.release.ID,
+		ConfigurationRevisionID: fixture.configuration.RevisionID, ConfigurationRevisionNumber: fixture.configuration.RevisionNumber,
+		DeploymentPlanRevisionID: fixture.plan.ID, DeploymentPlanRevisionNumber: fixture.plan.RevisionNumber,
+		Findings: expectedFindings,
 	}
-	fixture.deployments.deployment.Findings[0].Capability = "mutated"
-	if compileRequest.Findings[0].Capability != finding.Capability || fixture.deployments.finishRequests[0].Findings[0].Capability != finding.Capability {
-		t.Fatal("executor forwarded mutable policy findings")
+	if actual := fixture.deployments.finishRequests[0]; !reflect.DeepEqual(actual, wantFinish) {
+		t.Fatalf("finish request=%+v want=%+v", actual, wantFinish)
+	}
+	mutated := 0
+	for _, source := range fixture.deployments.readFindings {
+		if len(source) != 0 {
+			source[0].Capability = "mutated source"
+			mutated++
+		}
+	}
+	if mutated == 0 || !reflect.DeepEqual(compileRequest.Findings, expectedFindings) || !reflect.DeepEqual(fixture.deployments.finishRequests[0].Findings, expectedFindings) {
+		t.Fatal("compiler or finish request aliases the repository findings")
+	}
+	compileRequest.Findings[0].Capability = "mutated compiler request"
+	if !reflect.DeepEqual(fixture.deployments.finishRequests[0].Findings, expectedFindings) || !reflect.DeepEqual(fixture.deployment(t).Findings, expectedFindings) {
+		t.Fatal("compiler findings mutation changed finish findings or persisted policy")
+	}
+	runtimeDeployment := fixture.runtimeDeployment(t)
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || len(runtimeDeployment.Components) != 1 || runtimeDeployment.Components[0].State != generatedruntimestate.ComponentActive {
+		t.Fatalf("runtime deployment=%+v", runtimeDeployment)
 	}
 }
 
 func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 	for _, test := range []struct {
-		name            string
-		migration       bool
-		invalidateHead  bool
-		wantDisposition string
-		wantStatus      deployments.Status
+		name             string
+		invalidateHead   bool
+		alreadyFinalized bool
+		migration        bool
+		wantDisposition  string
+		wantStatus       deployments.Status
 	}{
-		{name: "matching committed head with completed migration", migration: true, wantStatus: deployments.Succeeded},
-		{name: "deployment already finalized", wantStatus: deployments.Succeeded},
-		{name: "head no longer matches", invalidateHead: true, wantDisposition: jobs.PauseRouteReconciliationRequired, wantStatus: deployments.Applying},
+		{name: "matching committed head after interrupted finalization", wantStatus: deployments.Succeeded},
+		{name: "completed migration after interrupted finalization", migration: true, wantStatus: deployments.Succeeded},
+		{name: "deployment already finalized", alreadyFinalized: true, wantStatus: deployments.Succeeded},
+		{name: "head no longer matches", invalidateHead: true, wantDisposition: jobs.PauseRouteReconciliationRequired, wantStatus: deployments.WaitingHealth},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newExecutorFixture(t, test.migration)
-			job := reviewedDeploymentJob()
+			var fixture *sealedExecutorFixture
 			if test.migration {
-				job = fixture.deploymentJob()
+				fixture = newSealedExecutorFixtureWithMigration(t)
+			} else {
+				fixture = newSealedExecutorFixture(t)
 			}
-			if _, err := fixture.execute(context.Background(), job, fixture.reporter); err != nil {
+			if !test.alreadyFinalized {
+				fixture.deployments.transitionErrStatus = deployments.Succeeded
+				fixture.deployments.transitionErr = errors.New("final deployment acknowledgement unavailable")
+			}
+			if _, err := fixture.execute(); test.alreadyFinalized && err != nil {
 				t.Fatal(err)
+			} else if !test.alreadyFinalized && err == nil {
+				t.Fatal("interrupted finalization unexpectedly succeeded")
 			}
-			if fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
+			if fixture.runtimeDeployment(t).Phase != generatedruntimestate.PhaseSucceeded {
 				t.Fatal("runtime did not commit success")
 			}
-			migrationRuns := len(fixture.migrations.requests)
-			if test.migration {
-				persisted, getErr := fixture.migrationAuthority.state.Get(context.Background(), testAppID, fixture.deployments.deployment.ID)
-				if getErr != nil || persisted.MigrationState != generatedruntimestate.MigrationSucceeded || migrationRuns != 1 {
-					t.Fatalf("fixture did not complete exactly one approved migration: state=%s runs=%d err=%v", persisted.MigrationState, migrationRuns, getErr)
-				}
+			if test.migration && (fixture.runtimeDeployment(t).MigrationState != generatedruntimestate.MigrationSucceeded || len(fixture.migrations.requests) != 1 || fixture.runner.createCalls != 2 || fixture.runner.startCalls != 2) {
+				t.Fatalf("migration did not complete once before restart: runtime=%+v migrations=%d creates=%d starts=%d", fixture.runtimeDeployment(t), len(fixture.migrations.requests), fixture.runner.createCalls, fixture.runner.startCalls)
 			}
-			if test.name != "deployment already finalized" {
-				fixture.deployments.deployment.Status = deployments.Applying
-			}
+			fixture.deployments.transitionErr = nil
 			if test.invalidateHead {
-				fixture.state.active.DeploymentID = testArtifactID
+				fixture.state.activeOverride = &generatedruntimestate.ActiveHead{AppID: fixture.app.ID, DeploymentID: uuid.NewString(), ReleaseID: fixture.release.ID, Slot: string(generatedruntime.SlotBlue), Generation: 2}
 			}
-			builds, switches, removals := fixture.compiler.calls, len(fixture.routes.requests), fixture.runtime.stopped
-			result, err := fixture.execute(context.Background(), job, fixture.reporter)
-			if err != nil || result.PauseDisposition != test.wantDisposition || fixture.deployments.deployment.Status != test.wantStatus {
-				t.Fatalf("finalize result=%+v err=%v deployment=%+v", result, err, fixture.deployments.deployment)
+			builds, switches, removals := fixture.compiler.calls, len(fixture.routes.requests), fixture.runtime.stopCalls
+			migrationRuns, creates, starts, processRemovals := len(fixture.migrations.requests), fixture.runner.createCalls, fixture.runner.startCalls, fixture.runner.removeCalls
+			result, err := fixture.execute()
+			deployment := fixture.deployment(t)
+			if err != nil || result.PauseDisposition != test.wantDisposition || deployment.Status != test.wantStatus {
+				t.Fatalf("finalize result=%+v err=%v deployment=%+v", result, err, deployment)
 			}
-			if fixture.compiler.calls != builds || len(fixture.routes.requests) != switches || fixture.runtime.stopped != removals || len(fixture.migrations.requests) != migrationRuns {
+			if test.wantStatus == deployments.Succeeded && result.CompletionCode != "deployment_completed" {
+				t.Fatalf("finalization did not report completion: %+v", result)
+			}
+			if fixture.compiler.calls != builds || len(fixture.routes.requests) != switches || fixture.runtime.stopCalls != removals ||
+				len(fixture.migrations.requests) != migrationRuns || fixture.runner.createCalls != creates || fixture.runner.startCalls != starts || fixture.runner.removeCalls != processRemovals {
 				t.Fatal("finalization replay built, migrated, switched, or removed a runtime resource")
+			}
+			if test.migration && fixture.runtimeDeployment(t).MigrationState != generatedruntimestate.MigrationSucceeded {
+				t.Fatal("finalization replay changed completed migration evidence")
 			}
 		})
 	}
 }
 
 func TestGeneratedExecutorResumesReviewedLatestJobWithRecordedProvenanceAfterHeadDrift(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	job := reviewedDeploymentJob()
-	result, err := fixture.execute(context.Background(), job, fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseInsufficientReplacementCapacity {
 		t.Fatalf("first result=%+v err=%v", result, err)
 	}
-	deployment := fixture.deployments.deployment
-	if !deployment.ProvenanceInitialized || deployment.ReleaseID != testReleaseID || deployment.DeploymentPlanRevisionID != testPlanID ||
-		deployment.DeploymentPlanRevisionNumber != 2 || deployment.ActualConfigurationRevisionID != testConfigID || deployment.ActualConfigurationRevisionNumber != 3 {
+	deployment := fixture.deployment(t)
+	if !deployment.ProvenanceInitialized || deployment.ReleaseID != fixture.release.ID || deployment.DeploymentPlanRevisionID != fixture.plan.ID ||
+		deployment.DeploymentPlanRevisionNumber != fixture.plan.RevisionNumber || deployment.ActualConfigurationRevisionID != fixture.configuration.RevisionID || deployment.ActualConfigurationRevisionNumber != fixture.configuration.RevisionNumber {
 		t.Fatalf("recorded provenance=%+v", deployment)
 	}
-	if fixture.compiler.calls != 0 || fixture.executor.releases.(*fakeReleases).materializeCalls != 1 {
-		t.Fatalf("work before pause: compiler=%d materializations=%d", fixture.compiler.calls, fixture.executor.releases.(*fakeReleases).materializeCalls)
+	if fixture.compiler.calls != 0 || fixture.releases.materializeCalls != 1 {
+		t.Fatalf("work before pause: compiler=%d materializations=%d", fixture.compiler.calls, fixture.releases.materializeCalls)
 	}
 
-	newHead := fixture.plan
-	newHead.ID, newHead.RevisionNumber = testArtifactID2, 4
-	fixture.executor.plans.(*fakePlans).head = &newHead
-	fixture.configuration.currentID, fixture.configuration.currentNumber = testArtifactID, 4
+	if _, err := fixture.plans.Replace(context.Background(), fixture.app.ID, fixture.actorID, deploymentplans.ReplaceInput{ExpectedRevisionNumber: fixture.plan.RevisionNumber, Plan: fixture.plan.Plan}); err != nil {
+		t.Fatal(err)
+	}
 	fixture.authorization.err = nil
-	result, err = fixture.execute(context.Background(), job, fixture.reporter)
+	result, err = fixture.execute()
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("resume result=%+v err=%v", result, err)
 	}
-	deployment = fixture.deployments.deployment
-	if deployment.Status != deployments.Succeeded || deployment.ReleaseID != testReleaseID || deployment.DeploymentPlanRevisionID != testPlanID ||
-		deployment.DeploymentPlanRevisionNumber != 2 || deployment.ActualConfigurationRevisionID != testConfigID || deployment.ActualConfigurationRevisionNumber != 3 {
+	deployment = fixture.deployment(t)
+	if deployment.Status != deployments.Succeeded || deployment.ReleaseID != fixture.release.ID || deployment.DeploymentPlanRevisionID != fixture.plan.ID ||
+		deployment.DeploymentPlanRevisionNumber != fixture.plan.RevisionNumber || deployment.ActualConfigurationRevisionID != fixture.configuration.RevisionID || deployment.ActualConfigurationRevisionNumber != fixture.configuration.RevisionNumber {
 		t.Fatalf("resumed deployment=%+v", deployment)
 	}
-	releases := fixture.executor.releases.(*fakeReleases)
-	if releases.materializeCalls != 1 || !reflect.DeepEqual(releases.readyWorkspaceIDs, []string{testReleaseID}) ||
-		fixture.compiler.calls != 1 || !reflect.DeepEqual(fixture.compiler.pins, []appconfig.RevisionIdentity{{RevisionID: testConfigID, RevisionNumber: 3}}) || len(fixture.routes.requests) != 1 {
-		t.Fatalf("resume sources: materializations=%d ready=%v compiler pins=%+v routes=%d", releases.materializeCalls, releases.readyWorkspaceIDs, fixture.compiler.pins, len(fixture.routes.requests))
+	if fixture.releases.materializeCalls != 1 || !reflect.DeepEqual(fixture.releases.readyWorkspaceIDs, []string{fixture.release.ID}) ||
+		fixture.compiler.calls != 1 || !reflect.DeepEqual(fixture.compiler.pins, []appconfig.RevisionIdentity{{RevisionID: fixture.configuration.RevisionID, RevisionNumber: fixture.configuration.RevisionNumber}}) || len(fixture.routes.requests) != 1 {
+		t.Fatalf("resume sources: materializations=%d ready=%v compiler pins=%+v routes=%d", fixture.releases.materializeCalls, fixture.releases.readyWorkspaceIDs, fixture.compiler.pins, len(fixture.routes.requests))
 	}
 }
 
 func TestGeneratedExecutorRejectsChangedReviewedProvenanceOnResume(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	job := reviewedDeploymentJob()
-	result, err := fixture.execute(context.Background(), job, fixture.reporter)
-	if err != nil || result.PauseDisposition != jobs.PauseInsufficientReplacementCapacity || !fixture.deployments.deployment.ProvenanceInitialized {
-		t.Fatalf("first result=%+v err=%v deployment=%+v", result, err, fixture.deployments.deployment)
+	result, err := fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseInsufficientReplacementCapacity || !fixture.deployment(t).ProvenanceInitialized {
+		t.Fatalf("first result=%+v err=%v deployment=%+v", result, err, fixture.deployment(t))
 	}
-	fixture.deployments.deployment.ActualConfigurationRevisionID = testArtifactID
+	input, _ := json.Marshal(jobs.DeploymentInput{
+		ConfigurationMode:      jobs.ConfigurationCurrent,
+		ExpectedPlanRevisionID: fixture.plan.ID, ExpectedPlanRevisionNumber: fixture.plan.RevisionNumber,
+		ExpectedConfigurationRevisionID: uuid.NewString(), ExpectedConfigurationRevisionNumber: fixture.configuration.RevisionNumber + 1,
+	})
+	fixture.job.Input = input
 	fixture.authorization.err = nil
-	_, err = fixture.execute(context.Background(), job, fixture.reporter)
+	_, err = fixture.execute()
 	requireExecutionErrorCode(t, err, "invalid_source")
-	if fixture.deployments.deployment.Status != deployments.Failed || fixture.compiler.calls != 0 || len(fixture.routes.requests) != 0 ||
-		fixture.executor.releases.(*fakeReleases).materializeCalls != 1 || len(fixture.executor.releases.(*fakeReleases).readyWorkspaceIDs) != 0 || fixture.authorization.calls != 1 {
+	deployment := fixture.deployment(t)
+	if deployment.Status != deployments.Failed || fixture.compiler.calls != 0 || len(fixture.routes.requests) != 0 ||
+		fixture.releases.materializeCalls != 1 || len(fixture.releases.readyWorkspaceIDs) != 0 || fixture.authorization.calls != 1 {
 		t.Fatalf("mismatched provenance side effects: deployment=%+v compiler=%d routes=%d materializations=%d ready=%v authorization=%d",
-			fixture.deployments.deployment, fixture.compiler.calls, len(fixture.routes.requests), fixture.executor.releases.(*fakeReleases).materializeCalls,
-			fixture.executor.releases.(*fakeReleases).readyWorkspaceIDs, fixture.authorization.calls)
+			deployment, fixture.compiler.calls, len(fixture.routes.requests), fixture.releases.materializeCalls,
+			fixture.releases.readyWorkspaceIDs, fixture.authorization.calls)
 	}
 }
 
@@ -997,67 +1045,82 @@ func requireExecutionErrorCode(t *testing.T, err error, code string) {
 
 func TestGeneratedExecutorRepositoryFailuresPreserveDurableTerminalState(t *testing.T) {
 	tests := []struct {
-		name   string
-		inject func(*executorFixture)
+		name         string
+		inject       func(*sealedExecutorFixture)
+		wantTerminal bool
+		code         string
 	}{
 		{
 			name: "runtime advance",
-			inject: func(fixture *executorFixture) {
+			inject: func(fixture *sealedExecutorFixture) {
 				fixture.state.advanceErrTo = generatedruntimestate.PhaseBuilding
 				fixture.state.advanceErr = errors.New("runtime state storage unavailable")
 			},
+			wantTerminal: true,
+			code:         "internal_error",
 		},
 		{
 			name: "deployment reload",
-			inject: func(fixture *executorFixture) {
+			inject: func(fixture *sealedExecutorFixture) {
 				fixture.deployments.getErr = errors.New("deployment storage unavailable")
 			},
+			wantTerminal: true,
+			code:         "internal_error",
 		},
 		{
-			name: "deployment waiting health transition",
-			inject: func(fixture *executorFixture) {
-				fixture.deployments.transitionErrStatus = deployments.WaitingHealth
+			name: "deployment success transition",
+			inject: func(fixture *sealedExecutorFixture) {
+				fixture.deployments.transitionErrStatus = deployments.Succeeded
 				fixture.deployments.transitionErr = errors.New("deployment transition storage unavailable")
 			},
+			code: "internal_error",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newExecutorFixture(t, false)
+			fixture := newSealedExecutorFixture(t)
 			test.inject(fixture)
-			_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-			requireExecutionErrorCode(t, err, "internal_error")
-			if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed {
-				t.Fatalf("runtime phase=%q want=%q", fixture.state.deployment.Phase, generatedruntimestate.PhaseFailed)
+			_, err := fixture.execute()
+			requireExecutionErrorCode(t, err, test.code)
+			if test.name == "deployment reload" {
+				fixture.deployments.getErr = nil
 			}
-			if fixture.deployments.deployment.Status != deployments.Failed || fixture.deployments.deployment.DiagnosticCode != "internal_error" {
-				t.Fatalf("deployment=%+v", fixture.deployments.deployment)
+			deployment := fixture.deployment(t)
+			runtimeDeployment := fixture.runtimeDeployment(t)
+			if test.name == "deployment success transition" {
+				if runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || deployment.Status != deployments.WaitingHealth {
+					t.Fatalf("recoverable finalization state: runtime=%+v deployment=%+v", runtimeDeployment, deployment)
+				}
+			} else if test.wantTerminal && (runtimeDeployment.Phase != generatedruntimestate.PhaseFailed || deployment.Status != deployments.Failed || deployment.DiagnosticCode != "internal_error") {
+				t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
+			} else if !test.wantTerminal && (runtimeDeployment.Phase == generatedruntimestate.PhaseFailed || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled) {
+				t.Fatalf("storage uncertainty terminalized candidate boundary: runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 			}
 		})
 	}
 }
 
 func TestGeneratedExecutorFinalAdvanceFailureRetainsRecoverableRuntimeState(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.state.advanceErrTo = generatedruntimestate.PhaseSucceeded
 	fixture.state.advanceErr = errors.New("runtime state storage unavailable")
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseDraining {
-		t.Fatalf("runtime phase=%q want recoverable %q", fixture.state.deployment.Phase, generatedruntimestate.PhaseDraining)
+	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
+		t.Fatalf("runtime phase=%q want recoverable %q", runtimeDeployment.Phase, generatedruntimestate.PhaseDraining)
 	}
-	if fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
-		t.Fatalf("deployment became terminal: %+v", fixture.deployments.deployment)
+	if deployment := fixture.deployment(t); deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+		t.Fatalf("deployment became terminal: %+v", deployment)
 	}
 
 	fixture.state.advanceErr = nil
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	result, err = fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	if err != nil || result.CompletionCode != "deployment_completed" || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded || fixture.deployments.deployment.Status != deployments.Succeeded {
-		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, fixture.state.deployment, fixture.deployments.deployment)
+	result, err = fixture.execute()
+	if runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t); err != nil || result.CompletionCode != "deployment_completed" || runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || deployment.Status != deployments.Succeeded {
+		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, runtimeDeployment, deployment)
 	}
 	if fixture.authorization.calls != 1 {
 		t.Fatalf("draining retry requested replacement capacity: authorization calls=%d", fixture.authorization.calls)
@@ -1098,55 +1161,22 @@ func TestGeneratedExecutorDistinguishesPlanStorageAndValidationFailures(t *testi
 }
 
 func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen(t *testing.T) {
-	fixture := newExecutorFixture(t, true)
-	result, err := fixture.execute(context.Background(), fixture.deploymentJob(), fixture.reporter)
+	fixture := newSealedExecutorFixtureWithMigration(t)
+	result, err := fixture.execute()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.CompletionCode != "deployment_completed" || fixture.deployments.deployment.Status != deployments.Succeeded || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
-		t.Fatalf("result=%+v deployment=%+v runtime phase=%s", result, fixture.deployments.deployment, fixture.state.deployment.Phase)
+	deployment, runtimeDeployment := fixture.deployment(t), fixture.runtimeDeployment(t)
+	if result.CompletionCode != "deployment_completed" || deployment.Status != deployments.Succeeded || runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || runtimeDeployment.MigrationState != generatedruntimestate.MigrationSucceeded {
+		t.Fatalf("result=%+v deployment=%+v runtime=%+v", result, deployment, runtimeDeployment)
 	}
-	wantEvents := []string{"authorize", "compile", "ensure_network", "ensure_network", "migration", "ensure_network", "create", "start", "health", "route"}
-	if !reflect.DeepEqual(*fixture.events, wantEvents) {
-		t.Fatalf("events=%v want=%v", *fixture.events, wantEvents)
+	if len(fixture.migrations.requests) != 1 || fixture.runner.createCalls != 2 || fixture.runner.startCalls != 2 || len(fixture.routes.requests) != 1 {
+		t.Fatalf("migration runs=%d creates=%d starts=%d routes=%d", len(fixture.migrations.requests), fixture.runner.createCalls, fixture.runner.startCalls, len(fixture.routes.requests))
 	}
-	if len(fixture.migrations.requests) != 1 || len(fixture.deployments.migrationRequests) != 1 {
-		t.Fatalf("migration invocations=%d pin requests=%d", len(fixture.migrations.requests), len(fixture.deployments.migrationRequests))
-	}
-	migrationRequest := fixture.deployments.migrationRequests[0]
 	identity := fixture.migrations.requests[0].Identity()
-	if !reflect.DeepEqual(migrationRequest.Claim, fixture.claim) || !reflect.DeepEqual(identity.Claim, fixture.claim) ||
-		migrationRequest.Claim.Attempt() != 2 || identity.Claim.Attempt() != 2 ||
-		migrationRequest.DeploymentID != fixture.deployments.deployment.ID || identity.DeploymentID != fixture.deployments.deployment.ID ||
-		migrationRequest.ReleaseID != fixture.executor.releases.(*fakeReleases).release.ID || identity.ReleaseID != migrationRequest.ReleaseID ||
-		migrationRequest.DeploymentPlanRevisionID != fixture.plan.ID || identity.DeploymentPlanRevisionID != fixture.plan.ID ||
-		migrationRequest.ArtifactID != fixture.compiler.artifacts[0].ID || migrationRequest.ArtifactAttemptNumber != fixture.compiler.artifacts[0].AttemptNumber {
-		t.Fatalf("migration request=%+v identity=%+v", migrationRequest, identity)
-	}
-	if len(fixture.runtime.createdSpecs) != 1 || fixture.runtime.createdSpecs[0].RunCommand != fixture.plan.Plan.Components[0].RunCommand || fixture.runtime.createdSpecs[0].Role != generatedruntime.RoleServer || fixture.runtime.createdSpecs[0].Reservation == nil {
-		t.Fatal("accepted run command was not preserved exactly")
-	}
-	wantNetwork := deployments.GeneratedNetworkRequest{
-		Claim: fixture.claim, DeploymentID: fixture.deployments.deployment.ID, ReleaseID: fixture.executor.releases.(*fakeReleases).release.ID,
-		ConfigurationRevisionID: fixture.deployments.deployment.ActualConfigurationRevisionID, ConfigurationRevisionNumber: fixture.deployments.deployment.ActualConfigurationRevisionNumber,
-		DeploymentPlanRevisionID: fixture.plan.ID, DeploymentPlanRevisionNumber: fixture.plan.RevisionNumber,
-	}
-	if len(fixture.runtime.networkRequests) != 3 {
-		t.Fatalf("network requests=%d", len(fixture.runtime.networkRequests))
-	}
-	for index, request := range fixture.runtime.networkRequests {
-		if !reflect.DeepEqual(request, wantNetwork) {
-			t.Fatalf("network request %d=%#v want=%#v", index, request, wantNetwork)
-		}
-	}
-	if !reflect.DeepEqual(fixture.runtime.createdSpecs[0].Network, wantNetwork) {
-		t.Fatalf("hidden network request=%#v want=%#v", fixture.runtime.createdSpecs[0].Network, wantNetwork)
-	}
-	if len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
-		t.Fatal("successful deployment did not release its aggregate reservation exactly once")
-	}
-	if fixture.state.switchCalls != 1 || len(fixture.routes.requests) != 1 {
-		t.Fatalf("switch calls=%d route requests=%d", fixture.state.switchCalls, len(fixture.routes.requests))
+	if !reflect.DeepEqual(identity.Claim, fixture.claim) || identity.DeploymentID != deployment.ID || identity.ReleaseID != fixture.release.ID ||
+		identity.DeploymentPlanRevisionID != fixture.plan.ID {
+		t.Fatalf("migration identity=%+v", identity)
 	}
 	if endpoints := fixture.routes.requests[0].Endpoints; len(endpoints) != 1 || endpoints[0].Role != generatedruntime.RoleServer {
 		t.Fatalf("route endpoints=%+v", endpoints)
@@ -1156,48 +1186,31 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 func TestGeneratedExecutorNetworkRefusalRetainsDurableStateWithoutFailureCleanup(t *testing.T) {
 	boundary := generatedNetworkBoundaryTestError()
 	for _, test := range []struct {
-		name           string
-		migration      bool
-		phase          generatedruntimestate.Phase
-		migrationState generatedruntimestate.MigrationState
+		name         string
+		seed         sealedCandidateSeed
+		wantRetained int
 	}{
-		{name: "building", phase: generatedruntimestate.PhaseBuilding, migrationState: generatedruntimestate.MigrationNotRequired},
-		{name: "migrating", migration: true, phase: generatedruntimestate.PhaseMigrating, migrationState: generatedruntimestate.MigrationPending},
-		{name: "starting candidate", phase: generatedruntimestate.PhaseStartingCandidate, migrationState: generatedruntimestate.MigrationNotRequired},
+		{name: "building"},
+		{name: "starting candidate receipt", seed: sealedSeedReceiptOnly, wantRetained: 1},
+		{name: "running candidate", seed: sealedSeedRunning, wantRetained: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newExecutorFixture(t, test.migration)
-			deploymentID, releaseID, planID, planNumber, artifactID := testDeploymentID, testReleaseID, testPlanID, int64(2), testArtifactID
-			fixture.deployments.deployment = initializedDeployment(deployments.Applying)
-			if test.migration {
-				release := fixture.executor.releases.(*fakeReleases).release
-				deploymentID, releaseID, planID, planNumber, artifactID = fixture.migrationAuthority.deploymentID, release.ID, fixture.plan.ID, fixture.plan.RevisionNumber, fixture.migrationAuthority.artifact.ID
-				fixture.deployments.deployment = deployments.Deployment{
-					ID: deploymentID, AppID: testAppID, JobID: testJobID, Status: deployments.Applying, ConfigurationMode: "current",
-					ReleaseID: releaseID, ActualConfigurationRevisionID: release.ConfigurationRevisionID, ActualConfigurationRevisionNumber: release.ConfigurationRevisionNumber,
-					RuntimeStrategy: deployments.RuntimeGeneratedNode, DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: planNumber, ProvenanceInitialized: true,
-				}
-			}
-			fixture.state.deployment = generatedruntimestate.Deployment{
-				DeploymentID: deploymentID, AppID: testAppID, ReleaseID: releaseID,
-				DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: planNumber,
-				CandidateSlot: "blue", Phase: test.phase, MigrationState: test.migrationState,
-				Components: []generatedruntimestate.Component{{DeploymentID: deploymentID, Name: "api", Slot: "blue", ImageArtifactID: artifactID, State: generatedruntimestate.ComponentImageReady}},
+			fixture := newSealedExecutorFixture(t)
+			if test.seed != 0 {
+				fixture.seedCandidate(t, test.seed)
 			}
 			fixture.runtime.networkErrs = []error{boundary}
-			beforeDeployment := fixture.deployments.deployment
-			beforeRuntime := fixture.state.deployment
-			beforeRuntime.Components = append([]generatedruntimestate.Component(nil), beforeRuntime.Components...)
-			result, err := fixture.execute(context.Background(), fixture.deploymentJob(), fixture.reporter)
+			result, err := fixture.execute()
 			var executionErr *jobs.ExecutionError
-			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deployments.ErrInvalidDeployment) {
+			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" {
 				t.Fatalf("result=%#v error=%v", result, err)
 			}
-			if !reflect.DeepEqual(fixture.deployments.deployment, beforeDeployment) || !reflect.DeepEqual(fixture.state.deployment, beforeRuntime) {
-				t.Fatalf("network refusal changed durable state: deployment=%#v runtime=%#v", fixture.deployments.deployment, fixture.state.deployment)
+			deployment, runtimeDeployment := fixture.deployment(t), fixture.runtimeDeployment(t)
+			if deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled || runtimeDeployment.Phase == generatedruntimestate.PhaseFailed || runtimeDeployment.Phase == generatedruntimestate.PhaseCancelled {
+				t.Fatalf("network refusal terminalized state: deployment=%#v runtime=%#v", deployment, runtimeDeployment)
 			}
-			if fixture.runtime.stopped != 0 || fixture.runtime.retained != 0 {
-				t.Fatalf("unattempted refusal cleanup=%d retention=%d", fixture.runtime.stopped, fixture.runtime.retained)
+			if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runtime.retained != test.wantRetained {
+				t.Fatalf("refusal cleanup=%d physical stops=%d retention=%d want=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runtime.retained, test.wantRetained)
 			}
 		})
 	}
@@ -1206,77 +1219,64 @@ func TestGeneratedExecutorNetworkRefusalRetainsDurableStateWithoutFailureCleanup
 func TestGeneratedExecutorSeedsResumedCandidateRiskBeforeNetworkRefusal(t *testing.T) {
 	boundary := generatedNetworkBoundaryTestError()
 	for _, test := range []struct {
-		name          string
-		state         generatedruntimestate.ComponentState
-		containerName string
-		containerID   string
-		wantRetained  int
+		name         string
+		seed         sealedCandidateSeed
+		wantRetained int
 	}{
-		{name: "all unattempted pending", state: generatedruntimestate.ComponentPending},
-		{name: "all unattempted image ready", state: generatedruntimestate.ComponentImageReady},
-		{name: "name only", state: generatedruntimestate.ComponentStarting, containerName: "rig-candidate", wantRetained: 1},
-		{name: "running", state: generatedruntimestate.ComponentRunning, containerName: "rig-candidate", containerID: strings.Repeat("a", 64), wantRetained: 1},
-		{name: "healthy", state: generatedruntimestate.ComponentHealthy, containerName: "rig-candidate", containerID: strings.Repeat("a", 64), wantRetained: 1},
-		{name: "active", state: generatedruntimestate.ComponentActive, containerName: "rig-candidate", containerID: strings.Repeat("a", 64), wantRetained: 1},
-		{name: "unknown state", state: generatedruntimestate.ComponentState("unknown"), wantRetained: 1},
+		{name: "all unattempted"},
+		{name: "name only receipt", seed: sealedSeedReceiptOnly, wantRetained: 1},
+		{name: "configured", seed: sealedSeedCreated, wantRetained: 1},
+		{name: "running", seed: sealedSeedRunning, wantRetained: 1},
+		{name: "attempt unknown", seed: sealedSeedAttemptUnknown, wantRetained: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newExecutorFixture(t, false)
-			fixture.deployments.deployment = initializedDeployment(deployments.Applying)
-			fixture.state.deployment = generatedruntimestate.Deployment{
-				DeploymentID: testDeploymentID, AppID: testAppID, ReleaseID: testReleaseID,
-				DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
-				CandidateSlot: "blue", Phase: generatedruntimestate.PhaseStartingCandidate, MigrationState: generatedruntimestate.MigrationNotRequired,
-				Components: []generatedruntimestate.Component{{DeploymentID: testDeploymentID, Name: "api", Slot: "blue", ImageArtifactID: testArtifactID, State: test.state, ContainerName: test.containerName, ContainerID: test.containerID}},
+			fixture := newSealedExecutorFixture(t)
+			if test.seed != 0 {
+				fixture.seedCandidate(t, test.seed)
 			}
 			fixture.runtime.networkErrs = []error{boundary}
-			beforeDeployment := fixture.deployments.deployment
-			beforeRuntime := fixture.state.deployment
-			beforeRuntime.Components = append([]generatedruntimestate.Component(nil), beforeRuntime.Components...)
-			_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-			if !errors.Is(err, deployments.ErrInvalidDeployment) {
+			_, err := fixture.execute()
+			if err == nil {
 				t.Fatalf("network refusal=%v", err)
 			}
-			if fixture.runtime.retained != test.wantRetained || fixture.runtime.stopped != 0 {
-				t.Fatalf("retention=%d want=%d cleanup=%d", fixture.runtime.retained, test.wantRetained, fixture.runtime.stopped)
+			if fixture.runtime.retained != test.wantRetained || fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
+				t.Fatalf("retention=%d want=%d cleanup=%d physical=%d", fixture.runtime.retained, test.wantRetained, fixture.runtime.stopCalls, fixture.runner.stopCalls)
 			}
-			if !reflect.DeepEqual(fixture.deployments.deployment, beforeDeployment) || !reflect.DeepEqual(fixture.state.deployment, beforeRuntime) {
-				t.Fatal("resumed network refusal changed durable state")
+			if deployment, runtimeDeployment := fixture.deployment(t), fixture.runtimeDeployment(t); deployment.Status == deployments.Failed || runtimeDeployment.Phase == generatedruntimestate.PhaseFailed {
+				t.Fatalf("resumed network refusal terminalized state: deployment=%+v runtime=%+v", deployment, runtimeDeployment)
 			}
 		})
 	}
 }
 
 func TestGeneratedExecutorRetainsWholeAggregateAfterSecondHiddenNetworkRefusal(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	secondComponent := fixture.plan.Plan.Components[0]
-	secondComponent.Name = "web"
-	secondComponent.RootDirectory = "apps/web"
-	fixture.plan.Plan.Components = append(fixture.plan.Plan.Components, secondComponent)
-	fixture.executor.plans = &fakePlans{revision: fixture.plan}
-	secondArtifact := readyArtifact(testArtifactID2)
-	secondArtifact.ComponentID = "web"
-	fixture.compiler.artifacts = append(fixture.compiler.artifacts, secondArtifact)
-	fixture.artifacts.values[secondArtifact.ID] = secondArtifact
-	fixture.runtime.createErrs = []error{nil, generatedNetworkBoundaryTestError()}
+	api := deploymentplans.Component{Name: "api", Role: generatedruntime.RoleServer, Technology: "node", RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: ".", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "node api.js", InternalPort: 3000, HealthProbe: "/health"}
+	web := api
+	web.Name, web.Role, web.Technology, web.RootDirectory, web.StaticOutputDirectory, web.InternalPort = "web", generatedruntime.RoleStatic, "static", "apps/web", "dist", 3001
+	web.RunCommand = projectanalysis.ManagedStaticCommand(web.StaticOutputDirectory, int(web.InternalPort))
+	web.InstallDirectory = web.RootDirectory
+	fixture := newSealedExecutorFixtureWithComponents(t, []deploymentplans.Component{api, web})
+	fixture.capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 256 << 20, DiskAvailableBytes: 256 << 20})
+	fixture.runner.createErrs = []error{nil, runtimeprocess.ErrTerminationFailed}
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	var executionErr *jobs.ExecutionError
-	if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deployments.ErrInvalidDeployment) {
+	if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, runtimeprocess.ErrTerminationFailed) {
 		t.Fatalf("result=%#v error=%v", result, err)
 	}
-	if fixture.runtime.retained != 1 || fixture.runtime.stopped != 0 {
-		t.Fatalf("retention=%d cleanup=%d", fixture.runtime.retained, fixture.runtime.stopped)
+	if fixture.runner.createCalls != 2 || fixture.runner.startCalls != 1 {
+		t.Fatalf("creates=%d starts=%d", fixture.runner.createCalls, fixture.runner.startCalls)
 	}
-	if fixture.deployments.deployment.Status != deployments.Applying || fixture.state.deployment.Phase != generatedruntimestate.PhaseStartingCandidate {
-		t.Fatalf("network refusal changed lifecycle: deployment=%#v runtime=%#v", fixture.deployments.deployment, fixture.state.deployment)
+	deployment, runtimeDeployment := fixture.deployment(t), fixture.runtimeDeployment(t)
+	if deployment.Status != deployments.Applying || runtimeDeployment.Phase != generatedruntimestate.PhaseStartingCandidate {
+		t.Fatalf("uncertain second create changed lifecycle: deployment=%#v runtime=%#v", deployment, runtimeDeployment)
 	}
-	api, web := fixture.state.component("api"), fixture.state.component("web")
-	if api.State != generatedruntimestate.ComponentRunning || api.ContainerID == "" || web.State != generatedruntimestate.ComponentStarting || web.ContainerName == "" || web.ContainerID != "" {
-		t.Fatalf("partial candidate evidence was not retained: api=%#v web=%#v", api, web)
+	if len(runtimeDeployment.Components) != 2 || runtimeDeployment.Components[1].State != generatedruntimestate.ComponentStarting || runtimeDeployment.Components[1].ContainerName == "" {
+		t.Fatalf("partial candidate evidence was not retained: %+v", runtimeDeployment.Components)
 	}
-	if len(fixture.runtime.createdSpecs) != 2 || !reflect.DeepEqual(fixture.runtime.createdSpecs[0].Network, fixture.runtime.createdSpecs[1].Network) {
-		t.Fatalf("hidden network authority changed between components: %#v", fixture.runtime.createdSpecs)
+	var receipts int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM generated_candidate_intents WHERE deployment_id=?`, deployment.ID).Scan(&receipts); err != nil || receipts != 2 {
+		t.Fatalf("candidate receipts=%d err=%v", receipts, err)
 	}
 }
 
@@ -1288,48 +1288,49 @@ func generatedNetworkBoundaryTestError() error {
 func TestGeneratedExecutorPassesAcceptedTechnologyToRuntime(t *testing.T) {
 	for _, technology := range []string{"", "node", "nextjs"} {
 		t.Run(technology, func(t *testing.T) {
-			fixture := newExecutorFixture(t, false)
-			if technology != "" {
-				fixture.plan.Plan.SetupVersion = projectanalysis.SetupVersion
-				fixture.plan.Plan.Components[0].InstallDirectory = fixture.plan.Plan.Components[0].RootDirectory
-				fixture.plan.Plan.Components[0].Technology = technology
-				fixture.executor.plans = &fakePlans{revision: fixture.plan}
-			}
-			result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+			fixture := newSealedExecutorFixtureWithTechnology(t, technology)
+			result, err := fixture.execute()
 			if err != nil || result.CompletionCode != "deployment_completed" {
 				t.Fatalf("result=%+v err=%v", result, err)
 			}
-			if len(fixture.runtime.createdSpecs) != 1 || fixture.runtime.createdSpecs[0].Technology != technology || len(fixture.runtime.started) != 1 || fixture.runtime.started[0].Technology != technology {
-				t.Fatalf("technology %q: specs=%+v started=%+v", technology, fixture.runtime.createdSpecs, fixture.runtime.started)
+			containers := fixture.runner.containers
+			if fixture.runner.createCalls != 1 || fixture.runner.startCalls != 1 {
+				t.Fatalf("technology %q: creates=%d starts=%d containers=%+v", technology, fixture.runner.createCalls, fixture.runner.startCalls, containers)
+			}
+			if technology == "nextjs" {
+				for _, container := range containers {
+					if _, ok := container.tmpfs["/workspace/.next/cache"]; !ok {
+						t.Fatalf("nextjs candidate omitted cache tmpfs: %+v", container.tmpfs)
+					}
+					break
+				}
 			}
 		})
 	}
 }
 
 func TestGeneratedExecutorUsesCurrentConfigurationOnSameSourceRelease(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	const currentConfigurationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	fixture.configuration.currentID = currentConfigurationID
-	fixture.configuration.currentNumber = 4
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	fixture := newSealedExecutorFixture(t)
+	result, err := fixture.execute()
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("same-source redeploy: result=%+v err=%v", result, err)
 	}
-	if fixture.deployments.deployment.ActualConfigurationRevisionID != currentConfigurationID || fixture.deployments.deployment.ActualConfigurationRevisionNumber != 4 {
-		t.Fatalf("deployment did not pin current configuration: %+v", fixture.deployments.deployment)
+	deployment := fixture.deployment(t)
+	if deployment.ActualConfigurationRevisionID != fixture.configuration.RevisionID || deployment.ActualConfigurationRevisionNumber != fixture.configuration.RevisionNumber {
+		t.Fatalf("deployment did not pin current configuration: %+v", deployment)
 	}
-	if len(fixture.compiler.pins) != 1 || fixture.compiler.pins[0].RevisionID != currentConfigurationID || fixture.compiler.pins[0].RevisionNumber != 4 {
+	if len(fixture.compiler.pins) != 1 || fixture.compiler.pins[0].RevisionID != fixture.configuration.RevisionID || fixture.compiler.pins[0].RevisionNumber != fixture.configuration.RevisionNumber {
 		t.Fatalf("compiler used release configuration rather than selected current revision: %+v", fixture.compiler.pins)
 	}
 }
 
 func TestGeneratedExecutorRejectsRuntimeExportWithDifferentConfigurationPin(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	fixture.configuration.exportMismatch = true
-	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	requireExecutionErrorCode(t, err, "configuration_unavailable")
-	if len(fixture.runtime.createdSpecs) != 0 {
-		t.Fatalf("mismatched runtime configuration reached Docker: creates=%d", len(fixture.runtime.createdSpecs))
+	fixture := newSealedExecutorFixture(t)
+	fixture.configurationView.mismatch = true
+	_, err := fixture.execute()
+	requireExecutionErrorCode(t, err, "configuration_review_required")
+	if fixture.runner.createCalls != 0 {
+		t.Fatalf("mismatched runtime configuration reached Docker: creates=%d", fixture.runner.createCalls)
 	}
 }
 
@@ -1379,134 +1380,110 @@ func TestGeneratedExecutorPreservesRuntimePolicyApprovalPause(t *testing.T) {
 }
 
 func TestGeneratedExecutorUsesCompilerOwnedImageAttestation(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	second := readyArtifact(testArtifactID2)
-	fixture.compiler.artifacts = []generatedimage.Artifact{second}
-	fixture.artifacts.values[second.ID] = second
-	if _, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter); err != nil {
+	fixture := newSealedExecutorFixture(t)
+	if _, err := fixture.execute(); err != nil {
 		t.Fatal(err)
 	}
-	if fixture.compiler.calls != 1 || fixture.runtime.validateCalls != 0 || len(fixture.artifacts.markedUnavailable) != 0 {
-		t.Fatalf("compile calls=%d runtime validations=%d marked=%v", fixture.compiler.calls, fixture.runtime.validateCalls, fixture.artifacts.markedUnavailable)
+	if fixture.compiler.calls != 1 || fixture.runner.createCalls != 1 {
+		t.Fatalf("compile calls=%d create calls=%d", fixture.compiler.calls, fixture.runner.createCalls)
 	}
-	if fixture.state.deployment.Components[0].ImageArtifactID != testArtifactID2 {
-		t.Fatalf("persisted artifact=%s", fixture.state.deployment.Components[0].ImageArtifactID)
+	if component := fixture.runtimeDeployment(t).Components[0]; component.ImageArtifactID != fixture.artifact.ID {
+		t.Fatalf("persisted artifact=%s", component.ImageArtifactID)
 	}
 }
 
 func TestGeneratedExecutorPreservesCompilerImageAuthorityRefusal(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	cause := &generatedimage.CompileError{Code: "image_validation_uncertain"}
 	fixture.compiler.errs = []error{cause}
-	var boundaryDeployment deployments.Deployment
-	var boundaryRuntime generatedruntimestate.Deployment
-	fixture.compiler.before = func(generatedimage.CompileRequest) {
-		boundaryDeployment = fixture.deployments.deployment
-		boundaryRuntime = fixture.state.deployment
-		boundaryRuntime.Components = append([]generatedruntimestate.Component(nil), boundaryRuntime.Components...)
+	_, err := fixture.execute()
+	if !errors.Is(err, cause) || fixture.compiler.calls != 1 || fixture.runner.createCalls != 0 {
+		t.Fatalf("err=%v compile calls=%d create calls=%d", err, fixture.compiler.calls, fixture.runner.createCalls)
 	}
-	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	if !errors.Is(err, cause) || fixture.compiler.calls != 1 || fixture.runtime.validateCalls != 0 || len(fixture.runtime.createdSpecs) != 0 {
-		t.Fatalf("err=%v compile calls=%d create calls=%d", err, fixture.compiler.calls, len(fixture.runtime.createdSpecs))
+	deployment, runtimeDeployment := fixture.deployment(t), fixture.runtimeDeployment(t)
+	if deployment.Status != deployments.Applying || runtimeDeployment.Phase != generatedruntimestate.PhaseBuilding || runtimeDeployment.Components[0].State != generatedruntimestate.ComponentPending {
+		t.Fatalf("compiler refusal mutated terminal state: deployment=%+v runtime=%+v", deployment, runtimeDeployment)
 	}
-	if len(fixture.artifacts.markedUnavailable) != 0 || !reflect.DeepEqual(fixture.deployments.deployment, boundaryDeployment) || !reflect.DeepEqual(fixture.state.deployment, boundaryRuntime) {
-		t.Fatalf("marked unavailable=%v deployment=%+v runtime=%+v", fixture.artifacts.markedUnavailable, fixture.deployments.deployment, fixture.state.deployment)
-	}
-	if fixture.runtime.retained != 0 || fixture.runtime.stopped != 0 || len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
-		t.Fatalf("retained=%d stopped=%d reservations=%+v", fixture.runtime.retained, fixture.runtime.stopped, fixture.authorization.reservations)
+	if fixture.runtime.retained != 0 || fixture.runtime.stopCalls != 0 {
+		t.Fatalf("retained=%d stopped=%d", fixture.runtime.retained, fixture.runtime.stopCalls)
 	}
 }
 
 func TestGeneratedExecutorRetainsCandidateCapacityOnImageRefusalWithPriorCandidateRisk(t *testing.T) {
 	for _, test := range []struct {
-		name          string
-		state         generatedruntimestate.ComponentState
-		containerName string
-		containerID   string
-		compilerCause error
-		wantCompiler  int
+		name string
+		seed sealedCandidateSeed
 	}{
-		{
-			name: "compiler refusal after name-only candidate risk", state: generatedruntimestate.ComponentPending,
-			containerName: "rig-prior-candidate", compilerCause: &generatedimage.CompileError{Code: "authority_unavailable"}, wantCompiler: 1,
-		},
-		{name: "unexpected running component", state: generatedruntimestate.ComponentRunning, containerName: "rig-prior-candidate", containerID: strings.Repeat("a", 64)},
-		{name: "unexpected healthy component", state: generatedruntimestate.ComponentHealthy, containerName: "rig-prior-candidate", containerID: strings.Repeat("a", 64)},
-		{name: "unknown component state", state: generatedruntimestate.ComponentState("unknown")},
+		{name: "receipt only", seed: sealedSeedReceiptOnly},
+		{name: "configured", seed: sealedSeedCreated},
+		{name: "running", seed: sealedSeedRunning},
+		{name: "attempt unknown", seed: sealedSeedAttemptUnknown},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newExecutorFixture(t, false)
-			var boundaryDeployment deployments.Deployment
-			var boundaryRuntime generatedruntimestate.Deployment
-			fixture.authorization.after = func() {
-				component := &fixture.state.deployment.Components[0]
-				component.State = test.state
-				component.ContainerName = test.containerName
-				component.ContainerID = test.containerID
-				// Snapshot the durable boundary after the successful authorization
-				// transition rather than the fixture's pre-Gate Preparing state.
-				fixture.deployments.deployment.Status = deployments.Applying
-				boundaryDeployment = fixture.deployments.deployment
-				boundaryRuntime = fixture.state.deployment
-				boundaryRuntime.Components = append([]generatedruntimestate.Component(nil), boundaryRuntime.Components...)
+			fixture := newSealedExecutorFixture(t)
+			fixture.capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 128 << 20, DiskAvailableBytes: 128 << 20})
+			checkCompetitor := fixture.capacityCompetitor(t)
+			fixture.seedCandidate(t, test.seed)
+			fixture.runner.mu.Lock()
+			delete(fixture.runner.images, fixture.artifact.ImageContentID)
+			for _, container := range fixture.runner.containers {
+				container.image = "sha256:" + strings.Repeat("0", 64)
 			}
-			if test.compilerCause != nil {
-				fixture.compiler.errs = []error{test.compilerCause}
-			}
-
-			_, err := fixture.execute(context.Background(), fixture.deploymentJob(), fixture.reporter)
+			fixture.runner.mu.Unlock()
+			_, err := fixture.execute()
 			var executionErr *jobs.ExecutionError
-			if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" ||
-				(test.compilerCause != nil && !errors.Is(err, test.compilerCause)) ||
-				(test.compilerCause == nil && !strings.Contains(err.Error(), "unexpected component state while building")) {
+			if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" {
 				t.Fatalf("image refusal error=%v", err)
 			}
-			if fixture.compiler.calls != test.wantCompiler || fixture.runtime.retained != 1 || fixture.runtime.stopped != 0 ||
-				!reflect.DeepEqual(fixture.deployments.deployment, boundaryDeployment) || !reflect.DeepEqual(fixture.state.deployment, boundaryRuntime) {
-				t.Fatalf("compiler=%d retained=%d stopped=%d deployment=%+v runtime=%+v", fixture.compiler.calls, fixture.runtime.retained, fixture.runtime.stopped, fixture.deployments.deployment, fixture.state.deployment)
+			deployment, runtimeDeployment := fixture.deployment(t), fixture.runtimeDeployment(t)
+			if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || deployment.Status == deployments.Failed || runtimeDeployment.Phase == generatedruntimestate.PhaseFailed {
+				t.Fatalf("cleanup=%d physical=%d deployment=%+v runtime=%+v", fixture.runtime.stopCalls, fixture.runner.stopCalls, deployment, runtimeDeployment)
 			}
+			checkCompetitor(true)
 		})
 	}
 }
 
 func TestGeneratedExecutorPreservesImageFinishAuthorityRefusal(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.deployments.finishErr = deploymentexecution.ErrAuthorityStale
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	var executionErr *jobs.ExecutionError
 	if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deploymentexecution.ErrAuthorityStale) {
 		t.Fatalf("result=%+v error=%v", result, err)
 	}
-	if fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled ||
-		fixture.state.deployment.Phase != generatedruntimestate.PhaseBuilding || len(fixture.state.deployment.Components) != 1 ||
-		fixture.state.deployment.Components[0].State != generatedruntimestate.ComponentImageReady ||
-		fixture.state.deployment.Components[0].ImageArtifactID != testArtifactID {
-		t.Fatalf("deployment=%+v runtime=%+v", fixture.deployments.deployment, fixture.state.deployment)
+	deployment, runtimeDeployment := fixture.deployment(t), fixture.runtimeDeployment(t)
+	if deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled ||
+		runtimeDeployment.Phase != generatedruntimestate.PhaseBuilding || len(runtimeDeployment.Components) != 1 ||
+		runtimeDeployment.Components[0].State != generatedruntimestate.ComponentImageReady ||
+		runtimeDeployment.Components[0].ImageArtifactID != fixture.artifact.ID {
+		t.Fatalf("deployment=%+v runtime=%+v", deployment, runtimeDeployment)
 	}
-	if fixture.compiler.calls != 1 || len(fixture.deployments.finishRequests) != 1 || len(fixture.runtime.createdSpecs) != 0 || len(fixture.runtime.started) != 0 {
-		t.Fatalf("compiler=%d finish=%d creates=%d starts=%d", fixture.compiler.calls, len(fixture.deployments.finishRequests), len(fixture.runtime.createdSpecs), len(fixture.runtime.started))
+	if fixture.compiler.calls != 1 || fixture.runner.createCalls != 0 || fixture.runner.startCalls != 0 {
+		t.Fatalf("compiler=%d creates=%d starts=%d", fixture.compiler.calls, fixture.runner.createCalls, fixture.runner.startCalls)
 	}
 }
 
 func TestGeneratedExecutorHealthFailurePreservesOldActiveHead(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	oldDeploymentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "blue", Generation: 4}
-	fixture.runtime.healthErr = &generatedruntime.Error{Code: generatedruntime.DiagnosticCandidateUnhealthy}
-	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	fixture := newSealedExecutorFixture(t)
+	assertPreviousUnchanged := fixture.beginReplacement(t)
+	fixture.runner.startHealth = "unhealthy"
+	_, err := fixture.execute()
 	var executionErr *jobs.ExecutionError
 	if !errors.As(err, &executionErr) || executionErr.Code != "health_failed" {
 		t.Fatalf("err=%v", err)
 	}
-	if fixture.state.switchCalls != 0 || len(fixture.routes.requests) != 0 || fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
-		t.Fatalf("old active changed before healthy switch: active=%+v route=%d", fixture.state.active, len(fixture.routes.requests))
+	assertPreviousUnchanged()
+	if len(fixture.routes.requests) != 0 {
+		t.Fatalf("route switched before candidate health: routes=%+v", fixture.routes.requests)
 	}
-	if fixture.runtime.stopped != 1 {
-		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	if fixture.runner.stopCalls != 1 || fixture.runner.removeCalls != 1 {
+		t.Fatalf("candidate cleanup stop=%d remove=%d", fixture.runner.stopCalls, fixture.runner.removeCalls)
 	}
-	if len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
-		t.Fatal("failed candidate lifecycle did not release aggregate admission exactly once")
+	deployment, runtimeDeployment := fixture.deployment(t), fixture.runtimeDeployment(t)
+	if deployment.Status != deployments.Failed || runtimeDeployment.Phase != generatedruntimestate.PhaseFailed {
+		t.Fatalf("observed health failure was not recorded: deployment=%+v runtime=%+v", deployment, runtimeDeployment)
 	}
 }
 
@@ -1585,85 +1562,72 @@ func TestGeneratedExecutorPreservesExistingMigrationWhenRuntimeReadIsUncertain(t
 }
 
 func TestGeneratedExecutorRecoveryAcquiresAndConsumesNewProcessReservation(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	fixture.plan.Plan.SetupVersion = projectanalysis.SetupVersion
-	fixture.plan.Plan.Components[0].InstallDirectory = fixture.plan.Plan.Components[0].RootDirectory
-	fixture.plan.Plan.Components[0].Technology = "nextjs"
-	fixture.executor.plans = &fakePlans{revision: fixture.plan}
-	fixture.deployments.deployment = initializedDeployment(deployments.WaitingHealth)
-	description, err := generatedruntime.DescribeInactiveCandidate(testAppID, "api", "")
+	fixture := newSealedExecutorFixtureWithTechnology(t, "nextjs")
+	fixture.seedCandidate(t, sealedSeedRunning)
+	createdBefore, startedBefore, compiledBefore := fixture.runner.createCalls, fixture.runner.startCalls, fixture.compiler.calls
+	result, err := fixture.execute()
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.state.deployment = generatedruntimestate.Deployment{
-		DeploymentID: testDeploymentID, AppID: testAppID, ReleaseID: testReleaseID,
-		DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
-		CandidateSlot: string(description.Slot), Phase: generatedruntimestate.PhaseWaitingHealth,
-		MigrationState: generatedruntimestate.MigrationNotRequired,
-		Components: []generatedruntimestate.Component{{
-			DeploymentID: testDeploymentID, Name: "api", Slot: string(description.Slot),
-			ImageArtifactID: testArtifactID, ContainerID: "a" + string(make([]byte, 63)),
-			ContainerName: description.ContainerName, State: generatedruntimestate.ComponentRunning,
-		}},
+	if result.CompletionCode != "deployment_completed" || fixture.compiler.calls != compiledBefore || fixture.runner.createCalls != createdBefore || fixture.runner.startCalls != startedBefore {
+		t.Fatalf("result=%+v compiler=%d creates=%d starts=%d", result, fixture.compiler.calls, fixture.runner.createCalls, fixture.runner.startCalls)
 	}
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	if err != nil {
-		t.Fatal(err)
+	if fixture.authorization.calls != 1 || fixture.runtime.pinCalls != 1 {
+		t.Fatalf("authorization=%d candidate pins=%d", fixture.authorization.calls, fixture.runtime.pinCalls)
 	}
-	if result.CompletionCode != "deployment_completed" || fixture.compiler.calls != 0 || len(fixture.runtime.createdSpecs) != 0 {
-		t.Fatalf("result=%+v compiler=%d creates=%d", result, fixture.compiler.calls, len(fixture.runtime.createdSpecs))
-	}
-	if fixture.authorization.calls != 1 || fixture.runtime.adopted < 1 || len(fixture.authorization.reservations) != 1 || fixture.authorization.reservations[0].releases != 1 {
-		t.Fatalf("authorization=%d adopted=%d reservations=%+v", fixture.authorization.calls, fixture.runtime.adopted, fixture.authorization.reservations)
-	}
-	for _, candidate := range fixture.runtime.adoptedValues {
-		if candidate.Technology != "nextjs" {
-			t.Fatalf("reconstructed candidate lost accepted technology: %+v", candidate)
-		}
+	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || runtimeDeployment.Components[0].State != generatedruntimestate.ComponentActive {
+		t.Fatalf("recovered candidate=%+v", runtimeDeployment)
 	}
 }
 
 func TestGeneratedExecutorCleansCandidateWhenActiveCASRollbackSucceeds(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	oldDeploymentID, oldContainerID := configurePreviousActive(t, fixture)
+	fixture := newSealedExecutorFixture(t)
+	if _, err := fixture.execute(); err != nil {
+		t.Fatal(err)
+	}
+	oldDeploymentID := fixture.deployment(t).ID
+	oldContainerID := fixture.runtimeDeployment(t).Components[0].ContainerID
+	fixture.nextDeployment(t)
+	fixture.routes.requests = nil
 	fixture.state.failSwitchActive = true
 	fixture.routes.errs = []error{nil, nil}
 
-	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	var executionErr *jobs.ExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != "apply_failed" {
-		t.Fatalf("err=%v", err)
+	result, err := fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.runtime.stopped != 1 {
-		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
+		t.Fatalf("candidate cleanup calls=%d docker stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
-	if fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
-		t.Fatalf("active head changed: %+v", fixture.state.active)
+	active, activeErr := fixture.stateStore.Active(context.Background(), fixture.app.ID)
+	if activeErr != nil || active.DeploymentID != oldDeploymentID {
+		t.Fatalf("active head changed: %+v err=%v", active, activeErr)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed || fixture.deployments.deployment.Status != deployments.Failed {
-		t.Fatalf("runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+	if runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 	}
-	if len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotGreen || len(fixture.routes.requests[1].Endpoints) != 1 || fixture.routes.requests[1].Endpoints[0].ContainerID != oldContainerID {
+	if len(fixture.routes.requests) != 2 || len(fixture.routes.requests[1].Endpoints) != 1 || fixture.routes.requests[1].Endpoints[0].ContainerID != oldContainerID {
 		t.Fatalf("route requests=%+v", fixture.routes.requests)
 	}
 }
 
 func TestGeneratedExecutorPreservesFirstSlotWhenActiveCASFails(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.state.failSwitchActive = true
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.runtime.stopped != 0 {
-		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
+		t.Fatalf("candidate cleanup calls=%d docker stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
-	if fixture.state.active.DeploymentID != "" || fixture.state.active.Generation != 0 {
-		t.Fatalf("active head changed: %+v", fixture.state.active)
+	active, _ := fixture.stateStore.Active(context.Background(), fixture.app.ID)
+	if active.DeploymentID != "" || active.Generation != 0 {
+		t.Fatalf("active head changed: %+v", active)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute || fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
-		t.Fatalf("runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+	if runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 	}
 	if len(fixture.routes.requests) != 1 || fixture.routes.requests[0].ToSlot != generatedruntime.SlotBlue {
 		t.Fatalf("route requests=%+v", fixture.routes.requests)
@@ -1671,125 +1635,144 @@ func TestGeneratedExecutorPreservesFirstSlotWhenActiveCASFails(t *testing.T) {
 }
 
 func TestGeneratedExecutorPreservesBothSlotsWhenActiveCASRollbackFails(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	oldDeploymentID, oldContainerID := configurePreviousActive(t, fixture)
+	fixture := newSealedExecutorFixture(t)
+	if _, err := fixture.execute(); err != nil {
+		t.Fatal(err)
+	}
+	oldDeploymentID := fixture.deployment(t).ID
+	oldContainerID := fixture.runtimeDeployment(t).Components[0].ContainerID
+	fixture.nextDeployment(t)
+	fixture.routes.requests = nil
 	fixture.state.failSwitchActive = true
 	fixture.routes.errs = []error{nil, errors.New("rollback route unavailable")}
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.runtime.stopped != 0 {
-		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
+		t.Fatalf("candidate cleanup calls=%d docker stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
-	if fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
-		t.Fatalf("active head changed: %+v", fixture.state.active)
+	active, _ := fixture.stateStore.Active(context.Background(), fixture.app.ID)
+	if active.DeploymentID != oldDeploymentID {
+		t.Fatalf("active head changed: %+v", active)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute || fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
-		t.Fatalf("runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+	if runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 	}
-	previous := fixture.state.previous[oldDeploymentID]
-	if len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentActive || previous.Components[0].ContainerID != oldContainerID {
+	previous, previousErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID)
+	if previousErr != nil || len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentActive || previous.Components[0].ContainerID != oldContainerID {
 		t.Fatalf("previous slot was not preserved: %+v", previous)
 	}
-	if len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotGreen {
+	if len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotBlue {
 		t.Fatalf("route requests=%+v", fixture.routes.requests)
 	}
 }
 
 func TestGeneratedExecutorNeverCleansNewSlotAfterActiveCAS(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.state.failAdvanceToDraining = true
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.state.active.DeploymentID != testDeploymentID || fixture.runtime.stopped != 0 {
-		t.Fatalf("active=%+v candidate cleanup=%d", fixture.state.active, fixture.runtime.stopped)
+	active, _ := fixture.stateStore.Active(context.Background(), fixture.app.ID)
+	if active.DeploymentID != fixture.deployment(t).ID || fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
+		t.Fatalf("active=%+v candidate cleanup=%d docker stops=%d", active, fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
-		t.Fatalf("durable phase=%s", fixture.state.deployment.Phase)
+	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("durable phase=%s", runtimeDeployment.Phase)
 	}
-	if fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
-		t.Fatalf("main deployment became terminal: %+v", fixture.deployments.deployment)
+	if deployment := fixture.deployment(t); deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+		t.Fatalf("main deployment became terminal: %+v", deployment)
 	}
 }
 
 func TestGeneratedExecutorReattestsRouteBeforeResumingAfterActiveCAS(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.state.failAdvanceToDraining = true
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || len(fixture.routes.requests) != 1 {
 		t.Fatalf("first result=%+v err=%v routes=%+v", result, err, fixture.routes.requests)
 	}
 
 	fixture.state.failAdvanceToDraining = false
-	result, err = fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err = fixture.execute()
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("retry result=%+v err=%v", result, err)
 	}
-	if len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotBlue || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded {
-		t.Fatalf("routes=%+v runtime=%+v", fixture.routes.requests, fixture.state.deployment)
+	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotBlue || runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded {
+		t.Fatalf("routes=%+v runtime=%+v", fixture.routes.requests, runtimeDeployment)
 	}
 }
 
 func TestGeneratedExecutorDoesNotDrainWhenRouteReattestationFails(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.state.failAdvanceToDraining = true
 	fixture.routes.errs = []error{nil, errors.New("route reattestation unavailable")}
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("first result=%+v err=%v", result, err)
 	}
 	fixture.state.failAdvanceToDraining = false
-	result, err = fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err = fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("retry result=%+v err=%v", result, err)
 	}
-	if len(fixture.routes.requests) != 2 || fixture.runtime.stopped != 0 || fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
-		t.Fatalf("routes=%+v stopped=%d runtime=%+v", fixture.routes.requests, fixture.runtime.stopped, fixture.state.deployment)
+	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 2 || fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("routes=%+v stopped=%d docker stops=%d runtime=%+v", fixture.routes.requests, fixture.runtime.stopCalls, fixture.runner.stopCalls, runtimeDeployment)
 	}
 }
 
 func TestGeneratedExecutorRetriesOldSlotCleanupWithoutTerminalizingDeployment(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	oldDeploymentID, _ := configurePreviousActive(t, fixture)
+	fixture := newSealedExecutorFixture(t)
+	if _, err := fixture.execute(); err != nil {
+		t.Fatal(err)
+	}
+	oldDeploymentID := fixture.deployment(t).ID
+	fixture.nextDeployment(t)
+	fixture.routes.requests = nil
 	fixture.executor.waitDrain = func(context.Context, time.Duration) error { return nil }
-	fixture.runtime.stopErrs = []error{errors.New("old slot cleanup unavailable"), nil}
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseDraining || fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
-		t.Fatalf("runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+	runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 	}
-	if previous := fixture.state.previous[oldDeploymentID]; len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
+	if previous, getErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); getErr != nil || len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
 		t.Fatalf("previous slot=%+v", previous)
 	}
 
 	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	result, err = fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	if err != nil || result.CompletionCode != "deployment_completed" || fixture.state.deployment.Phase != generatedruntimestate.PhaseSucceeded || fixture.deployments.deployment.Status != deployments.Succeeded {
-		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, fixture.state.deployment, fixture.deployments.deployment)
+	result, err = fixture.execute()
+	runtimeDeployment, deployment = fixture.runtimeDeployment(t), fixture.deployment(t)
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || runtimeDeployment.Phase != generatedruntimestate.PhaseDraining || deployment.Status == deployments.Succeeded {
+		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, runtimeDeployment, deployment)
 	}
-	if fixture.runtime.stopped != 2 {
-		t.Fatalf("cleanup attempts=%d", fixture.runtime.stopped)
+	if fixture.runtime.stopCalls != 2 || fixture.runner.stopCalls != 0 {
+		t.Fatalf("legacy cleanup attempts=%d physical stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
 	if fixture.authorization.calls != 1 {
 		t.Fatalf("draining retry requested replacement capacity: authorization calls=%d", fixture.authorization.calls)
 	}
-	if previous := fixture.state.previous[oldDeploymentID]; previous.Components[0].State != generatedruntimestate.ComponentStopped {
+	if previous, _ := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); previous.Components[0].State != generatedruntimestate.ComponentDraining {
 		t.Fatalf("previous slot=%+v", previous)
 	}
 }
 
 func TestGeneratedExecutorStopsPreviousSlotOnlyAfterDrainCompletes(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	oldDeploymentID, _ := configurePreviousActive(t, fixture)
+	fixture := newSealedExecutorFixture(t)
+	if _, err := fixture.execute(); err != nil {
+		t.Fatal(err)
+	}
+	oldDeploymentID := fixture.deployment(t).ID
+	fixture.nextDeployment(t)
+	fixture.routes.requests = nil
 	drainEntered := make(chan struct{})
 	releaseDrain := make(chan struct{})
 	fixture.executor.waitDrain = func(ctx context.Context, _ time.Duration) error {
@@ -1810,7 +1793,7 @@ func TestGeneratedExecutorStopsPreviousSlotOnlyAfterDrainCompletes(t *testing.T)
 	}
 	completed := make(chan outcome, 1)
 	go func() {
-		result, err := fixture.execute(testContext, deploymentJob(), fixture.reporter)
+		result, err := fixture.execute()
 		completed <- outcome{result: result, err: err}
 	}()
 
@@ -1827,90 +1810,86 @@ func TestGeneratedExecutorStopsPreviousSlotOnlyAfterDrainCompletes(t *testing.T)
 	case <-testContext.Done():
 		t.Fatalf("executor did not enter drain: %v", testContext.Err())
 	}
-	if previous := fixture.state.previous[oldDeploymentID]; len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
+	if previous, getErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); getErr != nil || len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
 		t.Fatalf("previous slot=%+v", previous)
 	}
-	if fixture.runtime.stopped != 0 {
-		t.Fatalf("old slot stopped before drain completed: %d", fixture.runtime.stopped)
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
+		t.Fatalf("old slot stopped before drain completed: legacy=%d physical=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
 
 	release()
 	select {
 	case execution := <-completed:
-		if execution.err != nil || execution.result.CompletionCode != "deployment_completed" {
+		if execution.err != nil || execution.result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 			t.Fatalf("result=%+v err=%v", execution.result, execution.err)
 		}
 	case <-testContext.Done():
 		t.Fatalf("executor did not complete after drain release: %v", testContext.Err())
 	}
-	if fixture.runtime.stopped != 1 {
-		t.Fatalf("old slot stop calls=%d", fixture.runtime.stopped)
+	if fixture.runtime.stopCalls != 1 || fixture.runner.stopCalls != 0 {
+		t.Fatalf("legacy refusal calls=%d physical stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
-	if previous := fixture.state.previous[oldDeploymentID]; len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentStopped {
+	if previous, _ := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
 		t.Fatalf("previous slot=%+v", previous)
 	}
 }
 
 func TestGeneratedExecutorPreservesCandidateWhenFailedRouteMayBeLive(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	oldDeploymentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "green", Generation: 4}
+	fixture := newSealedExecutorFixture(t)
+	assertPreviousUnchanged := fixture.beginReplacement(t)
 	fixture.routes.err = candidateMayBeLiveRouteError{}
 
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.runtime.stopped != 0 {
-		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 {
+		t.Fatalf("candidate cleanup calls=%d physical stops=%d removals=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
 	}
-	if fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
-		t.Fatalf("old active head changed: %+v", fixture.state.active)
+	assertPreviousUnchanged()
+	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("durable phase=%s", runtimeDeployment.Phase)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
-		t.Fatalf("durable phase=%s", fixture.state.deployment.Phase)
-	}
-	if fixture.deployments.deployment.Status == deployments.Failed || fixture.deployments.deployment.Status == deployments.Cancelled {
-		t.Fatalf("main deployment became terminal: %+v", fixture.deployments.deployment)
+	if deployment := fixture.deployment(t); deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+		t.Fatalf("main deployment became terminal: %+v", deployment)
 	}
 }
 
 func TestGeneratedExecutorCleansCandidateAfterRolledBackRouteFailure(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
+	fixture := newSealedExecutorFixture(t)
 	fixture.routes.err = errors.New("route rolled back")
 
-	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	var executionErr *jobs.ExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != "apply_failed" {
-		t.Fatalf("err=%v", err)
+	result, err := fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.runtime.stopped != 1 {
-		t.Fatalf("candidate cleanup calls=%d", fixture.runtime.stopped)
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
+		t.Fatalf("candidate cleanup calls=%d physical stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed {
-		t.Fatalf("durable phase=%s", fixture.state.deployment.Phase)
+	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("durable phase=%s", runtimeDeployment.Phase)
 	}
 }
 
-func TestGeneratedExecutorPersistsGatewayReadinessFailureAndPreservesOldHead(t *testing.T) {
-	fixture := newExecutorFixture(t, false)
-	oldDeploymentID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
-	fixture.state.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: oldDeploymentID, ReleaseID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Slot: "green", Generation: 4}
+func TestGeneratedExecutorPausesGatewayReadinessFailureAndPreservesOldHead(t *testing.T) {
+	fixture := newSealedExecutorFixture(t)
+	assertPreviousUnchanged := fixture.beginReplacement(t)
 	fixture.routes.err = gatewayReadinessRouteError{}
 
-	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	var executionErr *jobs.ExecutionError
-	if !errors.As(err, &executionErr) || executionErr.Code != "gateway_readiness_failed" {
-		t.Fatalf("err=%v", err)
+	result, err := fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.runtime.stopped != 1 || fixture.state.active.DeploymentID != oldDeploymentID || fixture.state.active.Generation != 4 {
-		t.Fatalf("candidate cleanup=%d active=%+v", fixture.runtime.stopped, fixture.state.active)
+	assertPreviousUnchanged()
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 {
+		t.Fatalf("candidate cleanup=%d physical stops=%d removals=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
 	}
-	if fixture.state.deployment.Phase != generatedruntimestate.PhaseFailed || fixture.state.deployment.DiagnosticCode != generatedruntimestate.DiagnosticRouteSwitchFailed {
-		t.Fatalf("runtime deployment=%+v", fixture.state.deployment)
+	runtimeDeployment := fixture.runtimeDeployment(t)
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+		t.Fatalf("runtime deployment=%+v", runtimeDeployment)
 	}
-	if fixture.deployments.deployment.Status != deployments.Failed || fixture.deployments.deployment.DiagnosticCode != "gateway_readiness_failed" {
-		t.Fatalf("deployment=%+v", fixture.deployments.deployment)
+	if deployment := fixture.deployment(t); deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+		t.Fatalf("deployment=%+v", deployment)
 	}
 }
 

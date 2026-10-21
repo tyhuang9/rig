@@ -466,6 +466,9 @@ func (r *Repository) Advance(ctx context.Context, appID, deploymentID string, ex
 	case expected == PhaseMigrating && next == PhaseStartingCandidate:
 		condition = " AND migration_state='succeeded'"
 	}
+	if next == PhaseFailed || next == PhaseCancelled {
+		condition += " AND NOT EXISTS (SELECT 1 FROM generated_candidate_intents i WHERE i.deployment_id=generated_runtime_deployments.deployment_id)"
+	}
 	result, err := r.db.ExecContext(ctx, `UPDATE generated_runtime_deployments SET phase=?,diagnostic_code=?,updated_at=?,finished_at=? WHERE deployment_id=? AND app_id=? AND phase=?`+condition, next, nullable(string(diagnostic)), now, finished, deploymentID, appID, expected)
 	if err != nil {
 		return Deployment{}, err
@@ -567,7 +570,13 @@ func (r *Repository) updateComponent(ctx context.Context, appID, deploymentID, c
 	if next == ComponentStopped || next == ComponentFailed {
 		finished = now
 	}
-	result, err := r.db.ExecContext(ctx, `UPDATE generated_runtime_components SET state=?,container_name=CASE WHEN ?<>'' THEN ? ELSE container_name END,container_id=CASE WHEN ?<>'' THEN ? ELSE container_id END,diagnostic_code=?,updated_at=?,finished_at=? WHERE deployment_id=? AND component_name=? AND state=? AND EXISTS(SELECT 1 FROM generated_runtime_deployments d WHERE d.deployment_id=? AND d.app_id=?)`, next, containerName, containerName, containerID, containerID, nullable(string(diagnostic)), now, finished, deploymentID, componentName, expected, deploymentID, appID)
+	condition := ""
+	if next == ComponentFailed {
+		// Refuse the entire receipt-owned roster, including unstarted siblings.
+		// Failure belongs to the owner's atomic whole-roster transaction.
+		condition = " AND NOT EXISTS (SELECT 1 FROM generated_candidate_intents i WHERE i.deployment_id=generated_runtime_components.deployment_id)"
+	}
+	result, err := r.db.ExecContext(ctx, `UPDATE generated_runtime_components SET state=?,container_name=CASE WHEN ?<>'' THEN ? ELSE container_name END,container_id=CASE WHEN ?<>'' THEN ? ELSE container_id END,diagnostic_code=?,updated_at=?,finished_at=? WHERE deployment_id=? AND component_name=? AND state=? AND EXISTS(SELECT 1 FROM generated_runtime_deployments d WHERE d.deployment_id=? AND d.app_id=?)`+condition, next, containerName, containerName, containerID, containerID, nullable(string(diagnostic)), now, finished, deploymentID, componentName, expected, deploymentID, appID)
 	if err != nil {
 		return Component{}, err
 	}

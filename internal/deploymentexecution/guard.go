@@ -63,16 +63,18 @@ type Pinned struct {
 }
 
 type pinnedState struct {
-	mu                      sync.Mutex
-	changed                 *sync.Cond
-	guard                   *Guard
-	ctx                     context.Context
-	leave                   func()
-	active                  int
-	children                int
-	migrationCleanupDerived bool
-	closing                 bool
-	left                    bool
+	mu                           sync.Mutex
+	changed                      *sync.Cond
+	guard                        *Guard
+	ctx                          context.Context
+	leave                        func()
+	active                       int
+	children                     int
+	migrationCleanupDerived      bool
+	candidateCleanupDeploymentID string
+	candidateCleanupDerived      map[generatedCandidateCleanupKey]generatedCandidateCleanupIdentity
+	closing                      bool
+	left                         bool
 }
 
 // GeneratedMigrationCleanup is a fixed, process-local cleanup capability for

@@ -32,10 +32,12 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
 	"github.com/hostd/hostd/internal/projectanalysis"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/sourceinspection"
@@ -134,9 +136,6 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("seed test application")
 	}
 	plan := hostingLivePlan(t, ctx, workspace, db, dataRoot, appID)
-	acceptedComponentNames := hostingLiveAcceptedComponentNames(t, plan)
-	syntheticUnstartedComponents := hostingLiveSyntheticUnstartedComponents(t, acceptedComponentNames, "api")
-	t.Logf("direct-runtime fixture will record synthetic replacement history for unstarted accepted components %q; this does not attest their Docker execution", syntheticUnstartedComponents)
 	config, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal("open scoped configuration store")
@@ -150,8 +149,12 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal("prepare runtime environment stager")
 	}
-	authority := liveauthority.New(t, db, filepath.Join(root, "working"))
-	engine, err := generatedruntime.NewEngine(runtimeprocess.ExecRunner{}, stager, hostingLiveCapacity{}, authority.Repository(), generatedruntime.EngineOptions{
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal("open protected fixture plan store")
+	}
+	authority := liveauthority.NewWithStores(t, db, filepath.Join(root, "working"), plans, config)
+	engine, err := generatedruntime.NewEngine(&runtimeprocess.ExecRunner{}, stager, hostingLiveCapacity{}, authority.Repository(), generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: runtimeDockerConfig,
 		WorkingDirectory: filepath.Join(root, "working"), CommandTimeout: 45 * time.Second,
 		HealthTimeout: 35 * time.Second, HealthPollInterval: 250 * time.Millisecond,
@@ -175,9 +178,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		defer stop()
 		for _, candidate := range []generatedruntime.Candidate{green, bad, blue} {
 			if candidate.ContainerID != "" {
-				if err := engine.StopAndRemove(cleanupCtx, candidate, 0); err != nil {
-					t.Errorf("remove exact hosted candidate: %s", hostingLiveRuntimeCode(err))
-				}
+				hostingLiveRemoveOwnedCandidate(t, cleanupCtx, docker, runtimeDockerConfig, candidate)
 			}
 		}
 		hostingLiveRemoveOwnedIngress(t, cleanupCtx, docker, runtimeDockerConfig)
@@ -209,17 +210,23 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 			t.Error("F7 Compose containers remain after cleanup")
 		}
 	})
-	networkContext, networkSpec := authority.BindCandidateAggregate(t, ctx, generatedruntime.CandidateSpec{
-		AppID: appID, ReleaseID: uuid.NewString(), DeploymentID: uuid.NewString(), ArtifactID: uuid.NewString(),
-		DeploymentPlanRevisionID: plan.ID, DeploymentPlanRevisionNumber: plan.RevisionNumber,
-		ConfigurationRevisionID: bootstrapConfiguration.RevisionID, ConfigurationRevisionNumber: bootstrapConfiguration.RevisionNumber,
-		ComponentName: "api", Role: generatedruntime.RoleServer,
-		ImageContentID: "sha256:" + strings.Repeat("6", 64), BuildDefinitionDigest: strings.Repeat("7", 64),
-	}, acceptedComponentNames)
+	networkScope, releaseNetwork, err := deploymenteffects.AcquireScoped(ctx, filepath.Join(root, "working"))
+	if err != nil {
+		t.Fatal("acquire fixture network scope")
+	}
+	defer releaseNetwork()
+	networkContext := deploymenteffects.WithScope(ctx, networkScope)
+	networkReleaseID := uuid.NewString()
+	networkSpec := hostingLiveCandidateSpec(appID, plan, "", strings.Repeat("7", 64), networkReleaseID, uuid.NewString())
+	networkSpec.ConfigurationRevisionID, networkSpec.ConfigurationRevisionNumber = bootstrapConfiguration.RevisionID, bootstrapConfiguration.RevisionNumber
+	networkSpec = authority.BindNetwork(t, networkContext, networkSpec)
 	if err := engine.EnsureAppNetwork(networkContext, networkSpec.Network); err != nil {
 		t.Fatalf("create app-private bridge: %s", hostingLiveRuntimeCode(err))
 	}
-	authority.RejectCandidate(t, networkSpec.DeploymentID, "")
+	authority.CancelNetwork(t, networkContext, networkSpec.DeploymentID)
+	if err := releaseNetwork(); err != nil {
+		t.Fatal("release fixture network scope")
+	}
 
 	gateway := hostingLiveGateway(t, ctx, docker, runtimeDockerConfig, appNetwork.Name)
 	postgresPort := hostingLiveFreePort(t, gateway)
@@ -270,11 +277,14 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("prepare generated ingress")
 	}
 	blueSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
-	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, authority, config, revisionA, settings, acceptedComponentNames, syntheticUnstartedComponents, blueSpec, &blue)
+	blueSession := hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, authority, config, revisionA, settings, blueSpec, &blue)
+	defer blueSession.Close()
 	hostingLiveOnlyAppNetwork(t, ctx, docker, runtimeDockerConfig, blue.ContainerID, appNetwork.Name)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(blue)}}); err != nil {
 		t.Fatal("route initial API candidate")
 	}
+	hostingLiveRecordPublished(t, ctx, ingress, appID, blueSession)
+	blueSession.Close()
 	hostingLiveAwaitMarker(t, ctx, port, appID, "runtime-A")
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", true)
 	hostingLiveAssertRequest(t, ctx, port, appID, http.MethodGet, "/api/test/dependency", "", http.StatusOK, "\"reachable\"")
@@ -285,49 +295,47 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	badRevision := hostingLiveReplaceConfig(t, ctx, config, appID, plan, revisionA.RevisionNumber, settings, "bad-ca", false)
 	badSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
 	badSpec.ActiveSlot = blue.Slot
-	badExport := hostingLiveExport(t, ctx, config, appID, plan, badRevision)
-	badSpec.Environment = append([]byte(nil), badExport.Environment...)
-	badExport.Clear()
-	badSpec.EnvironmentOperationID, badSpec.EnvironmentOperationAttempt = uuid.NewString(), 1
 	badSpec.ConfigurationRevisionID, badSpec.ConfigurationRevisionNumber = badRevision.RevisionID, badRevision.RevisionNumber
-	badSpec.DeploymentPlanRevisionNumber = plan.RevisionNumber
-	badContext, badSpec := authority.BindCandidateAggregate(t, ctx, badSpec, acceptedComponentNames)
-	bad, err = engine.CreateInactiveCandidate(badContext, badSpec)
+	badSession := authority.Begin(t, ctx, engine, badSpec)
+	defer badSession.Close()
+	bad, err = badSession.Start(t, badSession.BoundSpec())
 	if err != nil {
-		t.Fatalf("create bad-CA candidate: %s", hostingLiveRuntimeCode(err))
+		t.Fatal("start bad-CA candidate:", err)
 	}
 	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, runtimeDockerConfig, bad.ContainerID, settings)
-	if err := engine.StartCandidate(badContext, bad); err != nil {
-		t.Fatalf("start bad-CA candidate: %s", hostingLiveRuntimeCode(err))
-	}
-	if err := engine.WaitHealthy(badContext, bad); !generatedruntime.IsCode(err, generatedruntime.DiagnosticCandidateUnhealthy) {
+	if err := badSession.WaitHealthyAndHandoff(); !generatedruntime.IsCode(err, generatedruntime.DiagnosticCandidateUnhealthy) {
 		t.Fatalf("bad-CA candidate did not fail readiness: %s", hostingLiveRuntimeCode(err))
 	}
+	if err := badSession.RejectObservedFailure(); err != nil {
+		t.Fatal("record actual bad-CA failure and cleanup:", err)
+	}
+	badSession.Close()
 	badPresent, inspectErr := hostingLiveResourceExists(ctx, docker, runtimeDockerConfig, "container", bad.ContainerName)
 	if inspectErr != nil || badPresent {
 		t.Fatal("unhealthy bad-CA candidate still occupies the inactive slot")
 	}
 	bad = generatedruntime.Candidate{}
-	authority.RejectCandidate(t, badSpec.DeploymentID, blueSpec.DeploymentID)
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", false)
 	settings.ca = base64.StdEncoding.EncodeToString(ca)
 	revisionB := hostingLiveReplaceConfig(t, ctx, config, appID, plan, badRevision.RevisionNumber, settings, "runtime-B", false)
 	greenSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
 	greenSpec.ActiveSlot = blue.Slot
-	hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, authority, config, revisionB, settings, acceptedComponentNames, syntheticUnstartedComponents, greenSpec, &green)
+	greenSession := hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, authority, config, revisionB, settings, greenSpec, &green)
+	defer greenSession.Close()
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", false)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(green)}}); err != nil {
 		t.Fatal("switch to configuration-only replacement")
 	}
+	hostingLiveRecordPublished(t, ctx, ingress, appID, greenSession)
+	greenSession.Close()
 	hostingLiveAwaitMarker(t, ctx, port, appID, "runtime-B")
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-B", false)
-	if err := engine.StopAndRemove(ctx, blue, 0); err != nil {
-		t.Fatalf("remove drained API candidate: %s", hostingLiveRuntimeCode(err))
+	if err := engine.StopAndRemove(ctx, blue, 0); !errors.Is(err, deployments.ErrGeneratedCandidateRetirementUnavailable) {
+		t.Fatal("receipt-owned API predecessor bypassed retirement boundary")
 	}
-	blue = generatedruntime.Candidate{}
 	hostingLiveAssertRequest(t, ctx, port, appID, http.MethodGet, "/api/notes", "", http.StatusOK, "TLS bridge roundtrip")
 	t.Logf("M1 acceptance identities: app=%s strategy=generated plan=%s/%d config-initial=%s/%d config-final=%s/%d release=%s artifact=%s image=%s ingress-port=%d deployment=direct-runtime-gate", appID, plan.ID, plan.RevisionNumber, revisionA.RevisionID, revisionA.RevisionNumber, revisionB.RevisionID, revisionB.RevisionNumber, releaseID, artifactID, imageID, port)
-	t.Log("M1 hosted Docker gate: app-private bridge, verified TLS PostgreSQL roundtrip, HTTPS probe, bad-CA rollback, same-image scoped revision replacement, and persistent note read passed")
+	t.Log("M1 hosted Docker gate: app-private bridge, verified TLS PostgreSQL roundtrip, HTTPS probe, bad-CA rollback, same-image scoped revision replacement, and persistent note read passed; predecessor retirement is pending")
 }
 
 type hostingLiveCapacity struct{}
@@ -574,6 +582,19 @@ func hostingLivePlan(t *testing.T, ctx context.Context, workspace string, db *sq
 	if err := json.Unmarshal(setupBody, &setup); err != nil {
 		t.Fatal("decode hosting setup")
 	}
+	// This gate builds and executes the API only. Persist that exact accepted
+	// roster; never fabricate Active history for an unstarted frontend.
+	// The complete frontend/backend fixture has its own compiler/controller gates.
+	apiComponents := setup.Components[:0]
+	for _, component := range setup.Components {
+		if component.ID == "api" {
+			apiComponents = append(apiComponents, component)
+		}
+	}
+	if len(apiComponents) != 1 {
+		t.Fatal("fixture setup must contain one API component")
+	}
+	setup.Components = apiComponents
 	plan, _, err := deploymentplans.AcceptSetup(inspection.Analysis, setup, deploymentplans.SourceIdentity{Provider: "local", ResolvedDigest: inspection.Analysis.StructuralFingerprint})
 	if err != nil {
 		t.Fatal("accept reviewed hosting setup")
@@ -641,23 +662,6 @@ func hostingLiveBootstrapConfiguration(t *testing.T, ctx context.Context, store 
 		t.Fatal("protected empty scoped bootstrap configuration did not retain exact plan authority")
 	}
 	return revision
-}
-
-func hostingLiveSyntheticUnstartedComponents(t *testing.T, acceptedComponentNames []string, startedComponentName string) []string {
-	t.Helper()
-	unstarted := make([]string, 0, len(acceptedComponentNames)-1)
-	startedFound := false
-	for _, componentName := range acceptedComponentNames {
-		if componentName == startedComponentName {
-			startedFound = true
-			continue
-		}
-		unstarted = append(unstarted, componentName)
-	}
-	if !startedFound || len(unstarted) == 0 {
-		t.Fatal("direct-runtime aggregate fixture requires explicit unstarted accepted components")
-	}
-	return unstarted
 }
 
 func hostingLiveBuildAPI(t *testing.T, ctx context.Context, docker, dockerConfig, workspace, root, tag string, plan deploymentplans.DeploymentPlanRevision, appID, releaseID, artifactID string, forbidden ...string) (string, string) {
@@ -968,7 +972,7 @@ func hostingLiveReplaceConfig(t *testing.T, ctx context.Context, store *appconfi
 		entry(appconfig.PhaseRuntime, "api", "HTTPS_DEPENDENCY_TOKEN_ENV", appconfig.SensitivityPublic, "NOTES_FIXTURE_HTTPS_TOKEN"),
 		entry(appconfig.PhaseRuntime, "api", "TEST_FIXTURE_MODE", appconfig.SensitivityPublic, "1"),
 		entry(appconfig.PhaseRuntime, "api", "FIXTURE_SCHEMA", appconfig.SensitivityPublic, "rig_fixture_notes"),
-		entry(appconfig.PhaseBuild, "frontend", "VITE_BUILD_LABEL", appconfig.SensitivityPublic, "public-build-A"),
+		entry(appconfig.PhaseBuild, "api", "VITE_BUILD_LABEL", appconfig.SensitivityPublic, "public-build-A"),
 	}
 	if seedRequiredSecrets {
 		entries = append(entries,
@@ -1008,9 +1012,9 @@ func hostingLiveCandidateSpec(appID string, plan deploymentplans.DeploymentPlanR
 	for _, component := range plan.Plan.Components {
 		if component.Name == "api" {
 			return generatedruntime.CandidateSpec{
-				AppID: appID, ReleaseID: releaseID, DeploymentID: uuid.NewString(), ArtifactID: artifactID,
+				AppID: appID, ReleaseID: releaseID, ArtifactID: artifactID,
 				DeploymentPlanRevisionID: plan.ID, DeploymentPlanRevisionNumber: plan.RevisionNumber,
-				ComponentName: component.Name, Role: component.Role,
+				ComponentName: component.Name, Role: component.Role, Technology: component.Technology,
 				RootDirectory: component.RootDirectory, RunCommand: component.RunCommand,
 				InternalPort: component.InternalPort, HealthProbe: component.HealthProbe,
 				ImageContentID: imageID, BuildDefinitionDigest: definitionDigest,
@@ -1020,32 +1024,79 @@ func hostingLiveCandidateSpec(appID string, plan deploymentplans.DeploymentPlanR
 	return generatedruntime.CandidateSpec{}
 }
 
-func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig string, engine *generatedruntime.Engine, authority *liveauthority.Authority, store *appconfig.Store, revision appconfig.Configuration, settings hostingLiveSettings, acceptedComponentNames, syntheticUnstartedComponents []string, spec generatedruntime.CandidateSpec, candidate *generatedruntime.Candidate) {
+func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig string, engine *generatedruntime.Engine, authority *liveauthority.Authority, store *appconfig.Store, revision appconfig.Configuration, settings hostingLiveSettings, spec generatedruntime.CandidateSpec, candidate *generatedruntime.Candidate) *liveauthority.CandidateSession {
 	t.Helper()
-	// The candidate's plan identity is part of its image contract. Build the
-	// export using the same accepted plan identity without a broad revision read.
-	export, err := store.ExportComponentRuntimeForExecution(ctx, spec.AppID, revision.RevisionID, revision.RevisionNumber, spec.DeploymentPlanRevisionID, 1, spec.ComponentName)
+	// Assert phase isolation independently; the owner performs its own exact
+	// protected export and transport rather than accepting these caller bytes.
+	export, err := store.ExportComponentRuntimeForExecution(ctx, spec.AppID, revision.RevisionID, revision.RevisionNumber, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber, spec.ComponentName)
 	if err != nil {
 		t.Fatal("export selected API runtime revision")
 	}
-	spec.Environment = append([]byte(nil), export.Environment...)
+	if bytes.Contains(export.Environment, []byte("VITE_BUILD_LABEL")) {
+		export.Clear()
+		t.Fatal("build value entered runtime export")
+	}
 	export.Clear()
-	spec.EnvironmentOperationID, spec.EnvironmentOperationAttempt = uuid.NewString(), 1
 	spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber = revision.RevisionID, revision.RevisionNumber
-	boundContext, boundSpec := authority.BindCandidateAggregate(t, ctx, spec, acceptedComponentNames)
-	created, err := engine.CreateInactiveCandidate(boundContext, boundSpec)
+	session := authority.Begin(t, ctx, engine, spec)
+	t.Cleanup(session.Close)
+	created, err := session.Start(t, session.BoundSpec())
 	if err != nil {
-		t.Fatalf("create exact API candidate: %s", hostingLiveRuntimeCode(err))
+		t.Fatal("start exact API candidate:", err)
 	}
 	*candidate = created
-	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, dockerConfig, created.ContainerID, settings)
-	if err := engine.StartCandidate(boundContext, created); err != nil {
-		t.Fatalf("start exact API candidate: %s", hostingLiveRuntimeCode(err))
-	}
-	if err := engine.WaitHealthy(boundContext, created); err != nil {
+	hostingLiveAssertSelectedDockerEnv(t, ctx, docker, dockerConfig, candidate.ContainerID, settings)
+	if err := session.WaitHealthyAndHandoff(); err != nil {
 		t.Fatalf("API candidate did not pass database readiness: %s", hostingLiveRuntimeCode(err))
 	}
-	authority.FinishCandidateWithSyntheticUnstartedComponents(t, boundSpec.DeploymentID, syntheticUnstartedComponents)
+	return session
+}
+
+func hostingLiveRecordPublished(t *testing.T, ctx context.Context, ingress *generatedingress.Manager, appID string, session *liveauthority.CandidateSession) {
+	t.Helper()
+	observation, err := ingress.Observe(ctx, appID)
+	if err != nil {
+		t.Fatal("observe exact API route")
+	}
+	if err := session.RoutePublished(observation.Slot, observation.Endpoints); err != nil {
+		t.Fatal("record observed API route:", err)
+	}
+}
+
+// Exact disposable-fixture teardown is not controller retirement evidence.
+func hostingLiveRemoveOwnedCandidate(t *testing.T, ctx context.Context, docker, config string, candidate generatedruntime.Candidate) {
+	t.Helper()
+	exists, err := hostingLiveResourceExists(ctx, docker, config, "container", candidate.ContainerName)
+	if err != nil {
+		t.Error("inspect fixture candidate before cleanup")
+		return
+	}
+	if !exists {
+		return
+	}
+	body, err := hostingLiveDockerOutput(ctx, docker, config, nil, "container", "inspect", "--format", `{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Config.Labels}}}`, candidate.ContainerID)
+	defer clear(body)
+	var observed struct {
+		ID     string            `json:"id"`
+		Name   string            `json:"name"`
+		Labels map[string]string `json:"labels"`
+	}
+	if err != nil || json.Unmarshal(body, &observed) != nil || observed.ID != candidate.ContainerID || strings.TrimPrefix(observed.Name, "/") != candidate.ContainerName {
+		t.Error("fixture candidate identity is uncertain; retaining resource")
+		return
+	}
+	expected := map[string]string{"io.rig.managed": "generated-runtime", "io.rig.application": candidate.AppID, "io.rig.deployment": candidate.DeploymentID,
+		"io.rig.release": candidate.ReleaseID, "io.rig.artifact": candidate.ArtifactID, "io.rig.plan": candidate.DeploymentPlanRevisionID,
+		"io.rig.component": candidate.Component, "io.rig.slot": string(candidate.Slot), "io.rig.role": candidate.Role}
+	for key, value := range expected {
+		if observed.Labels[key] != value {
+			t.Error("fixture candidate ownership is uncertain; retaining resource")
+			return
+		}
+	}
+	if _, err := hostingLiveDockerOutput(ctx, docker, config, nil, "container", "rm", "--force", candidate.ContainerID); err != nil {
+		t.Error("remove exact fixture candidate")
+	}
 }
 
 func hostingLiveAssertSelectedDockerEnv(t *testing.T, ctx context.Context, docker, dockerConfig, containerID string, settings hostingLiveSettings) {

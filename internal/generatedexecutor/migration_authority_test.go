@@ -41,6 +41,7 @@ type executorMigrationAuthority struct {
 	deploymentID string
 	state        *generatedruntimestate.Repository
 	process      *executorMigrationProcess
+	engine       *generatedruntime.Engine
 	withScope    func(context.Context) context.Context
 }
 
@@ -115,6 +116,22 @@ func (s *executorMigrationStager) StageGeneratedMigration(_ string, _ int, conte
 	return &executorMigrationLease{stager: s, path: s.path}, nil
 }
 
+func (s *executorMigrationStager) Stage(operationID string, attempt int, contents []byte) (generatedruntime.EnvironmentLease, error) {
+	lease, err := s.StageGeneratedMigration(operationID, attempt, contents)
+	if err != nil {
+		return nil, err
+	}
+	return lease.(*executorMigrationLease), nil
+}
+
+func (s *executorMigrationStager) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+	lease, err := s.StageGeneratedMigration(operationID, attempt, contents)
+	if err != nil {
+		return nil, err
+	}
+	return lease.(*executorMigrationLease), nil
+}
+
 type executorMigrationLease struct {
 	stager *executorMigrationStager
 	path   string
@@ -143,6 +160,16 @@ type executorMigrationProcess struct {
 	startedAt       string
 	exitCode        int
 	removed         bool
+	candidate       bool
+	alias           string
+	health          string
+	memory          int64
+	memorySwap      int64
+	nanoCPUs        int64
+	pids            int64
+	tmpfs           map[string]string
+	logType         string
+	logConfig       map[string]string
 }
 
 func (p *executorMigrationProcess) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
@@ -168,10 +195,15 @@ func (p *executorMigrationProcess) Run(_ context.Context, request runtimeprocess
 	case "container create":
 		p.captureCreate(request.Args)
 		p.status = "created"
+		p.removed = false
+		p.health = ""
 		return runtimeprocess.CommandResult{Stdout: []byte(p.id + "\n")}, nil
 	case "container start":
 		p.status = "running"
 		p.startedAt = "2026-10-20T12:00:00.123456789Z"
+		if p.candidate {
+			p.health = "healthy"
+		}
 		return runtimeprocess.CommandResult{Stdout: []byte(p.id + "\n")}, nil
 	case "container wait":
 		p.status = "exited"
@@ -195,6 +227,7 @@ func (p *executorMigrationProcess) captureCreate(args []string) {
 	p.user = executorMigrationArgument(args, "--user")
 	p.workdir = executorMigrationArgument(args, "--workdir")
 	p.network = executorMigrationArgument(args, "--network")
+	p.alias = executorMigrationArgument(args, "--network-alias")
 	p.labels = map[string]string{}
 	for index := 0; index+1 < len(args); index++ {
 		if args[index] == "--label" {
@@ -203,6 +236,30 @@ func (p *executorMigrationProcess) captureCreate(args []string) {
 				p.labels[key] = value
 			}
 		}
+	}
+	p.candidate = p.labels["io.rig.managed"] == "generated-runtime"
+	if p.candidate {
+		p.memory, _ = strconv.ParseInt(executorMigrationArgument(args, "--memory"), 10, 64)
+		p.memorySwap, _ = strconv.ParseInt(executorMigrationArgument(args, "--memory-swap"), 10, 64)
+		p.pids, _ = strconv.ParseInt(executorMigrationArgument(args, "--pids-limit"), 10, 64)
+		cpus, _ := strconv.ParseFloat(executorMigrationArgument(args, "--cpus"), 64)
+		p.nanoCPUs = int64(cpus * 1_000_000_000)
+		p.tmpfs, p.logConfig = map[string]string{}, map[string]string{}
+		for index := 0; index+1 < len(args); index++ {
+			switch args[index] {
+			case "--tmpfs":
+				key, value, ok := strings.Cut(args[index+1], ":")
+				if ok {
+					p.tmpfs[key] = value
+				}
+			case "--log-opt":
+				key, value, ok := strings.Cut(args[index+1], "=")
+				if ok {
+					p.logConfig[key] = value
+				}
+			}
+		}
+		p.logType = executorMigrationArgument(args, "--log-driver")
 	}
 	p.image = args[len(args)-4]
 	p.command = args[len(args)-1]
@@ -217,6 +274,26 @@ func (p *executorMigrationProcess) inspection() map[string]any {
 	var networks map[string]any
 	if p.status == "running" || p.status == "exited" {
 		networks = map[string]any{p.network: map[string]any{}}
+	}
+	if p.candidate {
+		candidateNetworks := map[string]any{}
+		if running {
+			candidateNetworks[p.network] = map[string]any{"Aliases": []string{p.alias}}
+		}
+		return map[string]any{
+			"id": p.id, "name": "/" + p.name, "image": p.image, "configImage": p.image,
+			"user": p.user, "workingDir": p.workdir, "entrypoint": []string{"/usr/local/bin/rig-entrypoint"}, "cmd": []string{"/bin/sh", "-lc", p.command},
+			"labels": p.labels, "volumes": map[string]any{},
+			"healthTest":     []string{"CMD-SHELL", `node -e "const h=require('node:http');const q=h.get({host:'127.0.0.1',port:process.env.RIG_RUNTIME_INTERNAL_PORT,path:process.env.RIG_RUNTIME_HEALTH_PATH,timeout:1500},r=>{r.resume();process.exit(r.statusCode>=200&&r.statusCode<400?0:1)});q.on('error',()=>process.exit(1));q.on('timeout',()=>{q.destroy();process.exit(1)})"`},
+			"healthInterval": int64(2 * time.Second), "healthTimeout": int64(2 * time.Second), "healthStartPeriod": int64(5 * time.Second), "healthRetries": 3,
+			"memory": p.memory, "memorySwap": p.memorySwap, "nanoCpus": p.nanoCPUs, "pidsLimit": p.pids,
+			"ulimits": []map[string]any{{"Name": "nofile", "Soft": int64(1024), "Hard": int64(1024)}}, "init": true, "networkMode": p.network,
+			"readonlyRootfs": true, "privileged": false, "capAdd": []string{}, "capDrop": []string{"ALL"}, "securityOpt": []string{"no-new-privileges=true"},
+			"binds": []string{}, "hostMounts": []any{}, "portBindings": map[string]any{}, "tmpfs": p.tmpfs,
+			"logType": p.logType, "logConfig": p.logConfig, "restart": "no",
+			"status": p.status, "running": running, "paused": false, "restarting": false, "dead": false, "exitCode": 0, "startedAt": startedAt, "health": p.health,
+			"networks": candidateNetworks, "mounts": []any{},
+		}
 	}
 	return map[string]any{
 		"id": p.id, "name": "/" + p.name, "image": p.image, "configImage": p.image,
@@ -517,10 +594,22 @@ func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Compo
 	if _, err := state.Advance(context.Background(), testAppID, deployment.ID, runtimeDeployment.Phase, generatedruntimestate.PhaseMigrating, ""); err != nil {
 		t.Fatal(err)
 	}
+	capacity := &scriptedCapacitySource{}
+	capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 512 << 20, DiskAvailableBytes: 512 << 20})
+	engine, err := generatedruntime.NewEngine(process, stager, capacity, repository, generatedruntime.EngineOptions{
+		DockerExecutable: options.DockerExecutable, DockerConfigDirectory: options.DockerConfigDirectory,
+		WorkingDirectory: options.WorkingDirectory, CommandTimeout: time.Minute, HealthTimeout: time.Minute,
+		HealthPollInterval: 100 * time.Millisecond, OutputLimit: options.OutputLimit,
+		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20, LogSize: "1m", LogFiles: 2},
+		ReplacementDiskBytes: 128 << 20,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &executorMigrationAuthority{
 		repository: repository, runner: &executorMigrationRunner{repository: repository}, plan: revision,
 		release:  releasesnapshot.Release{ID: testReleaseID, AppID: testAppID, SourceProvider: "local", ResolvedSHA: strings.Repeat("c", 64), WorkspaceTreeSHA256: workspaceDigest, ConfigurationRevisionID: config.RevisionID, ConfigurationRevisionNumber: config.RevisionNumber, DeploymentPlanRevisionID: revision.ID, DeploymentPlanRevisionNumber: revision.RevisionNumber},
-		artifact: artifact, claim: claim, deploymentID: deployment.ID, state: state, process: process,
+		artifact: artifact, claim: claim, deploymentID: deployment.ID, state: state, process: process, engine: engine,
 		withScope: func(ctx context.Context) context.Context { return deploymenteffects.WithScope(ctx, scope) },
 	}
 }

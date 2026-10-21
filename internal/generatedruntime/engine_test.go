@@ -13,6 +13,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedcontainer"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -62,6 +65,16 @@ func (s *runtimeFakeEnvironment) Stage(_ string, _ int, contents []byte) (Enviro
 	return &runtimeFakeEnvironmentLease{path: s.path, cleanup: func() { s.cleaned++ }}, nil
 }
 
+func (s *runtimeFakeEnvironment) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+	lease, err := s.Stage(operationID, attempt, contents)
+	return lease, err
+}
+
+func (s *runtimeFakeEnvironment) StageGeneratedMigration(operationID string, attempt int, contents []byte) (deployments.GeneratedMigrationEnvironmentLease, error) {
+	lease, err := s.Stage(operationID, attempt, contents)
+	return lease, err
+}
+
 type runtimeFakeEnvironmentLease struct {
 	path    string
 	cleanup func()
@@ -74,102 +87,44 @@ func (l *runtimeFakeEnvironmentLease) Cleanup() error {
 }
 
 func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *testing.T) {
-	root := t.TempDir()
-	directories, err := runtimedocker.PrepareControllerDirectories(root)
-	if err != nil {
-		t.Fatal(err)
-	}
 	spec := candidateSpec()
 	spec.Technology = "nextjs"
 	command := `node server.js && printf '$() ${TOKEN}' \\unicode-✓`
 	spec.RunCommand = command
-	environment := &runtimeFakeEnvironment{path: filepath.Join(root, "runtime.env")}
 	limits := ContainerLimits{MemoryBytes: 384 << 20, MilliCPUs: 750, PIDs: 192, TmpfsBytes: 32 << 20, LogSize: "5m", LogFiles: 2}
-	networkInspections := 0
-	containerInspections := 0
-	runner := &runtimeFakeRunner{}
-	runner.run = func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		switch commandKind(request.Args) {
-		case "image inspect":
-			return runtimeJSON(validImageInspection(spec))
-		case "network inspect":
-			networkInspections++
-			if networkInspections == 1 {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("Error: No such network")}, err: errors.New("exit 1")}
-			}
-			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
-		case "network create":
-			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(strings.Repeat("c", 64))}}
-		case "container inspect":
-			identity := request.Args[len(request.Args)-1]
-			if identity != testContainerID {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("Error: No such container")}, err: errors.New("exit 1")}
-			}
-			containerInspections++
-			inspection := hardenedInspection(spec, limits)
-			switch containerInspections {
-			case 1, 2:
-				inspection.Running = false
-				inspection.Health = ""
-			case 3:
-				inspection.Running = true
-				inspection.Health = "starting"
-			default:
-				inspection.Running = true
-				inspection.Health = "healthy"
-			}
-			return runtimeJSON(inspection)
-		case "container create":
-			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID + "\n")}}
-		case "container start", "container stop", "container rm":
-			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID + "\n")}}
-		default:
-			t.Fatalf("unexpected Docker request: %#v", request.Args)
-			return runtimeRequestResult{}
-		}
-	}
-	authority := newRuntimeNetworkAuthority(t, directories.WorkingDirectory, spec)
-	spec = authority.spec
-	engine, err := NewEngine(runner, environment, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, authority.repository, EngineOptions{
-		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
-		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
-		HealthPollInterval: time.Millisecond * 100, Limits: limits, ReplacementDiskBytes: 128 << 20,
+	var program *runtimeCandidateProgram
+	session := newRuntimeCandidateSession(t, spec, limits, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		return program.run(request)
 	})
+	spec = session.authority.spec
+	program = newRuntimeCandidateProgram(t, spec, limits)
+	session.reserveAndPin(t)
+	invocation := session.beginCreate(t)
+	program.bind(invocation, session)
+	identity, err := session.execution.CreateAndRecord(invocation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reservation, err := engine.ReserveReplacement(context.Background(), 1)
-	if err != nil {
+	if identity.Slot != string(SlotGreen) || identity.ContainerName != containerName(spec.AppID, spec.ComponentName, SlotGreen) || identity.NetworkName != networkName(spec.AppID) || identity.ReceiptID == "" {
+		t.Fatalf("unexpected receipt-bound candidate identity: %+v", identity)
+	}
+	if err := session.execution.StartCandidate(invocation); err != nil {
 		t.Fatal(err)
 	}
-	spec.Reservation = reservation
-	candidate, err := engine.CreateInactiveCandidate(authority.context, spec)
-	if err != nil {
+	session.finishStarting(t)
+	program.health = "healthy"
+	if err := session.execution.WaitHealthyAndRecord(invocation); err != nil {
 		t.Fatal(err)
 	}
-	if candidate.Slot != SlotGreen || candidate.ContainerName != containerName(spec.AppID, spec.ComponentName, SlotGreen) || candidate.NetworkName != networkName(spec.AppID) {
-		t.Fatalf("unexpected candidate identity: %+v", candidate)
-	}
-	if candidate.Role != RoleServer || candidate.lease != nil {
-		t.Fatalf("candidate did not consume aggregate admission: %+v", candidate)
-	}
-	if err := engine.StartCandidate(context.Background(), candidate); err != nil {
+	if _, err := session.execution.FinishHealth(); err != nil {
 		t.Fatal(err)
 	}
-	if err := engine.WaitHealthy(context.Background(), candidate); err != nil {
-		t.Fatal(err)
-	}
-	if err := engine.StopAndRemove(context.Background(), candidate, 1500*time.Millisecond); err != nil {
-		t.Fatal(err)
-	}
-	reservation.Release()
-	reservation.Release()
-	if environment.cleaned != 1 || string(environment.contents) != "SECRET='value'\n" {
-		t.Fatalf("environment was not scoped and cleaned: cleaned=%d contents=%q", environment.cleaned, environment.contents)
+	if session.environment.cleaned != 1 || len(session.environment.contents) == 0 {
+		t.Fatalf("environment was not staged and cleaned: cleaned=%d contents=%q", session.environment.cleaned, session.environment.contents)
 	}
 
-	create := findRuntimeRequest(t, runner.requests, "container create")
-	assertArgumentPair(t, create.Args, "--env-file", environment.path)
+	create := findRuntimeRequest(t, session.runner.requests, "container create")
+	assertArgumentPair(t, create.Args, "--env-file", session.environment.path)
 	assertArgumentPair(t, create.Args, "--workdir", "/workspace/apps/api")
 	assertArgumentPair(t, create.Args, "--user", containerUser)
 	assertArgumentPair(t, create.Args, "--network", networkName(spec.AppID))
@@ -188,163 +143,124 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 			t.Fatalf("prohibited Docker argument present: %s in %#v", prohibited, create.Args)
 		}
 	}
-	for _, request := range runner.requests {
+	for _, request := range session.runner.requests {
 		if containsEnvironmentValue(request.Env, "SECRET") || containsEnvironmentValue(request.Env, "value") {
 			t.Fatalf("application configuration escaped into Docker client environment: %#v", request.Env)
 		}
-		if request.Executable != filepath.Join(root, "docker.exe") || request.Directory != directories.WorkingDirectory {
+		if request.Executable != session.engine.options.DockerExecutable || request.Directory != session.engine.options.WorkingDirectory {
 			t.Fatalf("unscoped Docker execution: %+v", request)
 		}
 	}
-	stop := findRuntimeRequest(t, runner.requests, "container stop")
-	assertArgumentPair(t, stop.Args, "--time", "2")
 }
 
 func TestGeneratedRuntimeRejectsImageLabelDriftBeforeDockerMutation(t *testing.T) {
-	expected := candidateSpec()
-	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		if commandKind(request.Args) != "image inspect" {
-			t.Fatalf("unexpected mutation after image drift: %#v", request.Args)
-		}
-		labels := imageLabels(expected)
-		labels["io.rig.application"] = uuid.NewString()
-		image := validImageInspection(expected)
-		image.Labels = labels
-		return runtimeJSON(image)
-	})
-	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	program.image = func(image imageInspection) imageInspection {
+		image.Labels["io.rig.application"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		return image
+	}
+	_, err := session.execution.CreateAndRecord(invocation)
 	if !IsCode(err, DiagnosticImageDriftDetected) {
 		t.Fatalf("expected image drift, got %v", err)
 	}
-	if len(runner.requests) != 1 {
-		t.Fatalf("image drift reached Docker mutation: %d requests", len(runner.requests))
+	if len(session.runner.requests) != 1 {
+		t.Fatalf("image drift reached Docker mutation: %d requests", len(session.runner.requests))
 	}
 }
 
 func TestGeneratedRuntimeRejectsImageComponentDriftBeforeDockerMutation(t *testing.T) {
-	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		if commandKind(request.Args) != "image inspect" {
-			t.Fatalf("component drift reached Docker mutation: %#v", request.Args)
-		}
-		image := validImageInspection(candidateSpec())
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	program.image = func(image imageInspection) imageInspection {
 		image.Labels["io.rig.component"] = "other-component"
-		return runtimeJSON(image)
-	})
-	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
+		return image
+	}
+	_, err := session.execution.CreateAndRecord(invocation)
 	if !IsCode(err, DiagnosticImageDriftDetected) {
 		t.Fatalf("expected image drift, got %v", err)
 	}
-	if len(runner.requests) != 1 {
-		t.Fatalf("component drift reached Docker mutation: %d requests", len(runner.requests))
+	if len(session.runner.requests) != 1 {
+		t.Fatalf("component drift reached Docker mutation: %d requests", len(session.runner.requests))
 	}
 }
 
 func TestGeneratedRuntimeRejectsImageRoleDriftBeforeDockerMutation(t *testing.T) {
-	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		if commandKind(request.Args) != "image inspect" {
-			t.Fatalf("role drift reached Docker mutation: %#v", request.Args)
-		}
-		image := validImageInspection(candidateSpec())
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	program.image = func(image imageInspection) imageInspection {
 		image.Labels["io.rig.role"] = RoleStatic
-		return runtimeJSON(image)
-	})
-	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
+		return image
+	}
+	_, err := session.execution.CreateAndRecord(invocation)
 	if !IsCode(err, DiagnosticImageDriftDetected) {
 		t.Fatalf("expected image role drift, got %v", err)
 	}
-	if len(runner.requests) != 1 {
-		t.Fatalf("role drift reached Docker mutation: %d requests", len(runner.requests))
+	if len(session.runner.requests) != 1 {
+		t.Fatalf("role drift reached Docker mutation: %d requests", len(session.runner.requests))
 	}
 }
 
 func TestGeneratedRuntimeOmitsEnvironmentFileWhenConfigurationIsEmpty(t *testing.T) {
-	var create runtimeprocess.CommandRequest
-	expected := candidateSpec()
-	engine, _, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		switch commandKind(request.Args) {
-		case "image inspect":
-			return runtimeJSON(validImageInspection(expected))
-		case "network inspect":
-			return runtimeJSON(networkInspection{Name: networkName(expected.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": expected.AppID}})
-		case "container inspect":
-			if request.Args[len(request.Args)-1] != testContainerID {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
-			}
-			return runtimeJSON(hardenedInspection(expected, defaultLimits()))
-		case "container create":
-			create = request
-			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID)}}
-		default:
-			t.Fatalf("unexpected request: %#v", request.Args)
-			return runtimeRequestResult{}
-		}
-	})
-	environment := engine.environment.(*runtimeFakeEnvironment)
+	spec := candidateSpec()
 	spec.Environment = nil
 	spec.EnvironmentOperationID = ""
 	spec.EnvironmentOperationAttempt = 0
-	if _, err := engine.CreateInactiveCandidate(runtimeContext, spec); err != nil {
+	session, _, invocation := newPreparedRuntimeCandidate(t, spec, defaultLimits(), nil)
+	if _, err := session.execution.CreateAndRecord(invocation); err != nil {
 		t.Fatal(err)
 	}
-	if environment.staged != 0 || containsExactArgument(create.Args, "--env-file") {
-		t.Fatalf("empty configuration was staged: calls=%d args=%#v", environment.staged, create.Args)
+	create := findRuntimeRequest(t, session.runner.requests, "container create")
+	if session.environment.staged != 0 || containsExactArgument(create.Args, "--env-file") {
+		t.Fatalf("empty configuration was staged: calls=%d args=%#v", session.environment.staged, create.Args)
 	}
 }
 
-func TestGeneratedRuntimeRejectsCapacityBeforeDockerMutation(t *testing.T) {
-	root := t.TempDir()
-	config := filepath.Join(root, "docker-config")
-	if err := os.Mkdir(config, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	spec := candidateSpec()
-	runner := &runtimeFakeRunner{run: func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		if commandKind(request.Args) != "image inspect" {
-			t.Fatalf("unexpected Docker mutation: %#v", request.Args)
-		}
-		return runtimeJSON(validImageInspection(spec))
+func TestGeneratedRuntimeStagesEnvironmentFileForExplicitEmptyPublicValue(t *testing.T) {
+	empty := ""
+	entries := []appconfig.ScopedValueInput{{
+		ScopedKey:   appconfig.ScopedKey{Phase: appconfig.PhaseRuntime, Component: "api", Key: "PUBLIC"},
+		Sensitivity: appconfig.SensitivityPublic,
+		Value:       &empty,
 	}}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 1, DiskAvailableBytes: 1}}, newConfiguredRuntimeDeployments(t, root), EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root, CommandTimeout: time.Second})
-	if err != nil {
+	session, _, invocation := newPreparedRuntimeCandidateWithConfiguration(t, candidateSpec(), defaultLimits(), nil, entries)
+	if _, err := session.execution.CreateAndRecord(invocation); err != nil {
 		t.Fatal(err)
 	}
-	_, err = engine.CreateInactiveCandidate(context.Background(), spec)
+	create := findRuntimeRequest(t, session.runner.requests, "container create")
+	if session.environment.staged != 1 {
+		t.Fatalf("explicit empty public value did not stage: calls=%d", session.environment.staged)
+	}
+	if got, want := string(session.environment.contents), "# hostd application configuration\nPUBLIC=\n"; got != want {
+		t.Fatalf("staged protected configuration=%q want %q", got, want)
+	}
+	assertArgumentPair(t, create.Args, "--env-file", session.environment.path)
+}
+
+func TestGeneratedRuntimeRejectsCapacityBeforeDockerMutation(t *testing.T) {
+	session := newRuntimeCandidateSession(t, candidateSpec(), defaultLimits(), fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 1, DiskAvailableBytes: 1}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		t.Fatalf("capacity rejection reached Docker: %#v", request.Args)
+		return runtimeRequestResult{}
+	})
+	_, err := session.engine.ReserveReplacement(session.authority.context, deployments.GeneratedReplacementRequest(session.request))
 	if !IsCode(err, DiagnosticInsufficientReplacementSpace) {
 		t.Fatalf("expected replacement capacity rejection, got %v", err)
 	}
-	if len(runner.requests) != 1 {
-		t.Fatalf("capacity rejection reached mutation: %d requests", len(runner.requests))
+	if len(session.runner.requests) != 0 {
+		t.Fatalf("capacity rejection reached Docker: %d requests", len(session.runner.requests))
 	}
 }
 
 func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
-	root := t.TempDir()
-	config := filepath.Join(root, "docker-config")
-	if err := os.Mkdir(config, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	spec := candidateSpec()
-	runner := &runtimeFakeRunner{run: func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		if commandKind(request.Args) != "image inspect" {
-			t.Fatalf("under-reserved replacement reached mutation: %#v", request.Args)
-		}
-		return runtimeJSON(validImageInspection(spec))
-	}}
 	limits := defaultLimits()
 	limits.LogSize = "50m"
 	limits.LogFiles = 10
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 550 << 20}}, newConfiguredRuntimeDeployments(t, root), EngineOptions{
-		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
-		CommandTimeout: time.Second, Limits: limits, ReplacementDiskBytes: 64 << 20,
+	session := newRuntimeCandidateSession(t, candidateSpec(), limits, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 550 << 20}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+		t.Fatalf("under-reserved replacement reached Docker: %#v", request.Args)
+		return runtimeRequestResult{}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := engine.CreateInactiveCandidate(context.Background(), spec); !IsCode(err, DiagnosticInsufficientReplacementSpace) {
+	if _, err := session.engine.ReserveReplacement(session.authority.context, deployments.GeneratedReplacementRequest(session.request)); !IsCode(err, DiagnosticInsufficientReplacementSpace) {
 		t.Fatalf("expected derived disk capacity rejection, got %v", err)
 	}
-	if engine.options.ReplacementDiskBytes != 564<<20 {
-		t.Fatalf("derived replacement disk = %d, want %d", engine.options.ReplacementDiskBytes, uint64(564<<20))
+	if session.engine.options.ReplacementDiskBytes != 564<<20 {
+		t.Fatalf("derived replacement disk = %d, want %d", session.engine.options.ReplacementDiskBytes, uint64(564<<20))
 	}
 }
 
@@ -484,58 +400,27 @@ func TestGeneratedRuntimeRejectsUnsafeNextCacheRootAndTechnology(t *testing.T) {
 }
 
 func TestGeneratedRuntimeCreatedCandidateAllowsUnavailableNetworkUntilHealthCheck(t *testing.T) {
-	spec := candidateSpec()
-	created := false
-	started := false
-	removed := false
-	engine, runner, authoritativeSpec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		switch commandKind(request.Args) {
-		case "image inspect":
-			return runtimeJSON(validImageInspection(spec))
-		case "network inspect":
-			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
-		case "container inspect":
-			identity := request.Args[len(request.Args)-1]
-			if removed || !created || (identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen)) {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
-			}
-			inspection := configuredInspection(spec, defaultLimits())
-			inspection.Running = started
-			inspection.Health = "starting"
-			return runtimeJSON(inspection)
-		case "container create":
-			created = true
-			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID)}}
-		case "container start":
-			started = true
-			return runtimeRequestResult{}
-		case "container rm":
-			if !containsExactArgument(request.Args, "--force") {
-				t.Fatalf("failed candidate cleanup was not forced: %#v", request.Args)
-			}
-			removed = true
-			return runtimeRequestResult{}
-		default:
-			t.Fatalf("unexpected request: %#v", request.Args)
-			return runtimeRequestResult{}
-		}
-	})
-	spec = authoritativeSpec
-	candidate, err := engine.CreateInactiveCandidate(runtimeContext, spec)
-	if err != nil {
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	if _, err := session.execution.CreateAndRecord(invocation); err != nil {
 		t.Fatalf("created candidate rejected before runtime state materialized: %v", err)
 	}
-	if err := engine.StartCandidate(context.Background(), candidate); err != nil {
+	if err := session.execution.StartCandidate(invocation); err != nil {
 		t.Fatalf("created candidate rejected before start: %v", err)
 	}
-	if err := engine.WaitHealthy(context.Background(), candidate); !IsCode(err, DiagnosticCandidateHardeningFailed) {
-		t.Fatalf("health check accepted missing runtime network attachment: %v", err)
+	session.finishStarting(t)
+	program.inspect = func(inspection generatedcontainer.Inspection) generatedcontainer.Inspection {
+		inspection.Networks = map[string]generatedcontainer.NetworkAttachment{}
+		return inspection
 	}
-	if !removed {
-		t.Fatal("fully labeled created candidate was not removed during failure cleanup")
+	if err := session.execution.WaitHealthyAndRecord(invocation); !IsCode(err, DiagnosticCandidateExited) {
+		t.Fatalf("health check accepted missing realized network attachment: %v", err)
 	}
-	findRuntimeRequest(t, runner.requests, "container start")
-	findRuntimeRequest(t, runner.requests, "container rm")
+	for _, request := range session.runner.requests {
+		if commandKind(request.Args) == "container rm" {
+			t.Fatal("health failure implicitly removed a receipt-owned candidate")
+		}
+	}
+	findRuntimeRequest(t, session.runner.requests, "container start")
 }
 
 func TestGeneratedRuntimeStopAndRemoveAllowsUnrealizedCreatedCandidate(t *testing.T) {
@@ -567,6 +452,20 @@ func TestGeneratedRuntimeStopAndRemoveAllowsUnrealizedCreatedCandidate(t *testin
 		t.Fatal("created candidate was not removed")
 	}
 	findRuntimeRequest(t, runner.requests, "container rm")
+}
+
+func TestGeneratedRuntimeStopAndRemoveRefusesReceiptOwnedCandidateBeforeDocker(t *testing.T) {
+	session, _, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	candidate := candidateForSpec(session.authority.spec)
+	if candidate.ContainerName != containerName(session.authority.spec.AppID, session.authority.spec.ComponentName, SlotGreen) || invocation.Identity().ReceiptID == "" {
+		t.Fatalf("test setup did not create a receipt-bound candidate: %+v", candidate)
+	}
+	if err := session.engine.StopAndRemove(session.authority.context, candidate, time.Second); !errors.Is(err, deployments.ErrGeneratedCandidateRetirementUnavailable) {
+		t.Fatalf("legacy removal accepted durable candidate receipt: %v", err)
+	}
+	if len(session.runner.requests) != 0 {
+		t.Fatalf("legacy receipt refusal reached Docker: %#v", session.runner.requests)
+	}
 }
 
 func TestGeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork(t *testing.T) {
@@ -642,141 +541,69 @@ func TestGeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork(t *test
 }
 
 func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testing.T) {
-	root := t.TempDir()
-	directories, err := runtimedocker.PrepareControllerDirectories(root)
-	if err != nil {
-		t.Fatal(err)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	program.inspect = func(inspection generatedcontainer.Inspection) generatedcontainer.Inspection {
+		inspection.Privileged = true
+		return inspection
 	}
-	spec := candidateSpec()
-	networkInspections := 0
-	created := false
-	removed := false
-	runner := &runtimeFakeRunner{}
-	runner.run = func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		switch commandKind(request.Args) {
-		case "image inspect":
-			return runtimeJSON(validImageInspection(spec))
-		case "network inspect":
-			networkInspections++
-			if networkInspections == 1 {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such network")}, err: errors.New("exit")}
-			}
-			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
-		case "network create":
-			return runtimeRequestResult{}
-		case "container inspect":
-			identity := request.Args[len(request.Args)-1]
-			if removed || (!created && identity != testContainerID) || (identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen)) {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
-			}
-			inspection := configuredInspection(spec, defaultLimits())
-			inspection.Privileged = true
-			return runtimeJSON(inspection)
-		case "container create":
-			created = true
-			return runtimeRequestResult{result: runtimeprocess.CommandResult{Stdout: []byte(testContainerID)}}
-		case "container rm":
-			if !containsArgument(request.Args, "--force") {
-				t.Fatalf("unsafe candidate cleanup was not forced: %#v", request.Args)
-			}
-			removed = true
-			return runtimeRequestResult{}
-		default:
-			t.Fatalf("unexpected request: %#v", request.Args)
-			return runtimeRequestResult{}
-		}
-	}
-	authority := newRuntimeNetworkAuthority(t, directories.WorkingDirectory, spec)
-	spec = authority.spec
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, authority.repository, EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = engine.CreateInactiveCandidate(authority.context, spec)
+	_, err := session.execution.CreateAndRecord(invocation)
 	if !IsCode(err, DiagnosticCandidateHardeningFailed) {
 		t.Fatalf("expected hardening failure, got %v", err)
 	}
-	findRuntimeRequest(t, runner.requests, "container rm")
+	if err := session.execution.RemoveInactive(invocation); !IsCode(err, DiagnosticCandidateHardeningFailed) {
+		t.Fatalf("explicit cleanup should recheck hardening, got %v", err)
+	}
+	for _, request := range session.runner.requests {
+		if commandKind(request.Args) == "container rm" {
+			t.Fatal("hardening failure removed a receipt-owned candidate")
+		}
+	}
 }
 
 func TestGeneratedRuntimeReconcilesAmbiguousCreateByDeterministicName(t *testing.T) {
-	spec := candidateSpec()
-	created := false
-	removed := false
-	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		switch commandKind(request.Args) {
-		case "image inspect":
-			return runtimeJSON(validImageInspection(spec))
-		case "network inspect":
-			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
-		case "container inspect":
-			identity := request.Args[len(request.Args)-1]
-			if removed || !created {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
-			}
-			if identity != testContainerID && identity != containerName(spec.AppID, spec.ComponentName, SlotGreen) {
-				t.Fatalf("ambiguous create reconciled through unexpected identity: %q", identity)
-			}
-			return runtimeJSON(hardenedInspection(spec, defaultLimits()))
-		case "container create":
-			created = true
-			return runtimeRequestResult{err: context.DeadlineExceeded}
-		case "container rm":
-			removed = true
-			return runtimeRequestResult{}
-		default:
-			t.Fatalf("unexpected request: %#v", request.Args)
-			return runtimeRequestResult{}
-		}
-	})
-	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	program.create = func() runtimeRequestResult { return runtimeRequestResult{err: context.DeadlineExceeded} }
+	_, err := session.execution.CreateAndRecord(invocation)
 	if !IsCode(err, DiagnosticRuntimeTimeout) {
-		t.Fatalf("expected original create timeout after successful reconciliation, got %v", err)
+		t.Fatalf("expected original create timeout, got %v", err)
 	}
-	if !removed {
-		t.Fatal("ambiguous create was not removed")
+	for _, request := range session.runner.requests {
+		if commandKind(request.Args) == "container rm" {
+			t.Fatal("ambiguous create implicitly removed the candidate")
+		}
 	}
-	findRuntimeRequest(t, runner.requests, "container rm")
+	if err := session.execution.RemoveInactive(invocation); err != nil {
+		t.Fatalf("original invocation could not remove its reconciled candidate: %v", err)
+	}
+	findRuntimeRequest(t, session.runner.requests, "container rm")
 }
 
 func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t *testing.T) {
-	spec := candidateSpec()
-	created := false
-	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		switch commandKind(request.Args) {
-		case "image inspect":
-			return runtimeJSON(validImageInspection(spec))
-		case "network inspect":
-			return runtimeJSON(networkInspection{Name: networkName(spec.AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": spec.AppID}})
-		case "container inspect":
-			if !created {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
-			}
-			inspection := hardenedInspection(spec, defaultLimits())
-			inspection.Labels["io.rig.deployment"] = uuid.NewString()
-			return runtimeJSON(inspection)
-		case "container create":
-			created = true
-			return runtimeRequestResult{err: context.DeadlineExceeded}
-		case "container rm":
-			t.Fatal("container with unproved ownership was removed")
-			return runtimeRequestResult{}
-		default:
-			t.Fatalf("unexpected request: %#v", request.Args)
-			return runtimeRequestResult{}
-		}
+	limits := defaultLimits()
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), limits,
+		fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: uint64(limits.MemoryBytes), DiskAvailableBytes: 1 << 30}})
+	program.create = func() runtimeRequestResult { return runtimeRequestResult{err: context.DeadlineExceeded} }
+	program.inspect = func(inspection generatedcontainer.Inspection) generatedcontainer.Inspection {
+		inspection.Labels["io.rig.deployment"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+		return inspection
+	}
+	_, err := session.execution.CreateAndRecord(invocation)
+	if !IsCode(err, DiagnosticRuntimeTimeout) {
+		t.Fatalf("expected unresolved create timeout, got %v", err)
+	}
+	if err := session.execution.RemoveInactive(invocation); !IsCode(err, DiagnosticCandidateHardeningFailed) {
+		t.Fatalf("unproved ownership cleanup was accepted: %v", err)
+	}
+	competing, acquireErr := session.engine.capacity.acquire(session.authority.context, capacityRequest{
+		memory: uint64(limits.MemoryBytes), disk: session.engine.options.ReplacementDiskBytes,
 	})
-	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
-	if !IsCode(err, DiagnosticCandidateCleanupFailed) {
-		t.Fatalf("expected fail-closed cleanup diagnostic, got %v", err)
+	if competing != nil {
+		competing.Release()
 	}
-	engine.capacity.mu.Lock()
-	reservedMemory := engine.capacity.memory
-	engine.capacity.mu.Unlock()
-	if reservedMemory != uint64(defaultLimits().MemoryBytes) {
-		t.Fatalf("unresolved candidate released admission: reserved=%d", reservedMemory)
+	if !IsCode(acquireErr, DiagnosticInsufficientReplacementSpace) {
+		t.Fatalf("unresolved candidate released admission to a competing replacement: %v", acquireErr)
 	}
-	for _, request := range runner.requests {
+	for _, request := range session.runner.requests {
 		if commandKind(request.Args) == "container rm" {
 			t.Fatal("unowned container reached removal")
 		}
@@ -784,40 +611,22 @@ func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t
 }
 
 func TestGeneratedRuntimeReconcilesAmbiguousStart(t *testing.T) {
-	spec := candidateSpec()
-	candidate := candidateForSpec(spec)
-	started := false
-	removed := false
-	engine, runner, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		switch commandKind(request.Args) {
-		case "container inspect":
-			if removed {
-				return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
-			}
-			inspection := hardenedInspection(spec, defaultLimits())
-			inspection.Running = started
-			if started {
-				inspection.Health = "starting"
-			}
-			return runtimeJSON(inspection)
-		case "container start":
-			started = true
-			return runtimeRequestResult{err: context.DeadlineExceeded}
-		case "container rm":
-			removed = true
-			return runtimeRequestResult{}
-		default:
-			t.Fatalf("unexpected request: %#v", request.Args)
-			return runtimeRequestResult{}
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	if _, err := session.execution.CreateAndRecord(invocation); err != nil {
+		t.Fatal(err)
+	}
+	program.start = func() runtimeRequestResult { return runtimeRequestResult{err: context.DeadlineExceeded} }
+	if err := session.execution.StartCandidate(invocation); err != nil {
+		t.Fatalf("lost acknowledgement did not accept the exact running candidate: %v", err)
+	}
+	if starts := countRuntimeRequests(session.runner.requests, "container start"); starts != 1 {
+		t.Fatalf("lost acknowledgement retried start %d times", starts)
+	}
+	for _, request := range session.runner.requests {
+		if commandKind(request.Args) == "container rm" {
+			t.Fatal("lost start acknowledgement implicitly removed the candidate")
 		}
-	})
-	if err := engine.StartCandidate(context.Background(), candidate); !IsCode(err, DiagnosticRuntimeTimeout) {
-		t.Fatalf("expected original start timeout after successful reconciliation, got %v", err)
 	}
-	if !started || !removed {
-		t.Fatalf("ambiguous start was not reconciled: started=%t removed=%t", started, removed)
-	}
-	findRuntimeRequest(t, runner.requests, "container rm")
 }
 
 func TestGeneratedRuntimeHealthWaitFailsClosed(t *testing.T) {
@@ -825,100 +634,83 @@ func TestGeneratedRuntimeHealthWaitFailsClosed(t *testing.T) {
 		name     string
 		running  bool
 		health   string
-		cancel   bool
 		expected DiagnosticCode
 	}{
 		{name: "unhealthy", running: true, health: "unhealthy", expected: DiagnosticCandidateUnhealthy},
 		{name: "exited", running: false, health: "starting", expected: DiagnosticCandidateExited},
 		{name: "missing health", running: true, health: "", expected: DiagnosticCandidateHardeningFailed},
-		{name: "cancelled", running: true, health: "starting", cancel: true, expected: DiagnosticCancelled},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			spec := candidateSpec()
-			candidate := candidateForSpec(spec)
-			removed := false
-			engine, runner, _, _ := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-				switch commandKind(request.Args) {
-				case "container inspect":
-					if removed {
-						return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte("No such container")}, err: errors.New("exit")}
-					}
-					inspection := hardenedInspection(spec, defaultLimits())
-					inspection.Running = test.running
-					inspection.Health = test.health
-					return runtimeJSON(inspection)
-				case "container rm":
-					if !containsExactArgument(request.Args, "--force") {
-						t.Fatalf("failed candidate cleanup was not forced: %#v", request.Args)
-					}
-					removed = true
-					return runtimeRequestResult{}
-				default:
-					t.Fatalf("unexpected health command: %#v", request.Args)
-					return runtimeRequestResult{}
-				}
-			})
-			ctx := context.Background()
-			if test.cancel {
-				cancelled, cancel := context.WithCancel(ctx)
-				cancel()
-				ctx = cancelled
-				runner.rejectCancelled = true
+			session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+			if _, err := session.execution.CreateAndRecord(invocation); err != nil {
+				t.Fatal(err)
 			}
-			if err := engine.WaitHealthy(ctx, candidate); !IsCode(err, test.expected) {
+			if err := session.execution.StartCandidate(invocation); err != nil {
+				t.Fatal(err)
+			}
+			session.finishStarting(t)
+			program.health = test.health
+			if !test.running {
+				program.running = false
+				program.started = true
+			}
+			if err := session.execution.WaitHealthyAndRecord(invocation); !IsCode(err, test.expected) {
 				t.Fatalf("expected %s, got %v", test.expected, err)
 			}
-			if !removed {
-				t.Fatal("failed health candidate was not removed")
+			for _, request := range session.runner.requests {
+				if commandKind(request.Args) == "container rm" {
+					t.Fatal("failed health candidate was implicitly removed")
+				}
 			}
+			if err := session.execution.RemoveInactive(invocation); err != nil {
+				t.Fatalf("original invocation failed explicit cleanup: %v", err)
+			}
+			findRuntimeRequest(t, session.runner.requests, "container rm")
 		})
 	}
 }
 
 func TestGeneratedRuntimeRefusesNetworkOwnershipDrift(t *testing.T) {
-	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		switch commandKind(request.Args) {
-		case "image inspect":
-			return runtimeJSON(validImageInspection(candidateSpec()))
-		case "network inspect":
-			return runtimeJSON(networkInspection{Name: networkName(candidateSpec().AppID), Driver: "bridge", Scope: "local", Labels: map[string]string{"io.rig.managed": "somebody-else"}})
-		default:
-			t.Fatalf("network drift reached mutation: %#v", request.Args)
-			return runtimeRequestResult{}
-		}
-	})
-	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	program.network = func(network networkInspection) networkInspection {
+		network.Labels["io.rig.managed"] = "somebody-else"
+		return network
+	}
+	_, err := session.execution.CreateAndRecord(invocation)
 	if !IsCode(err, DiagnosticNetworkDriftDetected) {
 		t.Fatalf("expected network drift, got %v", err)
 	}
-	if len(runner.requests) != 2 {
-		t.Fatalf("network drift should stop after two read-only inspections, got %d", len(runner.requests))
+	if len(session.runner.requests) != 2 {
+		t.Fatalf("network drift should stop after two read-only inspections, got %d", len(session.runner.requests))
 	}
 }
 
 func TestGeneratedRuntimeErrorsNeverIncludeDockerOutput(t *testing.T) {
 	secret := "super-secret-docker-output"
-	engine, _, spec, runtimeContext := newRuntimeTestEngine(t, func(runtimeprocess.CommandRequest) runtimeRequestResult {
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	program.image = func(image imageInspection) imageInspection {
+		return image
+	}
+	session.runner.run = func(runtimeprocess.CommandRequest) runtimeRequestResult {
 		return runtimeRequestResult{result: runtimeprocess.CommandResult{Stderr: []byte(secret)}, err: errors.New("exit 1: " + secret)}
-	})
-	_, err := engine.CreateInactiveCandidate(runtimeContext, spec)
+	}
+	_, err := session.execution.CreateAndRecord(invocation)
 	if err == nil || strings.Contains(err.Error(), secret) || !IsCode(err, DiagnosticImageUnavailable) {
 		t.Fatalf("unsafe error classification: %v", err)
 	}
 }
 
-func TestGeneratedRuntimeRejectsInvalidEnvironmentBeforeInspection(t *testing.T) {
-	engine, runner, spec, runtimeContext := newRuntimeTestEngine(t, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
-		t.Fatalf("invalid configuration reached Docker: %#v", request.Args)
-		return runtimeRequestResult{}
-	})
-	spec.Environment = []byte{'A', '=', 'x', 0, 'y'}
-	if _, err := engine.CreateInactiveCandidate(runtimeContext, spec); !IsCode(err, DiagnosticValidationFailed) {
-		t.Fatalf("expected validation failure, got %v", err)
+func TestGeneratedRuntimeRejectsUnavailableProtectedConfiguration(t *testing.T) {
+	session, _, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session.environment.stageError = errors.New("stager unavailable")
+	if _, err := session.execution.CreateAndRecord(invocation); !IsCode(err, DiagnosticConfigurationUnavailable) {
+		t.Fatalf("expected protected configuration failure, got %v", err)
 	}
-	if len(runner.requests) != 0 {
-		t.Fatalf("invalid configuration reached Docker: %d requests", len(runner.requests))
+	for _, request := range session.runner.requests {
+		if commandKind(request.Args) == "container create" {
+			t.Fatal("unavailable protected configuration reached create")
+		}
 	}
 }
 
@@ -1017,7 +809,7 @@ func candidateSpec() CandidateSpec {
 		AppID: "11111111-1111-4111-8111-111111111111", ReleaseID: "22222222-2222-4222-8222-222222222222",
 		DeploymentID: "33333333-3333-4333-8333-333333333333", ArtifactID: "44444444-4444-4444-8444-444444444444",
 		DeploymentPlanRevisionID: "55555555-5555-4555-8555-555555555555", ComponentName: "api", Role: RoleServer, RootDirectory: "apps/api",
-		RunCommand: "node server.js", InternalPort: 3000, HealthProbe: "/health?ready=1", ImageContentID: testImageID,
+		RunCommand: "node server.js", InternalPort: 3000, HealthProbe: "/health", ImageContentID: testImageID,
 		BuildDefinitionDigest: strings.Repeat("d", 64),
 		ActiveSlot:            SlotBlue, EnvironmentOperationID: "66666666-6666-4666-8666-666666666666", EnvironmentOperationAttempt: 1,
 		Environment: []byte("SECRET='value'\n"),
@@ -1221,6 +1013,16 @@ func findRuntimeRequest(t *testing.T, requests []runtimeprocess.CommandRequest, 
 	}
 	t.Fatalf("request %q not found in %#v", kind, requests)
 	return runtimeprocess.CommandRequest{}
+}
+
+func countRuntimeRequests(requests []runtimeprocess.CommandRequest, kind string) int {
+	count := 0
+	for _, request := range requests {
+		if commandKind(request.Args) == kind {
+			count++
+		}
+	}
+	return count
 }
 
 func assertArgumentPair(t *testing.T, args []string, key, value string) {

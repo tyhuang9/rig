@@ -34,8 +34,12 @@ func (r *compilerAttestorRunner) Run(ctx context.Context, request runtimeprocess
 
 type unusedCompilerEnvironment struct{}
 
-func (unusedCompilerEnvironment) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
+func (*unusedCompilerEnvironment) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
 	return nil, errors.New("compiler attestor test unexpectedly staged runtime environment")
+}
+
+func (*unusedCompilerEnvironment) StageGeneratedCandidate(string, int, []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+	return nil, errors.New("compiler attestor test unexpectedly staged candidate environment")
 }
 
 type compilerAttestorCapacity struct{}
@@ -683,7 +687,7 @@ func compilerImageObservation(t *testing.T, fixture *compilerFixture, observedCo
 func newCompilerAttestorEngine(t *testing.T, repository *deployments.Repository, runner runtimeprocess.CommandRunner) *generatedruntime.Engine {
 	t.Helper()
 	root := t.TempDir()
-	engine, err := generatedruntime.NewEngine(runner, unusedCompilerEnvironment{}, compilerAttestorCapacity{}, repository, generatedruntime.EngineOptions{
+	engine, err := generatedruntime.NewEngine(runner, &unusedCompilerEnvironment{}, compilerAttestorCapacity{}, repository, generatedruntime.EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: t.TempDir(), WorkingDirectory: root, CommandTimeout: time.Minute,
 	})
 	if err != nil {

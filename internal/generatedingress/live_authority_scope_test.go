@@ -28,6 +28,7 @@ func TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes(t *testing.T) {
 	_ = liveGeneratedDeployments(t, directories.WorkingDirectory)
 	scoped := deploymenteffects.WithScope(ctx, scope)
 	spec := liveCandidateSpec("blue", uuid.NewString(), uuid.NewString())
+	spec = authority.PrepareCandidate(t, ctx, spec)
 	scoped, bound := authority.bindCandidate(t, scoped, spec)
 	execution, err := authority.repository.PinGeneratedNetwork(scoped, bound.Network)
 	if err != nil {

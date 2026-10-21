@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -50,12 +53,13 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	runner := runtimeprocess.ExecRunner{}
+	runner := &runtimeprocess.ExecRunner{}
 	liveGatewayRequireLocalDocker(t, ctx, runner, docker, root, dockerConfig)
 
 	const (
 		appA = "12121212-1212-4121-8121-121212121212"
 		appB = "34343434-3434-4343-8343-343434343434"
+		appC = "78787878-7878-4787-8787-787878787878"
 		plan = "56565656-5656-4565-8565-565656565656"
 	)
 	networkA, err := generatedruntime.DescribeAppNetwork(appA)
@@ -66,20 +70,25 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	if err != nil {
 		t.Fatal("describe second application network")
 	}
+	networkC, err := generatedruntime.DescribeAppNetwork(appC)
+	if err != nil {
+		t.Fatal("describe replacement fixture network")
+	}
 	images := []liveGatewayImage{
 		{tag: "rig-generated-gateway-live:blue", appID: appA},
 		{tag: "rig-generated-gateway-live:loopback", appID: appA},
-		{tag: "rig-generated-gateway-live:replacement", appID: appA},
+		{tag: "rig-generated-gateway-live:replacement", appID: appC},
 		{tag: "rig-generated-gateway-live:first-loopback", appID: appB},
+		{tag: "rig-generated-gateway-live:replacement-baseline", appID: appC},
 	}
-	liveGatewayRequireCleanPreflight(t, ctx, runner, docker, root, dockerConfig, []string{networkA.Name, networkB.Name}, images)
+	liveGatewayRequireCleanPreflight(t, ctx, runner, docker, root, dockerConfig, []string{networkA.Name, networkB.Name, networkC.Name}, images)
 
 	limits := generatedruntime.ContainerLimits{
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
 	authority := liveGeneratedDeployments(t, working)
-	engine, err := generatedruntime.NewEngine(runner, liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
+	engine, err := generatedruntime.NewEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
@@ -101,10 +110,11 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 
 	var candidates []generatedruntime.Candidate
 	t.Cleanup(func() {
-		liveGatewayCleanup(t, engine, runner, docker, root, dockerConfig, candidates, map[string]string{networkA.Name: appA, networkB.Name: appB}, images)
+		liveGatewayCleanup(t, engine, runner, docker, root, dockerConfig, candidates, map[string]string{networkA.Name: appA, networkB.Name: appB, networkC.Name: appC}, images)
 	})
 
 	blueSpec := liveCandidateSpec("blue", appA, plan)
+	blueSpec = authority.PrepareCandidate(t, ctx, blueSpec)
 	blueSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[0].tag, blueSpec, "blue", "0.0.0.0")
 	blue := startLiveCandidate(t, ctx, engine, authority, blueSpec)
 	candidates = append(candidates, blue)
@@ -119,14 +129,15 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	if err != nil || blueObservation.URL == "" || blueObservation.Slot != blue.Slot || !reflect.DeepEqual(blueObservation.Endpoints, blueRoute.Endpoints) {
 		t.Fatal("healthy blue route was not attested")
 	}
-	engine.ReleaseAdmission(blue)
+	authority.published(t, ctx, ingress, blue)
 
 	loopbackSpec := liveCandidateSpec("green", appA, plan)
 	loopbackSpec.ActiveSlot = blue.Slot
+	loopbackSpec = authority.PrepareCandidate(t, ctx, loopbackSpec)
 	loopbackSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[1].tag, loopbackSpec, "loopback", "127.0.0.1")
 	loopback := createAndStartLiveCandidate(t, ctx, engine, authority, loopbackSpec)
 	candidates = append(candidates, loopback)
-	if err := engine.WaitHealthy(ctx, loopback); err != nil {
+	if err := authority.waitHealthy(loopback); err != nil {
 		failLiveGatewayRuntime(t, "loopback candidate did not pass Docker health", err)
 	}
 
@@ -147,38 +158,52 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 		t.Fatal("blue attested URL changed after loopback rejection")
 	}
 
-	if err := engine.StopAndRemove(ctx, loopback, 0); err != nil {
-		failLiveGatewayRuntime(t, "remove exact loopback candidate", err)
+	if err := engine.StopAndRemove(ctx, loopback, 0); !errors.Is(err, deployments.ErrGeneratedCandidateRetirementUnavailable) {
+		t.Fatal("handed-off candidate bypassed the retirement boundary")
 	}
-	candidates = candidates[:len(candidates)-1]
-	if liveGatewayResourceExists(t, ctx, runner, docker, root, dockerConfig, "container", loopback.ContainerName) {
-		t.Fatal("loopback candidate remains after exact removal")
+	if !liveGatewayResourceExists(t, ctx, runner, docker, root, dockerConfig, "container", loopback.ContainerName) {
+		t.Fatal("unresolved handed-off candidate was removed")
 	}
-	authority.rejectCandidateAuthority(t, loopbackSpec.DeploymentID, blueSpec.DeploymentID)
+	authority.sessions[loopback.DeploymentID].Close()
+	// Post-handoff recovery belongs to the route/retirement owner. Exercise a
+	// successful replacement on a separate application rather than fabricating
+	// failure/completion history to reuse the unresolved application's slot.
+	baselineSpec := liveCandidateSpec("blue", appC, plan)
+	baselineSpec.ReleaseID, baselineSpec.DeploymentID, baselineSpec.ArtifactID = uuid.NewString(), uuid.NewString(), uuid.NewString()
+	baselineSpec = authority.PrepareCandidate(t, ctx, baselineSpec)
+	baselineSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[4].tag, baselineSpec, "replacement-baseline", "0.0.0.0")
+	baseline := startLiveCandidate(t, ctx, engine, authority, baselineSpec)
+	candidates = append(candidates, baseline)
+	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appC, ToSlot: baseline.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(baseline)}}); err != nil {
+		failLiveIngress(t, "route replacement baseline", err)
+	}
+	authority.published(t, ctx, ingress, baseline)
 
-	replacementSpec := liveCandidateSpec("green", appA, plan)
+	replacementSpec := liveCandidateSpec("green", appC, plan)
 	replacementSpec.ReleaseID = "d1111111-1111-4111-8111-111111111111"
 	replacementSpec.DeploymentID = "d2222222-2222-4222-8222-222222222222"
 	replacementSpec.ArtifactID = "d3333333-3333-4333-8333-333333333333"
 	replacementSpec.BuildDefinitionDigest = strings.Repeat("d", 64)
-	replacementSpec.ActiveSlot = blue.Slot
+	replacementSpec.ActiveSlot = baseline.Slot
+	replacementSpec = authority.PrepareCandidate(t, ctx, replacementSpec)
 	replacementSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[2].tag, replacementSpec, "replacement", "0.0.0.0")
 	replacement := startLiveCandidate(t, ctx, engine, authority, replacementSpec)
 	candidates = append(candidates, replacement)
 	replacementRoute := generatedruntime.RouteSwitchRequest{
-		AppID: appA, FromSlot: blue.Slot, ToSlot: replacement.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(replacement)},
+		AppID: appC, FromSlot: baseline.Slot, ToSlot: replacement.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(replacement)},
 	}
 	if err := ingress.Switch(ctx, replacementRoute); err != nil {
 		failLiveIngress(t, "route healthy replacement", err)
 	}
-	assertLiveOneShot(t, ctx, ingress.options.HostPort, appA, "/", "replacement", "healthy replacement did not serve through Caddy")
-	engine.ReleaseAdmission(replacement)
+	assertLiveOneShot(t, ctx, ingress.options.HostPort, appC, "/", "replacement", "healthy replacement did not serve through Caddy")
+	authority.published(t, ctx, ingress, replacement)
 
 	firstSpec := liveCandidateSpec("other", appB, plan)
+	firstSpec = authority.PrepareCandidate(t, ctx, firstSpec)
 	firstSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[3].tag, firstSpec, "first-loopback", "127.0.0.1")
 	firstLoopback := createAndStartLiveCandidate(t, ctx, engine, authority, firstSpec)
 	candidates = append(candidates, firstLoopback)
-	if err := engine.WaitHealthy(ctx, firstLoopback); err != nil {
+	if err := authority.waitHealthy(firstLoopback); err != nil {
 		failLiveGatewayRuntime(t, "first loopback candidate did not pass Docker health", err)
 	}
 	firstRoute := generatedruntime.RouteSwitchRequest{
@@ -194,7 +219,9 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 		t.Fatal("first loopback deployment exposed a verified URL")
 	}
 	liveGatewayAssertCaddyDetached(t, ctx, runner, docker, root, dockerConfig, networkB.Name)
-	assertLiveOneShot(t, ctx, ingress.options.HostPort, appA, "/", "replacement", "first loopback deployment changed committed route")
+	assertLiveOneShot(t, ctx, ingress.options.HostPort, appA, "/", "blue", "first loopback deployment changed retained route")
+	assertLiveOneShot(t, ctx, ingress.options.HostPort, appC, "/", "replacement", "first loopback deployment changed replacement route")
+	authority.sessions[firstLoopback.DeploymentID].Close()
 }
 
 type liveGatewayImage struct {
@@ -383,10 +410,8 @@ func liveGatewayCleanup(t *testing.T, engine *generatedruntime.Engine, runner ru
 	defer cancel()
 	for index := len(candidates) - 1; index >= 0; index-- {
 		candidate := candidates[index]
-		if candidate.ContainerID != "" && engine != nil {
-			if err := engine.StopAndRemove(ctx, candidate, 0); err != nil {
-				t.Errorf("remove exact gateway candidate: %s", liveRuntimeDiagnostic(err))
-			}
+		if candidate.ContainerID != "" {
+			liveGatewayRemoveOwnedCandidate(t, ctx, runner, docker, directory, dockerConfig, candidate)
 		}
 	}
 	liveGatewayRemoveOwnedIngress(t, ctx, runner, docker, directory, dockerConfig)
@@ -412,6 +437,37 @@ func liveGatewayCleanup(t *testing.T, engine *generatedruntime.Engine, runner ru
 		if liveGatewayResourceExists(t, ctx, runner, docker, directory, dockerConfig, "image", image.tag) {
 			t.Errorf("owned fixture image remains after cleanup")
 		}
+	}
+}
+
+// This is disposable fixture teardown, not controller retirement evidence.
+// The candidate ID came from the real owner's create result and every immutable
+// ownership label is checked before removing that exact Docker ID.
+func liveGatewayRemoveOwnedCandidate(t *testing.T, parent context.Context, runner runtimeprocess.CommandRunner, docker, directory, dockerConfig string, candidate generatedruntime.Candidate) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
+	defer cancel()
+	if !liveGatewayResourceExists(t, ctx, runner, docker, directory, dockerConfig, "container", candidate.ContainerName) {
+		return
+	}
+	format := `{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Config.Labels}}}`
+	result, err := runLiveDocker(ctx, runner, docker, directory, dockerConfig, 20*time.Second, "container", "inspect", "--format", format, candidate.ContainerID)
+	var observed struct {
+		ID     string            `json:"id"`
+		Name   string            `json:"name"`
+		Labels map[string]string `json:"labels"`
+	}
+	valid := err == nil && !result.StdoutTruncated && !result.StderrTruncated && json.Unmarshal(result.Stdout, &observed) == nil &&
+		observed.ID == candidate.ContainerID && strings.TrimPrefix(observed.Name, "/") == candidate.ContainerName && liveContainsLabels(observed.Labels, liveCandidateLabels(candidate))
+	clearLiveResult(&result)
+	if !valid {
+		t.Error("fixture candidate ownership is uncertain; retaining resource")
+		return
+	}
+	result, err = runLiveDocker(ctx, runner, docker, directory, dockerConfig, 20*time.Second, "container", "rm", "--force", candidate.ContainerID)
+	clearLiveResult(&result)
+	if err != nil {
+		t.Error("remove exact disposable fixture candidate")
 	}
 }
 

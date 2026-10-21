@@ -128,17 +128,43 @@ type Repository struct {
 	migrationProcess                           runtimeprocess.CommandRunner
 	migrationOptions                           GeneratedMigrationProcessOptions
 	migrationDockerEnv                         []string
+	candidateAuthorityRegistry                 *generatedCandidateAuthorityRegistry
 	afterGeneratedMigrationBeginCommit         func()
 	afterGeneratedMigrationConfigurationExport func(*appconfig.ExecutionConfiguration)
 }
 
-func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }
+func New(db *sql.DB) *Repository {
+	return &Repository{
+		db: db, now: time.Now,
+		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+	}
+}
 
 func NewWithExecutionGuard(db *sql.DB, guard *deploymentexecution.Guard) (*Repository, error) {
 	if db == nil || guard == nil || !guard.UsesDatabase(db) {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
-	return &Repository{db: db, executionGuard: guard, now: time.Now}, nil
+	return &Repository{
+		db: db, executionGuard: guard, now: time.Now,
+		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+	}, nil
+}
+
+// NewWithExecutionGuardAndGeneratedCandidates composes the guarded repository
+// with the protected stores used by the candidate owner. Candidate process,
+// environment and capacity dependencies are fixed by GeneratedCandidateAuthority.
+func NewWithExecutionGuardAndGeneratedCandidates(db *sql.DB, guard *deploymentexecution.Guard,
+	plans *deploymentplans.Store, configuration *appconfig.Store,
+) (*Repository, error) {
+	if db == nil || guard == nil || !guard.UsesDatabase(db) || plans == nil || !plans.ConfiguredFor(db) ||
+		configuration == nil || !configuration.ConfiguredFor(db) {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	return &Repository{
+		db: db, executionGuard: guard, now: time.Now,
+		migrationPlans: plans, migrationConfiguration: configuration,
+		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+	}, nil
 }
 
 // NewWithExecutionGuardAndGeneratedMigration composes the guarded repository
@@ -162,6 +188,7 @@ func NewWithExecutionGuardAndGeneratedMigration(
 		db: db, executionGuard: guard, now: time.Now,
 		migrationPlans: plans, migrationConfiguration: configuration,
 		migrationEnvironment: environment, migrationProcess: process, migrationOptions: options,
+		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
 	}
 	if err := repository.initializeGeneratedMigrationProcess(); err != nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration
@@ -357,7 +384,14 @@ func (r *Repository) Transition(ctx context.Context, appID, deploymentID string,
 		finished = now
 	}
 	summary := diagnosticSummary(diagnosticCode)
-	result, err := tx.ExecContext(ctx, `UPDATE deployments SET status=?,started_at=CASE WHEN ? IN ('applying','waiting_health','succeeded') THEN COALESCE(started_at,?) ELSE started_at END,finished_at=?,diagnostic_code=?,failure_code=?,failure_summary=? WHERE id=? AND app_id=? AND status=?`, next, next, now, finished, nullable(diagnosticCode), nullable(diagnosticCode), nullable(summary), deploymentID, appID, current)
+	condition := ""
+	if next == Failed || next == Cancelled {
+		// A concurrent BeginCreate can install an intent after a caller's read.
+		// Only the candidate owner's confirmed-failure transaction may terminalize
+		// that deployment; enforce the boundary in this writer as well.
+		condition = " AND NOT EXISTS (SELECT 1 FROM generated_candidate_intents i WHERE i.deployment_id=deployments.id)"
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE deployments SET status=?,started_at=CASE WHEN ? IN ('applying','waiting_health','succeeded') THEN COALESCE(started_at,?) ELSE started_at END,finished_at=?,diagnostic_code=?,failure_code=?,failure_summary=? WHERE id=? AND app_id=? AND status=?`+condition, next, next, now, finished, nullable(diagnosticCode), nullable(diagnosticCode), nullable(summary), deploymentID, appID, current)
 	if err != nil {
 		return Deployment{}, err
 	}

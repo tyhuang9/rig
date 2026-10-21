@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
@@ -172,7 +173,16 @@ func newGeneratedImageTestAuthorityWithDependencies(t *testing.T, db *sql.DB, re
 		if err != nil {
 			t.Fatal(err)
 		}
-		repository, err = deployments.NewWithExecutionGuard(db, guard)
+		protectedRoot := t.TempDir()
+		plans, err := deploymentplans.New(db, protectedRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		configuration, err := appconfig.New(db, protectedRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		repository, err = deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
 		if err != nil {
 			t.Fatal(err)
 		}
