@@ -16,7 +16,7 @@ type authorizationStore interface {
 }
 
 type replacementReserver interface {
-	ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error)
+	ReserveReplacement(context.Context, deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error)
 }
 
 // RepositoryAuthorizationGate revalidates immutable deployment/plan identity,
@@ -49,7 +49,8 @@ func (g *RepositoryAuthorizationGate) Authorize(ctx context.Context, request Aut
 	}
 	if !deployment.ProvenanceInitialized || deployment.RuntimeStrategy != deployments.RuntimeGeneratedNode ||
 		deployment.ReleaseID != request.ReleaseID || deployment.DeploymentPlanRevisionID != request.DeploymentPlanRevisionID ||
-		deployment.DeploymentPlanRevisionNumber != request.DeploymentPlanRevisionNumber {
+		deployment.DeploymentPlanRevisionNumber != request.DeploymentPlanRevisionNumber ||
+		deployment.ActualConfigurationRevisionID != request.ConfigurationRevisionID || deployment.ActualConfigurationRevisionNumber != request.ConfigurationRevisionNumber {
 		return nil, errors.New("generated deployment provenance is unavailable")
 	}
 	plan, err := g.plans.GetRevision(ctx, request.AppID, request.DeploymentPlanRevisionID, request.DeploymentPlanRevisionNumber)
@@ -63,7 +64,12 @@ func (g *RepositoryAuthorizationGate) Authorize(ctx context.Context, request Aut
 	if plan.Plan.Migration != nil && plan.Plan.Migration.Approval.Status != deploymentplans.MigrationApprovalApproved {
 		return nil, deployments.ErrApprovalRequired
 	}
-	reservation, err := g.capacity.ReserveReplacement(ctx, request.ComponentCount)
+	reservation, err := g.capacity.ReserveReplacement(ctx, deployments.GeneratedReplacementRequest{
+		Claim: request.Claim, DeploymentID: request.DeploymentID, ReleaseID: request.ReleaseID,
+		ConfigurationRevisionID: request.ConfigurationRevisionID, ConfigurationRevisionNumber: request.ConfigurationRevisionNumber,
+		DeploymentPlanRevisionID: request.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: request.DeploymentPlanRevisionNumber,
+		CandidateSlot: string(request.CandidateSlot), Findings: append([]deployments.Finding(nil), request.Findings...),
+	})
 	if generatedruntime.IsCode(err, generatedruntime.DiagnosticInsufficientReplacementSpace) {
 		return nil, ErrInsufficientReplacementCapacity
 	}
@@ -85,7 +91,7 @@ func (g *RepositoryAuthorizationGate) Authorize(ctx context.Context, request Aut
 	default:
 		return nil, deployments.ErrInvalidTransition
 	}
-	if err = g.deployments.Gate(ctx, deployments.GateRequest{Claim: request.Claim, DeploymentID: request.DeploymentID}); err != nil {
+	if err = g.deployments.Gate(ctx, deployments.GateRequest{Claim: request.Claim, DeploymentID: request.DeploymentID, Findings: append([]deployments.Finding(nil), request.Findings...)}); err != nil {
 		return nil, err
 	}
 	releaseOnFailure = false

@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedcontainer"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -64,13 +65,12 @@ type EngineOptions struct {
 
 type Engine struct {
 	runner      runtimeprocess.CommandRunner
-	environment EnvironmentStager
 	capacity    *capacityGate
 	deployments *deployments.Repository
+	candidates  *deployments.GeneratedCandidateAuthority
 	options     EngineOptions
 	dockerEnv   []string
 	networkMu   sync.Mutex
-	candidateMu sync.Mutex
 
 	afterNetworkCommandPrepared func()
 }
@@ -111,314 +111,68 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{runner: runner, environment: environment, capacity: gate, deployments: deploymentRepository, options: options, dockerEnv: dockerEnv}, nil
-}
-
-// ReserveReplacement atomically admits all components required for one
-// blue/green replacement. Callers release the opaque reservation on every
-// terminal, failed, or paused path.
-func (e *Engine) ReserveReplacement(ctx context.Context, componentCount int) (ReplacementReservation, error) {
-	if e == nil || ctx == nil || componentCount < 1 || componentCount > 2 {
-		return nil, &Error{Code: DiagnosticValidationFailed}
+	candidateEnvironment, ok := environment.(deployments.GeneratedCandidateEnvironmentStager)
+	if !ok {
+		return nil, errors.New("generated candidate environment owner is required")
 	}
-	lease, err := e.capacity.acquireCount(ctx, capacityRequest{
-		memory: uint64(e.options.Limits.MemoryBytes),
-		disk:   e.options.ReplacementDiskBytes,
-	}, componentCount)
+	candidates, err := deploymentRepository.GeneratedCandidateAuthority(runner, candidateEnvironment, gate.budget, deployments.GeneratedCandidateProcessOptions{
+		DockerExecutable: options.DockerExecutable, DockerEndpoint: options.DockerEndpoint,
+		DockerConfigDirectory: options.DockerConfigDirectory, WorkingDirectory: options.WorkingDirectory,
+		CommandTimeout: options.CommandTimeout, HealthTimeout: options.HealthTimeout,
+		HealthPollInterval: options.HealthPollInterval, OutputLimit: options.OutputLimit,
+		MemoryBytes: options.Limits.MemoryBytes, MilliCPUs: options.Limits.MilliCPUs, PIDs: options.Limits.PIDs,
+		TmpfsBytes: options.Limits.TmpfsBytes, LogSize: options.Limits.LogSize, LogFiles: options.Limits.LogFiles,
+		ReplacementDiskBytes: options.ReplacementDiskBytes,
+	})
 	if err != nil {
 		return nil, err
 	}
-	return &replacementReservation{
-		owner: e.capacity, lease: lease, limit: componentCount,
-		components: make(map[string]struct{}, componentCount),
-	}, nil
+	return &Engine{runner: runner, capacity: gate, deployments: deploymentRepository, candidates: candidates, options: options, dockerEnv: dockerEnv}, nil
 }
 
-// RetainReplacementCapacity irreversibly keeps a replacement aggregate
-// charged when network uncertainty means candidate absence cannot be proven.
+// ReserveReplacement derives the complete protected roster through the
+// repository owner before the deployment gate and image preparation.
+func (e *Engine) ReserveReplacement(ctx context.Context, request deployments.GeneratedReplacementRequest) (ReplacementReservation, error) {
+	if e == nil || e.candidates == nil {
+		return nil, &Error{Code: DiagnosticValidationFailed}
+	}
+	return e.candidates.ReserveReplacement(ctx, request)
+}
+
 func (e *Engine) RetainReplacementCapacity(reservation ReplacementReservation) error {
-	if e == nil || e.capacity == nil || reservation == nil {
-		return &Error{Code: DiagnosticInternalError}
-	}
-	concrete, ok := reservation.(*replacementReservation)
-	if !ok || !concrete.retain(e.capacity) {
-		return &Error{Code: DiagnosticInternalError}
-	}
-	return nil
-}
-
-// AdoptCandidate consumes the matching share for a durable candidate during
-// daemon-restart recovery without inspecting or mutating Docker.
-func (e *Engine) AdoptCandidate(candidate Candidate, reservation ReplacementReservation) (Candidate, error) {
-	if e == nil || !validCandidate(candidate) || reservation == nil {
-		return Candidate{}, &Error{Code: DiagnosticValidationFailed}
-	}
-	value, ok := reservation.(*replacementReservation)
-	if !ok {
-		return Candidate{}, &Error{Code: DiagnosticValidationFailed}
-	}
-	if accepted, _ := value.consume(e.capacity, candidate.Component); !accepted {
-		return Candidate{}, &Error{Code: DiagnosticInsufficientReplacementSpace}
-	}
-	return candidate, nil
-}
-
-func (e *Engine) CreateInactiveCandidate(ctx context.Context, spec CandidateSpec) (Candidate, error) {
-	defer clear(spec.Environment)
-	if e == nil || ctx == nil || !validCandidateSpec(spec) {
-		return Candidate{}, &Error{Code: DiagnosticValidationFailed}
-	}
-	slot, err := InactiveSlot(spec.ActiveSlot)
-	if err != nil {
-		return Candidate{}, &Error{Code: DiagnosticValidationFailed}
-	}
-	image, err := e.inspectImage(ctx, spec)
-	if err != nil {
-		return Candidate{}, err
-	}
-	var lease *capacityLease
-	var reservation *replacementReservation
-	reservationConsumed := false
-	if spec.Reservation != nil {
-		var ok bool
-		reservation, ok = spec.Reservation.(*replacementReservation)
-		if !ok {
-			return Candidate{}, &Error{Code: DiagnosticValidationFailed}
-		}
-		accepted, newlyConsumed := reservation.consume(e.capacity, spec.ComponentName)
-		if !accepted {
-			return Candidate{}, &Error{Code: DiagnosticInsufficientReplacementSpace}
-		}
-		reservationConsumed = newlyConsumed
-	} else {
-		lease, err = e.capacity.acquire(ctx, capacityRequest{memory: uint64(e.options.Limits.MemoryBytes), disk: e.options.ReplacementDiskBytes})
-		if err != nil {
-			return Candidate{}, err
-		}
-	}
-	releaseOnFailure := true
-	defer func() {
-		if releaseOnFailure {
-			lease.Release()
-			if reservationConsumed {
-				reservation.unconsume(spec.ComponentName)
-			}
-		}
-	}()
-
-	network := networkName(spec.AppID)
-	if !sameGeneratedNetworkCandidate(spec.Network, spec) {
-		return Candidate{}, networkBoundaryFailure(DiagnosticValidationFailed, deployments.ErrInvalidDeployment)
-	}
-	if err := e.ensureNetwork(ctx, spec.Network, network); err != nil {
-		return Candidate{}, err
-	}
-	name := containerName(spec.AppID, spec.ComponentName, slot)
-	alias := containerAlias(spec.ComponentName, slot)
-
-	// Docker container names are the final cross-process exclusion boundary;
-	// this mutex avoids needless same-process create races and makes fake-driven
-	// verification deterministic.
-	e.candidateMu.Lock()
-	defer e.candidateMu.Unlock()
-	if _, found, inspectErr := e.inspectContainer(ctx, name); inspectErr != nil {
-		return Candidate{}, inspectErr
-	} else if found {
-		return Candidate{}, &Error{Code: DiagnosticCandidateSlotOccupied}
-	}
-
-	var environmentLease EnvironmentLease
-	if len(spec.Environment) > 0 {
-		environmentLease, err = e.environment.Stage(spec.EnvironmentOperationID, spec.EnvironmentOperationAttempt, spec.Environment)
-		spec.Environment = nil
-		if err != nil || environmentLease == nil || !validAbsolutePath(environmentLease.Path()) {
-			if environmentLease != nil {
-				_ = environmentLease.Cleanup()
-			}
-			return Candidate{}, &Error{Code: DiagnosticConfigurationUnavailable}
-		}
-	} else {
-		spec.Environment = nil
-	}
-	cleaned := false
-	cleanupEnvironment := func() error {
-		if cleaned {
-			return nil
-		}
-		cleaned = true
-		if environmentLease == nil {
-			return nil
-		}
-		return environmentLease.Cleanup()
-	}
-	defer func() { _ = cleanupEnvironment() }()
-
-	workingDirectory := runtimeWorkingDirectory(spec.RootDirectory)
-	labels := runtimeLabels(spec, slot)
-	candidate := Candidate{
-		AppID: spec.AppID, ReleaseID: spec.ReleaseID, DeploymentID: spec.DeploymentID,
-		ArtifactID: spec.ArtifactID, DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID,
-		Component: spec.ComponentName, Role: spec.Role, Technology: spec.Technology, Slot: slot,
-		ContainerName: name, NetworkName: network, NetworkAlias: alias,
-		InternalPort: spec.InternalPort, ImageContentID: spec.ImageContentID,
-		WorkingDirectory: workingDirectory, RunCommandDigest: sha256Hex(spec.RunCommand), lease: lease,
-	}
-	args := []string{
-		"container", "create",
-		"--name", name,
-		"--hostname", name,
-		"--network", network,
-		"--network-alias", alias,
-	}
-	if environmentLease != nil {
-		args = append(args, "--env-file", environmentLease.Path())
-	}
-	args = append(args,
-		"--env", "RIG_RUNTIME_INTERNAL_PORT="+strconv.FormatUint(uint64(spec.InternalPort), 10),
-		"--env", "RIG_RUNTIME_HEALTH_PATH="+spec.HealthProbe,
-		"--user", containerUser,
-		"--workdir", workingDirectory,
-		"--read-only",
-		"--init",
-		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size="+strconv.FormatInt(e.options.Limits.TmpfsBytes, 10),
-		"--cap-drop", "ALL",
-		"--security-opt", "no-new-privileges=true",
-		"--memory", strconv.FormatInt(e.options.Limits.MemoryBytes, 10),
-		"--memory-swap", strconv.FormatInt(e.options.Limits.MemoryBytes, 10),
-		"--cpus", formatCPUs(e.options.Limits.MilliCPUs),
-		"--pids-limit", strconv.FormatInt(e.options.Limits.PIDs, 10),
-		"--ulimit", "nofile=1024:1024",
-		"--log-driver", "local",
-		"--log-opt", "max-size="+e.options.Limits.LogSize,
-		"--log-opt", "max-file="+strconv.Itoa(e.options.Limits.LogFiles),
-		"--restart", "no",
-		"--health-cmd", healthCommand,
-		"--health-interval", "2s",
-		"--health-timeout", "2s",
-		"--health-start-period", "5s",
-		"--health-retries", "3",
-	)
-	if spec.Technology == "nextjs" {
-		args = append(args, "--tmpfs", nextCacheDirectory(workingDirectory)+":rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size="+strconv.FormatInt(nextCacheTmpfsBytes, 10))
-	}
-	for _, key := range sortedKeys(labels) {
-		args = append(args, "--label", key+"="+labels[key])
-	}
-	args = append(args, spec.ImageContentID, "/bin/sh", "-lc", spec.RunCommand)
-	result, runErr := e.run(ctx, args, e.options.CommandTimeout)
-	containerID := strings.TrimSpace(string(result.Stdout))
-	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCreateFailed)
-	clearResult(&result)
-	if diagnostic != "" || !lowerHex(containerID, 64) {
-		if lowerHex(containerID, 64) {
-			candidate.ContainerID = containerID
-		}
-		if cleanupErr := e.cleanupOwnedCandidate(ctx, candidate, name); cleanupErr != nil {
-			releaseOnFailure = false
-			return Candidate{}, cleanupErr
-		}
-		if diagnostic == "" {
-			diagnostic = DiagnosticCandidateCreateFailed
-		}
-		return Candidate{}, &Error{Code: diagnostic}
-	}
-	candidate.ContainerID = containerID
-	if err := cleanupEnvironment(); err != nil {
-		if cleanupErr := e.cleanupOwnedCandidate(ctx, candidate, name); cleanupErr != nil {
-			releaseOnFailure = false
-			return Candidate{}, cleanupErr
-		}
-		return Candidate{}, &Error{Code: DiagnosticConfigurationUnavailable}
-	}
-
-	container, found, err := e.inspectContainer(ctx, containerID)
-	if err != nil || !found || !matchesCreatedContainer(container, spec, candidate, image.ID, workingDirectory, labels, e.options.Limits) {
-		if cleanupErr := e.cleanupOwnedCandidate(ctx, candidate, name); cleanupErr != nil {
-			releaseOnFailure = false
-			return Candidate{}, cleanupErr
-		}
-		return Candidate{}, &Error{Code: DiagnosticCandidateHardeningFailed}
-	}
-	releaseOnFailure = false
-	return candidate, nil
-}
-
-func (e *Engine) StartCandidate(ctx context.Context, candidate Candidate) error {
-	if e == nil || ctx == nil || !validCandidate(candidate) {
+	if e == nil || e.candidates == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
-	container, found, err := e.inspectContainer(ctx, candidate.ContainerID)
-	if err != nil {
-		return e.failInactiveCandidate(ctx, candidate, err)
-	}
-	if !found || !matchesCandidateConfiguredHardening(container, candidate, e.options.Limits) {
-		return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateHardeningFailed})
-	}
-	result, runErr := e.run(ctx, []string{"container", "start", candidate.ContainerID}, e.options.CommandTimeout)
-	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateStartFailed)
-	clearResult(&result)
-	if diagnostic != "" {
-		return e.failInactiveCandidate(ctx, candidate, &Error{Code: diagnostic})
-	}
-	return nil
+	return e.candidates.RetainReplacementCapacity(reservation)
 }
 
-func (e *Engine) WaitHealthy(ctx context.Context, candidate Candidate) error {
-	if e == nil || ctx == nil || !validCandidate(candidate) {
-		return &Error{Code: DiagnosticValidationFailed}
+// PinCandidates forwards only immutable identities and sealed accounting.
+// Candidate commands, secret staging and result transactions stay in the owner.
+func (e *Engine) PinCandidates(ctx context.Context, request deployments.GeneratedCandidateRequest, reservation ReplacementReservation) (*deployments.GeneratedCandidateExecution, error) {
+	if e == nil || e.candidates == nil {
+		return nil, &Error{Code: DiagnosticValidationFailed}
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, e.options.HealthTimeout)
-	defer cancel()
-	for {
-		container, found, err := e.inspectContainer(waitCtx, candidate.ContainerID)
-		if err != nil {
-			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
-				return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateUnhealthy})
-			}
-			return e.failInactiveCandidate(ctx, candidate, err)
-		}
-		if !found || !matchesCandidateHardening(container, candidate, e.options.Limits) {
-			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateHardeningFailed})
-		}
-		if !container.Running {
-			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateExited})
-		}
-		switch container.Health {
-		case "healthy":
-			return nil
-		case "unhealthy":
-			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateUnhealthy})
-		case "starting":
-		default:
-			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateHardeningFailed})
-		}
-		timer := time.NewTimer(e.options.HealthPollInterval)
-		select {
-		case <-waitCtx.Done():
-			timer.Stop()
-			if errors.Is(ctx.Err(), context.Canceled) {
-				return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCancelled})
-			}
-			return e.failInactiveCandidate(ctx, candidate, &Error{Code: DiagnosticCandidateUnhealthy})
-		case <-timer.C:
-		}
-	}
+	return e.candidates.PinCandidates(ctx, request, reservation)
 }
 
-// StopAndRemove performs the post-drain cleanup. It releases capacity only
-// after Docker confirms removal; a failed cleanup remains reserved so another
-// deployment cannot overcommit the host.
+// StopAndRemove is retained only for legacy predecessors without a candidate
+// receipt. Receipt-owned targets require the bound retirement owner.
 func (e *Engine) StopAndRemove(ctx context.Context, candidate Candidate, grace time.Duration) error {
 	if e == nil || ctx == nil || !validCandidate(candidate) || grace < 0 || grace > 30*time.Second {
 		return &Error{Code: DiagnosticValidationFailed}
+	}
+	if err := e.checkLegacyRemoval(ctx, candidate); err != nil {
+		return err
 	}
 	container, found, err := e.inspectContainer(ctx, candidate.ContainerID)
 	if err != nil {
 		return err
 	}
 	if !found {
-		candidate.lease.Release()
 		return nil
+	}
+	if container.Labels[generatedcontainer.ReceiptLabel] != "" {
+		return deployments.ErrGeneratedCandidateRetirementUnavailable
 	}
 	if !matchesCandidateOwnership(container, candidate) {
 		return &Error{Code: DiagnosticCandidateHardeningFailed}
@@ -428,6 +182,9 @@ func (e *Engine) StopAndRemove(ctx context.Context, candidate Candidate, grace t
 		if grace%time.Second != 0 {
 			seconds++
 		}
+		if err := e.checkLegacyRemoval(ctx, candidate); err != nil {
+			return err
+		}
 		result, runErr := e.run(ctx, []string{"container", "stop", "--time", strconv.FormatInt(seconds, 10), candidate.ContainerID}, grace+e.options.CommandTimeout)
 		diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCleanupFailed)
 		clearResult(&result)
@@ -435,21 +192,24 @@ func (e *Engine) StopAndRemove(ctx context.Context, candidate Candidate, grace t
 			return &Error{Code: diagnostic}
 		}
 	}
+	if err := e.checkLegacyRemoval(ctx, candidate); err != nil {
+		return err
+	}
 	result, runErr := e.run(ctx, []string{"container", "rm", candidate.ContainerID}, e.options.CommandTimeout)
 	diagnostic := e.commandDiagnostic(ctx, result, runErr, DiagnosticCandidateCleanupFailed)
 	clearResult(&result)
 	if diagnostic != "" {
 		return &Error{Code: diagnostic}
 	}
-	candidate.lease.Release()
 	return nil
 }
 
-// ReleaseAdmission is called after a candidate becomes the active slot and
-// the old slot has been removed. Actual usage is then reflected by the next
-// host capacity snapshot.
-func (e *Engine) ReleaseAdmission(candidate Candidate) {
-	candidate.lease.Release()
+func (e *Engine) checkLegacyRemoval(ctx context.Context, candidate Candidate) error {
+	if e == nil || e.deployments == nil {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	return e.deployments.CheckLegacyGeneratedCandidateRemoval(ctx, candidate.AppID, candidate.DeploymentID,
+		candidate.Component, candidate.ContainerName, candidate.ContainerID)
 }
 
 // ValidateImage is a read-only preflight. It proves that an artifact still
@@ -486,14 +246,6 @@ func (e *Engine) EnsureAppNetwork(ctx context.Context, request deployments.Gener
 		return networkBoundaryFailure(DiagnosticValidationFailed, deployments.ErrInvalidDeployment)
 	}
 	return e.ensureNetwork(ctx, request, networkName(request.Claim.ApplicationID()))
-}
-
-func (e *Engine) inspectImage(ctx context.Context, spec CandidateSpec) (imageInspection, error) {
-	return e.inspectImageSpec(ctx, ImageSpec{
-		AppID: spec.AppID, ReleaseID: spec.ReleaseID, ArtifactID: spec.ArtifactID,
-		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, ImageContentID: spec.ImageContentID,
-		ComponentName: spec.ComponentName, Role: spec.Role, BuildDefinitionDigest: spec.BuildDefinitionDigest,
-	})
 }
 
 func (e *Engine) ensureNetwork(ctx context.Context, request deployments.GeneratedNetworkRequest, name string) error {
@@ -611,55 +363,6 @@ func (e *Engine) inspectContainer(ctx context.Context, identity string) (contain
 	return container, true, nil
 }
 
-func (e *Engine) failInactiveCandidate(ctx context.Context, candidate Candidate, cause error) error {
-	if cleanupErr := e.cleanupOwnedCandidate(ctx, candidate, candidate.ContainerName); cleanupErr != nil {
-		return cleanupErr
-	}
-	return cause
-}
-
-// cleanupOwnedCandidate reconciles uncertain Docker mutations without trusting
-// command output. It removes only a container whose deterministic identity and
-// complete ownership labels match the candidate, and releases admission only
-// after a follow-up inspection proves the container is absent.
-func (e *Engine) cleanupOwnedCandidate(parent context.Context, candidate Candidate, identity string) error {
-	if identity == "" {
-		return &Error{Code: DiagnosticCandidateCleanupFailed}
-	}
-	timeout := 3 * e.options.CommandTimeout
-	if timeout > 5*time.Minute {
-		timeout = 5 * time.Minute
-	}
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), timeout)
-	defer cancel()
-
-	container, found, err := e.inspectContainer(cleanupCtx, identity)
-	if err != nil {
-		return &Error{Code: DiagnosticCandidateCleanupFailed}
-	}
-	if !found {
-		candidate.lease.Release()
-		return nil
-	}
-	if !validImageContainerID(container.ID) || (candidate.ContainerID != "" && candidate.ContainerID != container.ID) {
-		return &Error{Code: DiagnosticCandidateCleanupFailed}
-	}
-	candidate.ContainerID = container.ID
-	if !matchesCandidateOwnership(container, candidate) {
-		return &Error{Code: DiagnosticCandidateCleanupFailed}
-	}
-
-	result, runErr := e.run(cleanupCtx, []string{"container", "rm", "--force", candidate.ContainerID}, e.options.CommandTimeout)
-	_ = e.commandDiagnostic(cleanupCtx, result, runErr, DiagnosticCandidateCleanupFailed)
-	clearResult(&result)
-	_, found, err = e.inspectContainer(cleanupCtx, candidate.ContainerID)
-	if err != nil || found {
-		return &Error{Code: DiagnosticCandidateCleanupFailed}
-	}
-	candidate.lease.Release()
-	return nil
-}
-
 func (e *Engine) run(ctx context.Context, args []string, timeout time.Duration) (runtimeprocess.CommandResult, error) {
 	request, err := e.prepareCommand(args, timeout)
 	if err != nil {
@@ -702,14 +405,6 @@ func contextCause(ctx context.Context) error {
 		return nil
 	}
 	return ctx.Err()
-}
-
-func sameGeneratedNetworkCandidate(request deployments.GeneratedNetworkRequest, spec CandidateSpec) bool {
-	return request.Claim.ApplicationID() == spec.AppID && request.DeploymentID == spec.DeploymentID &&
-		request.ReleaseID == spec.ReleaseID && request.ConfigurationRevisionID == spec.ConfigurationRevisionID &&
-		request.ConfigurationRevisionNumber == spec.ConfigurationRevisionNumber &&
-		request.DeploymentPlanRevisionID == spec.DeploymentPlanRevisionID &&
-		request.DeploymentPlanRevisionNumber == spec.DeploymentPlanRevisionNumber
 }
 
 func (e *Engine) commandDiagnostic(ctx context.Context, result runtimeprocess.CommandResult, err error, fallback DiagnosticCode) DiagnosticCode {

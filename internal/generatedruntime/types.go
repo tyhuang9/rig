@@ -1,6 +1,6 @@
-// Package generatedruntime owns the Docker execution boundary for images
-// produced by the generated-image compiler. It deliberately contains no job
-// orchestration or durable deployment state.
+// Package generatedruntime composes generated container execution. Candidate
+// lifecycle commands delegate to the repository-owned authority; retained
+// lifecycle and the legacy predecessor adapter keep their dedicated boundaries.
 package generatedruntime
 
 import (
@@ -67,7 +67,11 @@ func (e *Error) Error() string { return "generated runtime: " + string(e.Code) }
 
 func IsCode(err error, code DiagnosticCode) bool {
 	var target *Error
-	return errors.As(err, &target) && target.Code == code
+	if errors.As(err, &target) && target.Code == code {
+		return true
+	}
+	var candidate *deployments.GeneratedCandidateError
+	return errors.As(err, &candidate) && candidate.Code == string(code)
 }
 
 type networkBoundaryError struct {
@@ -121,11 +125,11 @@ type CandidateSpec struct {
 	ActiveSlot                   Slot
 	EnvironmentOperationID       string
 	EnvironmentOperationAttempt  int
-	// Environment is protected configuration exported for this exact release.
-	// CreateInactiveCandidate takes ownership and clears it before returning.
+	// Environment describes fixture configuration. Production candidate
+	// commands obtain configuration through the protected repository owner.
 	Environment []byte
-	// Reservation is an opaque, process-local aggregate admission acquired
-	// before the final deployment gate. Direct callers may leave it nil.
+	// Reservation is sealed protected-roster admission. Descriptions carry no
+	// authority to invoke or release a candidate command.
 	Reservation ReplacementReservation
 	// Network carries the original immutable deployment authority for the
 	// hidden application-network boundary inside candidate creation.
@@ -164,16 +168,10 @@ type Candidate struct {
 	ImageContentID           string
 	WorkingDirectory         string
 	RunCommandDigest         string
-
-	lease *capacityLease
 }
 
-// ReplacementReservation represents one atomic admission for every
-// component in a blue/green replacement. Resource and share accounting are
-// intentionally opaque to coordinators.
-type ReplacementReservation interface {
-	Release()
-}
+// ReplacementReservation is the repository's sealed protected-roster handle.
+type ReplacementReservation = deployments.GeneratedReplacementReservation
 
 // CandidateDescription exposes only deterministic, non-secret resource
 // identity. Coordinators persist it before Docker mutation so recovery never

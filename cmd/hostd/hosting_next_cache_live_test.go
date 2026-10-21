@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -22,6 +23,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
@@ -72,7 +74,6 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	}
 	tag := "rig-live-nextjs:" + uuid.NewString()
 	t.Cleanup(func() { nextLiveCleanup(t, docker, appID, network.Name, tag) })
-	imageID := nextLiveBuildImage(t, ctx, docker, root, tag, appID, releaseID, artifactID, planID)
 	staging, err := securetemp.NewGeneratedRuntime(dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +82,7 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := runtimeprocess.ExecRunner{}
+	runner := &runtimeprocess.ExecRunner{}
 	db, err := database.Open(dataRoot)
 	if err != nil {
 		t.Fatal("open Next cache controller database")
@@ -117,20 +118,32 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 		AppID: appID, ReleaseID: releaseID, DeploymentID: uuid.NewString(), ArtifactID: artifactID,
 		DeploymentPlanRevisionID: planID, ComponentName: "web", Role: generatedruntime.RoleServer, Technology: "nextjs",
 		RootDirectory: ".", RunCommand: "npm run start", InternalPort: 3000, HealthProbe: "/api/health",
-		ImageContentID: imageID, BuildDefinitionDigest: fmt.Sprintf("%x", definition),
+		BuildDefinitionDigest: fmt.Sprintf("%x", definition),
 	}
-	// The engine clears its own input buffer after staging. Keep only synthetic
-	// identifiers in assertions and never log Docker configuration or response bodies.
+	// Persist fixture values in the protected scoped store before admission.
+	// The candidate owner alone exports them for the exact selected revision.
 	firstSecret, secondSecret := "next-runtime-"+uuid.NewString(), "next-runtime-"+uuid.NewString()
 	spec.EnvironmentOperationID, spec.EnvironmentOperationAttempt = uuid.NewString(), 1
 	spec.Environment = []byte("RIG_FIXTURE_RUNTIME_SECRET=" + firstSecret + "\nRIG_FIXTURE_SLOT_MARKER=blue\n")
-	blue := nextLiveStart(t, ctx, engine, authority, spec)
-	defer func() { _ = engine.StopAndRemove(context.Background(), blue, 0) }()
+	spec = authority.PrepareCandidate(t, ctx, spec)
+	blueSession := authority.Begin(t, ctx, engine, spec)
+	defer blueSession.Close()
+	spec = blueSession.BoundSpec()
+	spec.ImageContentID = nextLiveBuildImage(t, ctx, docker, root, tag, appID, releaseID, artifactID, spec.DeploymentPlanRevisionID)
+	blue, err := blueSession.Start(t, spec)
+	if err != nil {
+		t.Fatal("start Next candidate:", err)
+	}
+	if err := blueSession.WaitHealthyAndHandoff(); err != nil {
+		t.Fatal("Next candidate unhealthy:", err)
+	}
 	assertNextLiveContainer(t, ctx, docker, blue, firstSecret)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{nextLiveEndpoint(blue)}}); err != nil {
 		t.Fatal("route initial Next server:", err)
 	}
 	nextLiveAttestedEndpoint(t, ctx, ingress, appID, blue)
+	nextLiveRecordPublished(t, ctx, ingress, appID, blueSession)
+	blueSession.Close()
 	base := "http://127.0.0.1:" + strconv.Itoa(int(port))
 	nextLiveRequest(t, ctx, base, appID, "/", http.StatusOK, "next-public-A", firstSecret)
 	nextLiveRequest(t, ctx, base, appID, "/api/health", http.StatusOK, `"status":"ok"`, firstSecret)
@@ -140,17 +153,25 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	if _, err := controllerJourneyDocker(ctx, docker, nil, "container", "restart", blue.ContainerID); err != nil {
 		t.Fatal("restart exact Next candidate")
 	}
-	if err := engine.WaitHealthy(ctx, blue); err != nil {
-		t.Fatal("recover Next candidate after restart:", err)
-	}
+	nextLiveWaitRestartHealth(t, ctx, docker, blue.ContainerID)
 	assertNextLiveContainer(t, ctx, docker, blue, firstSecret)
 	nextLiveImageCache(t, ctx, base, appID, firstSecret, 48)
 	nextLiveCacheWritable(t, ctx, docker, blue.ContainerID)
 	spec.ActiveSlot, spec.DeploymentID = blue.Slot, uuid.NewString()
 	spec.EnvironmentOperationID = uuid.NewString()
+	spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber = "", 0
 	spec.Environment = []byte("RIG_FIXTURE_RUNTIME_SECRET=" + secondSecret + "\nRIG_FIXTURE_SLOT_MARKER=green\n")
-	green := nextLiveStart(t, ctx, engine, authority, spec)
-	defer func() { _ = engine.StopAndRemove(context.Background(), green, 0) }()
+	spec = authority.PrepareCandidate(t, ctx, spec)
+	greenSession := authority.Begin(t, ctx, engine, spec)
+	defer greenSession.Close()
+	spec = greenSession.BoundSpec()
+	green, err := greenSession.Start(t, spec)
+	if err != nil {
+		t.Fatal("start replacement Next candidate:", err)
+	}
+	if err := greenSession.WaitHealthyAndHandoff(); err != nil {
+		t.Fatal("replacement Next candidate unhealthy:", err)
+	}
 	assertNextLiveContainer(t, ctx, docker, green, secondSecret)
 	nextLiveRequest(t, ctx, base, appID, "/api/runtime", http.StatusOK, `"runtimeMarker":"blue"`, firstSecret)
 	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{
@@ -160,32 +181,44 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 		t.Fatal("replace Next route:", err)
 	}
 	nextLiveAttestedEndpoint(t, ctx, ingress, appID, green)
+	nextLiveRecordPublished(t, ctx, ingress, appID, greenSession)
+	greenSession.Close()
 	nextLiveRequest(t, ctx, base, appID, "/", http.StatusOK, "next-public-A", secondSecret)
 	nextLiveRequest(t, ctx, base, appID, "/api/runtime", http.StatusOK, `"runtimeMarker":"green"`, secondSecret)
 	nextLiveImageCache(t, ctx, base, appID, secondSecret, 32)
 	nextLiveCacheWritable(t, ctx, docker, green.ContainerID)
-	if err := engine.StopAndRemove(ctx, blue, time.Second); err != nil {
-		t.Fatal("remove drained Next candidate:", err)
+	if err := engine.StopAndRemove(ctx, blue, time.Second); !errors.Is(err, deployments.ErrGeneratedCandidateRetirementUnavailable) {
+		t.Fatal("receipt-owned predecessor bypassed the retirement boundary:", err)
 	}
 	nextLiveRequest(t, ctx, base, appID, "/api/health", http.StatusOK, `"status":"ok"`, secondSecret)
-	t.Logf("Next cache runtime route passed: app=%s release=%s blue=%s green=%s port=%d", appID, releaseID, blue.Slot, green.Slot, port)
+	t.Logf("Next cache runtime route passed: app=%s release=%s blue=%s green=%s port=%d; predecessor retirement remains pending", appID, releaseID, blue.Slot, green.Slot, port)
 }
 
-func nextLiveStart(t *testing.T, ctx context.Context, engine *generatedruntime.Engine, authority *liveauthority.Authority, spec generatedruntime.CandidateSpec) generatedruntime.Candidate {
+func nextLiveRecordPublished(t *testing.T, ctx context.Context, ingress *generatedingress.Manager, appID string, session *liveauthority.CandidateSession) {
 	t.Helper()
-	boundContext, boundSpec := authority.BindCandidate(t, ctx, spec)
-	candidate, err := engine.CreateInactiveCandidate(boundContext, boundSpec)
-	if err != nil {
-		t.Fatal("create Next candidate:", err)
+	observation, err := ingress.Observe(ctx, appID)
+	if err != nil || session.RoutePublished(observation.Slot, observation.Endpoints) != nil {
+		t.Fatal("record exact observed Next route")
 	}
-	if err := engine.StartCandidate(boundContext, candidate); err != nil {
-		t.Fatal("start Next candidate:", err)
+}
+
+// Restart is a fixture action. This read-only observation proves Docker health;
+// it does not claim controller cold-recovery or admission-transfer acceptance.
+func nextLiveWaitRestartHealth(t *testing.T, ctx context.Context, docker, containerID string) {
+	t.Helper()
+	deadline, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	for {
+		body, err := controllerJourneyDocker(deadline, docker, nil, "container", "inspect", "--format", "{{.Id}} {{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", containerID)
+		if err == nil && strings.TrimSpace(string(body)) == containerID+" true healthy" {
+			return
+		}
+		select {
+		case <-deadline.Done():
+			t.Fatal("exact restarted Next container did not regain Docker health")
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
-	if err := engine.WaitHealthy(boundContext, candidate); err != nil {
-		t.Fatal("Next candidate unhealthy:", err)
-	}
-	authority.FinishCandidate(t, boundSpec.DeploymentID)
-	return candidate
 }
 
 func nextLiveEndpoint(candidate generatedruntime.Candidate) generatedruntime.RouteEndpoint {

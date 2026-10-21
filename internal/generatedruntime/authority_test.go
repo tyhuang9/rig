@@ -3,28 +3,35 @@ package generatedruntime
 import (
 	"context"
 	"database/sql"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedimagestate"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 func newConfiguredRuntimeDeployments(t *testing.T, workingDirectory string) *deployments.Repository {
 	t.Helper()
-	_, repository, _ := configuredRuntimeDeployments(t, workingDirectory)
+	_, repository, _, _, _ := configuredRuntimeDeployments(t, workingDirectory)
 	return repository
 }
 
-func configuredRuntimeDeployments(t *testing.T, workingDirectory string) (*sql.DB, *deployments.Repository, *deploymentbinding.Repository) {
+func configuredRuntimeDeployments(t *testing.T, workingDirectory string) (*sql.DB, *deployments.Repository, *deploymentbinding.Repository, *deploymentplans.Store, *appconfig.Store) {
 	t.Helper()
 	db, err := databasefixture.Open(t.TempDir())
 	if err != nil {
@@ -48,11 +55,42 @@ func configuredRuntimeDeployments(t *testing.T, workingDirectory string) (*sql.D
 	if err != nil {
 		t.Fatal(err)
 	}
-	repository, err := deployments.NewWithExecutionGuard(db, guard)
+	protectedRoot, err := os.MkdirTemp("", "rig-runtime-protected-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return db, repository, bindings
+	t.Cleanup(func() {
+		if err := os.RemoveAll(protectedRoot); err != nil {
+			t.Errorf("remove generated runtime protected fixture: %v", err)
+		}
+	})
+	plans, err := deploymentplans.New(db, protectedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := appconfig.New(db, protectedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	migrationDockerConfig := filepath.Join(t.TempDir(), "migration-docker-config")
+	if err := os.Mkdir(migrationDockerConfig, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	migrationEnvironment := &runtimeFakeEnvironment{path: filepath.Join(t.TempDir(), "migration.env")}
+	migrationProcess := &runtimeFakeRunner{run: func(runtimeprocess.CommandRequest) runtimeRequestResult {
+		return runtimeRequestResult{}
+	}}
+	repository, err := deployments.NewWithExecutionGuardAndGeneratedMigration(
+		db, guard, plans, configuration, migrationEnvironment, migrationProcess,
+		deployments.GeneratedMigrationProcessOptions{
+			DockerExecutable: filepath.Join(t.TempDir(), "docker"), DockerConfigDirectory: migrationDockerConfig,
+			WorkingDirectory: workingDirectory, Timeout: time.Second, OutputLimit: 1024,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return db, repository, bindings, plans, configuration
 }
 
 type runtimeNetworkAuthority struct {
@@ -65,8 +103,16 @@ type runtimeNetworkAuthority struct {
 }
 
 func newRuntimeNetworkAuthority(t *testing.T, workingDirectory string, spec CandidateSpec) runtimeNetworkAuthority {
+	return newRuntimeNetworkAuthorityWithConfiguration(t, workingDirectory, spec, nil)
+}
+
+// newRuntimeNetworkAuthorityWithConfiguration supplies an exact scoped
+// configuration through the protected configuration store. A nil entries slice
+// keeps the standard candidate fixture configuration; a non-nil slice lets a
+// boundary test provide its own real protected runtime entries.
+func newRuntimeNetworkAuthorityWithConfiguration(t *testing.T, workingDirectory string, spec CandidateSpec, entries []appconfig.ScopedValueInput) runtimeNetworkAuthority {
 	t.Helper()
-	db, repository, bindings := configuredRuntimeDeployments(t, workingDirectory)
+	db, repository, bindings, plans, configuration := configuredRuntimeDeployments(t, workingDirectory)
 	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
 	if err != nil {
 		t.Fatal(err)
@@ -98,30 +144,63 @@ func newRuntimeNetworkAuthority(t *testing.T, workingDirectory string, spec Cand
 	if _, err := bindings.Read(context.Background(), created.Job.ID); err != nil {
 		t.Fatalf("read generated network binding: %v", err)
 	}
-	if spec.ConfigurationRevisionID == "" {
-		spec.ConfigurationRevisionID = uuid.NewString()
+	component := runtimePlanComponent(spec)
+	spec.Technology = component.Technology
+	plan, err := plans.Replace(context.Background(), spec.AppID, actorID, deploymentplans.ReplaceInput{Plan: deploymentplans.Plan{
+		SetupVersion: projectanalysis.SetupVersion, Strategy: deploymentplans.StrategyGeneratedNode,
+		Detector:        deploymentplans.Detector{Name: "manual-setup", Version: "1", SourceStructuralFingerprint: strings.Repeat("1", 64)},
+		Source:          deploymentplans.SourceIdentity{Provider: "local", ResolvedDigest: strings.Repeat("2", 64)},
+		Components:      []deploymentplans.Component{component},
+		FieldProvenance: runtimePlanProvenance(component),
+	}})
+	if err != nil {
+		t.Fatalf("write accepted protected plan: %v", err)
 	}
-	if spec.ConfigurationRevisionNumber == 0 {
-		spec.ConfigurationRevisionNumber = 1
+	loadedPlan, err := plans.GetRevision(context.Background(), spec.AppID, plan.ID, plan.RevisionNumber)
+	if err != nil {
+		t.Fatalf("read accepted protected plan: %v", err)
 	}
-	if spec.DeploymentPlanRevisionNumber == 0 {
-		spec.DeploymentPlanRevisionNumber = 1
+	if loadedPlan.ID != plan.ID || loadedPlan.RevisionNumber != plan.RevisionNumber || loadedPlan.State != deploymentplans.RevisionAccepted {
+		t.Fatalf("accepted protected plan identity=%+v", loadedPlan)
 	}
-	if _, err := db.Exec(`INSERT INTO application_configuration_revisions(id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count) VALUES(?,?,?,?,?,?,0,0)`, spec.ConfigurationRevisionID, spec.AppID, spec.ConfigurationRevisionNumber, "generated-network:"+spec.ConfigurationRevisionID, actorID, stamp); err != nil {
-		t.Fatal(err)
+	configurationInput := appconfig.ScopedReplaceInput{
+		PlanRevisionID: plan.ID, PlanRevisionNumber: plan.RevisionNumber,
+		Components: []appconfig.ComponentTarget{{Name: component.Name, Role: component.Role}},
 	}
-	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at) VALUES(?,?,?,?,'generated_node','test','1',?,'local',0,?,?,1,0,'',?,?,'accepted',?,?)`, spec.DeploymentPlanRevisionID, spec.AppID, spec.DeploymentPlanRevisionNumber, "generated-network:"+spec.DeploymentPlanRevisionID, strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64), actorID, stamp, actorID, stamp); err != nil {
-		t.Fatal(err)
+	if entries != nil {
+		configurationInput.Entries = append([]appconfig.ScopedValueInput(nil), entries...)
+	} else if len(spec.Environment) != 0 {
+		value := "value"
+		configurationInput.Entries = []appconfig.ScopedValueInput{{
+			ScopedKey:   appconfig.ScopedKey{Phase: appconfig.PhaseRuntime, Component: component.Name, Key: "SECRET"},
+			Sensitivity: appconfig.SensitivitySecret, Value: &value,
+		}}
 	}
-	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,?,?,?)`, spec.ReleaseID, spec.AppID, stamp, strings.Repeat("4", 64), strings.Repeat("5", 64), spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber); err != nil {
+	configurationRevision, err := configuration.ReplaceScoped(context.Background(), spec.AppID, actorID, configurationInput)
+	if err != nil {
+		t.Fatalf("write scoped protected configuration: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,?,?,?)`, spec.ReleaseID, spec.AppID, stamp, strings.Repeat("4", 64), strings.Repeat("5", 64), configurationRevision.RevisionID, configurationRevision.RevisionNumber, plan.ID, plan.RevisionNumber); err != nil {
 		t.Fatal(err)
 	}
 	state := generatedruntimestate.New(db)
+	deployment, _, err := repository.GetOrCreateByJob(context.Background(), spec.AppID, created.Job.ID, "current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deployment, err = repository.InitializeRuntime(context.Background(), spec.AppID, deployment.ID, spec.ReleaseID,
+		configurationRevision.RevisionID, configurationRevision.RevisionNumber, deployments.RuntimeGeneratedNode, plan.ID, plan.RevisionNumber)
+	if err != nil {
+		t.Fatalf("initialize generated deployment provenance: %v", err)
+	}
+	if _, err := repository.Transition(context.Background(), spec.AppID, deployment.ID, deployments.Applying, ""); err != nil {
+		t.Fatalf("enter applying deployment state: %v", err)
+	}
+	spec.DeploymentID = deployment.ID
+	spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber = configurationRevision.RevisionID, configurationRevision.RevisionNumber
+	spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber = plan.ID, plan.RevisionNumber
 	if spec.ActiveSlot != "" {
 		seedRuntimeActivePredecessor(t, db, state, spec, stamp)
-	}
-	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,actual_configuration_revision_id,actual_configuration_revision_number,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?,'preparing','current',?,?,1,'generated_node',?,?)`, spec.DeploymentID, spec.AppID, spec.ReleaseID, created.Job.ID, spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber); err != nil {
-		t.Fatal(err)
 	}
 	claim, err := deploymentexecution.NewClaim(created.Binding, created.Job.ID, spec.AppID, 1)
 	if err != nil {
@@ -138,7 +217,7 @@ func newRuntimeNetworkAuthority(t *testing.T, workingDirectory string, spec Cand
 	})
 	ctx := deploymenteffects.WithScope(context.Background(), scope)
 	if err := repository.Gate(ctx, deployments.GateRequest{Claim: claim, DeploymentID: spec.DeploymentID}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("gate generated deployment: %v", err)
 	}
 	runtimeDeployment, createdRuntime, err := state.Begin(context.Background(), generatedruntimestate.BeginInput{
 		DeploymentID: spec.DeploymentID, AppID: spec.AppID, ReleaseID: spec.ReleaseID,
@@ -151,15 +230,56 @@ func newRuntimeNetworkAuthority(t *testing.T, workingDirectory string, spec Cand
 	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate} {
 		runtimeDeployment, err = state.Advance(context.Background(), spec.AppID, spec.DeploymentID, runtimeDeployment.Phase, next, "")
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("advance generated runtime to %q: %v", next, err)
 		}
 	}
+	artifacts := generatedimagestate.NewRepository(db)
+	artifact, _, err := artifacts.Begin(context.Background(), generatedimagestate.BeginArtifactInput{
+		ReleaseID: spec.ReleaseID, DeploymentPlanRevisionID: plan.ID, DeploymentPlanRevisionNumber: plan.RevisionNumber,
+		ComponentID: component.Name, CompilerVersion: "runtime-test", BuildDefinitionDigest: spec.BuildDefinitionDigest,
+	})
+	if err != nil {
+		t.Fatalf("begin ready generated image artifact: %v", err)
+	}
+	artifact, err = artifacts.Complete(context.Background(), artifact.ID, spec.ImageContentID)
+	if err != nil {
+		t.Fatalf("complete generated image artifact: %v", err)
+	}
+	if _, err := state.SetImageReady(context.Background(), spec.AppID, spec.DeploymentID, component.Name, artifact.ID); err != nil {
+		t.Fatalf("record ready generated image artifact: %v", err)
+	}
+	if _, err := plans.GetRevision(context.Background(), spec.AppID, plan.ID, plan.RevisionNumber); err != nil {
+		t.Fatalf("read accepted protected plan after runtime fixture setup: %v", err)
+	}
+	spec.ArtifactID = artifact.ID
 	spec.Network = deployments.GeneratedNetworkRequest{
 		Claim: claim, DeploymentID: spec.DeploymentID, ReleaseID: spec.ReleaseID,
 		ConfigurationRevisionID: spec.ConfigurationRevisionID, ConfigurationRevisionNumber: spec.ConfigurationRevisionNumber,
 		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: spec.DeploymentPlanRevisionNumber,
 	}
 	return runtimeNetworkAuthority{db: db, repository: repository, context: ctx, release: release, scope: scope, spec: spec}
+}
+
+func runtimePlanComponent(spec CandidateSpec) deploymentplans.Component {
+	technology := spec.Technology
+	if technology == "" {
+		technology = "node"
+	}
+	return deploymentplans.Component{
+		Name: spec.ComponentName, Role: spec.Role, RootDirectory: spec.RootDirectory,
+		PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: spec.RootDirectory,
+		NodeVersion: "20", BuildCommand: "npm run build", RunCommand: spec.RunCommand,
+		InternalPort: spec.InternalPort, HealthProbe: spec.HealthProbe, Technology: technology,
+	}
+}
+
+func runtimePlanProvenance(component deploymentplans.Component) []deploymentplans.FieldProvenance {
+	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "buildCommand", "runCommand", "internalPort", "healthProbe", "technology", "staticOutputDirectory"}
+	result := make([]deploymentplans.FieldProvenance, 0, len(fields))
+	for _, field := range fields {
+		result = append(result, deploymentplans.FieldProvenance{Field: "components." + component.Name + "." + field, Origin: deploymentplans.ProvenanceInferred, Confidence: 100, Evidence: []string{"package.json"}})
+	}
+	return result
 }
 
 func seedRuntimeActivePredecessor(t *testing.T, db *sql.DB, state *generatedruntimestate.Repository, spec CandidateSpec, stamp string) {

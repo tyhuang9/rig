@@ -40,6 +40,12 @@ func (s *SecureEnvironmentStager) StageGeneratedMigration(operationID string, at
 	return s.Stage(operationID, attempt, contents)
 }
 
+// StageGeneratedCandidate exposes the same protected staging implementation
+// to the repository-owned candidate lifecycle.
+func (s *SecureEnvironmentStager) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+	return s.Stage(operationID, attempt, contents)
+}
+
 func (s *SecureEnvironmentStager) Stage(operationID string, attempt int, contents []byte) (EnvironmentLease, error) {
 	defer clear(contents)
 	if s == nil || s.temporary == nil || len(contents) == 0 || len(contents) > maximumEnvironmentBytes {
@@ -55,7 +61,11 @@ func (s *SecureEnvironmentStager) Stage(operationID string, attempt int, content
 		return nil, err
 	}
 	if err := files.WriteEnv(contents); err != nil {
-		_ = files.Cleanup()
+		if cleanupErr := files.Cleanup(); cleanupErr != nil {
+			// Preserve the lease when deletion fails so the concrete owner can
+			// retry cleanup without losing the original staging error.
+			return &secureEnvironmentLease{files: files}, errors.Join(err, cleanupErr)
+		}
 		return nil, err
 	}
 	return &secureEnvironmentLease{files: files}, nil

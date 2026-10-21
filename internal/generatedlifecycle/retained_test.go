@@ -14,10 +14,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
@@ -397,11 +399,20 @@ func newRetainedAdapterFixture(t *testing.T, componentCount int, action applifec
 	if err != nil {
 		t.Fatal(err)
 	}
-	deploymentRepository, err := deployments.NewWithExecutionGuard(db, guard)
+	protectedRoot := filepath.Join(root, "candidate-protected")
+	plans, err := deploymentplans.New(db, protectedRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := generatedruntime.NewEngine(runner, noEnvironmentStager{}, fixedAdapterCapacity{}, deploymentRepository, generatedruntime.EngineOptions{
+	configuration, err := appconfig.New(db, protectedRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deploymentRepository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := generatedruntime.NewEngine(runner, &noEnvironmentStager{}, fixedAdapterCapacity{}, deploymentRepository, generatedruntime.EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
 		HealthPollInterval: 100 * time.Millisecond, ReplacementDiskBytes: 128 << 20,
@@ -712,8 +723,12 @@ func adapterJSON(value any) runtimeprocess.CommandResult {
 
 type noEnvironmentStager struct{}
 
-func (noEnvironmentStager) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
+func (*noEnvironmentStager) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
 	return nil, errors.New("retained adapter must not stage environment")
+}
+
+func (*noEnvironmentStager) StageGeneratedCandidate(string, int, []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+	return nil, errors.New("retained adapter must not stage candidate environment")
 }
 
 type fixedAdapterCapacity struct{}

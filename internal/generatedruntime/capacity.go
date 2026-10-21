@@ -3,7 +3,6 @@ package generatedruntime
 import (
 	"context"
 	"errors"
-	"sync"
 
 	"github.com/hostd/hostd/internal/generatedcapacity"
 )
@@ -65,72 +64,4 @@ func capacityDiagnostic(ctx context.Context, err error) error {
 	default:
 		return &Error{Code: DiagnosticRuntimeUnavailable}
 	}
-}
-
-type replacementReservation struct {
-	owner      *capacityGate
-	lease      *capacityLease
-	limit      int
-	mu         sync.Mutex
-	components map[string]struct{}
-	released   bool
-	retained   bool
-}
-
-func (r *replacementReservation) Release() {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	if r.released || r.retained {
-		r.mu.Unlock()
-		return
-	}
-	r.released = true
-	lease := r.lease
-	r.mu.Unlock()
-	lease.Release()
-}
-
-func (r *replacementReservation) consume(owner *capacityGate, component string) (accepted, newlyConsumed bool) {
-	if r == nil || owner == nil || r.owner != owner || component == "" {
-		return false, false
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.released || r.retained {
-		return false, false
-	}
-	if _, exists := r.components[component]; exists {
-		return true, false
-	}
-	if len(r.components) >= r.limit {
-		return false, false
-	}
-	r.components[component] = struct{}{}
-	return true, true
-}
-
-func (r *replacementReservation) unconsume(component string) {
-	if r == nil {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if !r.released && !r.retained {
-		delete(r.components, component)
-	}
-}
-
-func (r *replacementReservation) retain(owner *capacityGate) bool {
-	if r == nil || owner == nil || r.owner != owner {
-		return false
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.released {
-		return false
-	}
-	r.retained = true
-	return true
 }

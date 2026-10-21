@@ -5,14 +5,12 @@ import (
 	"errors"
 	"sort"
 
-	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
-	"github.com/hostd/hostd/internal/jobs"
 )
 
 var (
@@ -171,161 +169,115 @@ func generatedMigrationFailed(cause error) error {
 	return errors.Join(executionError("apply_failed"), cause)
 }
 
-func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, claim deploymentexecution.Claim, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {
-	result := make(map[string]generatedruntime.Candidate, len(runtimeDeployment.Components))
-	activeSlot := generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot)
+func (e *Executor) startCandidates(execution *deployments.GeneratedCandidateExecution, runtimeDeployment generatedruntimestate.Deployment) (map[string]deployments.GeneratedCandidateInvocation, error) {
+	result := make(map[string]deployments.GeneratedCandidateInvocation, len(runtimeDeployment.Components))
 	for _, persisted := range sortedComponents(runtimeDeployment.Components) {
-		component, exists := componentPlan(resolved.plan, persisted.Name)
-		artifact, artifactExists := artifacts[persisted.Name]
-		if !exists || !artifactExists {
-			return result, staticError("candidate provenance unavailable")
-		}
+		var invocation deployments.GeneratedCandidateInvocation
+		var err error
 		switch persisted.State {
 		case generatedruntimestate.ComponentImageReady:
-			description, err := generatedruntime.DescribeInactiveCandidate(resolved.deployment.AppID, component.Name, activeSlot)
-			if err != nil || string(description.Slot) != runtimeDeployment.CandidateSlot {
-				return result, staticError("candidate identity mismatch")
-			}
-			if _, err = e.state.SetContainerStarting(ctx, resolved.deployment.AppID, resolved.deployment.ID, component.Name, description.ContainerName); err != nil {
-				return result, staticError("persist candidate intent")
-			}
-			configuration, err := e.configuration.ExportComponentRuntimeForExecution(ctx, resolved.deployment.AppID, resolved.configurationID, resolved.configurationNumber, resolved.plan.ID, resolved.plan.RevisionNumber, component.Name)
+			invocation, err = execution.BeginCreate(persisted.Name)
 			if err != nil {
-				if appconfig.IsCode(err, "configuration_review_required") {
-					return result, codedError("configuration_review_required")
-				}
-				return result, codedError("configuration_unavailable")
-			}
-			if configuration.RevisionID != resolved.configurationID || configuration.RevisionNumber != resolved.configurationNumber {
-				configuration.Clear()
-				return result, codedError("configuration_unavailable")
-			}
-			candidate, createErr := e.runtime.CreateInactiveCandidate(ctx, generatedruntime.CandidateSpec{
-				AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-				ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
-				ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
-				ComponentName: component.Name, Role: component.Role, Technology: component.Technology,
-				RootDirectory: component.RootDirectory, RunCommand: component.RunCommand, InternalPort: component.InternalPort,
-				HealthProbe: component.HealthProbe, ImageContentID: artifact.ImageContentID,
-				BuildDefinitionDigest: artifact.BuildDefinitionDigest, ActiveSlot: activeSlot,
-				EnvironmentOperationID: artifact.ID, EnvironmentOperationAttempt: job.Attempt, Environment: configuration.Environment,
-				Reservation: reservation, Network: generatedNetworkRequest(claim, resolved),
-			})
-			configuration.Environment = nil
-			configuration.Clear()
-			if createErr != nil {
-				return result, createErr
-			}
-			result[component.Name] = candidate
-			if _, err = e.state.SetContainerRunning(ctx, resolved.deployment.AppID, resolved.deployment.ID, component.Name, candidate.ContainerID); err != nil {
-				return result, staticError("persist candidate container")
-			}
-			if err = e.runtime.StartCandidate(ctx, candidate); err != nil {
 				return result, err
 			}
-		case generatedruntimestate.ComponentStarting:
-			// A crash between Docker create and SetContainerRunning cannot be
-			// resolved from intent alone without trusting container discovery.
-			return result, staticError("candidate create was interrupted")
+			// Retain the original handle even when create or its result fails.
+			// Only this handle can request explicit inactive cleanup.
+			result[persisted.Name] = invocation
+			if _, err = execution.CreateAndRecord(invocation); err != nil {
+				return result, err
+			}
 		case generatedruntimestate.ComponentRunning:
-			candidate, err := reconstructCandidate(resolved, runtimeDeployment, persisted, artifact)
+			invocation, err = execution.AdoptCandidate(persisted.Name)
 			if err != nil {
 				return result, err
 			}
-			candidate, err = e.runtime.AdoptCandidate(candidate, reservation)
-			if err != nil {
-				return result, err
-			}
-			result[component.Name] = candidate
-			if err = e.runtime.StartCandidate(ctx, candidate); err != nil {
-				return result, err
-			}
+			result[persisted.Name] = invocation
 		default:
-			return result, staticError("unexpected component state while starting")
+			// Starting with no durable ID never permits discovery-based adoption.
+			return result, staticError("candidate state requires reconciliation")
+		}
+		if err = execution.StartCandidate(invocation); err != nil {
+			return result, err
 		}
 	}
 	return result, nil
 }
 
-func (e *Executor) healthyCandidates(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, existing map[string]generatedruntime.Candidate, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {
-	result := existing
-	if result == nil {
-		result = make(map[string]generatedruntime.Candidate, len(runtimeDeployment.Components))
-	}
+func (e *Executor) healthyCandidates(execution *deployments.GeneratedCandidateExecution, runtimeDeployment generatedruntimestate.Deployment, existing map[string]deployments.GeneratedCandidateInvocation) error {
 	for _, persisted := range sortedComponents(runtimeDeployment.Components) {
-		artifact, exists := artifacts[persisted.Name]
-		if !exists {
-			return result, staticError("health artifact unavailable")
+		if persisted.State != generatedruntimestate.ComponentRunning && persisted.State != generatedruntimestate.ComponentHealthy {
+			return staticError("candidate health requires reconciliation")
 		}
-		candidate, exists := result[persisted.Name]
-		if !exists {
+		invocation := existing[persisted.Name]
+		if invocation == nil {
 			var err error
-			candidate, err = reconstructCandidate(resolved, runtimeDeployment, persisted, artifact)
+			invocation, err = execution.AdoptCandidate(persisted.Name)
 			if err != nil {
-				return result, err
+				return err
 			}
-			candidate, err = e.runtime.AdoptCandidate(candidate, reservation)
-			if err != nil {
-				return result, err
-			}
-			result[persisted.Name] = candidate
+			existing[persisted.Name] = invocation
 		}
-		switch persisted.State {
-		case generatedruntimestate.ComponentRunning:
-			if err := e.runtime.WaitHealthy(ctx, candidate); err != nil {
-				return result, err
-			}
-			if _, err := e.state.AdvanceComponent(ctx, resolved.deployment.AppID, resolved.deployment.ID, persisted.Name, generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-				return result, staticError("persist candidate health")
-			}
-		case generatedruntimestate.ComponentHealthy:
-		default:
-			return result, staticError("unexpected component state while waiting for health")
+		// Persisted Healthy is reobserved through the same bound owner.
+		if err := execution.WaitHealthyAndRecord(invocation); err != nil {
+			return err
 		}
 	}
-	return result, nil
+	return nil
 }
 
-func (e *Executor) reconstructCandidates(resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {
+func observeRouteCandidates(execution *deployments.GeneratedCandidateExecution, appID string, runtimeDeployment generatedruntimestate.Deployment) (map[string]generatedruntime.Candidate, error) {
 	result := make(map[string]generatedruntime.Candidate, len(runtimeDeployment.Components))
-	for _, component := range sortedComponents(runtimeDeployment.Components) {
-		if component.State != generatedruntimestate.ComponentHealthy && component.State != generatedruntimestate.ComponentActive {
-			return nil, staticError("route candidate is not healthy")
-		}
-		artifact, exists := artifacts[component.Name]
-		if !exists {
-			return nil, staticError("route artifact unavailable")
-		}
-		candidate, err := reconstructCandidate(resolved, runtimeDeployment, component, artifact)
+	for _, persisted := range sortedComponents(runtimeDeployment.Components) {
+		identity, err := execution.ObserveRouteCandidate(persisted.Name)
 		if err != nil {
 			return nil, err
 		}
-		candidate, err = e.runtime.AdoptCandidate(candidate, reservation)
-		if err != nil {
-			return nil, err
+		// This value is route description only and carries no lifecycle handle.
+		result[persisted.Name] = generatedruntime.Candidate{
+			AppID: appID, DeploymentID: identity.DeploymentID, ReleaseID: identity.ReleaseID,
+			ArtifactID: identity.ArtifactID, DeploymentPlanRevisionID: identity.DeploymentPlanRevisionID,
+			Component: identity.ComponentName, Role: identity.Role, Technology: identity.Technology,
+			Slot: generatedruntime.Slot(identity.Slot), ContainerID: identity.ContainerID,
+			ContainerName: identity.ContainerName, NetworkName: identity.NetworkName,
+			NetworkAlias: identity.NetworkAlias, InternalPort: identity.InternalPort,
 		}
-		result[component.Name] = candidate
 	}
 	return result, nil
 }
 
-func reconstructCandidate(resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, persisted generatedruntimestate.Component, artifact generatedimage.Artifact) (generatedruntime.Candidate, error) {
-	component, exists := componentPlan(resolved.plan, persisted.Name)
-	if !exists || persisted.ContainerID == "" || persisted.ContainerName == "" || persisted.Slot != runtimeDeployment.CandidateSlot {
-		return generatedruntime.Candidate{}, staticError("durable candidate provenance unavailable")
+func candidateRequest(claim deploymentexecution.Claim, resolved resolvedDeployment, slot string) deployments.GeneratedCandidateRequest {
+	return deployments.GeneratedCandidateRequest{
+		Claim: claim, DeploymentID: resolved.deployment.ID, ReleaseID: resolved.release.ID,
+		ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
+		DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
+		CandidateSlot: slot, Findings: append([]deployments.Finding(nil), resolved.deployment.Findings...),
 	}
-	description, err := generatedruntime.DescribeInactiveCandidate(resolved.deployment.AppID, persisted.Name, generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot))
-	if err != nil || description.ContainerName != persisted.ContainerName || string(description.Slot) != persisted.Slot {
-		return generatedruntime.Candidate{}, staticError("durable candidate identity mismatch")
+}
+
+// candidateFailure requests cleanup explicitly, then asks the owner whether
+// its private observations prove a terminal failure. An empty map, an adopted
+// handle, cleanup uncertainty or a closed route handoff cannot supply proof.
+func (e *Executor) candidateFailure(ctx context.Context, execution *deployments.GeneratedCandidateExecution, reservation generatedruntime.ReplacementReservation, invocations map[string]deployments.GeneratedCandidateInvocation, cause error) error {
+	var cleanupErr error
+	for _, invocation := range invocations {
+		cleanupErr = errors.Join(cleanupErr, execution.RemoveInactive(invocation))
 	}
-	return generatedruntime.Candidate{
-		AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-		ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, Component: persisted.Name, Role: component.Role, Technology: component.Technology,
-		Slot: description.Slot, ContainerID: persisted.ContainerID, ContainerName: description.ContainerName,
-		NetworkName: description.NetworkName, NetworkAlias: description.NetworkAlias, InternalPort: component.InternalPort,
-		ImageContentID: artifact.ImageContentID, WorkingDirectory: runtimeWorkingDirectory(component.RootDirectory),
-		RunCommandDigest: commandDigest(component.RunCommand),
-	}, nil
+	if cleanupErr != nil {
+		// An uncertain cleanup must preserve the complete replacement budget,
+		// including siblings whose runner was not entered. The owner retains
+		// risky individual shares even if whole-reservation retention refuses.
+		retainErr := e.runtime.RetainReplacementCapacity(reservation)
+		return generatedAuthorizationRefusal(ctx, errors.Join(cause, cleanupErr, retainErr))
+	}
+	failed, err := execution.RecordObservedFailure()
+	if err != nil {
+		return generatedAuthorizationRefusal(ctx, errors.Join(cause, err))
+	}
+	code := "apply_failed"
+	if failed.DiagnosticCode == generatedruntimestate.DiagnosticHealthFailed {
+		code = "health_failed"
+	}
+	return errors.Join(executionError(code), cause)
 }
 
 func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, candidates map[string]generatedruntime.Candidate) (generatedruntimestate.Deployment, bool, error) {
@@ -536,16 +488,4 @@ func reconstructPreviousCandidates(appID string, previous generatedruntimestate.
 		}
 	}
 	return result, nil
-}
-
-func (e *Executor) cleanupCandidates(ctx context.Context, candidates map[string]generatedruntime.Candidate) error {
-	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.options.CleanupTimeout)
-	defer cancel()
-	var firstErr error
-	for _, candidate := range candidates {
-		if err := e.runtime.StopAndRemove(cleanup, candidate, 0); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
 }

@@ -164,6 +164,9 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 	}
 
 	if err := report(reporter, jobs.Running, "apply_runtime", 60); err != nil {
+		if generatedCandidateBoundaryRisk(runtimeDeployment) {
+			return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, err)
+		}
 		if runtimeDeployment.Phase == generatedruntimestate.PhaseMigrating {
 			return jobs.ExecutionResult{}, generatedMigrationUncertain(ctx, err)
 		}
@@ -182,6 +185,8 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		reservation, err = e.authorization.Authorize(ctx, AuthorizationRequest{
 			Claim: claim,
 			AppID: deployment.AppID, DeploymentID: deployment.ID, ReleaseID: deployment.ReleaseID,
+			ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
+			Findings:                     append([]deployments.Finding(nil), resolved.deployment.Findings...),
 			DeploymentPlanRevisionID:     deployment.DeploymentPlanRevisionID,
 			DeploymentPlanRevisionNumber: deployment.DeploymentPlanRevisionNumber,
 			CandidateSlot:                generatedruntime.Slot(runtimeDeployment.CandidateSlot), ComponentCount: len(componentNames),
@@ -206,6 +211,9 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 	networkCapacityRisk := generatedNetworkCapacityRisk(runtimeDeployment)
 	persistedDeployment, getErr := e.deployments.Get(ctx, deployment.AppID, deployment.ID)
 	if getErr != nil {
+		if generatedCandidateBoundaryRisk(runtimeDeployment) {
+			return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, getErr)
+		}
 		if runtimeDeployment.Phase == generatedruntimestate.PhaseMigrating {
 			return jobs.ExecutionResult{}, e.generatedMigrationRefusal(reservation, networkCapacityRisk, generatedMigrationUncertain(ctx, getErr))
 		}
@@ -215,7 +223,13 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 	networkRequest := generatedNetworkRequest(claim, resolved)
 
 	artifacts := make(map[string]generatedimage.Artifact, len(componentNames))
-	candidates := make(map[string]generatedruntime.Candidate, len(componentNames))
+	invocations := make(map[string]deployments.GeneratedCandidateInvocation, len(componentNames))
+	var candidateExecution *deployments.GeneratedCandidateExecution
+	defer func() {
+		if candidateExecution != nil {
+			candidateExecution.Leave()
+		}
+	}()
 	for {
 		switch runtimeDeployment.Phase {
 		case generatedruntimestate.PhaseBuilding:
@@ -265,91 +279,61 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			}
 
 		case generatedruntimestate.PhaseStartingCandidate:
-			if len(artifacts) == 0 {
-				artifacts, err = e.loadArtifacts(ctx, resolved, runtimeDeployment)
+			if candidateExecution == nil {
+				candidateExecution, err = e.runtime.PinCandidates(ctx, candidateRequest(claim, resolved, runtimeDeployment.CandidateSlot), reservation)
 				if err != nil {
-					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+					return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, err)
 				}
 			}
 			if err = e.runtime.EnsureAppNetwork(ctx, networkRequest); err != nil {
-				if generatedruntime.IsGeneratedNetworkBoundaryFailure(err) {
-					return jobs.ExecutionResult{}, e.generatedNetworkRefusal(ctx, reservation, networkCapacityRisk, err)
-				}
-				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
+				return jobs.ExecutionResult{}, e.generatedNetworkRefusal(ctx, reservation, networkCapacityRisk, err)
 			}
-			candidates, err = e.startCandidates(ctx, job, claim, resolved, runtimeDeployment, artifacts, reservation)
+			invocations, err = e.startCandidates(candidateExecution, runtimeDeployment)
 			if err != nil {
-				if generatedruntime.IsGeneratedNetworkBoundaryFailure(err) {
-					return jobs.ExecutionResult{}, e.generatedNetworkRefusal(ctx, reservation, networkCapacityRisk || len(candidates) > 0, err)
-				}
-				if cleanupErr := e.cleanupCandidates(ctx, candidates); cleanupErr != nil {
-					err = cleanupErr
-				}
-				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticStartFailed)
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
+				return jobs.ExecutionResult{}, e.candidateFailure(ctx, candidateExecution, reservation, invocations, err)
 			}
-			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseStartingCandidate, generatedruntimestate.PhaseWaitingHealth, "")
+			advanced, advanceErr := candidateExecution.FinishStarting()
 			if advanceErr != nil {
-				_ = e.cleanupCandidates(ctx, candidates)
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+				return jobs.ExecutionResult{}, e.candidateFailure(ctx, candidateExecution, reservation, invocations, advanceErr)
 			}
 			runtimeDeployment = advanced
-			if deployment.Status == deployments.Applying {
-				waitingDeployment, transitionErr := e.deployments.Transition(ctx, deployment.AppID, deployment.ID, deployments.WaitingHealth, "")
-				if transitionErr != nil {
-					_ = e.cleanupCandidates(ctx, candidates)
-					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
-				}
-				deployment = waitingDeployment
-			}
+			deployment.Status = deployments.WaitingHealth
 
 		case generatedruntimestate.PhaseWaitingHealth:
-			if err = report(reporter, jobs.Running, "wait_for_health", 85); err != nil {
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
-			}
-			if len(artifacts) == 0 {
-				artifacts, err = e.loadArtifacts(ctx, resolved, runtimeDeployment)
+			if candidateExecution == nil {
+				candidateExecution, err = e.runtime.PinCandidates(ctx, candidateRequest(claim, resolved, runtimeDeployment.CandidateSlot), reservation)
 				if err != nil {
-					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+					return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, err)
 				}
 			}
-			candidates, err = e.healthyCandidates(ctx, resolved, runtimeDeployment, artifacts, candidates, reservation)
-			if err != nil {
-				if cleanupErr := e.cleanupCandidates(ctx, candidates); cleanupErr != nil {
-					err = cleanupErr
-				}
-				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticHealthFailed)
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
+			if err = report(reporter, jobs.Running, "wait_for_health", 85); err != nil {
+				return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, err)
 			}
-			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute, "")
+			if err = e.healthyCandidates(candidateExecution, runtimeDeployment, invocations); err != nil {
+				return jobs.ExecutionResult{}, e.candidateFailure(ctx, candidateExecution, reservation, invocations, err)
+			}
+			advanced, advanceErr := candidateExecution.FinishHealth()
 			if advanceErr != nil {
-				_ = e.cleanupCandidates(ctx, candidates)
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+				return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, advanceErr)
 			}
 			runtimeDeployment = advanced
 
 		case generatedruntimestate.PhaseSwitchingRoute:
-			if len(artifacts) == 0 {
-				artifacts, err = e.loadArtifacts(ctx, resolved, runtimeDeployment)
+			if candidateExecution == nil {
+				candidateExecution, err = e.runtime.PinCandidates(ctx, candidateRequest(claim, resolved, runtimeDeployment.CandidateSlot), reservation)
 				if err != nil {
-					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+					return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, err)
 				}
 			}
-			candidates, err = e.reconstructCandidates(resolved, runtimeDeployment, artifacts, reservation)
-			if err != nil {
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+			candidates, observeErr := observeRouteCandidates(candidateExecution, deployment.AppID, runtimeDeployment)
+			if observeErr != nil {
+				return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, observeErr)
 			}
-			advanced, switched, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
+			advanced, _, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
 			if switchErr != nil {
-				if switched {
-					return waitingFor(jobs.PauseRouteReconciliationRequired), nil
-				}
-				_ = e.cleanupCandidates(ctx, candidates)
-				if generatedruntime.RouteGatewayReadinessFailed(switchErr) {
-					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "gateway_readiness_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
-				}
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "apply_failed", generatedruntimestate.DiagnosticRouteSwitchFailed)
+				// FinishHealth irreversibly closed inactive cleanup before route
+				// publication. Route failures always preserve these candidates.
+				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			runtimeDeployment = advanced
 
@@ -358,9 +342,6 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 				// The new slot is already active. Keep the deployment and job
 				// nonterminal so retry or restart recovery can finish old-slot cleanup.
 				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
-			}
-			for _, candidate := range candidates {
-				e.runtime.ReleaseAdmission(candidate)
 			}
 			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, "")
 			if advanceErr != nil {
@@ -450,10 +431,29 @@ func (e *Executor) existingMigrationRefusal(ctx context.Context, deployment depl
 	if err != nil {
 		return generatedMigrationUncertain(ctx, errors.Join(cause, err)), true
 	}
+	if generatedCandidateBoundaryRisk(persisted) {
+		return generatedAuthorizationRefusal(ctx, cause), true
+	}
 	if persisted.Phase != generatedruntimestate.PhaseMigrating {
 		return nil, false
 	}
 	return generatedMigrationUncertain(ctx, cause), true
+}
+
+// Durable phase and identity remain evidence even before a current invocation
+// map exists. No generic failure writer may terminalize these candidates.
+func generatedCandidateBoundaryRisk(value generatedruntimestate.Deployment) bool {
+	switch value.Phase {
+	case generatedruntimestate.PhaseStartingCandidate, generatedruntimestate.PhaseWaitingHealth,
+		generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded:
+		return true
+	}
+	for _, component := range value.Components {
+		if component.ContainerName != "" || component.ContainerID != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.DeploymentInput, deployment deployments.Deployment, reporter jobs.ProgressReporter) (resolvedDeployment, error) {
@@ -655,6 +655,11 @@ func (e *Executor) fail(ctx context.Context, deployment deployments.Deployment, 
 	defer cancel()
 	if persisted, err := e.state.Get(finalize, runtimeDeployment.AppID, runtimeDeployment.DeploymentID); err == nil {
 		runtimeDeployment = persisted
+	} else if !errors.Is(err, generatedruntimestate.ErrNotFound) {
+		return generatedAuthorizationRefusal(ctx, err)
+	}
+	if generatedCandidateBoundaryRisk(runtimeDeployment) {
+		return generatedAuthorizationRefusal(ctx, executionError(code))
 	}
 	if runtimeDeployment.DeploymentID != "" && runtimeDeployment.Phase != generatedruntimestate.PhaseFailed && runtimeDeployment.Phase != generatedruntimestate.PhaseCancelled && runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded {
 		componentDiagnostic, markComponents := failureComponentDiagnostic(diagnostic)
@@ -693,6 +698,13 @@ func failureComponentDiagnostic(diagnostic generatedruntimestate.DiagnosticCode)
 func (e *Executor) failMain(ctx context.Context, deployment deployments.Deployment, code string) error {
 	if deployment.ID == "" {
 		return executionError(code)
+	}
+	if persisted, err := e.state.Get(ctx, deployment.AppID, deployment.ID); err == nil {
+		if generatedCandidateBoundaryRisk(persisted) {
+			return generatedAuthorizationRefusal(ctx, executionError(code))
+		}
+	} else if !errors.Is(err, generatedruntimestate.ErrNotFound) {
+		return generatedAuthorizationRefusal(ctx, err)
 	}
 	status := deployments.Failed
 	if code == "cancelled" {

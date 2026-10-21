@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"reflect"
-	"sync/atomic"
 	"testing"
 
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -33,18 +32,15 @@ func (s *authorizationFixtureStore) Gate(_ context.Context, request deployments.
 	return s.gateErr
 }
 
-type authorizationFixtureReservation struct{ releases atomic.Int32 }
-
-func (r *authorizationFixtureReservation) Release() { r.releases.Add(1) }
-
 type authorizationFixtureCapacity struct {
 	calls       int
 	err         error
 	events      *[]string
-	reservation *authorizationFixtureReservation
+	delegate    replacementReserver
+	reservation generatedruntime.ReplacementReservation
 }
 
-func (c *authorizationFixtureCapacity) ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error) {
+func (c *authorizationFixtureCapacity) ReserveReplacement(ctx context.Context, request deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error) {
 	c.calls++
 	if c.events != nil {
 		*c.events = append(*c.events, "reserve")
@@ -52,8 +48,12 @@ func (c *authorizationFixtureCapacity) ReserveReplacement(context.Context, int) 
 	if c.err != nil {
 		return nil, c.err
 	}
-	c.reservation = &authorizationFixtureReservation{}
-	return c.reservation, nil
+	if c.delegate == nil {
+		return nil, errors.New("successful authorization requires the sealed candidate authority")
+	}
+	reservation, err := c.delegate.ReserveReplacement(ctx, request)
+	c.reservation = reservation
+	return reservation, err
 }
 
 type authorizationFixturePlans struct {
@@ -70,15 +70,16 @@ func (p authorizationFixturePlans) GetRevision(context.Context, string, string, 
 }
 
 func TestRepositoryAuthorizationGateMovesExactPinnedDeploymentToApplying(t *testing.T) {
-	store, plans, request := authorizationFixture(t)
+	authority := newSealedExecutorFixture(t)
+	store, plans, request := authorizationFixture(t, authority)
 	events := []string{}
 	store.events = &events
-	capacity := &authorizationFixtureCapacity{events: &events}
+	capacity := &authorizationFixtureCapacity{events: &events, delegate: authority.engine}
 	gate, err := NewAuthorizationGate(store, plans, capacity)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reservation, err := gate.Authorize(context.Background(), request)
+	reservation, err := gate.Authorize(authority.context, request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +93,7 @@ func TestRepositoryAuthorizationGateMovesExactPinnedDeploymentToApplying(t *test
 	}
 	for _, status := range []deployments.Status{deployments.Applying, deployments.WaitingHealth} {
 		store.deployment.Status = status
-		reservation, err = gate.Authorize(context.Background(), request)
+		reservation, err = gate.Authorize(authority.context, request)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -115,14 +116,14 @@ func assertAuthorizationGateRequest(t *testing.T, actual deployments.GateRequest
 }
 
 func TestRepositoryAuthorizationGateFailsBeforeMutationOnProvenanceOrMigrationDrift(t *testing.T) {
-	store, plans, request := authorizationFixture(t)
+	store, plans, request := authorizationFixture(t, nil)
 	capacity := &authorizationFixtureCapacity{}
 	gate, _ := NewAuthorizationGate(store, plans, capacity)
 	store.deployment.ReleaseID = "wrong"
 	if _, err := gate.Authorize(context.Background(), request); err == nil || store.gateCalls != 0 || capacity.calls != 0 {
 		t.Fatal("release provenance drift was accepted")
 	}
-	store, plans, request = authorizationFixture(t)
+	store, plans, request = authorizationFixture(t, nil)
 	plans.plan.Plan.Migration = &deploymentplans.Migration{ComponentName: "web", RootDirectory: ".", Command: "npm run migrate", EvidenceDigest: string(make([]byte, 64)), Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending}}
 	capacity = &authorizationFixtureCapacity{}
 	gate, _ = NewAuthorizationGate(store, plans, capacity)
@@ -144,7 +145,7 @@ func TestRepositoryAuthorizationGatePreservesReadFailureCauses(t *testing.T) {
 		{name: "plan deadline", err: context.DeadlineExceeded, set: func(_ *authorizationFixtureStore, plans *authorizationFixturePlans, err error) { plans.err = err }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store, plans, request := authorizationFixture(t)
+			store, plans, request := authorizationFixture(t, nil)
 			test.set(store, &plans, test.err)
 			capacity := &authorizationFixtureCapacity{}
 			gate, err := NewAuthorizationGate(store, plans, capacity)
@@ -162,34 +163,36 @@ func TestRepositoryAuthorizationGatePreservesReadFailureCauses(t *testing.T) {
 }
 
 func TestRepositoryAuthorizationGateReleasesReservationWhenDatabaseGateFails(t *testing.T) {
-	store, plans, request := authorizationFixture(t)
+	authority := newSealedExecutorFixture(t)
+	store, plans, request := authorizationFixture(t, authority)
 	store.deployment.Status = deployments.Succeeded
-	capacity := &authorizationFixtureCapacity{}
+	capacity := &authorizationFixtureCapacity{delegate: authority.engine}
 	gate, _ := NewAuthorizationGate(store, plans, capacity)
-	if _, err := gate.Authorize(context.Background(), request); err == nil {
+	if _, err := gate.Authorize(authority.context, request); err == nil {
 		t.Fatal("terminal deployment was authorized")
 	}
-	if capacity.reservation == nil || capacity.reservation.releases.Load() != 1 {
-		t.Fatal("failed authorization did not release its aggregate reservation exactly once")
+	if capacity.reservation == nil || authority.engine.RetainReplacementCapacity(capacity.reservation) == nil {
+		t.Fatal("failed authorization left its sealed reservation live")
 	}
 }
 
 func TestRepositoryAuthorizationGateReleasesRecoveredReservationExactlyOnceOnGateRefusal(t *testing.T) {
 	for _, status := range []deployments.Status{deployments.Applying, deployments.WaitingHealth} {
 		t.Run(string(status), func(t *testing.T) {
-			store, plans, request := authorizationFixture(t)
+			authority := newSealedExecutorFixture(t)
+			store, plans, request := authorizationFixture(t, authority)
 			store.deployment.Status = status
 			cause := errors.New("gate refusal sentinel")
 			store.gateErr = cause
-			capacity := &authorizationFixtureCapacity{}
+			capacity := &authorizationFixtureCapacity{delegate: authority.engine}
 			gate, err := NewAuthorizationGate(store, plans, capacity)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if reservation, err := gate.Authorize(context.Background(), request); reservation != nil || !errors.Is(err, cause) {
+			if reservation, err := gate.Authorize(authority.context, request); reservation != nil || !errors.Is(err, cause) {
 				t.Fatalf("reservation=%#v error=%v", reservation, err)
 			}
-			if capacity.calls != 1 || store.gateCalls != 1 || capacity.reservation == nil || capacity.reservation.releases.Load() != 1 {
+			if capacity.calls != 1 || store.gateCalls != 1 || capacity.reservation == nil || authority.engine.RetainReplacementCapacity(capacity.reservation) == nil {
 				t.Fatalf("capacity=%d gate=%d reservation=%#v", capacity.calls, store.gateCalls, capacity.reservation)
 			}
 			assertAuthorizationGateRequest(t, store.requests[0], request)
@@ -198,7 +201,7 @@ func TestRepositoryAuthorizationGateReleasesRecoveredReservationExactlyOnceOnGat
 }
 
 func TestRepositoryAuthorizationGateMapsInsufficientAggregateCapacity(t *testing.T) {
-	store, plans, request := authorizationFixture(t)
+	store, plans, request := authorizationFixture(t, nil)
 	capacity := &authorizationFixtureCapacity{err: &generatedruntime.Error{Code: generatedruntime.DiagnosticInsufficientReplacementSpace}}
 	gate, _ := NewAuthorizationGate(store, plans, capacity)
 	if _, err := gate.Authorize(context.Background(), request); err != ErrInsufficientReplacementCapacity {
@@ -209,7 +212,11 @@ func TestRepositoryAuthorizationGateMapsInsufficientAggregateCapacity(t *testing
 	}
 }
 
-func authorizationFixture(t *testing.T) (*authorizationFixtureStore, authorizationFixturePlans, AuthorizationRequest) {
+func authorizationFixture(t *testing.T, authority *sealedExecutorFixture) (*authorizationFixtureStore, authorizationFixturePlans, AuthorizationRequest) {
+	if authority != nil {
+		deployment, request := authority.prepareAuthorization(t)
+		return &authorizationFixtureStore{deployment: deployment}, authorizationFixturePlans{plan: authority.plan}, request
+	}
 	appID := "11111111-1111-4111-8111-111111111111"
 	deploymentID := "22222222-2222-4222-8222-222222222222"
 	planID := "33333333-3333-4333-8333-333333333333"

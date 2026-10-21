@@ -73,23 +73,17 @@ type runtimeState interface {
 	Get(context.Context, string, string) (generatedruntimestate.Deployment, error)
 	Active(context.Context, string) (generatedruntimestate.ActiveHead, error)
 	Advance(context.Context, string, string, generatedruntimestate.Phase, generatedruntimestate.Phase, generatedruntimestate.DiagnosticCode) (generatedruntimestate.Deployment, error)
-	SetContainerStarting(context.Context, string, string, string, string) (generatedruntimestate.Component, error)
-	SetContainerRunning(context.Context, string, string, string, string) (generatedruntimestate.Component, error)
 	AdvanceComponent(context.Context, string, string, string, generatedruntimestate.ComponentState, generatedruntimestate.ComponentState) (generatedruntimestate.Component, error)
 	FailComponent(context.Context, string, string, string, generatedruntimestate.ComponentState, generatedruntimestate.DiagnosticCode) (generatedruntimestate.Component, error)
 	SwitchActive(context.Context, string, string, int64) (generatedruntimestate.ActiveHead, bool, error)
 }
 
 type runtimeEngine interface {
-	ReserveReplacement(context.Context, int) (generatedruntime.ReplacementReservation, error)
+	ReserveReplacement(context.Context, deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error)
 	RetainReplacementCapacity(generatedruntime.ReplacementReservation) error
 	EnsureAppNetwork(context.Context, deployments.GeneratedNetworkRequest) error
-	CreateInactiveCandidate(context.Context, generatedruntime.CandidateSpec) (generatedruntime.Candidate, error)
-	AdoptCandidate(generatedruntime.Candidate, generatedruntime.ReplacementReservation) (generatedruntime.Candidate, error)
-	StartCandidate(context.Context, generatedruntime.Candidate) error
-	WaitHealthy(context.Context, generatedruntime.Candidate) error
+	PinCandidates(context.Context, deployments.GeneratedCandidateRequest, generatedruntime.ReplacementReservation) (*deployments.GeneratedCandidateExecution, error)
 	StopAndRemove(context.Context, generatedruntime.Candidate, time.Duration) error
-	ReleaseAdmission(generatedruntime.Candidate)
 }
 
 // AuthorizationRequest contains only immutable identities and aggregate
@@ -99,10 +93,13 @@ type AuthorizationRequest struct {
 	AppID                        string
 	DeploymentID                 string
 	ReleaseID                    string
+	ConfigurationRevisionID      string
+	ConfigurationRevisionNumber  int64
 	DeploymentPlanRevisionID     string
 	DeploymentPlanRevisionNumber int64
 	CandidateSlot                generatedruntime.Slot
 	ComponentCount               int
+	Findings                     []deployments.Finding
 }
 
 // AuthorizationGate is the final pre-mutation transaction. Implementations
