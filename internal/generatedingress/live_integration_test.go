@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -21,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"syscall"
@@ -33,6 +35,7 @@ import (
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -79,6 +82,7 @@ func liveGatewayAccessRepository(t *testing.T, dataRoot string) *appaccess.Repos
 type liveGeneratedAuthority struct {
 	*liveauthority.Authority
 	repository       *deployments.Repository
+	db               *sql.DB
 	workingDirectory string
 	sessions         map[string]*liveauthority.CandidateSession
 }
@@ -90,9 +94,17 @@ func liveGeneratedDeployments(t *testing.T, workingDirectory string) *liveGenera
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	return liveGeneratedDeploymentsWithDatabase(t, db, workingDirectory)
+}
+
+func liveGeneratedDeploymentsWithDatabase(t *testing.T, db *sql.DB, workingDirectory string) *liveGeneratedAuthority {
+	t.Helper()
+	if db == nil {
+		t.Fatal("live generated authority requires a database")
+	}
 	authority := liveauthority.New(t, db, workingDirectory)
 	return &liveGeneratedAuthority{Authority: authority, repository: authority.Repository(),
-		workingDirectory: workingDirectory, sessions: make(map[string]*liveauthority.CandidateSession)}
+		db: db, workingDirectory: workingDirectory, sessions: make(map[string]*liveauthority.CandidateSession)}
 }
 
 func (a *liveGeneratedAuthority) bindCandidate(t *testing.T, ctx context.Context, spec generatedruntime.CandidateSpec) (context.Context, generatedruntime.CandidateSpec) {
@@ -114,6 +126,30 @@ func (a *liveGeneratedAuthority) published(t *testing.T, ctx context.Context, in
 		t.Fatal("record exact published candidate route:", err)
 	}
 	session.Close()
+}
+
+func (a *liveGeneratedAuthority) publishedHistory(ctx context.Context, db *sql.DB,
+	candidate generatedruntime.Candidate,
+) (generatedruntimestate.ActiveHead, error) {
+	if a == nil || ctx == nil || db == nil || db != a.db {
+		return generatedruntimestate.ActiveHead{}, errors.New("live published history requires the original database")
+	}
+	session := a.sessions[candidate.DeploymentID]
+	if session == nil || !reflect.DeepEqual(candidate, session.Candidate()) {
+		return generatedruntimestate.ActiveHead{}, errors.New("live published history requires the original candidate session")
+	}
+	return session.PublishedHistory(ctx, db)
+}
+
+func (a *liveGeneratedAuthority) requirePublishedHistory(t *testing.T, ctx context.Context, db *sql.DB,
+	candidate generatedruntime.Candidate,
+) generatedruntimestate.ActiveHead {
+	t.Helper()
+	head, err := a.publishedHistory(ctx, db, candidate)
+	if err != nil {
+		t.Fatal("validate original live published history:", err)
+	}
+	return head
 }
 
 func (a *liveGeneratedAuthority) waitHealthy(candidate generatedruntime.Candidate) error {

@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 )
@@ -62,5 +64,82 @@ func TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes(t *testing.T) {
 	defer replayed.Leave()
 	if err := replayed.CheckObservation(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLiveGeneratedAuthorityUsesCallerDatabaseAcrossSequentialBindings(t *testing.T) {
+	root := t.TempDir()
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := database.Open(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	authority := liveGeneratedDeploymentsWithDatabase(t, db, directories.WorkingDirectory)
+	ctx := context.Background()
+
+	var bound []generatedruntime.CandidateSpec
+	for index, version := range []string{"blue", "green"} {
+		original := liveCandidateSpec(version, uuid.NewString(), uuid.NewString())
+		prepared := authority.PrepareCandidate(t, ctx, original)
+		if prepared.DeploymentID != "" || prepared.DeploymentPlanRevisionID == original.DeploymentPlanRevisionID ||
+			prepared.ConfigurationRevisionID == "" {
+			t.Fatalf("preparation %d retained obsolete identity or omitted protected revisions", index+1)
+		}
+		scope, release, err := deploymenteffects.AcquireScoped(ctx, directories.WorkingDirectory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		boundSpec := authority.BindNetwork(t, deploymenteffects.WithScope(ctx, scope), prepared)
+		authority.CancelNetwork(t, deploymenteffects.WithScope(ctx, scope), boundSpec.DeploymentID)
+		if err := release(); err != nil {
+			t.Fatal(err)
+		}
+		bound = append(bound, boundSpec)
+	}
+	if bound[0].DeploymentID == "" || bound[0].DeploymentID == bound[1].DeploymentID ||
+		bound[0].DeploymentPlanRevisionID == bound[1].DeploymentPlanRevisionID ||
+		bound[0].ConfigurationRevisionID == bound[1].ConfigurationRevisionID {
+		t.Fatal("sequential bindings did not retain distinct genuine database identities")
+	}
+	var jobs, deployments, runtimeDeployments int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE type='deploy'`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM deployments`).Scan(&deployments); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM generated_runtime_deployments`).Scan(&runtimeDeployments); err != nil {
+		t.Fatal(err)
+	}
+	if jobs != 2 || deployments != 2 || runtimeDeployments != 2 {
+		t.Fatalf("same-database binding history changed: jobs=%d deployments=%d runtime=%d", jobs, deployments, runtimeDeployments)
+	}
+
+	var before, after int64
+	if err := db.QueryRow(`SELECT total_changes()`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	candidate := generatedruntime.Candidate{AppID: bound[0].AppID, DeploymentID: bound[0].DeploymentID}
+	if _, err := authority.publishedHistory(ctx, db, candidate); err == nil {
+		t.Fatal("missing original session unexpectedly validated")
+	}
+	if err := db.QueryRow(`SELECT total_changes()`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatalf("published-history refusal wrote database state: before=%d after=%d", before, after)
+	}
+
+	foreign, err := database.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = foreign.Close() })
+	if _, err := authority.publishedHistory(ctx, foreign, candidate); err == nil {
+		t.Fatal("foreign database unexpectedly validated")
 	}
 }
