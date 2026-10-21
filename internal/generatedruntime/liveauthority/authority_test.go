@@ -16,6 +16,7 @@ import (
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
@@ -269,7 +270,7 @@ func TestPublishedHistoryRefusesIncompleteMismatchedAndForeignStateWithoutWrites
 	sessionFor := func(value generatedruntime.Candidate) *CandidateSession {
 		return &CandidateSession{
 			authority: authority, spec: bound, candidate: value,
-			execution: &deployments.GeneratedCandidateExecution{},
+			execution: &generatedingress.GeneratedCandidateExecution{},
 			published: generatedruntimestate.ActiveHead{
 				AppID: bound.AppID, DeploymentID: bound.DeploymentID, ReleaseID: bound.ReleaseID,
 				Slot: runtime.CandidateSlot, Generation: 1, UpdatedAt: runtime.UpdatedAt,
