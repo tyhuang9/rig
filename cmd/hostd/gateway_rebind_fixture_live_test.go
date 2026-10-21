@@ -262,35 +262,41 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 	if err != nil || json.Unmarshal(setupBytes, &setup) != nil {
 		t.Fatal("read reviewed generated build recipe")
 	}
+	baselineObserver := newLiveHostdRebindBaselineExecutionObserver(composition.executor)
 	workerCtx, stopWorker := context.WithCancel(ctx)
 	workerDone, err := prepareRuntimeWorker(workerCtx, runtimeRecovery{
 		recoverState: jobStore.RecoverRuntimeContext,
-	}, composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+	}, baselineObserver, func(workerContext context.Context, executor jobs.Executor) error {
 		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
 	}, func(error) {})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		stopWorker()
-		select {
-		case <-workerDone:
-		case <-time.After(10 * time.Second):
+		liveHostdRebindStopBaselineWorker(stopWorker, workerDone, func() {
 			t.Error("baseline setup worker did not stop during cleanup")
-		}
+		}, func(line string) {
+			t.Log(line)
+		}, baselineObserver)
 	})
 	// The full hostd children intentionally run without a GitHub provider. Keep
 	// the baseline applications local so a later public deployment request can
 	// materialize its release through the same child rather than failing before
 	// it reaches route publication.
-	fixture.app = liveHostdRebindDeployLocal(t, &setupAPI, jobStore, deploymentStore, composition.state,
-		source, setup, "Supported rebind A", "supported-rebind-a-v1", &fixture.appIDs)
-	fixture.secondApp = liveHostdRebindDeployLocal(t, &setupAPI, jobStore, deploymentStore, composition.state,
-		source, setup, "Supported rebind B", "supported-rebind-b-v1", &fixture.appIDs)
+	liveHostdRebindRunBaselinePhase(baselineObserver, liveHostdRebindBaselineADeployPhase, func() {
+		fixture.app = liveHostdRebindDeployLocal(t, &setupAPI, jobStore, deploymentStore, composition.state,
+			source, setup, "Supported rebind A", "supported-rebind-a-v1", &fixture.appIDs)
+	})
+	liveHostdRebindRunBaselinePhase(baselineObserver, liveHostdRebindBaselineBDeployPhase, func() {
+		fixture.secondApp = liveHostdRebindDeployLocal(t, &setupAPI, jobStore, deploymentStore, composition.state,
+			source, setup, "Supported rebind B", "supported-rebind-b-v1", &fixture.appIDs)
+	})
 	// Capture the exact legacy predecessor while it is still the baseline
 	// gateway. The subsequent v1-to-v2 upgrade intentionally retains it, and
 	// cleanup may delegate only this observed identity to the older callback.
-	fixture.legacyV1 = liveHostdRebindCaptureLegacyV1Resources(t, fixture)
+	liveHostdRebindRunBaselinePhase(baselineObserver, liveHostdRebindLegacyIdentityCapturePhase, func() {
+		fixture.legacyV1 = liveHostdRebindCaptureLegacyV1Resources(t, fixture)
+	})
 
 	predecessorQuery := fmt.Sprintf("?interfaceId=%s&selectedIpv4=%s&portStart=%d&portEnd=%d",
 		urlQuery(predecessor.InterfaceID), urlQuery(predecessor.IPv4), ports[0], ports[2])
