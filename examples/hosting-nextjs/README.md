@@ -6,8 +6,8 @@ reviewed generated plan uses Node 24, npm with `npm ci`, `npm run build`, and
 3000 with `/api/health` as its readiness path.
 
 `NEXT_PUBLIC_BUILD_MARKER` is a public build input. The runtime-only
-`RIG_FIXTURE_RUNTIME_SECRET` belongs in a scoped server secret; `/api/runtime`
-reports only whether it is present. `RIG_FIXTURE_SLOT_MARKER` is a harmless
+`APP_FIXTURE_RUNTIME_SECRET` belongs in a scoped server secret; `/api/runtime`
+reports only whether it is present. `APP_FIXTURE_SLOT_MARKER` is a harmless
 runtime marker that identifies blue and green responses in the hosted test.
 Never place the secret in a build input.
 

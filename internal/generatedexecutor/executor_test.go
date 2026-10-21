@@ -17,7 +17,6 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -29,6 +28,7 @@ import (
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 const (
@@ -744,7 +744,7 @@ func TestExecutorPreservesAuthorizationRefusalAndCancellationWithoutFailureMutat
 
 func newGeneratedExecutorClaim(t *testing.T) deploymentexecution.Claim {
 	t.Helper()
-	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	db, err := databasefixture.Open(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -107,7 +107,7 @@ func TestLiveNextFixtureImage(t *testing.T) {
 		t.Fatal("invalid Next.js image identity")
 	}
 	imageEnv, err := exec.CommandContext(ctx, docker, "image", "inspect", "--format", "{{json .Config.Env}}", imageID).CombinedOutput()
-	if err != nil || bytes.Contains(imageEnv, []byte("RIG_FIXTURE_RUNTIME_SECRET")) {
+	if err != nil || bytes.Contains(imageEnv, []byte("APP_FIXTURE_RUNTIME_SECRET")) {
 		t.Fatalf("runtime secret key reached image environment: %v", err)
 	}
 	history, err := exec.CommandContext(ctx, docker, "image", "history", "--no-trunc", imageID).CombinedOutput()

@@ -11,6 +11,7 @@ import (
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -116,15 +117,18 @@ type LiveRuntimeTestAuthority interface {
 	Repository() *deployments.Repository
 	PrepareCandidate(*testing.T, context.Context, LiveRuntimeTestCandidateSpec) LiveRuntimeTestCandidateSpec
 	BindNetwork(*testing.T, context.Context, LiveRuntimeTestCandidateSpec) LiveRuntimeTestCandidateSpec
+	CancelNetwork(*testing.T, context.Context, string)
 	Begin(*testing.T, context.Context, LiveRuntimeTestEngine, LiveRuntimeTestCandidateSpec) LiveRuntimeTestSession
 }
 
 type LiveRuntimeTestSession interface {
 	BoundSpec() LiveRuntimeTestCandidateSpec
+	Candidate() LiveRuntimeTestCandidate
 	Start(*testing.T, LiveRuntimeTestCandidateSpec) (LiveRuntimeTestCandidate, error)
 	WaitHealthyAndHandoff() error
 	RejectObservedFailure() error
 	RoutePublished(generatedidentity.Slot, []generatedroute.RouteEndpoint) error
+	PublishedHistory(context.Context, *sql.DB) (generatedruntimestate.ActiveHead, error)
 	Close()
 }
 
