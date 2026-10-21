@@ -17,9 +17,17 @@ env:
 
 jobs:
   migration-journey:
-    name: Approved migration and uncertain completion in Docker
+    name: Migration in Docker (${{ matrix.scenario }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: approval-and-uncertainty
+            test: TestLiveGeneratedMigrationApprovalAndUncertaintyJourney
+          - scenario: authority-revoked-before-start
+            test: TestLiveGeneratedMigrationAuthorityRevokedBeforeStart
     steps:
       - name: Check out source
         timeout-minutes: 2
@@ -41,21 +49,30 @@ jobs:
           docker buildx version
           docker compose version
 
-      - name: Exercise approved migration and uncertain completion
+      - name: Exercise the selected migration journey
         timeout-minutes: 32
         shell: bash
         env:
           RIG_RUN_LIVE_MIGRATION_JOURNEY: "1"
+          RIG_MIGRATION_TEST: ${{ matrix.test }}
         run: |
           set -euo pipefail
           output="$(mktemp)"
           trap 'rm -f "$output"' EXIT
-          test_name='TestLiveGeneratedMigrationApprovalAndUncertaintyJourney'
+          test_name="$RIG_MIGRATION_TEST"
+          case "$test_name" in
+            TestLiveGeneratedMigrationApprovalAndUncertaintyJourney|TestLiveGeneratedMigrationAuthorityRevokedBeforeStart) ;;
+            *) printf 'Unknown migration test selection.\n' >&2; exit 1 ;;
+          esac
           provider_test='TestControllerJourneyGitHubProviderRetainsImmutableRevisions'
           package_name='github.com/hostd/hostd/cmd/hostd'
-          go test -tags live_docker -json -v -count=1 -timeout=31m ./cmd/hostd -run '^Test(ControllerJourneyGitHubProviderRetainsImmutableRevisions|LiveGeneratedMigrationApprovalAndUncertaintyJourney)$' | tee "$output"
+          go test -tags live_docker -json -v -count=1 -timeout=31m ./cmd/hostd -run "^($provider_test|$test_name)$" | tee "$output"
           for required in "$provider_test" "$test_name"; do
-            jq -e --arg package_name "$package_name" --arg test_name "$required" 'select(.Action == "pass" and .Package == $package_name and .Test == $test_name)' "$output" > /dev/null
+            jq -s -e --arg package_name "$package_name" --arg test_name "$required" '
+              ([.[] | select(.Action == "run" and .Package == $package_name and .Test == $test_name)] | length) == 1 and
+              ([.[] | select(.Action == "pass" and .Package == $package_name and .Test == $test_name)] | length) == 1 and
+              ([.[] | select(.Package == $package_name and (.Action == "skip" or .Action == "fail"))] | length) == 0
+            ' "$output" > /dev/null
           done
 
       - name: Require complete owned Docker cleanup

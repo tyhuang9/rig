@@ -265,24 +265,8 @@ type RouteSwitcher interface {
 	Switch(context.Context, RouteSwitchRequest) error
 }
 
-type MigrationRequest struct {
-	AppID                        string
-	ReleaseID                    string
-	DeploymentID                 string
-	ArtifactID                   string
-	DeploymentPlanRevisionID     string
-	DeploymentPlanRevisionNumber int64
-	ComponentName                string
-	RootDirectory                string
-	ImageContentID               string
-	Command                      string
-	ConfigurationRevisionID      string
-	ConfigurationRevisionNumber  int64
-	AllowedEnvironmentKeys       []string
-}
-
-// MigrationRunner is implemented separately because a migration has a
-// different configuration and persistence boundary from an application slot.
+// MigrationRunner accepts only a sealed deployment-owned invocation. It runs
+// physical work without writing the durable migration outcome.
 type MigrationRunner interface {
-	Run(context.Context, MigrationRequest) error
+	Run(context.Context, deployments.GeneratedMigrationInvocation) error
 }

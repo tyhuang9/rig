@@ -3,6 +3,7 @@ package generatedruntime
 import (
 	"errors"
 
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
 
@@ -31,6 +32,12 @@ func (l *secureEnvironmentLease) Cleanup() error {
 		return nil
 	}
 	return l.files.Cleanup()
+}
+
+// StageGeneratedMigration preserves the protected staging and input clearing
+// contract for the repository-owned migration observer.
+func (s *SecureEnvironmentStager) StageGeneratedMigration(operationID string, attempt int, contents []byte) (deployments.GeneratedMigrationEnvironmentLease, error) {
+	return s.Stage(operationID, attempt, contents)
 }
 
 func (s *SecureEnvironmentStager) Stage(operationID string, attempt int, contents []byte) (EnvironmentLease, error) {

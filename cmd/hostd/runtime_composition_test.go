@@ -118,6 +118,47 @@ func (reporter *runtimeCompositionReporter) Report(update jobs.ProgressUpdate) e
 	return nil
 }
 
+func TestRuntimeCompositionRequiresSameDatabaseMigrationStoresBeforeSetup(t *testing.T) {
+	for _, dependency := range []string{"plans", "configuration"} {
+		t.Run(dependency, func(t *testing.T) {
+			fixture := newRuntimeCompositionFixture(t)
+			fixture.configuration.GeneratedRuntime = true
+			foreignRoot := filepath.Clean(t.TempDir())
+			foreignDB, err := database.Open(foreignRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = foreignDB.Close() })
+			dependencies := fixture.dependencies
+			if dependency == "plans" {
+				dependencies.plans, err = deploymentplans.New(foreignDB, foreignRoot)
+			} else {
+				dependencies.configuration, err = appconfig.New(foreignDB, foreignRoot)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			steps, recovered := 0, false
+			runner := &runtimeCompositionCommandRunner{}
+			result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
+				dockerExecutable: fixture.dockerExecutable,
+				runner:           runner,
+				beforeStep: func(string) error {
+					steps++
+					return nil
+				},
+				recoverIngress: func(context.Context, *generatedingress.Manager) error {
+					recovered = true
+					return nil
+				},
+			})
+			if err == nil || result.executor != nil || result.generated != nil || steps != 0 || recovered || runner.calls != 0 {
+				t.Fatalf("foreign %s accepted or crossed setup: err=%v steps=%d recovered=%t calls=%d", dependency, err, steps, recovered, runner.calls)
+			}
+		})
+	}
+}
+
 func TestRuntimeCompositionRequiresSameDatabaseDeploymentBindingsBeforeSetup(t *testing.T) {
 	t.Run("same database", func(t *testing.T) {
 		fixture := newRuntimeCompositionFixture(t)
@@ -486,8 +527,8 @@ type runtimeCompositionMigrationRunner struct {
 	delegate generatedruntime.MigrationRunner
 }
 
-func (runner runtimeCompositionMigrationRunner) Run(ctx context.Context, request generatedruntime.MigrationRequest) error {
-	return runner.delegate.Run(ctx, request)
+func (runner runtimeCompositionMigrationRunner) Run(ctx context.Context, invocation deployments.GeneratedMigrationInvocation) error {
+	return runner.delegate.Run(ctx, invocation)
 }
 
 type runtimeCompositionCapacitySource struct {
@@ -587,8 +628,9 @@ func TestGeneratedCompositionFailureStopsAtExactStep(t *testing.T) {
 	steps := []string{
 		"compose_temp_create", "compose_temp_recover", "generated_build_temp_create", "generated_build_temp_recover",
 		"generated_environment_temp_create", "generated_environment_temp_recover",
-		"artifact_repository_create", "artifact_repository_recover", "controller_directories_create", "builder_create",
-		"environment_stager_create", "ingress_create", "ingress_recover", "runtime_engine_create", "compiler_create",
+		"artifact_repository_create", "artifact_repository_recover", "controller_directories_create",
+		"environment_stager_create", "migration_authority_create", "builder_create",
+		"ingress_create", "ingress_recover", "runtime_engine_create", "compiler_create",
 		"migration_runner_create", "runtime_state_create", "authorization_gate_create", "generated_executor_create",
 		"compose_executor_create", "runtime_router_create",
 	}

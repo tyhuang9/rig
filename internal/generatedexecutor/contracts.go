@@ -43,6 +43,16 @@ type deploymentStore interface {
 	InitializeRuntime(context.Context, string, string, string, string, int64, deployments.RuntimeStrategy, string, int64) (deployments.Deployment, error)
 	Transition(context.Context, string, string, deployments.Status, string) (deployments.Deployment, error)
 	FinishGeneratedImagePreparation(context.Context, deployments.GeneratedNetworkRequest) (generatedruntimestate.Phase, error)
+	PinGeneratedMigration(context.Context, deployments.GeneratedMigrationRequest) (*deployments.GeneratedMigrationExecution, error)
+}
+
+type generatedMigrationExecution interface {
+	ObserveSucceeded() (generatedruntimestate.Deployment, error)
+	Begin() (deployments.GeneratedMigrationInvocation, generatedruntimestate.Deployment, error)
+	RecordSucceeded() (generatedruntimestate.Deployment, error)
+	RecordObservedFailure() (generatedruntimestate.Deployment, error)
+	FinishPreparation() (generatedruntimestate.Deployment, error)
+	Leave()
 }
 
 type planReader interface {
@@ -63,8 +73,6 @@ type runtimeState interface {
 	Get(context.Context, string, string) (generatedruntimestate.Deployment, error)
 	Active(context.Context, string) (generatedruntimestate.ActiveHead, error)
 	Advance(context.Context, string, string, generatedruntimestate.Phase, generatedruntimestate.Phase, generatedruntimestate.DiagnosticCode) (generatedruntimestate.Deployment, error)
-	BeginMigration(context.Context, string, string) (generatedruntimestate.Deployment, error)
-	FinishMigration(context.Context, string, string, bool) (generatedruntimestate.Deployment, error)
 	SetContainerStarting(context.Context, string, string, string, string) (generatedruntimestate.Component, error)
 	SetContainerRunning(context.Context, string, string, string, string) (generatedruntimestate.Component, error)
 	AdvanceComponent(context.Context, string, string, string, generatedruntimestate.ComponentState, generatedruntimestate.ComponentState) (generatedruntimestate.Component, error)

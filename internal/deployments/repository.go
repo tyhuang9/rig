@@ -7,13 +7,17 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/generatedrecovery"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 type Status string
@@ -111,13 +115,21 @@ type Approval struct {
 }
 
 type Repository struct {
-	db                                *sql.DB
-	executionGuard                    *deploymentexecution.Guard
-	now                               func() time.Time
-	afterGatePolicyRead               func()
-	afterComposeIdentityRead          func()
-	afterGeneratedNetworkIdentityRead func()
-	afterGeneratedImageIdentityRead   func()
+	db                                         *sql.DB
+	executionGuard                             *deploymentexecution.Guard
+	now                                        func() time.Time
+	afterGatePolicyRead                        func()
+	afterComposeIdentityRead                   func()
+	afterGeneratedNetworkIdentityRead          func()
+	afterGeneratedImageIdentityRead            func()
+	migrationPlans                             *deploymentplans.Store
+	migrationConfiguration                     *appconfig.Store
+	migrationEnvironment                       GeneratedMigrationEnvironmentStager
+	migrationProcess                           runtimeprocess.CommandRunner
+	migrationOptions                           GeneratedMigrationProcessOptions
+	migrationDockerEnv                         []string
+	afterGeneratedMigrationBeginCommit         func()
+	afterGeneratedMigrationConfigurationExport func(*appconfig.ExecutionConfiguration)
 }
 
 func New(db *sql.DB) *Repository { return &Repository{db: db, now: time.Now} }
@@ -127,6 +139,47 @@ func NewWithExecutionGuard(db *sql.DB, guard *deploymentexecution.Guard) (*Repos
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
 	return &Repository{db: db, executionGuard: guard, now: time.Now}, nil
+}
+
+// NewWithExecutionGuardAndGeneratedMigration composes the guarded repository
+// with the concrete, same-database dependencies that own generated migration
+// command and observation authority.
+func NewWithExecutionGuardAndGeneratedMigration(
+	db *sql.DB,
+	guard *deploymentexecution.Guard,
+	plans *deploymentplans.Store,
+	configuration *appconfig.Store,
+	environment GeneratedMigrationEnvironmentStager,
+	process runtimeprocess.CommandRunner,
+	options GeneratedMigrationProcessOptions,
+) (*Repository, error) {
+	if db == nil || guard == nil || !guard.UsesDatabase(db) || plans == nil || !plans.ConfiguredFor(db) ||
+		configuration == nil || !configuration.ConfiguredFor(db) || nilInterface(environment) || nilInterface(process) ||
+		!validGeneratedMigrationProcessOptions(options) {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	repository := &Repository{
+		db: db, executionGuard: guard, now: time.Now,
+		migrationPlans: plans, migrationConfiguration: configuration,
+		migrationEnvironment: environment, migrationProcess: process, migrationOptions: options,
+	}
+	if err := repository.initializeGeneratedMigrationProcess(); err != nil {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	return repository, nil
+}
+
+func nilInterface(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func (r *Repository) UsesDatabase(db *sql.DB) bool {

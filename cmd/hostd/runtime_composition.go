@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
@@ -113,7 +114,12 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		(dependencies.bindings == nil || !dependencies.bindings.UsesDatabase(dependencies.db)) {
 		return runtimeComposition{}, errors.New("runtime deployment lifecycle binding repository is required")
 	}
+	if configuration.GeneratedRuntime &&
+		(!dependencies.plans.ConfiguredFor(dependencies.db) || !dependencies.configuration.ConfiguredFor(dependencies.db)) {
+		return runtimeComposition{}, errors.New("generated runtime stores must use the composition database")
+	}
 	var runtimeDeployments = dependencies.deployments
+	var executionGuard *deploymentexecution.Guard
 	if configuration.ComposeRuntime || configuration.GeneratedRuntime {
 		if !dependencies.deployments.UsesDatabase(dependencies.db) || dependencies.effectsWorkingDirectory == "" ||
 			!filepath.IsAbs(dependencies.effectsWorkingDirectory) || filepath.Clean(dependencies.effectsWorkingDirectory) != dependencies.effectsWorkingDirectory {
@@ -123,13 +129,15 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("runtime deployment positive fence setup: %w", err)
 		}
-		executionGuard, err := deploymentexecution.NewGuard(dependencies.db, dependencies.bindings, positiveFence, dependencies.effectsWorkingDirectory)
+		executionGuard, err = deploymentexecution.NewGuard(dependencies.db, dependencies.bindings, positiveFence, dependencies.effectsWorkingDirectory)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("runtime deployment execution guard setup: %w", err)
 		}
-		runtimeDeployments, err = deployments.NewWithExecutionGuard(dependencies.db, executionGuard)
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("runtime deployment repository setup: %w", err)
+		if !configuration.GeneratedRuntime {
+			runtimeDeployments, err = deployments.NewWithExecutionGuard(dependencies.db, executionGuard)
+			if err != nil {
+				return runtimeComposition{}, fmt.Errorf("runtime deployment repository setup: %w", err)
+			}
 		}
 	}
 	if configuration.GeneratedRuntime && (options.dockerExecutable == "" || !filepath.IsAbs(options.dockerExecutable) || filepath.Clean(options.dockerExecutable) != options.dockerExecutable) {
@@ -214,6 +222,27 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated controller directory setup: %w", err)
 		}
+		if err := step("environment_stager_create"); err != nil {
+			return runtimeComposition{}, err
+		}
+		environment, err := generatedruntime.NewSecureEnvironmentStager(environmentTemporary)
+		if err != nil {
+			return runtimeComposition{}, fmt.Errorf("generated runtime environment setup: %w", err)
+		}
+		if err := step("migration_authority_create"); err != nil {
+			return runtimeComposition{}, err
+		}
+		runtimeDeployments, err = deployments.NewWithExecutionGuardAndGeneratedMigration(
+			dependencies.db, executionGuard, dependencies.plans, dependencies.configuration,
+			environment, options.runner, deployments.GeneratedMigrationProcessOptions{
+				DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
+				DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
+				Timeout: 10 * time.Minute, OutputLimit: 16 << 10,
+			},
+		)
+		if err != nil {
+			return runtimeComposition{}, fmt.Errorf("generated migration authority setup: %w", err)
+		}
 		if err := step("builder_create"); err != nil {
 			return runtimeComposition{}, err
 		}
@@ -222,13 +251,6 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		})
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated builder setup: %w", err)
-		}
-		if err := step("environment_stager_create"); err != nil {
-			return runtimeComposition{}, err
-		}
-		environment, err := generatedruntime.NewSecureEnvironmentStager(environmentTemporary)
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("generated runtime environment setup: %w", err)
 		}
 		if err := step("ingress_create"); err != nil {
 			return runtimeComposition{}, err
@@ -282,10 +304,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err := step("migration_runner_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		migration, err := generatedmigration.New(dependencies.configuration, environment, options.runner, generatedmigration.Options{
-			DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
-			DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-		})
+		migration, err := generatedmigration.New(runtimeDeployments)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated migration runner setup: %w", err)
 		}

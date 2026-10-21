@@ -40,6 +40,7 @@ type Executor struct {
 	authorization AuthorizationGate
 	routes        generatedruntime.RouteSwitcher
 	migrations    generatedruntime.MigrationRunner
+	pinMigration  func(context.Context, deployments.GeneratedMigrationRequest) (generatedMigrationExecution, error)
 	options       Options
 	waitDrain     func(context.Context, time.Duration) error
 }
@@ -76,6 +77,9 @@ func NewExecutor(
 		applications: applications, releases: releases, configuration: configuration,
 		deployments: deploymentRepository, plans: plans, compiler: compiler, artifacts: artifacts,
 		state: state, runtime: runtime, authorization: authorization, routes: routes, migrations: migrations,
+		pinMigration: func(ctx context.Context, request deployments.GeneratedMigrationRequest) (generatedMigrationExecution, error) {
+			return deploymentRepository.PinGeneratedMigration(ctx, request)
+		},
 		options: options, waitDrain: waitForDrain,
 	}, nil
 }
@@ -111,6 +115,9 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 	}
 	resolved, err := e.resolve(ctx, job, input, deployment, reporter)
 	if err != nil {
+		if refusal, ok := e.existingMigrationRefusal(ctx, deployment, err); ok {
+			return jobs.ExecutionResult{}, refusal
+		}
 		return jobs.ExecutionResult{}, e.failMain(ctx, deployment, executionCode(ctx, err))
 	}
 	deployment = resolved.deployment
@@ -132,6 +139,9 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 	}
 	if err != nil {
+		if refusal, ok := e.existingMigrationRefusal(ctx, deployment, err); ok {
+			return jobs.ExecutionResult{}, refusal
+		}
 		return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
 	}
 	if runtimeDeployment.Phase == generatedruntimestate.PhaseSucceeded {
@@ -154,6 +164,9 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 	}
 
 	if err := report(reporter, jobs.Running, "apply_runtime", 60); err != nil {
+		if runtimeDeployment.Phase == generatedruntimestate.PhaseMigrating {
+			return jobs.ExecutionResult{}, generatedMigrationUncertain(ctx, err)
+		}
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 	}
 	if runtimeDeployment.Phase == generatedruntimestate.PhasePreflight {
@@ -190,13 +203,16 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		}
 		defer reservation.Release()
 	}
+	networkCapacityRisk := generatedNetworkCapacityRisk(runtimeDeployment)
 	persistedDeployment, getErr := e.deployments.Get(ctx, deployment.AppID, deployment.ID)
 	if getErr != nil {
+		if runtimeDeployment.Phase == generatedruntimestate.PhaseMigrating {
+			return jobs.ExecutionResult{}, e.generatedMigrationRefusal(reservation, networkCapacityRisk, generatedMigrationUncertain(ctx, getErr))
+		}
 		return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
 	}
 	deployment = persistedDeployment
 	networkRequest := generatedNetworkRequest(claim, resolved)
-	networkCapacityRisk := generatedNetworkCapacityRisk(runtimeDeployment)
 
 	artifacts := make(map[string]generatedimage.Artifact, len(componentNames))
 	candidates := make(map[string]generatedruntime.Candidate, len(componentNames))
@@ -235,30 +251,18 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			if len(artifacts) == 0 {
 				artifacts, err = e.loadArtifacts(ctx, resolved, runtimeDeployment)
 				if err != nil {
-					return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
+					return jobs.ExecutionResult{}, e.generatedMigrationRefusal(reservation, networkCapacityRisk, generatedMigrationUncertain(ctx, err))
 				}
 			}
-			if err = e.runtime.EnsureAppNetwork(ctx, networkRequest); err != nil {
-				if generatedruntime.IsGeneratedNetworkBoundaryFailure(err) {
-					return jobs.ExecutionResult{}, e.generatedNetworkRefusal(ctx, reservation, networkCapacityRisk, err)
+			if runtimeDeployment.MigrationState == generatedruntimestate.MigrationPending {
+				if err = e.runtime.EnsureAppNetwork(ctx, networkRequest); err != nil {
+					return jobs.ExecutionResult{}, e.generatedMigrationRefusal(reservation, networkCapacityRisk, generatedMigrationUncertain(ctx, err))
 				}
-				code, diagnostic := runtimeFailure(ctx, err, generatedruntimestate.DiagnosticRuntimeUnavailable)
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
 			}
-			runtimeDeployment, err = e.runMigration(ctx, resolved, runtimeDeployment, artifacts)
+			runtimeDeployment, err = e.runMigration(ctx, claim, resolved, runtimeDeployment, artifacts)
 			if err != nil {
-				code := "apply_failed"
-				diagnostic := generatedruntimestate.DiagnosticMigrationFailed
-				if errors.Is(err, errMigrationInterrupted) {
-					code, diagnostic = "internal_error", generatedruntimestate.DiagnosticDaemonRestarted
-				}
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, code, diagnostic)
+				return jobs.ExecutionResult{}, e.generatedMigrationRefusal(reservation, networkCapacityRisk, err)
 			}
-			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseMigrating, generatedruntimestate.PhaseStartingCandidate, "")
-			if advanceErr != nil {
-				return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)
-			}
-			runtimeDeployment = advanced
 
 		case generatedruntimestate.PhaseStartingCandidate:
 			if len(artifacts) == 0 {
@@ -426,6 +430,30 @@ func (e *Executor) generatedNetworkRefusal(ctx context.Context, reservation gene
 		cause = errors.Join(cause, e.runtime.RetainReplacementCapacity(reservation))
 	}
 	return generatedAuthorizationRefusal(ctx, cause)
+}
+
+func (e *Executor) generatedMigrationRefusal(reservation generatedruntime.ReplacementReservation, retain bool, cause error) error {
+	if retain {
+		cause = errors.Join(cause, e.runtime.RetainReplacementCapacity(reservation))
+	}
+	return cause
+}
+
+func (e *Executor) existingMigrationRefusal(ctx context.Context, deployment deployments.Deployment, cause error) (error, bool) {
+	if deployment.ID == "" || deployment.AppID == "" {
+		return generatedMigrationUncertain(ctx, errors.Join(cause, deployments.ErrInvalidDeployment)), true
+	}
+	persisted, err := e.state.Get(ctx, deployment.AppID, deployment.ID)
+	if errors.Is(err, generatedruntimestate.ErrNotFound) {
+		return nil, false
+	}
+	if err != nil {
+		return generatedMigrationUncertain(ctx, errors.Join(cause, err)), true
+	}
+	if persisted.Phase != generatedruntimestate.PhaseMigrating {
+		return nil, false
+	}
+	return generatedMigrationUncertain(ctx, cause), true
 }
 
 func (e *Executor) resolve(ctx context.Context, job jobs.Job, input jobs.DeploymentInput, deployment deployments.Deployment, reporter jobs.ProgressReporter) (resolvedDeployment, error) {

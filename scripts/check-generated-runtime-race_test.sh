@@ -51,8 +51,8 @@ composition_suites=(rebind-composition-native rebind-composition-startup rebind-
 suites=("${typed_suites[@]}" "${composition_suites[@]}")
 
 for mode in default race plain; do
-  # Artifact storage moved into its own package. Keep its complete test suite
-  # in both the race and Windows plain lanes alongside the compiler tests.
+  # Keep artifact storage and migration tests in both the race and Windows
+  # plain lanes alongside the compiler tests.
   if [[ "$mode" == default ]]; then run runtime-packages; else run runtime-packages "$mode"; fi
   expected=(test -json)
   if [[ "$mode" != plain ]]; then expected+=(-race); fi
@@ -61,6 +61,7 @@ for mode in default race plain; do
     ./internal/deploymentplans
     ./internal/generatedimage
     ./internal/generatedimagestate
+    ./internal/generatedmigration
     ./internal/generatedruntime
     ./internal/generatedexecutor
     ./internal/generatedruntimestate

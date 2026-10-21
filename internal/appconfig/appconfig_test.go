@@ -33,6 +33,29 @@ func testStore(t *testing.T) (*Store, string) {
 	return store, root
 }
 
+func TestStoreConfiguredForRequiresExactDatabase(t *testing.T) {
+	store, _ := testStore(t)
+	foreign, err := database.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = foreign.Close() })
+
+	if !store.ConfiguredFor(store.db) {
+		t.Fatal("store rejected its exact database")
+	}
+	if store.ConfiguredFor(foreign) {
+		t.Fatal("store accepted a different database handle")
+	}
+	if store.ConfiguredFor(nil) {
+		t.Fatal("store accepted a nil database")
+	}
+	var missing *Store
+	if missing.ConfiguredFor(store.db) {
+		t.Fatal("nil store reported configured")
+	}
+}
+
 func TestExportRevisionForExecutionPinsExactRevision(t *testing.T) {
 	store, _ := testStore(t)
 	ctx := context.Background()

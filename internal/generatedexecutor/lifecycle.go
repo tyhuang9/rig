@@ -15,7 +15,10 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 )
 
-var errMigrationInterrupted = errors.New("generated migration execution was interrupted")
+var (
+	errMigrationInterrupted      = errors.New("generated migration execution was interrupted")
+	errMigrationPreviouslyFailed = errors.New("generated migration previously failed")
+)
 
 func (e *Executor) build(ctx context.Context, claim deploymentexecution.Claim, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment) (map[string]generatedimage.Artifact, error) {
 	artifacts := make(map[string]generatedimage.Artifact, len(runtimeDeployment.Components))
@@ -71,51 +74,101 @@ func (e *Executor) loadArtifacts(ctx context.Context, resolved resolvedDeploymen
 	return result, nil
 }
 
-func (e *Executor) runMigration(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact) (generatedruntimestate.Deployment, error) {
+func (e *Executor) runMigration(ctx context.Context, claim deploymentexecution.Claim, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact) (generatedruntimestate.Deployment, error) {
 	migration := resolved.plan.Plan.Migration
 	if migration == nil || migration.Approval.Status != deploymentplans.MigrationApprovalApproved {
-		return runtimeDeployment, staticError("migration approval unavailable")
+		return runtimeDeployment, generatedMigrationUncertain(ctx, staticError("migration approval unavailable"))
 	}
 	switch runtimeDeployment.MigrationState {
-	case generatedruntimestate.MigrationSucceeded:
-		return runtimeDeployment, nil
 	case generatedruntimestate.MigrationRunning:
-		return runtimeDeployment, errMigrationInterrupted
+		return runtimeDeployment, generatedMigrationUncertain(ctx, errMigrationInterrupted)
 	case generatedruntimestate.MigrationFailed:
-		return runtimeDeployment, staticError("migration previously failed")
-	case generatedruntimestate.MigrationPending:
+		return runtimeDeployment, generatedMigrationFailed(errMigrationPreviouslyFailed)
+	case generatedruntimestate.MigrationPending, generatedruntimestate.MigrationSucceeded:
 	default:
-		return runtimeDeployment, staticError("invalid migration state")
+		return runtimeDeployment, generatedMigrationUncertain(ctx, staticError("invalid migration state"))
 	}
 	artifact, exists := artifacts[migration.ComponentName]
 	if !exists {
-		return runtimeDeployment, staticError("migration component artifact unavailable")
+		return runtimeDeployment, generatedMigrationUncertain(ctx, staticError("migration component artifact unavailable"))
 	}
-	updated, err := e.state.BeginMigration(ctx, resolved.deployment.AppID, resolved.deployment.ID)
-	if err != nil {
-		return runtimeDeployment, staticError("persist migration start")
-	}
-	runtimeDeployment = updated
-	err = e.migrations.Run(ctx, generatedruntime.MigrationRequest{
-		AppID: resolved.deployment.AppID, ReleaseID: resolved.release.ID, DeploymentID: resolved.deployment.ID,
-		ArtifactID: artifact.ID, DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
-		ComponentName: migration.ComponentName, RootDirectory: migration.RootDirectory,
-		ImageContentID: artifact.ImageContentID, Command: migration.Command,
-		ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
-		AllowedEnvironmentKeys: append([]string(nil), migration.EnvironmentKeys...),
-	})
-	if err != nil {
-		updated, finishErr := e.state.FinishMigration(context.WithoutCancel(ctx), resolved.deployment.AppID, resolved.deployment.ID, false)
-		if finishErr == nil {
-			runtimeDeployment = updated
+	execution, err := e.pinMigration(ctx, generatedMigrationRequest(claim, resolved, migration, artifact))
+	if err != nil || execution == nil {
+		if err == nil {
+			err = deployments.ErrInvalidDeployment
 		}
-		return runtimeDeployment, staticError("migration execution failed")
+		return runtimeDeployment, generatedMigrationUncertain(ctx, err)
 	}
-	updated, err = e.state.FinishMigration(ctx, resolved.deployment.AppID, resolved.deployment.ID, true)
-	if err != nil {
-		return runtimeDeployment, staticError("persist migration completion")
+	defer execution.Leave()
+
+	if runtimeDeployment.MigrationState == generatedruntimestate.MigrationSucceeded {
+		observed, observeErr := execution.ObserveSucceeded()
+		if observeErr != nil {
+			return runtimeDeployment, generatedMigrationUncertain(ctx, observeErr)
+		}
+		prepared, finishErr := execution.FinishPreparation()
+		if finishErr != nil {
+			return observed, generatedMigrationUncertain(ctx, finishErr)
+		}
+		return prepared, nil
 	}
-	return updated, nil
+
+	invocation, begun, beginErr := execution.Begin()
+	if beginErr != nil || invocation == nil {
+		if beginErr == nil {
+			beginErr = deployments.ErrInvalidDeployment
+		}
+		return runtimeDeployment, generatedMigrationUncertain(ctx, beginErr)
+	}
+	runtimeDeployment = begun
+	runErr := e.migrations.Run(ctx, invocation)
+	if runErr != nil {
+		failed, recordErr := execution.RecordObservedFailure()
+		if recordErr != nil {
+			return runtimeDeployment, generatedMigrationUncertain(ctx, errors.Join(runErr, recordErr))
+		}
+		return failed, generatedMigrationFailed(runErr)
+	}
+	succeeded, recordErr := execution.RecordSucceeded()
+	if recordErr != nil {
+		return runtimeDeployment, generatedMigrationUncertain(ctx, recordErr)
+	}
+	prepared, finishErr := execution.FinishPreparation()
+	if finishErr != nil {
+		return succeeded, generatedMigrationUncertain(ctx, finishErr)
+	}
+	return prepared, nil
+}
+
+func generatedMigrationRequest(claim deploymentexecution.Claim, resolved resolvedDeployment, migration *deploymentplans.Migration, artifact generatedimage.Artifact) deployments.GeneratedMigrationRequest {
+	return deployments.GeneratedMigrationRequest{
+		Claim: claim, DeploymentID: resolved.deployment.ID, ReleaseID: resolved.release.ID,
+		ConfigurationRevisionID: resolved.configurationID, ConfigurationRevisionNumber: resolved.configurationNumber,
+		DeploymentPlanRevisionID: resolved.plan.ID, DeploymentPlanRevisionNumber: resolved.plan.RevisionNumber,
+		ComponentName: migration.ComponentName, CompilerVersion: artifact.CompilerVersion, BuildDefinitionDigest: artifact.BuildDefinitionDigest,
+		PlanCanonicalDigest: resolved.plan.CanonicalDigest, MigrationEvidenceDigest: migration.EvidenceDigest,
+		SourceProvider: resolved.release.SourceProvider, SourceRepositoryID: resolved.release.RepositoryID, SourceResolvedDigest: resolved.release.ResolvedSHA,
+		PlanSourceProvider: resolved.plan.Plan.Source.Provider, PlanSourceRepositoryID: resolved.plan.Plan.Source.RepositoryID, PlanSourceResolvedDigest: resolved.plan.Plan.Source.ResolvedDigest,
+		ArchiveSHA256: resolved.release.ArchiveSHA256, WorkspaceTreeSHA256: resolved.release.WorkspaceTreeSHA256,
+		ArtifactID: artifact.ID, ArtifactAttemptNumber: artifact.AttemptNumber, ImageContentID: artifact.ImageContentID,
+		Findings: append([]deployments.Finding(nil), resolved.deployment.Findings...),
+	}
+}
+
+func generatedMigrationUncertain(ctx context.Context, cause error) error {
+	code := "runtime_unavailable"
+	if ctx != nil && ctx.Err() != nil || errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		code = "internal_error"
+		if ctx != nil && ctx.Err() != nil {
+			code = cancellationCode(ctx)
+			return errors.Join(executionError(code), cause, deploymentexecution.ErrCanceled, ctx.Err())
+		}
+	}
+	return errors.Join(executionError(code), cause)
+}
+
+func generatedMigrationFailed(cause error) error {
+	return errors.Join(executionError("apply_failed"), cause)
 }
 
 func (e *Executor) startCandidates(ctx context.Context, job jobs.Job, claim deploymentexecution.Claim, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, artifacts map[string]generatedimage.Artifact, reservation generatedruntime.ReplacementReservation) (map[string]generatedruntime.Candidate, error) {

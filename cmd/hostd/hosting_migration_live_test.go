@@ -47,12 +47,30 @@ const (
 	migrationJourneyV3SHA   = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 )
 
+type migrationJourneyScenario uint8
+
+const (
+	migrationJourneyApprovalAndUncertainty migrationJourneyScenario = iota + 1
+	migrationJourneyAuthorityRevokedBeforeStart
+)
+
 // TestLiveGeneratedMigrationApprovalAndUncertaintyJourney proves the approved
 // Knex path against a disposable, host-side PostgreSQL fixture. The test-only
 // interruption occurs after the real short-lived migration container has
 // committed its additive database changes and before state completion is
 // recorded, so the durable Running state must refuse a replay after reopen.
 func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
+	runLiveGeneratedMigrationJourney(t, migrationJourneyApprovalAndUncertainty)
+}
+
+func TestLiveGeneratedMigrationAuthorityRevokedBeforeStart(t *testing.T) {
+	runLiveGeneratedMigrationJourney(t, migrationJourneyAuthorityRevokedBeforeStart)
+}
+
+func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneyScenario) {
+	if scenario != migrationJourneyApprovalAndUncertainty && scenario != migrationJourneyAuthorityRevokedBeforeStart {
+		t.Fatal("unknown generated migration live scenario")
+	}
 	if os.Getenv("RIG_RUN_LIVE_MIGRATION_JOURNEY") != "1" {
 		t.Fatal("set RIG_RUN_LIVE_MIGRATION_JOURNEY=1 to run the hosted Docker gate")
 	}
@@ -204,6 +222,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	deploymentStore := deployments.New(db)
 	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	migrationRunner := &migrationJourneyRunner{}
+	migrationProcess := newMigrationAuthorityProcessObserver(db)
 	settings := config.Defaults()
 	settings.DataRoot = dataRoot
 	settings.GeneratedRuntime = true
@@ -213,6 +232,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 		effectsWorkingDirectory: effectsWorkingDirectory,
 	}, runtimeCompositionOptions{
 		dockerExecutable: docker,
+		runner:           migrationProcess,
 		migrationRunnerFactory: func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
 			migrationRunner.SetDelegate(delegate)
 			return migrationRunner
@@ -229,10 +249,11 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	t.Cleanup(func() {
 		cleanup, stop := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer stop()
+		excludedContainerID := migrationProcess.CleanupRetained(t, cleanup)
 		if application.ID != "" {
 			for _, kind := range []string{"container", "image"} {
 				ids, listErr := controllerJourneyDocker(cleanup, docker, nil, map[string][]string{
-					"container": {"ps", "-aq", "--filter", "label=io.rig.application=" + application.ID},
+					"container": {"ps", "-aq", "--no-trunc", "--filter", "label=io.rig.application=" + application.ID},
 					"image":     {"image", "ls", "-q", "--filter", "label=io.rig.application=" + application.ID},
 				}[kind]...)
 				if listErr != nil {
@@ -240,10 +261,22 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 					continue
 				}
 				for _, id := range strings.Fields(string(ids)) {
+					if kind == "container" && id == excludedContainerID {
+						continue
+					}
 					args := map[string][]string{"container": {"container", "rm", "--force", id}, "image": {"image", "rm", "--force", id}}[kind]
 					if _, removeErr := controllerJourneyDocker(cleanup, docker, nil, args...); removeErr != nil {
 						t.Errorf("remove exact app-owned %s", kind)
 					}
+				}
+			}
+			for _, kind := range []string{"container", "image"} {
+				ids, listErr := controllerJourneyDocker(cleanup, docker, nil, map[string][]string{
+					"container": {"ps", "-aq", "--no-trunc", "--filter", "label=io.rig.application=" + application.ID},
+					"image":     {"image", "ls", "-q", "--filter", "label=io.rig.application=" + application.ID},
+				}[kind]...)
+				if listErr != nil || len(strings.Fields(string(ids))) != 0 {
+					t.Errorf("exact app-owned %s remains after cleanup", kind)
 				}
 			}
 		}
@@ -384,10 +417,11 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 		t.Fatal("controller did not persist v1 DATABASE_URL as one scoped runtime secret")
 	}
 
+	executionObserver := newMigrationAuthorityExecutionObserver(composition.executor)
 	workerContext, stopWorkerContext := context.WithCancel(ctx)
 	workerDone, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
 		recoverState: jobStore.RecoverRuntimeContext,
-	}, composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
+	}, executionObserver, func(workerContext context.Context, executor jobs.Executor) error {
 		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
 	}, func(workerErr error) { t.Errorf("migration journey worker: %v", workerErr) })
 	if err != nil {
@@ -473,8 +507,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	if v2Paused.PauseDisposition != jobs.PauseMigrationApprovalRequired || migrationRunner.Calls() != 0 {
 		t.Fatalf("v2 pending approval status=%s pause=%s migrationCalls=%d", v2Paused.Status, v2Paused.PauseDisposition, migrationRunner.Calls())
 	}
-	migrationJourneyAssertTableAbsent(t, ctx, docker, fixtureEnv, fixtureRoot, "rig_migration_ledger")
-	migrationJourneyAssertTableAbsent(t, ctx, docker, fixtureEnv, fixtureRoot, "rig_migration_counter")
+	migrationAuthorityAssertRelationsAbsent(t, ctx, docker, fixtureEnv, fixtureRoot)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/counter", "", http.StatusOK, `"value":0`)
 
 	var v2Approved apicontract.DeploymentPlanRevision
@@ -484,18 +517,44 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	if v2Approved.RevisionID != v2Plan.RevisionID || v2Approved.RevisionNumber != v2Plan.RevisionNumber || v2Approved.Migration.ApprovalStatus != "approved" {
 		t.Fatal("controller did not approve exact v2 migration plan revision")
 	}
+	if scenario == migrationJourneyAuthorityRevokedBeforeStart {
+		runMigrationAuthorityRevokedBeforeStart(t, migrationAuthorityRevocationInput{
+			ctx: ctx, db: db, dataRoot: dataRoot, docker: docker, fixtureEnvironment: fixtureEnv, fixtureRoot: fixtureRoot,
+			application: application, v1Deployment: v1Deployment, v2Mutation: v2Mutation,
+			v2Plan: v2Plan, v2Configuration: v2Configuration, request: request, jobs: jobStore,
+			composition: composition, runner: migrationRunner, process: migrationProcess, execution: executionObserver,
+		})
+		return
+	}
+	if err := executionObserver.Arm(v2Mutation.Job.ID); err != nil {
+		t.Fatal("arm approved migration execution return observer")
+	}
+	resumeFailureDiagnostic, resumeDiagnosticComplete := migrationJourneyResumeFailureDiagnostic(t, migrationJourneyResumeFailureDiagnosticInput{
+		Parent:      ctx,
+		Application: application.ID,
+		Job:         v2Mutation.Job.ID,
+		GetJob:      jobStore.Get,
+		Deployments: deploymentStore.List,
+		Runtime:     composition.state.Get,
+		Runner:      migrationRunner.DiagnosticSnapshot,
+		Execution:   executionObserver.DiagnosticSnapshot,
+		Process:     migrationProcess.DiagnosticSnapshot,
+	})
+	defer resumeFailureDiagnostic()
 	var v2Resumed apicontract.JobResponse
 	request(http.MethodPost, "/api/v1/jobs/"+v2Mutation.Job.ID+"/resume", nil, http.StatusOK, &v2Resumed)
-	migrationJourneyWaitForJob(t, ctx, jobStore, v2Mutation.Job.ID, jobs.Succeeded)
+	v2Finished := migrationJourneyWaitForJob(t, ctx, jobStore, v2Mutation.Job.ID, jobs.Succeeded)
 	if migrationRunner.Calls() != 1 {
 		t.Fatalf("approved v2 migration runner calls=%d, want 1", migrationRunner.Calls())
 	}
+	resumeDiagnosticComplete()
 	var v2History apicontract.DeploymentList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/deployments", nil, http.StatusOK, &v2History)
 	v2Deployment := migrationJourneyDeploymentForJob(t, v2History, v2Mutation.Job.ID)
 	if v2Deployment.Status != "succeeded" || v2Deployment.ReleaseID == v1Deployment.ReleaseID || v2Deployment.DeploymentPlanRevisionID != v2Plan.RevisionID || v2Deployment.ActualConfigurationRevisionID != v2Configuration.RevisionID {
 		t.Fatal("approved v2 deployment did not retain new immutable source, plan, and configuration")
 	}
+	migrationJourneyAssertInvocation(t, migrationRunner.Identities(), 0, application.ID, v2Finished, v2Deployment)
 	var v2Releases apicontract.ReleaseList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &v2Releases)
 	v2Release := migrationJourneyReleaseForID(t, v2Releases, v2Deployment.ReleaseID)
@@ -613,6 +672,7 @@ func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
 	if interruptedDeployment.Status != string(deployments.Applying) || interruptedDeployment.ReleaseID == "" || interruptedDeployment.DeploymentPlanRevisionID != v3Plan.RevisionID || interruptedDeployment.ActualConfigurationRevisionID != v3Configuration.RevisionID || interruptedDeployment.ReleaseID == rollbackDeployment.ReleaseID {
 		t.Fatal("interrupted v3 deployment did not retain immutable release, plan, and configuration pins")
 	}
+	migrationJourneyAssertInvocation(t, migrationRunner.Identities(), 1, application.ID, v3Running, interruptedDeployment)
 	deploymentID := interruptedDeployment.ID
 	running, err := composition.state.Get(ctx, application.ID, deploymentID)
 	if err != nil || running.Phase != generatedruntimestate.PhaseMigrating || running.MigrationState != generatedruntimestate.MigrationRunning || running.MigrationStartedAt.IsZero() || !running.MigrationFinishedAt.IsZero() {
@@ -867,24 +927,34 @@ type migrationJourneyRunner struct {
 	mu                     sync.Mutex
 	delegate               generatedruntime.MigrationRunner
 	calls                  int
+	identities             []deployments.GeneratedMigrationIdentity
+	results                []error
 	afterSuccess           func() error
 	exitWorkerAfterSuccess bool
 	workerExited           chan<- struct{}
 }
 
-func (runner *migrationJourneyRunner) Run(ctx context.Context, request generatedruntime.MigrationRequest) error {
+func (runner *migrationJourneyRunner) Run(ctx context.Context, invocation deployments.GeneratedMigrationInvocation) error {
+	if invocation == nil {
+		return fmt.Errorf("migration test wrapper received no invocation")
+	}
 	runner.mu.Lock()
 	delegate := runner.delegate
 	afterSuccess := runner.afterSuccess
 	exitWorkerAfterSuccess := runner.exitWorkerAfterSuccess
 	workerExited := runner.workerExited
 	runner.calls++
+	runner.identities = append(runner.identities, invocation.Identity())
 	runner.mu.Unlock()
 	if delegate == nil {
 		return fmt.Errorf("migration test wrapper has no production delegate")
 	}
-	if err := delegate.Run(ctx, request); err != nil {
-		return err
+	runErr := delegate.Run(ctx, invocation)
+	runner.mu.Lock()
+	runner.results = append(runner.results, runErr)
+	runner.mu.Unlock()
+	if runErr != nil {
+		return runErr
 	}
 	if afterSuccess != nil {
 		if err := afterSuccess(); err != nil {
@@ -927,6 +997,41 @@ func (runner *migrationJourneyRunner) Calls() int {
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 	return runner.calls
+}
+
+func (runner *migrationJourneyRunner) Identities() []deployments.GeneratedMigrationIdentity {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return append([]deployments.GeneratedMigrationIdentity(nil), runner.identities...)
+}
+
+func (runner *migrationJourneyRunner) Results() []error {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return append([]error(nil), runner.results...)
+}
+
+func (runner *migrationJourneyRunner) DiagnosticSnapshot() migrationJourneyRunnerDiagnosticSnapshot {
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	return migrationJourneyRunnerDiagnosticSnapshot{
+		Calls:   runner.calls,
+		Results: append([]error(nil), runner.results...),
+	}
+}
+
+func migrationJourneyAssertInvocation(t *testing.T, identities []deployments.GeneratedMigrationIdentity, index int, appID string, job jobs.Job, deployment apicontract.Deployment) {
+	t.Helper()
+	if index < 0 || len(identities) != index+1 {
+		t.Fatal("migration invocation count does not match the completed attempt")
+	}
+	identity := identities[index]
+	if job.Attempt <= 1 || identity.Claim.Attempt() != job.Attempt || identity.Claim.JobID() != job.ID || identity.Claim.ApplicationID() != appID ||
+		identity.DeploymentID != deployment.ID || identity.ReleaseID != deployment.ReleaseID ||
+		identity.ConfigurationRevisionID != deployment.ActualConfigurationRevisionID || identity.ConfigurationRevisionNumber != deployment.ActualConfigurationRevisionNumber ||
+		identity.DeploymentPlanRevisionID != deployment.DeploymentPlanRevisionID || identity.DeploymentPlanRevisionNumber != deployment.DeploymentPlanRevisionNumber {
+		t.Fatal("migration invocation did not retain the original resumed attempt and immutable deployment pins")
+	}
 }
 
 func migrationJourneyRequest(t *testing.T, ctx context.Context, baseURL string, session auth.Session) func(string, string, any, int, any, ...map[string]string) []byte {

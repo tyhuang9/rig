@@ -243,6 +243,80 @@ func (r *Repository) FinishBuildingTx(ctx context.Context, tx *sql.Tx, appID, de
 	return next, nil
 }
 
+// BeginMigrationTx records the only executable migration attempt inside the
+// caller's guarded writer transaction. A running or completed attempt cannot
+// be silently replayed.
+func (r *Repository) BeginMigrationTx(ctx context.Context, tx *sql.Tx, appID, deploymentID string) error {
+	return r.transitionMigrationTx(ctx, tx, appID, deploymentID, MigrationPending, MigrationRunning)
+}
+
+// RecordMigrationSucceededTx records an attested zero exit inside the caller's
+// guarded writer transaction.
+func (r *Repository) RecordMigrationSucceededTx(ctx context.Context, tx *sql.Tx, appID, deploymentID string) error {
+	return r.transitionMigrationTx(ctx, tx, appID, deploymentID, MigrationRunning, MigrationSucceeded)
+}
+
+// RecordMigrationFailedTx records an attested nonzero exit inside the caller's
+// guarded writer transaction.
+func (r *Repository) RecordMigrationFailedTx(ctx context.Context, tx *sql.Tx, appID, deploymentID string) error {
+	return r.transitionMigrationTx(ctx, tx, appID, deploymentID, MigrationRunning, MigrationFailed)
+}
+
+func (r *Repository) transitionMigrationTx(ctx context.Context, tx *sql.Tx, appID, deploymentID string, expected, next MigrationState) error {
+	if r == nil || r.db == nil || ctx == nil || tx == nil || !canonicalUUID(appID) || !canonicalUUID(deploymentID) {
+		return ErrInvalidTransition
+	}
+	if !(expected == MigrationPending && next == MigrationRunning) &&
+		!(expected == MigrationRunning && (next == MigrationSucceeded || next == MigrationFailed)) {
+		return ErrInvalidTransition
+	}
+	now := r.now().UTC().Format(time.RFC3339Nano)
+	query := `UPDATE generated_runtime_deployments SET migration_state=?,migration_finished_at=?,migration_started_at=COALESCE(migration_started_at,?),updated_at=?
+		WHERE deployment_id=? AND app_id=? AND phase='migrating' AND migration_state=?`
+	finished := any(now)
+	if next == MigrationRunning {
+		finished = nil
+		query += ` AND migration_started_at IS NULL AND migration_finished_at IS NULL`
+	} else {
+		query += ` AND migration_started_at IS NOT NULL AND migration_finished_at IS NULL`
+	}
+	result, err := tx.ExecContext(ctx, query, next, finished, now, now, deploymentID, appID, expected)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return ErrInvalidTransition
+	}
+	return nil
+}
+
+// FinishMigrationPreparationTx advances only a successfully attested
+// migration. The caller cannot select another follow-up phase.
+func (r *Repository) FinishMigrationPreparationTx(ctx context.Context, tx *sql.Tx, appID, deploymentID string) (Phase, error) {
+	if r == nil || r.db == nil || ctx == nil || tx == nil || !canonicalUUID(appID) || !canonicalUUID(deploymentID) {
+		return "", ErrInvalidTransition
+	}
+	now := r.now().UTC().Format(time.RFC3339Nano)
+	result, err := tx.ExecContext(ctx, `UPDATE generated_runtime_deployments SET phase='starting_candidate',updated_at=?
+		WHERE deployment_id=? AND app_id=? AND phase='migrating' AND migration_state='succeeded'
+		AND migration_started_at IS NOT NULL AND migration_finished_at IS NOT NULL`, now, deploymentID, appID)
+	if err != nil {
+		return "", err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if changed != 1 {
+		return "", ErrInvalidTransition
+	}
+	return PhaseStartingCandidate, nil
+}
+
 // Begin creates the durable preflight record and derives the inactive slot
 // from the current active head in the same transaction. A replay with the exact
 // same immutable identity returns the existing record.

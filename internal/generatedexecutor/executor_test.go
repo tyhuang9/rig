@@ -72,6 +72,8 @@ type fakeConfiguration struct {
 	value          []byte
 	currentID      string
 	currentNumber  int64
+	planID         string
+	planNumber     int64
 	exportMismatch bool
 }
 
@@ -80,10 +82,18 @@ func (f *fakeConfiguration) RevisionIdentity(context.Context, string) (appconfig
 	if id == "" {
 		id, number = testConfigID, 3
 	}
-	return appconfig.RevisionIdentity{RevisionID: id, RevisionNumber: number, FormatVersion: 2, DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2}, nil
+	planID, planNumber := f.planID, f.planNumber
+	if planID == "" {
+		planID, planNumber = testPlanID, 2
+	}
+	return appconfig.RevisionIdentity{RevisionID: id, RevisionNumber: number, FormatVersion: 2, DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: planNumber}, nil
 }
 func (f *fakeConfiguration) ExactRevisionIdentity(_ context.Context, _, revisionID string, revisionNumber int64) (appconfig.RevisionIdentity, error) {
-	return appconfig.RevisionIdentity{RevisionID: revisionID, RevisionNumber: revisionNumber, FormatVersion: 2, DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2}, nil
+	planID, planNumber := f.planID, f.planNumber
+	if planID == "" {
+		planID, planNumber = testPlanID, 2
+	}
+	return appconfig.RevisionIdentity{RevisionID: revisionID, RevisionNumber: revisionNumber, FormatVersion: 2, DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: planNumber}, nil
 }
 func (f *fakeConfiguration) ExportComponentRuntimeForExecution(_ context.Context, _, revisionID string, revisionNumber int64, _ string, _ int64, _ string) (appconfig.ExecutionConfiguration, error) {
 	if f.exportMismatch {
@@ -104,6 +114,10 @@ type fakeDeployments struct {
 	state               *fakeRuntimeState
 	finishErr           error
 	finishRequests      []deployments.GeneratedNetworkRequest
+	migrationRepository *deployments.Repository
+	migrationContext    func(context.Context) context.Context
+	migrationRequests   []deployments.GeneratedMigrationRequest
+	migrationErr        error
 }
 
 func (f *fakeDeployments) GetOrCreateByJob(context.Context, string, string, string) (deployments.Deployment, bool, error) {
@@ -148,6 +162,17 @@ func (f *fakeDeployments) FinishGeneratedImagePreparation(_ context.Context, req
 	}
 	f.state.deployment.Phase = next
 	return next, nil
+}
+
+func (f *fakeDeployments) PinGeneratedMigration(ctx context.Context, request deployments.GeneratedMigrationRequest) (*deployments.GeneratedMigrationExecution, error) {
+	f.migrationRequests = append(f.migrationRequests, request)
+	if f.migrationErr != nil {
+		return nil, f.migrationErr
+	}
+	if f.migrationRepository == nil || f.migrationContext == nil {
+		return nil, deployments.ErrInvalidDeployment
+	}
+	return f.migrationRepository.PinGeneratedMigration(f.migrationContext(ctx), request)
 }
 
 type fakePlans struct {
@@ -263,6 +288,7 @@ type fakeRuntimeState struct {
 	previous              map[string]generatedruntimestate.Deployment
 	active                generatedruntimestate.ActiveHead
 	beginErr              error
+	getErr                error
 	migrationRequired     bool
 	switchCalls           int
 	failSwitchActive      bool
@@ -297,6 +323,9 @@ func (f *fakeRuntimeState) Begin(_ context.Context, input generatedruntimestate.
 	return f.deployment, true, nil
 }
 func (f *fakeRuntimeState) Get(_ context.Context, _, deploymentID string) (generatedruntimestate.Deployment, error) {
+	if f.getErr != nil {
+		return generatedruntimestate.Deployment{}, f.getErr
+	}
 	if deploymentID == f.deployment.DeploymentID {
 		return f.deployment, nil
 	}
@@ -317,17 +346,6 @@ func (f *fakeRuntimeState) Advance(_ context.Context, _, _ string, _, next gener
 	}
 	f.deployment.Phase = next
 	f.deployment.DiagnosticCode = diagnostic
-	return f.deployment, nil
-}
-func (f *fakeRuntimeState) BeginMigration(context.Context, string, string) (generatedruntimestate.Deployment, error) {
-	f.deployment.MigrationState = generatedruntimestate.MigrationRunning
-	return f.deployment, nil
-}
-func (f *fakeRuntimeState) FinishMigration(_ context.Context, _, _ string, succeeded bool) (generatedruntimestate.Deployment, error) {
-	f.deployment.MigrationState = generatedruntimestate.MigrationFailed
-	if succeeded {
-		f.deployment.MigrationState = generatedruntimestate.MigrationSucceeded
-	}
 	return f.deployment, nil
 }
 func (f *fakeRuntimeState) SetImageReady(_ context.Context, _, _, name, artifactID string) (generatedruntimestate.Component, error) {
@@ -372,7 +390,7 @@ func (f *fakeRuntimeState) SwitchActive(context.Context, string, string, int64) 
 	if f.failSwitchActive {
 		return generatedruntimestate.ActiveHead{}, false, generatedruntimestate.ErrConflict
 	}
-	f.active = generatedruntimestate.ActiveHead{AppID: testAppID, DeploymentID: testDeploymentID, ReleaseID: testReleaseID, Slot: "blue", Generation: f.active.Generation + 1}
+	f.active = generatedruntimestate.ActiveHead{AppID: f.deployment.AppID, DeploymentID: f.deployment.DeploymentID, ReleaseID: f.deployment.ReleaseID, Slot: f.deployment.CandidateSlot, Generation: f.active.Generation + 1}
 	for index := range f.deployment.Components {
 		f.deployment.Components[index].State = generatedruntimestate.ComponentActive
 	}
@@ -533,59 +551,95 @@ func (gatewayReadinessRouteError) GatewayReadinessFailed() bool { return true }
 
 type fakeMigrations struct {
 	events   *[]string
-	requests []generatedruntime.MigrationRequest
+	requests []deployments.GeneratedMigrationInvocation
+	delegate generatedruntime.MigrationRunner
+	err      error
 }
 
-func (f *fakeMigrations) Run(_ context.Context, request generatedruntime.MigrationRequest) error {
+func (f *fakeMigrations) Run(ctx context.Context, request deployments.GeneratedMigrationInvocation) error {
 	*f.events = append(*f.events, "migration")
 	f.requests = append(f.requests, request)
-	return nil
+	if f.err != nil {
+		return f.err
+	}
+	if f.delegate == nil {
+		return nil
+	}
+	return f.delegate.Run(ctx, request)
 }
 
-type fakeReporter struct{ phases []string }
+type fakeReporter struct {
+	phases    []string
+	failPhase string
+	err       error
+}
 
 func (f *fakeReporter) Report(update jobs.ProgressUpdate) error {
 	f.phases = append(f.phases, update.Phase)
+	if update.Phase == f.failPhase {
+		return f.err
+	}
 	return nil
 }
 
 type executorFixture struct {
-	executor      *Executor
-	claim         deploymentexecution.Claim
-	configuration *fakeConfiguration
-	deployments   *fakeDeployments
-	state         *fakeRuntimeState
-	compiler      *fakeCompiler
-	artifacts     *fakeArtifacts
-	runtime       *fakeRuntime
-	authorization *fakeAuthorization
-	routes        *fakeRoutes
-	migrations    *fakeMigrations
-	reporter      *fakeReporter
-	events        *[]string
-	plan          deploymentplans.DeploymentPlanRevision
+	executor           *Executor
+	claim              deploymentexecution.Claim
+	configuration      *fakeConfiguration
+	deployments        *fakeDeployments
+	state              *fakeRuntimeState
+	compiler           *fakeCompiler
+	artifacts          *fakeArtifacts
+	runtime            *fakeRuntime
+	authorization      *fakeAuthorization
+	routes             *fakeRoutes
+	migrations         *fakeMigrations
+	reporter           *fakeReporter
+	events             *[]string
+	plan               deploymentplans.DeploymentPlanRevision
+	migrationAuthority *executorMigrationAuthority
 }
 
 func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	t.Helper()
 	events := []string{}
-	component := deploymentplans.Component{Name: "api", Role: generatedruntime.RoleServer, RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm start && echo $READY", InternalPort: 3000, HealthProbe: "/health"}
+	component := deploymentplans.Component{Name: "api", Role: generatedruntime.RoleServer, RootDirectory: ".", PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: ".", NodeVersion: "22", BuildCommand: "npm run build", RunCommand: "npm start && echo $READY", InternalPort: 3000, HealthProbe: "/health"}
 	plan := deploymentplans.DeploymentPlanRevision{ID: testPlanID, AppID: testAppID, RevisionNumber: 2, State: deploymentplans.RevisionAccepted, Plan: deploymentplans.Plan{Strategy: deploymentplans.StrategyGeneratedNode, Components: []deploymentplans.Component{component}}}
 	if migration {
 		plan.Plan.Migration = &deploymentplans.Migration{ComponentName: "api", RootDirectory: ".", Command: "npm run migrate && echo $DATABASE_URL", EnvironmentKeys: []string{"DATABASE_URL"}, EvidenceDigest: string(make([]byte, 64)), Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalApproved}}
 	}
 	release := releasesnapshot.Release{ID: testReleaseID, AppID: testAppID, DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2, ConfigurationRevisionID: testConfigID, ConfigurationRevisionNumber: 3}
 	artifact := readyArtifact(testArtifactID)
+	claim := newGeneratedExecutorClaim(t)
+	var authority *executorMigrationAuthority
+	if migration {
+		authority = newExecutorMigrationAuthority(t, component)
+		plan, release, artifact, claim = authority.plan, authority.release, authority.artifact, authority.claim
+	}
 	deploymentsFake := &fakeDeployments{deployment: deployments.Deployment{ID: testDeploymentID, AppID: testAppID, JobID: testJobID, Status: deployments.Preparing, ConfigurationMode: "current"}}
+	if authority != nil {
+		deploymentsFake.deployment.ID = authority.deploymentID
+		deploymentsFake.migrationRepository = authority.repository
+		deploymentsFake.migrationContext = authority.withScope
+	}
 	state := &fakeRuntimeState{active: generatedruntimestate.ActiveHead{AppID: testAppID}, migrationRequired: migration}
 	deploymentsFake.state = state
 	compiler := &fakeCompiler{events: &events, artifacts: []generatedimage.Artifact{artifact}, state: state}
 	configuration := &fakeConfiguration{value: []byte("DATABASE_URL=secret\n")}
+	if authority != nil {
+		configuration.currentID = release.ConfigurationRevisionID
+		configuration.currentNumber = release.ConfigurationRevisionNumber
+		configuration.planID = plan.ID
+		configuration.planNumber = plan.RevisionNumber
+	}
 	artifacts := &fakeArtifacts{values: map[string]generatedimage.Artifact{artifact.ID: artifact}}
 	runtime := &fakeRuntime{events: &events}
 	authorization := &fakeAuthorization{events: &events, deployments: deploymentsFake}
 	routes := &fakeRoutes{events: &events}
 	migrations := &fakeMigrations{events: &events}
+	if authority != nil {
+		migrations.delegate = authority.runner
+	}
 	executor, err := NewExecutor(
 		&fakeApplications{app: apps.Application{ID: testAppID, Source: apps.Source{Type: apps.SourceLocal, Path: `C:\source`}}},
 		&fakeReleases{release: release}, configuration, deploymentsFake,
@@ -594,11 +648,17 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &executorFixture{executor: executor, claim: newGeneratedExecutorClaim(t), configuration: configuration, deployments: deploymentsFake, state: state, compiler: compiler, artifacts: artifacts, runtime: runtime, authorization: authorization, routes: routes, migrations: migrations, reporter: &fakeReporter{}, events: &events, plan: plan}
+	return &executorFixture{executor: executor, claim: claim, configuration: configuration, deployments: deploymentsFake, state: state, compiler: compiler, artifacts: artifacts, runtime: runtime, authorization: authorization, routes: routes, migrations: migrations, reporter: &fakeReporter{}, events: &events, plan: plan, migrationAuthority: authority}
 }
 
 func (f *executorFixture) execute(ctx context.Context, job jobs.Job, reporter jobs.ProgressReporter) (jobs.ExecutionResult, error) {
 	return f.executor.ExecuteBound(ctx, job, f.claim, reporter)
+}
+
+func (f *executorFixture) deploymentJob() jobs.Job {
+	job := deploymentJob()
+	job.Attempt = f.claim.Attempt()
+	return job
 }
 
 func TestGeneratedExecutorRejectsZeroOrMismatchedClaimBeforePreparation(t *testing.T) {
@@ -835,6 +895,9 @@ func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, test.migration)
 			job := reviewedDeploymentJob()
+			if test.migration {
+				job = fixture.deploymentJob()
+			}
 			if _, err := fixture.execute(context.Background(), job, fixture.reporter); err != nil {
 				t.Fatal(err)
 			}
@@ -842,8 +905,11 @@ func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
 				t.Fatal("runtime did not commit success")
 			}
 			migrationRuns := len(fixture.migrations.requests)
-			if test.migration && (fixture.state.deployment.MigrationState != generatedruntimestate.MigrationSucceeded || migrationRuns != 1) {
-				t.Fatal("fixture did not complete exactly one approved migration")
+			if test.migration {
+				persisted, getErr := fixture.migrationAuthority.state.Get(context.Background(), testAppID, fixture.deployments.deployment.ID)
+				if getErr != nil || persisted.MigrationState != generatedruntimestate.MigrationSucceeded || migrationRuns != 1 {
+					t.Fatalf("fixture did not complete exactly one approved migration: state=%s runs=%d err=%v", persisted.MigrationState, migrationRuns, getErr)
+				}
 			}
 			if test.name != "deployment already finalized" {
 				fixture.deployments.deployment.Status = deployments.Applying
@@ -1033,7 +1099,7 @@ func TestGeneratedExecutorDistinguishesPlanStorageAndValidationFailures(t *testi
 
 func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen(t *testing.T) {
 	fixture := newExecutorFixture(t, true)
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), fixture.deploymentJob(), fixture.reporter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1044,19 +1110,26 @@ func TestGeneratedExecutorOrdersGateBeforeMutationAndCompletesMigrationBlueGreen
 	if !reflect.DeepEqual(*fixture.events, wantEvents) {
 		t.Fatalf("events=%v want=%v", *fixture.events, wantEvents)
 	}
-	if len(fixture.migrations.requests) != 1 || !reflect.DeepEqual(fixture.migrations.requests[0].AllowedEnvironmentKeys, []string{"DATABASE_URL"}) {
-		t.Fatalf("migration request=%+v", fixture.migrations.requests)
+	if len(fixture.migrations.requests) != 1 || len(fixture.deployments.migrationRequests) != 1 {
+		t.Fatalf("migration invocations=%d pin requests=%d", len(fixture.migrations.requests), len(fixture.deployments.migrationRequests))
 	}
-	if fixture.migrations.requests[0].Command != fixture.plan.Plan.Migration.Command {
-		t.Fatal("accepted migration command was not preserved exactly")
+	migrationRequest := fixture.deployments.migrationRequests[0]
+	identity := fixture.migrations.requests[0].Identity()
+	if !reflect.DeepEqual(migrationRequest.Claim, fixture.claim) || !reflect.DeepEqual(identity.Claim, fixture.claim) ||
+		migrationRequest.Claim.Attempt() != 2 || identity.Claim.Attempt() != 2 ||
+		migrationRequest.DeploymentID != fixture.deployments.deployment.ID || identity.DeploymentID != fixture.deployments.deployment.ID ||
+		migrationRequest.ReleaseID != fixture.executor.releases.(*fakeReleases).release.ID || identity.ReleaseID != migrationRequest.ReleaseID ||
+		migrationRequest.DeploymentPlanRevisionID != fixture.plan.ID || identity.DeploymentPlanRevisionID != fixture.plan.ID ||
+		migrationRequest.ArtifactID != fixture.compiler.artifacts[0].ID || migrationRequest.ArtifactAttemptNumber != fixture.compiler.artifacts[0].AttemptNumber {
+		t.Fatalf("migration request=%+v identity=%+v", migrationRequest, identity)
 	}
 	if len(fixture.runtime.createdSpecs) != 1 || fixture.runtime.createdSpecs[0].RunCommand != fixture.plan.Plan.Components[0].RunCommand || fixture.runtime.createdSpecs[0].Role != generatedruntime.RoleServer || fixture.runtime.createdSpecs[0].Reservation == nil {
 		t.Fatal("accepted run command was not preserved exactly")
 	}
 	wantNetwork := deployments.GeneratedNetworkRequest{
-		Claim: fixture.claim, DeploymentID: testDeploymentID, ReleaseID: testReleaseID,
-		ConfigurationRevisionID: testConfigID, ConfigurationRevisionNumber: 3,
-		DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
+		Claim: fixture.claim, DeploymentID: fixture.deployments.deployment.ID, ReleaseID: fixture.executor.releases.(*fakeReleases).release.ID,
+		ConfigurationRevisionID: fixture.deployments.deployment.ActualConfigurationRevisionID, ConfigurationRevisionNumber: fixture.deployments.deployment.ActualConfigurationRevisionNumber,
+		DeploymentPlanRevisionID: fixture.plan.ID, DeploymentPlanRevisionNumber: fixture.plan.RevisionNumber,
 	}
 	if len(fixture.runtime.networkRequests) != 3 {
 		t.Fatalf("network requests=%d", len(fixture.runtime.networkRequests))
@@ -1094,18 +1167,28 @@ func TestGeneratedExecutorNetworkRefusalRetainsDurableStateWithoutFailureCleanup
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newExecutorFixture(t, test.migration)
+			deploymentID, releaseID, planID, planNumber, artifactID := testDeploymentID, testReleaseID, testPlanID, int64(2), testArtifactID
 			fixture.deployments.deployment = initializedDeployment(deployments.Applying)
+			if test.migration {
+				release := fixture.executor.releases.(*fakeReleases).release
+				deploymentID, releaseID, planID, planNumber, artifactID = fixture.migrationAuthority.deploymentID, release.ID, fixture.plan.ID, fixture.plan.RevisionNumber, fixture.migrationAuthority.artifact.ID
+				fixture.deployments.deployment = deployments.Deployment{
+					ID: deploymentID, AppID: testAppID, JobID: testJobID, Status: deployments.Applying, ConfigurationMode: "current",
+					ReleaseID: releaseID, ActualConfigurationRevisionID: release.ConfigurationRevisionID, ActualConfigurationRevisionNumber: release.ConfigurationRevisionNumber,
+					RuntimeStrategy: deployments.RuntimeGeneratedNode, DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: planNumber, ProvenanceInitialized: true,
+				}
+			}
 			fixture.state.deployment = generatedruntimestate.Deployment{
-				DeploymentID: testDeploymentID, AppID: testAppID, ReleaseID: testReleaseID,
-				DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
+				DeploymentID: deploymentID, AppID: testAppID, ReleaseID: releaseID,
+				DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: planNumber,
 				CandidateSlot: "blue", Phase: test.phase, MigrationState: test.migrationState,
-				Components: []generatedruntimestate.Component{{DeploymentID: testDeploymentID, Name: "api", Slot: "blue", ImageArtifactID: testArtifactID, State: generatedruntimestate.ComponentImageReady}},
+				Components: []generatedruntimestate.Component{{DeploymentID: deploymentID, Name: "api", Slot: "blue", ImageArtifactID: artifactID, State: generatedruntimestate.ComponentImageReady}},
 			}
 			fixture.runtime.networkErrs = []error{boundary}
 			beforeDeployment := fixture.deployments.deployment
 			beforeRuntime := fixture.state.deployment
 			beforeRuntime.Components = append([]generatedruntimestate.Component(nil), beforeRuntime.Components...)
-			result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+			result, err := fixture.execute(context.Background(), fixture.deploymentJob(), fixture.reporter)
 			var executionErr *jobs.ExecutionError
 			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" || !errors.Is(err, deployments.ErrInvalidDeployment) {
 				t.Fatalf("result=%#v error=%v", result, err)
@@ -1253,7 +1336,7 @@ func TestGeneratedExecutorRejectsRuntimeExportWithDifferentConfigurationPin(t *t
 func TestGeneratedExecutorWaitsBeforeMutationWhenMigrationApprovalIsMissing(t *testing.T) {
 	fixture := newExecutorFixture(t, true)
 	fixture.state.beginErr = generatedruntimestate.ErrMigrationApprovalRequired
-	result, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+	result, err := fixture.execute(context.Background(), fixture.deploymentJob(), fixture.reporter)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1371,7 +1454,7 @@ func TestGeneratedExecutorRetainsCandidateCapacityOnImageRefusalWithPriorCandida
 				fixture.compiler.errs = []error{test.compilerCause}
 			}
 
-			_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+			_, err := fixture.execute(context.Background(), fixture.deploymentJob(), fixture.reporter)
 			var executionErr *jobs.ExecutionError
 			if !errors.As(err, &executionErr) || executionErr.Code != "runtime_unavailable" ||
 				(test.compilerCause != nil && !errors.Is(err, test.compilerCause)) ||
@@ -1427,18 +1510,77 @@ func TestGeneratedExecutorHealthFailurePreservesOldActiveHead(t *testing.T) {
 	}
 }
 
-func TestGeneratedExecutorDoesNotRerunInterruptedMigration(t *testing.T) {
-	fixture := newExecutorFixture(t, true)
-	fixture.deployments.deployment = initializedDeployment(deployments.Applying)
-	fixture.state.deployment = generatedruntimestate.Deployment{
-		DeploymentID: testDeploymentID, AppID: testAppID, ReleaseID: testReleaseID,
-		DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2, CandidateSlot: "blue",
-		Phase: generatedruntimestate.PhaseMigrating, MigrationState: generatedruntimestate.MigrationRunning,
-		Components: []generatedruntimestate.Component{{DeploymentID: testDeploymentID, Name: "api", Slot: "blue", ImageArtifactID: testArtifactID, State: generatedruntimestate.ComponentImageReady}},
+func TestGeneratedExecutorDoesNotRerunInterruptedOrFailedMigration(t *testing.T) {
+	for _, migrationState := range []generatedruntimestate.MigrationState{generatedruntimestate.MigrationRunning, generatedruntimestate.MigrationFailed} {
+		t.Run(string(migrationState), func(t *testing.T) {
+			fixture := newExecutorFixture(t, true)
+			release := fixture.executor.releases.(*fakeReleases).release
+			fixture.deployments.deployment = deployments.Deployment{
+				ID: fixture.migrationAuthority.deploymentID, AppID: testAppID, JobID: testJobID, Status: deployments.Applying,
+				ConfigurationMode: "current", ReleaseID: release.ID, ActualConfigurationRevisionID: release.ConfigurationRevisionID,
+				ActualConfigurationRevisionNumber: release.ConfigurationRevisionNumber, RuntimeStrategy: deployments.RuntimeGeneratedNode,
+				DeploymentPlanRevisionID: fixture.plan.ID, DeploymentPlanRevisionNumber: fixture.plan.RevisionNumber, ProvenanceInitialized: true,
+			}
+			fixture.state.deployment = generatedruntimestate.Deployment{
+				DeploymentID: fixture.migrationAuthority.deploymentID, AppID: testAppID, ReleaseID: release.ID,
+				DeploymentPlanRevisionID: fixture.plan.ID, DeploymentPlanRevisionNumber: fixture.plan.RevisionNumber, CandidateSlot: "blue",
+				Phase: generatedruntimestate.PhaseMigrating, MigrationState: migrationState,
+				Components: []generatedruntimestate.Component{{DeploymentID: fixture.migrationAuthority.deploymentID, Name: "api", Slot: "blue", ImageArtifactID: fixture.migrationAuthority.artifact.ID, State: generatedruntimestate.ComponentImageReady}},
+			}
+			_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
+			if err == nil || len(fixture.migrations.requests) != 0 || len(fixture.deployments.migrationRequests) != 0 {
+				t.Fatalf("err=%v migration calls=%d pin calls=%d", err, len(fixture.migrations.requests), len(fixture.deployments.migrationRequests))
+			}
+			if fixture.state.deployment.Phase != generatedruntimestate.PhaseMigrating || fixture.state.deployment.MigrationState != migrationState || fixture.deployments.deployment.Status != deployments.Applying {
+				t.Fatalf("migration evidence was reset: runtime=%+v deployment=%+v", fixture.state.deployment, fixture.deployments.deployment)
+			}
+		})
 	}
-	_, err := fixture.execute(context.Background(), deploymentJob(), fixture.reporter)
-	if err == nil || len(fixture.migrations.requests) != 0 {
-		t.Fatalf("err=%v migration calls=%d", err, len(fixture.migrations.requests))
+}
+
+func TestGeneratedExecutorPreservesExistingMigrationWhenRuntimeReadIsUncertain(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		cancel bool
+	}{
+		{name: "live context"},
+		{name: "cancelled context", cancel: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExecutorFixture(t, false)
+			fixture.deployments.deployment = initializedDeployment(deployments.Applying)
+			fixture.state.deployment = generatedruntimestate.Deployment{
+				DeploymentID: testDeploymentID, AppID: testAppID, ReleaseID: testReleaseID,
+				DeploymentPlanRevisionID: testPlanID, DeploymentPlanRevisionNumber: 2,
+				CandidateSlot: "blue", Phase: generatedruntimestate.PhaseMigrating, MigrationState: generatedruntimestate.MigrationRunning,
+				Components: []generatedruntimestate.Component{{DeploymentID: testDeploymentID, Name: "api", Slot: "blue", ImageArtifactID: testArtifactID, State: generatedruntimestate.ComponentImageReady}},
+			}
+			resolveCause := errors.New("deployment resolution unavailable")
+			readCause := errors.New("runtime state read unavailable")
+			fixture.reporter.failPhase = "prepare_workspace"
+			fixture.reporter.err = resolveCause
+			fixture.state.getErr = readCause
+			beforeDeployment := fixture.deployments.deployment
+			beforeRuntime := fixture.state.deployment
+			var ctx context.Context = context.Background()
+			if test.cancel {
+				cancelled, cancel := context.WithCancel(ctx)
+				cancel()
+				ctx = cancelled
+			}
+
+			result, err := fixture.execute(ctx, deploymentJob(), fixture.reporter)
+			var executionErr *jobs.ExecutionError
+			if result != (jobs.ExecutionResult{}) || !errors.As(err, &executionErr) || !errors.Is(err, resolveCause) || !errors.Is(err, readCause) {
+				t.Fatalf("result=%#v error=%v", result, err)
+			}
+			if test.cancel && (!errors.Is(err, deploymentexecution.ErrCanceled) || !errors.Is(err, context.Canceled)) {
+				t.Fatalf("cancellation causes missing: %v", err)
+			}
+			if !reflect.DeepEqual(fixture.deployments.deployment, beforeDeployment) || !reflect.DeepEqual(fixture.state.deployment, beforeRuntime) || fixture.runtime.stopped != 0 || fixture.runtime.retained != 0 {
+				t.Fatalf("read uncertainty terminalized or cleaned migration: deployment=%+v runtime=%+v stopped=%d retained=%d", fixture.deployments.deployment, fixture.state.deployment, fixture.runtime.stopped, fixture.runtime.retained)
+			}
+		})
 	}
 }
 
