@@ -16,12 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
-	"github.com/hostd/hostd/internal/generatedruntimestate"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -74,14 +72,7 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 		liveGatewayResourceExists(t, fixture.ctx, fixture.runner, fixture.docker, fixture.root, fixture.dockerConfig, "image", image.tag) {
 		t.Fatal("loopback-only fixture identities already exist")
 	}
-	authority := liveGeneratedDeployments(t, fixture.ingress.options.WorkingDirectory)
-	engine, err := newLiveRuntimeEngine(fixture.runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
-		DockerExecutable: fixture.docker, DockerConfigDirectory: fixture.dockerConfig, WorkingDirectory: fixture.ingress.options.WorkingDirectory,
-		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond, OutputLimit: liveDockerOutputLimit,
-		Limits: liveRuntimeContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128, TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2}, ReplacementDiskBytes: 96 << 20})
-	if err != nil {
-		t.Fatal("create second live runtime")
-	}
+	authority, engine := fixture.authority, fixture.engine
 	var secondCandidates []liveRuntimeCandidate
 	t.Cleanup(func() {
 		// Both application networks are still attached to the retained predecessor.
@@ -105,12 +96,9 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 	}
 	db, repository := fixture.db, fixture.repository
 	profile := prepareLiveGatewayRebindStagePredecessor(t, fixture, db, repository)
-	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`, loopbackID, "handover-loopback", "Loopback-only handover app"); err != nil {
-		t.Fatal(err)
-	}
 	secondFixture := *fixture
 	secondFixture.candidates = []liveRuntimeCandidate{second}
-	seedLiveFinalHandoverLoopbackRuntime(t, db, &secondFixture)
+	validateLiveGatewayRebindPublishedRuntime(t, db, &secondFixture)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile, appaccess.GatewayProfileSpec{
 		SelectedIPv4: after.IPv4, InterfaceID: after.InterfaceID, PortStart: fixture.port, PortEnd: fixture.port})
 	return liveGatewayRebindSourceFixture{fixture: fixture, db: db, repository: repository,
@@ -440,117 +428,3 @@ func (d *liveFinalHandoverDriver) removeIngressNetwork(ctx context.Context, v ga
 }
 
 var _ gatewayRebindFinalHandoverDriver = (*liveFinalHandoverDriver)(nil)
-
-func seedLiveFinalHandoverLoopbackRuntime(t *testing.T, db *sql.DB,
-	fixture *liveGatewayV2Fixture,
-) generatedruntimestate.ActiveHead {
-	t.Helper()
-	candidate := fixture.candidates[0]
-	spec := liveCandidateSpec("green", candidate.AppID, candidate.DeploymentPlanRevisionID)
-	if candidate.ReleaseID != spec.ReleaseID || candidate.DeploymentID != spec.DeploymentID ||
-		candidate.ArtifactID != spec.ArtifactID || candidate.Component != spec.ComponentName {
-		t.Fatal("live candidate does not match its runtime seed identities")
-	}
-	stamp := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(
-		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
-		analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,
-		field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at
-	) VALUES(?,?,1,?,'generated_node','test','1',?,'local',0,?,?,1,8,'',?,?,'accepted',?,?)`,
-		candidate.DeploymentPlanRevisionID, candidate.AppID,
-		"apps/"+candidate.AppID+"/deployment-plans/"+candidate.DeploymentPlanRevisionID+".secret",
-		strings.Repeat("c", 64), strings.Repeat("d", 64), strings.Repeat("e", 64),
-		gatewayRebindTestAdministrator, stamp, gatewayRebindTestAdministrator, stamp); err != nil {
-		t.Fatalf("seed live candidate deployment plan: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO releases(
-		id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,
-		workspace_state,workspace_tree_sha256,deployment_plan_revision_id,deployment_plan_revision_number
-	) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,1)`, candidate.ReleaseID, candidate.AppID, stamp,
-		strings.Repeat("d", 64), strings.Repeat("f", 64), candidate.DeploymentPlanRevisionID); err != nil {
-		t.Fatalf("seed live candidate release: %v", err)
-	}
-	jobID := uuid.NewString()
-	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,created_at,updated_at)
-		VALUES(?,'deploy','application',?,'running','running',?,?,?)`, jobID, candidate.AppID,
-		gatewayRebindTestAdministrator, stamp, stamp); err != nil {
-		t.Fatalf("seed live candidate job: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO deployments(
-		id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,
-		deployment_plan_revision_id,deployment_plan_revision_number
-	) VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,1)`, candidate.DeploymentID,
-		candidate.AppID, candidate.ReleaseID, jobID, candidate.DeploymentPlanRevisionID); err != nil {
-		t.Fatalf("seed live candidate deployment: %v", err)
-	}
-	runtime := generatedruntimestate.New(db)
-	value, _, err := runtime.Begin(context.Background(), generatedruntimestate.BeginInput{
-		DeploymentID: candidate.DeploymentID, AppID: candidate.AppID, ReleaseID: candidate.ReleaseID,
-		DeploymentPlanRevisionID:     candidate.DeploymentPlanRevisionID,
-		DeploymentPlanRevisionNumber: 1, ComponentNames: []string{candidate.Component},
-	})
-	if err != nil {
-		t.Fatalf("begin live candidate runtime: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO generated_image_artifacts(
-		id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,
-		compiler_version,build_definition_digest,attempt_number,image_content_id,state,
-		created_at,updated_at,finished_at
-	) VALUES(?,?,?,?,?,'test',?,1,?,'ready',?,?,?)`, candidate.ArtifactID,
-		candidate.ReleaseID, candidate.DeploymentPlanRevisionID, 1, candidate.Component,
-		spec.BuildDefinitionDigest, candidate.ImageContentID, stamp, stamp, stamp); err != nil {
-		t.Fatalf("seed live candidate image artifact: %v", err)
-	}
-	if _, err := runtime.SetImageReady(context.Background(), candidate.AppID, candidate.DeploymentID,
-		candidate.Component, candidate.ArtifactID); err != nil {
-		t.Fatalf("mark live candidate image ready: %v", err)
-	}
-	if _, err := runtime.SetContainerStarting(context.Background(), candidate.AppID, candidate.DeploymentID,
-		candidate.Component, candidate.ContainerName); err != nil {
-		t.Fatalf("mark live candidate container starting: %v", err)
-	}
-	if _, err := runtime.SetContainerRunning(context.Background(), candidate.AppID, candidate.DeploymentID,
-		candidate.Component, candidate.ContainerID); err != nil {
-		t.Fatalf("mark live candidate container running: %v", err)
-	}
-	if _, err := runtime.AdvanceComponent(context.Background(), candidate.AppID, candidate.DeploymentID,
-		candidate.Component, generatedruntimestate.ComponentRunning,
-		generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatalf("mark live candidate component healthy: %v", err)
-	}
-	for _, next := range []generatedruntimestate.Phase{
-		generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate,
-		generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute,
-	} {
-		value, err = runtime.Advance(context.Background(), candidate.AppID, candidate.DeploymentID,
-			value.Phase, next, "")
-		if err != nil {
-			t.Fatalf("advance live candidate runtime: %v", err)
-		}
-	}
-	head, changed, err := runtime.SwitchActive(context.Background(), candidate.AppID, candidate.DeploymentID, 0)
-	if err != nil || !changed || head.DeploymentID != candidate.DeploymentID ||
-		head.ReleaseID != candidate.ReleaseID || head.Slot != string(candidate.Slot) {
-		t.Fatalf("switch live candidate runtime: changed=%t err=%v", changed, err)
-	}
-	completed := time.Now().UTC().Format(time.RFC3339Nano)
-	jobResult, err := db.Exec(`UPDATE jobs SET status='succeeded',phase='completed',updated_at=?,finished_at=?
-		WHERE id=? AND status='running'`, completed, completed, jobID)
-	if err != nil {
-		t.Fatalf("settle live candidate job: %v", err)
-	}
-	jobRows, err := jobResult.RowsAffected()
-	if err != nil || jobRows != 1 {
-		t.Fatalf("settle exact live candidate job: rows=%d err=%v", jobRows, err)
-	}
-	deploymentResult, err := db.Exec(`UPDATE deployments SET status='succeeded',finished_at=?
-		WHERE id=? AND status='preparing'`, completed, candidate.DeploymentID)
-	if err != nil {
-		t.Fatalf("settle live candidate deployment: %v", err)
-	}
-	deploymentRows, err := deploymentResult.RowsAffected()
-	if err != nil || deploymentRows != 1 {
-		t.Fatalf("settle exact live candidate deployment: rows=%d err=%v", deploymentRows, err)
-	}
-	return head
-}

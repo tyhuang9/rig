@@ -13,6 +13,7 @@ import (
 
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/jobs"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 func TestApplicationDesiredLifecycleTransitionsAndHistoricalReplay(t *testing.T) {
@@ -393,7 +394,7 @@ type lifecycleFixture struct {
 
 func newLifecycleFixture(t *testing.T) lifecycleFixture {
 	t.Helper()
-	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	db, err := databasefixture.Open(filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
 	}

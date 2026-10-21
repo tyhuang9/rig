@@ -19,7 +19,6 @@ import (
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -37,6 +36,7 @@ import (
 	"github.com/hostd/hostd/internal/runtimeexecutor"
 	"github.com/hostd/hostd/internal/sourceconnections"
 	"github.com/hostd/hostd/internal/sourceinspection"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 func TestCapacityPausedDeploymentResumesWithRecordedPinsAndOneReplacement(t *testing.T) {
@@ -260,7 +260,7 @@ type capacityResumeFixture struct {
 func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	t.Helper()
 	dataRoot := t.TempDir()
-	db, err := database.Open(dataRoot)
+	db, err := databasefixture.Open(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

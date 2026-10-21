@@ -140,7 +140,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
+	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
 	}
@@ -293,7 +293,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
+	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("open fresh production ingress manager:", err)
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -61,6 +62,10 @@ func (a *liveRuntimeAuthority) BindNetwork(t *testing.T, ctx context.Context, sp
 	return testCandidateSpec(a.value.BindNetwork(t, ctx, runtimeCandidateSpec(spec)))
 }
 
+func (a *liveRuntimeAuthority) CancelNetwork(t *testing.T, ctx context.Context, deploymentID string) {
+	a.value.CancelNetwork(t, ctx, deploymentID)
+}
+
 func (a *liveRuntimeAuthority) Begin(t *testing.T, ctx context.Context, engine generatedingress.LiveRuntimeTestEngine, spec generatedingress.LiveRuntimeTestCandidateSpec) generatedingress.LiveRuntimeTestSession {
 	wrapped, ok := engine.(*liveRuntimeEngine)
 	if !ok || wrapped == nil || wrapped.value == nil {
@@ -77,6 +82,10 @@ func (s *liveRuntimeSession) BoundSpec() generatedingress.LiveRuntimeTestCandida
 	return testCandidateSpec(s.value.BoundSpec())
 }
 
+func (s *liveRuntimeSession) Candidate() generatedingress.LiveRuntimeTestCandidate {
+	return testCandidate(s.value.Candidate())
+}
+
 func (s *liveRuntimeSession) Start(t *testing.T, spec generatedingress.LiveRuntimeTestCandidateSpec) (generatedingress.LiveRuntimeTestCandidate, error) {
 	value, err := s.value.Start(t, runtimeCandidateSpec(spec))
 	return testCandidate(value), err
@@ -86,6 +95,9 @@ func (s *liveRuntimeSession) WaitHealthyAndHandoff() error { return s.value.Wait
 func (s *liveRuntimeSession) RejectObservedFailure() error { return s.value.RejectObservedFailure() }
 func (s *liveRuntimeSession) RoutePublished(slot generatedruntime.Slot, endpoints []generatedroute.RouteEndpoint) error {
 	return s.value.RoutePublished(slot, endpoints)
+}
+func (s *liveRuntimeSession) PublishedHistory(ctx context.Context, db *sql.DB) (generatedruntimestate.ActiveHead, error) {
+	return s.value.PublishedHistory(ctx, db)
 }
 func (s *liveRuntimeSession) Close() { s.value.Close() }
 
