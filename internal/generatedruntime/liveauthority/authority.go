@@ -256,12 +256,18 @@ func (a *Authority) BindCandidate(t *testing.T, scopedCtx context.Context, spec 
 	return a.bind(t, scopedCtx, spec)
 }
 
-// BindNetwork creates the same genuine pre-candidate history without requiring
-// or fabricating an image artifact.
+// BindNetwork creates genuine gated pre-candidate history without requiring or
+// fabricating an image artifact.
 func (a *Authority) BindNetwork(t *testing.T, scopedCtx context.Context, spec generatedruntime.CandidateSpec) generatedruntime.CandidateSpec {
 	t.Helper()
 	spec.ArtifactID, spec.ImageContentID, spec.BuildDefinitionDigest = "", "", ""
-	return a.bind(t, scopedCtx, spec)
+	bound := a.bind(t, scopedCtx, spec)
+	if err := a.repository.Gate(scopedCtx, deployments.GateRequest{
+		Claim: bound.Network.Claim, DeploymentID: bound.DeploymentID, Findings: bound.Network.Findings,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return bound
 }
 
 func (a *Authority) bind(t *testing.T, scopedCtx context.Context, spec generatedruntime.CandidateSpec) generatedruntime.CandidateSpec {
