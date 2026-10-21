@@ -16,7 +16,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/secretfile"
 )
 
@@ -1426,7 +1426,7 @@ func cloneGatewayV2RouteState(state gatewayV2RouteState) gatewayV2RouteState {
 	result := state
 	result.Apps = make(map[string]gatewayV2AppRoute, len(state.Apps))
 	for appID, app := range state.Apps {
-		app.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+		app.Route.Endpoints = append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)
 		if app.LAN != nil {
 			binding := *app.LAN
 			app.LAN = &binding
@@ -1484,7 +1484,7 @@ func cloneGatewayV2LANRecoveryBatch(value *gatewayV2LANRecoveryBatch) *gatewayV2
 }
 
 func cloneGatewayV2AppRoute(app gatewayV2AppRoute) gatewayV2AppRoute {
-	app.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+	app.Route.Endpoints = append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)
 	if app.LAN != nil {
 		binding := *app.LAN
 		app.LAN = &binding

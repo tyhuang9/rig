@@ -9,7 +9,8 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 type caddyConfig struct {
@@ -76,7 +77,7 @@ func buildCaddyConfig(routes map[string]routeRecord, listenAddress string) ([]by
 			server.Routes = append(server.Routes, proxyRoute(host, nil, route.Endpoints[0]))
 			continue
 		}
-		var api, static generatedruntime.RouteEndpoint
+		var api, static generatedroute.RouteEndpoint
 		for _, endpoint := range route.Endpoints {
 			if endpoint.Role == "server" {
 				api = endpoint
@@ -93,7 +94,7 @@ func buildCaddyConfig(routes map[string]routeRecord, listenAddress string) ([]by
 	return json.Marshal(result)
 }
 
-func proxyRoute(host string, paths []string, endpoint generatedruntime.RouteEndpoint) caddyRoute {
+func proxyRoute(host string, paths []string, endpoint generatedroute.RouteEndpoint) caddyRoute {
 	return caddyRoute{
 		Match: []caddyMatch{{Host: []string{host}, Path: paths}},
 		Handle: []caddyHandle{{Handler: "reverse_proxy", Upstreams: []caddyUpstream{{
@@ -105,7 +106,7 @@ func proxyRoute(host string, paths []string, endpoint generatedruntime.RouteEndp
 }
 
 func validateRoute(route routeRecord) error {
-	if route.Slot != generatedruntime.SlotBlue && route.Slot != generatedruntime.SlotGreen || len(route.Endpoints) < 1 || len(route.Endpoints) > 2 {
+	if route.Slot != generatedidentity.SlotBlue && route.Slot != generatedidentity.SlotGreen || len(route.Endpoints) < 1 || len(route.Endpoints) > 2 {
 		return errors.New("invalid generated ingress route")
 	}
 	seenComponents := map[string]bool{}

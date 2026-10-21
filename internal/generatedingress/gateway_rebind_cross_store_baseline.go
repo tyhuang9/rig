@@ -6,7 +6,7 @@ import (
 	"sort"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func gatewayRebindV2CheckpointApps(checkpoint gatewayRebindPredecessorCheckpoint) (map[string]gatewayCurrentAppRoute, error) {
@@ -15,7 +15,7 @@ func gatewayRebindV2CheckpointApps(checkpoint gatewayRebindPredecessorCheckpoint
 	case checkpoint.UpgradeState != nil && checkpoint.CurrentState == nil:
 		for appID, app := range checkpoint.UpgradeState.Apps {
 			current := gatewayCurrentAppRoute{Route: app.Route}
-			current.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+			current.Route.Endpoints = append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)
 			if app.LAN != nil {
 				raw := *app.LAN
 				current.LAN = &gatewayCurrentLANBinding{Raw: raw}
@@ -25,7 +25,7 @@ func gatewayRebindV2CheckpointApps(checkpoint gatewayRebindPredecessorCheckpoint
 	case checkpoint.UpgradeState == nil && checkpoint.CurrentState != nil:
 		for appID, app := range checkpoint.CurrentState.Apps {
 			current := app
-			current.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+			current.Route.Endpoints = append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)
 			if app.LAN != nil {
 				binding := *app.LAN
 				if app.LAN.Transfer != nil {

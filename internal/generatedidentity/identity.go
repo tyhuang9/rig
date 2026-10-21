@@ -18,6 +18,10 @@ type Slot string
 const (
 	SlotBlue  Slot = "blue"
 	SlotGreen Slot = "green"
+
+	// NetworkOwnershipLabelValue identifies the controller-owned application
+	// network shared by the generated runtime and ingress gateway.
+	NetworkOwnershipLabelValue = "generated-runtime-network"
 )
 
 type CandidateDescription struct {

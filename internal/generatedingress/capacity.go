@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedcapacity"
 )
 
 // The command is controller-owned and fixed. It executes inside the pinned,
@@ -14,21 +14,21 @@ import (
 // volume, so df measures the Docker data plane rather than Rig's source disk.
 const capacityProbeCommand = `memory=$(awk '/MemAvailable:/ {print $2*1024}' /proc/meminfo); disk=$(df -Pk /config | awk 'NR==2 {print $4*1024}'); printf '%s %s\n' "$memory" "$disk"`
 
-// Snapshot implements generatedruntime.CapacitySource. Provision must have
+// Snapshot implements generatedcapacity.Source. Provision must have
 // succeeded at startup; this method is intentionally read-only apart from the
 // fixed process executed inside the already-running Caddy container.
-func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedruntime.CapacitySnapshot, resultErr error) {
+func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedcapacity.Snapshot, resultErr error) {
 	if m == nil || ctx == nil {
-		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity source is invalid")
+		return generatedcapacity.Snapshot{}, errors.New("generated ingress capacity source is invalid")
 	}
 	release, err := m.lockGateway(ctx)
 	if err != nil {
-		return generatedruntime.CapacitySnapshot{}, err
+		return generatedcapacity.Snapshot{}, err
 	}
 	defer func() {
 		releaseGatewayLock(release, &resultErr)
 		if resultErr != nil {
-			snapshot = generatedruntime.CapacitySnapshot{}
+			snapshot = generatedcapacity.Snapshot{}
 		}
 	}()
 	// A native rebind commits its successor outside the migration-026 state.
@@ -36,50 +36,50 @@ func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedruntime.Capac
 	// capacity read cannot fall back to the retired predecessor.
 	selection, _, handled, err := m.gatewayCurrentSelectedStateLocked(ctx)
 	if err != nil {
-		return generatedruntime.CapacitySnapshot{}, err
+		return generatedcapacity.Snapshot{}, err
 	}
 	if handled {
 		attestation, err := m.attestGatewayCurrentPhysicalLocked(ctx, selection)
 		if err != nil {
-			return generatedruntime.CapacitySnapshot{}, err
+			return generatedcapacity.Snapshot{}, err
 		}
 		if attestation.Outcome != gatewayCurrentPhysicalStableServing || attestation.Resources.FinalContainer == nil {
-			return generatedruntime.CapacitySnapshot{}, &Error{Code: DiagnosticRouteUnresolved}
+			return generatedcapacity.Snapshot{}, &Error{Code: DiagnosticRouteUnresolved}
 		}
 		return m.snapshotFromContainer(ctx, attestation.Resources.FinalContainer.ID)
 	}
 	if _, state, journal, committed, err := m.committedV2Locked(ctx); err != nil {
-		return generatedruntime.CapacitySnapshot{}, err
+		return generatedcapacity.Snapshot{}, err
 	} else if committed {
 		if err := m.attestCommittedV2Locked(ctx, state, journal); err != nil {
-			return generatedruntime.CapacitySnapshot{}, err
+			return generatedcapacity.Snapshot{}, err
 		}
 		return m.snapshotFromContainer(ctx, state.Identity.FinalContainer)
 	}
 	if err := m.fenceLegacyV1Locked(); err != nil {
-		return generatedruntime.CapacitySnapshot{}, err
+		return generatedcapacity.Snapshot{}, err
 	}
 	inspection, found, err := m.inspectCaddy(ctx)
 	if err != nil || !found || !inspection.Running || inspection.Labels["io.rig.managed"] != "generated-ingress" || inspection.Labels["io.rig.identity-version"] != "v1" {
-		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe is unavailable")
+		return generatedcapacity.Snapshot{}, errors.New("generated ingress capacity probe is unavailable")
 	}
 	return m.snapshotFromContainer(ctx, caddyContainerName)
 }
 
-func (m *Manager) snapshotFromContainer(ctx context.Context, container string) (generatedruntime.CapacitySnapshot, error) {
+func (m *Manager) snapshotFromContainer(ctx context.Context, container string) (generatedcapacity.Snapshot, error) {
 	result, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", container, "sh", "-c", capacityProbeCommand)
 	if err != nil {
-		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe failed")
+		return generatedcapacity.Snapshot{}, errors.New("generated ingress capacity probe failed")
 	}
 	fields := strings.Fields(string(result.Stdout))
 	clearResult(&result)
 	if len(fields) != 2 {
-		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe is invalid")
+		return generatedcapacity.Snapshot{}, errors.New("generated ingress capacity probe is invalid")
 	}
 	memory, memoryErr := strconv.ParseUint(fields[0], 10, 64)
 	disk, diskErr := strconv.ParseUint(fields[1], 10, 64)
 	if memoryErr != nil || diskErr != nil {
-		return generatedruntime.CapacitySnapshot{}, errors.New("generated ingress capacity probe is invalid")
+		return generatedcapacity.Snapshot{}, errors.New("generated ingress capacity probe is invalid")
 	}
-	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: memory, DiskAvailableBytes: disk}, nil
+	return generatedcapacity.Snapshot{MemoryAvailableBytes: memory, DiskAvailableBytes: disk}, nil
 }

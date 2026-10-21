@@ -7,11 +7,11 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"time"
 
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 type Slot = generatedidentity.Slot
@@ -23,9 +23,9 @@ const (
 	RoleServer = "server"
 	RoleStatic = "static"
 
-	// NetworkOwnershipLabelValue is shared with ingress so it can attest the
-	// exact controller-owned application network before joining it.
-	NetworkOwnershipLabelValue = "generated-runtime-network"
+	// NetworkOwnershipLabelValue is retained as a source-compatible alias for
+	// the shared identity contract.
+	NetworkOwnershipLabelValue = generatedidentity.NetworkOwnershipLabelValue
 )
 
 // InactiveSlot deterministically selects the replacement slot. An empty active
@@ -207,22 +207,9 @@ type EnvironmentStager interface {
 	Stage(operationID string, attempt int, contents []byte) (EnvironmentLease, error)
 }
 
-type RouteEndpoint struct {
-	Component    string
-	Role         string
-	ContainerID  string
-	NetworkName  string
-	NetworkAlias string
-	InternalPort uint16
-}
+type RouteEndpoint = generatedroute.RouteEndpoint
 
-type RouteSwitchRequest struct {
-	AppID       string
-	FromSlot    Slot
-	ToSlot      Slot
-	Endpoints   []RouteEndpoint
-	DrainPeriod time.Duration
-}
+type RouteSwitchRequest = generatedroute.RouteSwitchRequest
 
 // RouteSwitchFailure describes whether a failed route switch may still be
 // using the candidate. Callers must preserve the candidate when this is true

@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func gatewayCurrentGrantTransition(before gatewayCurrentRouteState,
@@ -201,7 +201,7 @@ func gatewayCurrentGrantObservation(state gatewayCurrentRouteState, request Gate
 	}
 	return GatewayV2LANGrantObservation{
 		Request: request, Disposition: disposition, ActivationUncertain: activationUncertain,
-		Slot: app.Route.Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...),
+		Slot: app.Route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...),
 		GatewayOperationID: state.Lineage.OperationID, ProtectedStateDigest: state.Digest,
 		EffectiveBinding: proof, ObservedAt: time.Now().UTC(),
 	}, nil

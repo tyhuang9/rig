@@ -11,7 +11,7 @@ import (
 	"reflect"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/secretfile"
 )
 
@@ -66,10 +66,10 @@ type gatewayCurrentAppliedAuthorityV2 struct {
 // removes an application from the traffic projection; it does not erase the
 // selected runtime head or imply that its containers have stopped.
 type gatewayCurrentRuntimePinV2 struct {
-	DeploymentID     string                `json:"deploymentId"`
-	ReleaseID        string                `json:"releaseId"`
-	Slot             generatedruntime.Slot `json:"slot"`
-	ActiveGeneration int64                 `json:"activeGeneration"`
+	DeploymentID     string                 `json:"deploymentId"`
+	ReleaseID        string                 `json:"releaseId"`
+	Slot             generatedidentity.Slot `json:"slot"`
+	ActiveGeneration int64                  `json:"activeGeneration"`
 }
 
 type gatewayCurrentAppRouteV2 struct {
@@ -246,7 +246,7 @@ func validGatewayCurrentAppliedAuthorityV2(traffic gatewayCurrentTrafficV2,
 
 func validGatewayCurrentRuntimePinV2(value gatewayCurrentRuntimePinV2) bool {
 	return validCanonicalUUID(value.DeploymentID) && validGatewayCurrentRuntimeReleaseIDV2(value.ReleaseID) &&
-		(value.Slot == generatedruntime.SlotBlue || value.Slot == generatedruntime.SlotGreen) && value.ActiveGeneration > 0
+		(value.Slot == generatedidentity.SlotBlue || value.Slot == generatedidentity.SlotGreen) && value.ActiveGeneration > 0
 }
 
 func validGatewayCurrentAppRouteV2(appID string, profile gatewayProfileBinding, value gatewayCurrentAppRouteV2,

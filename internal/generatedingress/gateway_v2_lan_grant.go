@@ -10,7 +10,8 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 // GatewayV2LANGrantRequest is the complete immutable identity of one approved
@@ -85,8 +86,8 @@ type GatewayV2LANGrantObservation struct {
 	Request              GatewayV2LANGrantRequest
 	Disposition          GatewayV2LANGrantDisposition
 	ActivationUncertain  bool
-	Slot                 generatedruntime.Slot
-	Endpoints            []generatedruntime.RouteEndpoint
+	Slot                 generatedidentity.Slot
+	Endpoints            []generatedroute.RouteEndpoint
 	GatewayOperationID   string
 	ProtectedStateDigest string
 	EffectiveBinding     GatewayV2LANEffectiveBindingProof
@@ -1039,7 +1040,7 @@ func newGatewayV2LANGrantObservation(state gatewayV2RouteState, request gatewayV
 	}
 	return GatewayV2LANGrantObservation{
 		Request: request, Disposition: disposition, ActivationUncertain: activationUncertain,
-		Slot: app.Route.Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...),
+		Slot: app.Route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...),
 		GatewayOperationID: state.OperationID, ProtectedStateDigest: digest, ObservedAt: time.Now().UTC(),
 	}, nil
 }
