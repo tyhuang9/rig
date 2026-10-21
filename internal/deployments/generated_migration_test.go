@@ -430,6 +430,71 @@ func TestGeneratedMigrationRepositoryRequiresExactConcreteComposition(t *testing
 	}
 }
 
+type generatedMigrationDockerTemplateFixture struct {
+	ID              string `json:"Id"`
+	Name            string
+	Image           string
+	State           generatedMigrationDockerTemplateState
+	Config          generatedMigrationDockerTemplateConfig
+	HostConfig      generatedMigrationDockerTemplateHostConfig
+	NetworkSettings *generatedMigrationDockerTemplateNetworkSettings
+	Mounts          []any
+}
+
+type generatedMigrationDockerTemplateState struct {
+	Status     string
+	Running    bool
+	Paused     bool
+	Restarting bool
+	Dead       bool
+	ExitCode   int
+	StartedAt  string
+}
+
+type generatedMigrationDockerTemplateConfig struct {
+	Image      string
+	User       string
+	WorkingDir string
+	Entrypoint []string
+	Cmd        []string
+	Labels     map[string]string
+	Volumes    map[string]any
+	Env        []string
+}
+
+type generatedMigrationDockerTemplateHostConfig struct {
+	Memory         int64
+	MemorySwap     int64
+	CPUPeriod      int64 `json:"CpuPeriod"`
+	CPUQuota       int64 `json:"CpuQuota"`
+	PidsLimit      int64
+	Ulimits        []any
+	Init           bool
+	NetworkMode    string
+	ReadonlyRootfs bool
+	Privileged     bool
+	CapAdd         []string
+	CapDrop        []string
+	SecurityOpt    []string
+	Binds          []string
+	Mounts         []any
+	PortBindings   map[string]any
+	Tmpfs          map[string]string
+	LogConfig      generatedMigrationDockerTemplateLogConfig
+	RestartPolicy  generatedMigrationDockerTemplateRestartPolicy
+}
+
+type generatedMigrationDockerTemplateLogConfig struct {
+	Type   string
+	Config map[string]string
+}
+
+type generatedMigrationDockerTemplateRestartPolicy struct{ Name string }
+
+type generatedMigrationDockerTemplateNetworkSettings struct {
+	Networks map[string]any
+}
+
 func TestGeneratedMigrationInspectionProjectionIsValidAndSecretFree(t *testing.T) {
 	projection, err := template.New("inspect").Funcs(template.FuncMap{"json": func(value any) (string, error) {
 		body, err := json.Marshal(value)
@@ -438,12 +503,21 @@ func TestGeneratedMigrationInspectionProjectionIsValidAndSecretFree(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := map[string]any{
-		"ID": "id", "Name": "/name", "Image": "image",
-		"State":           map[string]any{"Status": "created", "Running": false, "Paused": false, "Restarting": false, "Dead": false, "ExitCode": 0, "StartedAt": "0001-01-01T00:00:00Z"},
-		"Config":          map[string]any{"Image": "image", "User": "node", "WorkingDir": "/workspace", "Entrypoint": []string{"entry"}, "Cmd": []string{"cmd"}, "Labels": map[string]string{}, "Volumes": map[string]any{}, "Env": []string{"DATABASE_URL=sentinel-secret"}},
-		"HostConfig":      map[string]any{"Memory": int64(1), "MemorySwap": int64(1), "CpuPeriod": int64(1), "CpuQuota": int64(1), "PidsLimit": int64(1), "Ulimits": []any{}, "Init": true, "NetworkMode": "network", "ReadonlyRootfs": true, "Privileged": false, "CapAdd": []string{}, "CapDrop": []string{"ALL"}, "SecurityOpt": []string{"no-new-privileges"}, "Binds": []string{}, "Mounts": []any{}, "PortBindings": map[string]any{}, "Tmpfs": map[string]string{}, "LogConfig": map[string]any{"Type": "json-file", "Config": map[string]string{}}, "RestartPolicy": map[string]string{"Name": "no"}},
-		"NetworkSettings": nil, "Mounts": []any{},
+	input := generatedMigrationDockerTemplateFixture{
+		ID: "id", Name: "/name", Image: "image",
+		State: generatedMigrationDockerTemplateState{Status: "created", StartedAt: "0001-01-01T00:00:00Z"},
+		Config: generatedMigrationDockerTemplateConfig{
+			Image: "image", User: "node", WorkingDir: "/workspace", Entrypoint: []string{"entry"}, Cmd: []string{"cmd"},
+			Labels: map[string]string{}, Volumes: map[string]any{}, Env: []string{"DATABASE_URL=sentinel-secret"},
+		},
+		HostConfig: generatedMigrationDockerTemplateHostConfig{
+			Memory: 1, MemorySwap: 1, CPUPeriod: 1, CPUQuota: 1, PidsLimit: 1, Ulimits: []any{}, Init: true,
+			NetworkMode: "network", ReadonlyRootfs: true, CapAdd: []string{}, CapDrop: []string{"ALL"}, SecurityOpt: []string{"no-new-privileges"},
+			Binds: []string{}, Mounts: []any{}, PortBindings: map[string]any{}, Tmpfs: map[string]string{},
+			LogConfig:     generatedMigrationDockerTemplateLogConfig{Type: "json-file", Config: map[string]string{}},
+			RestartPolicy: generatedMigrationDockerTemplateRestartPolicy{Name: "no"},
+		},
+		Mounts: []any{},
 	}
 	var rendered strings.Builder
 	if err := projection.Execute(&rendered, input); err != nil {
