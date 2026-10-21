@@ -96,6 +96,29 @@ func (s *GeneratedOwnerStores) Configured() bool {
 		s.configuration != nil && s.configuration.ConfiguredFor(s.database)
 }
 
+// ConfiguredForDomain reports whether this bundle value still names the exact
+// sealed concrete dependencies and configured paths expected by a generated
+// domain constructor. An unchanged value copy remains valid. The result is
+// configuration provenance only: it neither proves physical path identity nor
+// grants effect authority.
+func (s *GeneratedOwnerStores) ConfiguredForDomain(dataRoot, workingDirectory string) bool {
+	if s == nil || s.identity == nil {
+		return false
+	}
+	registry := s.identity
+	registry.mu.Lock()
+	canonical := registry.stores
+	matchesCanonical := canonical != nil && canonical.identity == registry &&
+		s.repository == canonical.repository && s.database == canonical.database &&
+		s.guard == canonical.guard && s.plans == canonical.plans &&
+		s.configuration == canonical.configuration
+	registry.mu.Unlock()
+	return matchesCanonical && s.matches(s.repository) &&
+		s.guard.ConfiguredForDomain(s.database, workingDirectory) &&
+		s.plans.ConfiguredForDomain(s.database, dataRoot) &&
+		s.configuration.ConfiguredForDomain(s.database, dataRoot)
+}
+
 // Repository returns the exact generic deployment repository captured by the
 // bundle. Candidate-specific authority is not constructed by this repository.
 func (s *GeneratedOwnerStores) Repository() *Repository {

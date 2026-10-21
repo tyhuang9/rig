@@ -43,6 +43,106 @@ func TestStoreConfiguredForRequiresExactDatabase(t *testing.T) {
 	}
 }
 
+func TestStoreConfiguredForDomainRequiresExactRootAndDatabase(t *testing.T) {
+	db := planDB(t)
+	root := t.TempDir()
+	store, err := New(db, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := database.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = foreign.Close() })
+
+	if !store.ConfiguredForDomain(db, root) {
+		t.Fatal("store rejected its exact domain configuration")
+	}
+	alias := deploymentPlanDomainRootAlias(t, root)
+	for name, request := range map[string]struct {
+		db   *sql.DB
+		root string
+	}{
+		"foreign database": {db: foreign, root: root},
+		"wrong root":       {db: db, root: t.TempDir()},
+		"alias root":       {db: db, root: alias},
+		"noncanonical root": {
+			db: db, root: root + string(filepath.Separator) + ".",
+		},
+		"relative root": {db: db, root: "relative"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if store.ConfiguredForDomain(request.db, request.root) {
+				t.Fatal("mismatched domain configuration accepted")
+			}
+		})
+	}
+
+	for name, unsupported := range deploymentPlanUnsupportedDomainRoots(t) {
+		t.Run("unsupported "+name, func(t *testing.T) {
+			unsupportedStore, err := New(db, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			unsupportedStore.root = filepath.Join(unsupported, "apps")
+			if unsupportedStore.ConfiguredForDomain(db, unsupported) {
+				t.Fatal("unsupported root spelling accepted")
+			}
+		})
+	}
+	changed, err := New(db, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ConfiguredForDomain(db, root) {
+		t.Fatal("changed store root accepted")
+	}
+	changedDatabase, err := New(foreign, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedDatabase.ConfiguredForDomain(db, root) {
+		t.Fatal("changed store database accepted")
+	}
+	var zero Store
+	if zero.ConfiguredForDomain(db, root) {
+		t.Fatal("zero store reported domain configuration")
+	}
+	var missing *Store
+	if missing.ConfiguredForDomain(db, root) || store.ConfiguredForDomain(nil, root) {
+		t.Fatal("nil store or database reported domain configuration")
+	}
+}
+
+func deploymentPlanDomainRootAlias(t *testing.T, root string) string {
+	t.Helper()
+	alias := filepath.Join(t.TempDir(), "domain-root-alias")
+	if err := os.Symlink(root, alias); err != nil {
+		upper := strings.ToUpper(root)
+		if upper == root {
+			upper = strings.ToLower(root)
+		}
+		if upper == root {
+			t.Fatalf("create domain-root alias: %v", err)
+		}
+		return upper
+	}
+	return alias
+}
+
+func deploymentPlanUnsupportedDomainRoots(t *testing.T) map[string]string {
+	t.Helper()
+	return map[string]string{
+		"UNC":                  `\\domain.invalid\share\rig`,
+		"slash-normalized UNC": `//domain.invalid/share/rig`,
+		"object manager":       `\??\C:\rig`,
+		"slash object manager": `/??/rig`,
+		"device":               `\Device\HarddiskVolume1\rig`,
+		"absolute NUL":         filepath.Join(t.TempDir(), "rig") + "\x00suffix",
+	}
+}
+
 func TestValidateCommand(t *testing.T) {
 	for _, command := range []string{"", " \t", "npm run build\nrm -rf /", "echo\x00bad", "echo\x1bbad", strings.Repeat("x", maxCommandBytes+1)} {
 		if err := ValidateCommand(command); err == nil {

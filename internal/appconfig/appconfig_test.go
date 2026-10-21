@@ -2,6 +2,7 @@ package appconfig
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -53,6 +54,101 @@ func TestStoreConfiguredForRequiresExactDatabase(t *testing.T) {
 	var missing *Store
 	if missing.ConfiguredFor(store.db) {
 		t.Fatal("nil store reported configured")
+	}
+}
+
+func TestStoreConfiguredForDomainRequiresExactRootAndDatabase(t *testing.T) {
+	store, root := testStore(t)
+	foreign, err := database.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = foreign.Close() })
+
+	if !store.ConfiguredForDomain(store.db, root) {
+		t.Fatal("store rejected its exact domain configuration")
+	}
+	alias := appConfigDomainRootAlias(t, root)
+	for name, request := range map[string]struct {
+		db   *sql.DB
+		root string
+	}{
+		"foreign database": {db: foreign, root: root},
+		"wrong root":       {db: store.db, root: t.TempDir()},
+		"alias root":       {db: store.db, root: alias},
+		"noncanonical root": {
+			db: store.db, root: root + string(filepath.Separator) + ".",
+		},
+		"relative root": {db: store.db, root: "relative"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if store.ConfiguredForDomain(request.db, request.root) {
+				t.Fatal("mismatched domain configuration accepted")
+			}
+		})
+	}
+
+	for name, unsupported := range appConfigUnsupportedDomainRoots(t) {
+		t.Run("unsupported "+name, func(t *testing.T) {
+			unsupportedStore, err := New(store.db, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			unsupportedStore.root = filepath.Join(unsupported, "apps")
+			if unsupportedStore.ConfiguredForDomain(store.db, unsupported) {
+				t.Fatal("unsupported root spelling accepted")
+			}
+		})
+	}
+	changed, err := New(store.db, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ConfiguredForDomain(store.db, root) {
+		t.Fatal("changed store root accepted")
+	}
+	changedDatabase, err := New(foreign, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedDatabase.ConfiguredForDomain(store.db, root) {
+		t.Fatal("changed store database accepted")
+	}
+	var zero Store
+	if zero.ConfiguredForDomain(store.db, root) {
+		t.Fatal("zero store reported domain configuration")
+	}
+	var missing *Store
+	if missing.ConfiguredForDomain(store.db, root) || store.ConfiguredForDomain(nil, root) {
+		t.Fatal("nil store or database reported domain configuration")
+	}
+}
+
+func appConfigDomainRootAlias(t *testing.T, root string) string {
+	t.Helper()
+	alias := filepath.Join(t.TempDir(), "domain-root-alias")
+	if err := os.Symlink(root, alias); err != nil {
+		upper := strings.ToUpper(root)
+		if upper == root {
+			upper = strings.ToLower(root)
+		}
+		if upper == root {
+			t.Fatalf("create domain-root alias: %v", err)
+		}
+		return upper
+	}
+	return alias
+}
+
+func appConfigUnsupportedDomainRoots(t *testing.T) map[string]string {
+	t.Helper()
+	return map[string]string{
+		"UNC":                  `\\domain.invalid\share\rig`,
+		"slash-normalized UNC": `//domain.invalid/share/rig`,
+		"object manager":       `\??\C:\rig`,
+		"slash object manager": `/??/rig`,
+		"device":               `\Device\HarddiskVolume1\rig`,
+		"absolute NUL":         filepath.Join(t.TempDir(), "rig") + "\x00suffix",
 	}
 }
 

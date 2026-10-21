@@ -93,6 +93,38 @@ Evidence is retained under
 Historical failed compile attempts and the corrected WSL argument invocation
 remain preserved. They are not counted as passing checks.
 
+## Configured store and path provenance checkpoint
+
+The next private-construction prerequisite adds descriptive `ConfiguredForDomain`
+checks to the application configuration store, deployment plan store, execution
+guard and sealed generated-owner bundle. They require the exact database handle,
+supported absolute clean root spelling, exact `<root>/apps` mapping and exact
+effects directory. The bundle also revalidates its issued dependencies and the
+current object behind its repository pointer. A foreign or zero overwrite of
+that repository handle refuses. Unchanged bundle copies retain their provenance.
+
+These checks perform no filesystem or process operations and grant no effect
+authority. Physical root/database identity, daemon identity and collision
+exclusion still require the later private construction work. Existing constructor
+acceptance and E4 runtime behavior are unchanged.
+
+Pinned Go 1.26.7 verification passed 10 parent tests and 51 subcases on each of
+Windows and native Linux, with no failures or skips. Exact discovery preceded
+execution. All four affected packages compiled on both targets and passed Windows
+vet. All 67 pre-existing functions in the four changed test files remain
+unchanged. Independent source review accepted the corrected unit; earlier review
+findings and superseded verification attempts remain preserved.
+
+Evidence under `m4-generated-domain-verification/configured-domain-20261021T022109Z/`:
+
+- `verification-receipt.md`, SHA-256
+  `55a82771f41cb99adb37e594d73ef3f4ce31a741c695213f67693bff8aaae695`.
+- All 1,031 Go/module source hashes remained unchanged; freeze and closure
+  manifest SHA-256
+  `fd795884a1cc95212151d8e06d6e77c25e1804fff68eb319668d98532bee305d`.
+- The sibling source review report has SHA-256
+  `50b36bb17d7a2ee53d604f9ad4f05de4e0f8069c832bd7aed714dd02e1047a64`.
+
 ## Remaining implementation boundary
 
 The fixed private domain factory, physical-domain collision checks, gateway
