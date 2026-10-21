@@ -3,12 +3,18 @@ package liveauthority
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
@@ -37,7 +43,7 @@ func TestAuthorityConstructorDoesNotAcquireEffectsScope(t *testing.T) {
 func TestPrepareCandidateUsesProtectedStoresAndClearsEnvironment(t *testing.T) {
 	db, working := liveAuthorityDatabase(t)
 	authority := New(t, db, working)
-	raw := []byte("PUBLIC=value\nSECRET=top-secret\n")
+	raw := []byte("APP_FIXTURE_SLOT_MARKER=blue\nAPP_FIXTURE_RUNTIME_SECRET=top-secret\n")
 	spec := authority.PrepareCandidate(t, context.Background(), liveAuthoritySpec(raw))
 	if spec.DeploymentPlanRevisionID == "" || spec.DeploymentPlanRevisionNumber != 1 || spec.ConfigurationRevisionID == "" || spec.ConfigurationRevisionNumber != 1 || spec.Environment != nil {
 		t.Fatalf("candidate was not bound to protected revisions: %#v", spec)
@@ -56,7 +62,7 @@ func TestPrepareCandidateUsesProtectedStoresAndClearsEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer exported.Clear()
-	if string(exported.Environment) != "# hostd application configuration\nPUBLIC=value\nSECRET=top-secret\n" {
+	if string(exported.Environment) != "# hostd application configuration\nAPP_FIXTURE_RUNTIME_SECRET=top-secret\nAPP_FIXTURE_SLOT_MARKER=blue\n" {
 		t.Fatal("protected runtime export changed fixture values")
 	}
 }
@@ -86,6 +92,22 @@ func TestBindNetworkCreatesOnlyGenuineBuildingHistory(t *testing.T) {
 	if intents != 0 || artifacts != 0 {
 		t.Fatal("network binding fabricated candidate receipt or image")
 	}
+	var status deployments.Status
+	if err := db.QueryRow(`SELECT status FROM deployments WHERE id=?`, bound.DeploymentID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != deployments.Applying {
+		t.Fatalf("network binding did not cross the policy gate: status=%q", status)
+	}
+	execution, err := authority.repository.PinGeneratedNetwork(ctx, bound.Network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.CheckBeforeCreate(); err != nil {
+		execution.Leave()
+		t.Fatalf("network binding did not authorize the create boundary: %v", err)
+	}
+	execution.Leave()
 	authority.CancelNetwork(t, ctx, bound.DeploymentID)
 	value, err = authority.runtime.Get(ctx, bound.AppID, bound.DeploymentID)
 	if err != nil || value.Phase != generatedruntimestate.PhaseCancelled {
@@ -214,6 +236,136 @@ func TestBindCandidateAllowsSelectedConfigurationAfterReleaseOriginal(t *testing
 		t.Fatalf("release-original and selected configuration were not preserved: release=%q deployment=%q", releaseConfiguration, deploymentConfiguration)
 	}
 	authority.CancelNetwork(t, deploymenteffects.WithScope(context.Background(), secondScope), selected.DeploymentID)
+}
+
+func TestPublishedHistoryRefusesIncompleteMismatchedAndForeignStateWithoutWrites(t *testing.T) {
+	db, working := liveAuthorityDatabase(t)
+	planRoot, configurationRoot := t.TempDir(), t.TempDir()
+	plans, err := deploymentplans.New(db, planRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := appconfig.New(db, configurationRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := NewWithStores(t, db, working, plans, configuration)
+	spec := authority.PrepareCandidate(t, context.Background(), liveAuthoritySpec([]byte("VALUE=protected\n")))
+	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), working)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = release() }()
+	ctx := deploymenteffects.WithScope(context.Background(), scope)
+	bound := authority.BindCandidate(t, ctx, spec)
+	runtime := authority.bound[bound.DeploymentID].runtime
+	candidate := generatedruntime.Candidate{
+		AppID: bound.AppID, ReleaseID: bound.ReleaseID, DeploymentID: bound.DeploymentID,
+		ArtifactID: bound.ArtifactID, DeploymentPlanRevisionID: bound.DeploymentPlanRevisionID,
+		Component: bound.ComponentName, Role: bound.Role, Technology: bound.Technology,
+		Slot: generatedruntime.Slot(runtime.CandidateSlot), ContainerName: "rig-building-only",
+		ContainerID: strings.Repeat("1", 64), ImageContentID: bound.ImageContentID,
+	}
+	sessionFor := func(value generatedruntime.Candidate) *CandidateSession {
+		return &CandidateSession{
+			authority: authority, spec: bound, candidate: value,
+			execution: &deployments.GeneratedCandidateExecution{},
+			published: generatedruntimestate.ActiveHead{
+				AppID: bound.AppID, DeploymentID: bound.DeploymentID, ReleaseID: bound.ReleaseID,
+				Slot: runtime.CandidateSlot, Generation: 1, UpdatedAt: runtime.UpdatedAt,
+			},
+		}
+	}
+	session := sessionFor(candidate)
+	protectedBefore := liveAuthorityTreeSnapshot(t, planRoot, configurationRoot)
+	var changesBefore, changesAfter int64
+	if err := db.QueryRow(`SELECT total_changes()`).Scan(&changesBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.PublishedHistory(ctx, db); err == nil {
+		t.Fatal("genuine building-only history unexpectedly validated as published")
+	}
+	if err := db.QueryRow(`SELECT total_changes()`).Scan(&changesAfter); err != nil {
+		t.Fatal(err)
+	}
+	if changesBefore != changesAfter {
+		t.Fatalf("building-history refusal wrote database state: before=%d after=%d", changesBefore, changesAfter)
+	}
+
+	stamp := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO generated_runtime_components(
+		deployment_id,component_name,slot,state,created_at,updated_at
+	) VALUES(?,?,?,'pending',?,?)`,
+		bound.DeploymentID, "unexpected-worker", runtime.CandidateSlot, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+	var components int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM generated_runtime_components WHERE deployment_id=?`,
+		bound.DeploymentID).Scan(&components); err != nil || components != 2 {
+		t.Fatalf("unexpected-component mismatch setup: count=%d error=%v", components, err)
+	}
+	if err := db.QueryRow(`SELECT total_changes()`).Scan(&changesBefore); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := session.PublishedHistory(ctx, db); !errors.Is(err, errPublishedComponentRoster) {
+		t.Fatalf("unexpected component roster refusal = %v", err)
+	}
+	changed := candidate
+	changed.AppID = uuid.NewString()
+	if _, err := sessionFor(changed).PublishedHistory(ctx, db); err == nil {
+		t.Fatal("mismatched original candidate app unexpectedly validated")
+	}
+	changed = candidate
+	changed.DeploymentID = uuid.NewString()
+	if _, err := sessionFor(changed).PublishedHistory(ctx, db); err == nil {
+		t.Fatal("mismatched original candidate deployment unexpectedly validated")
+	}
+	foreign, _ := liveAuthorityDatabase(t)
+	if _, err := session.PublishedHistory(ctx, foreign); err == nil {
+		t.Fatal("foreign database unexpectedly validated")
+	}
+	if _, err := (&CandidateSession{}).PublishedHistory(ctx, db); err == nil {
+		t.Fatal("absent original session unexpectedly validated")
+	}
+	if err := db.QueryRow(`SELECT total_changes()`).Scan(&changesAfter); err != nil {
+		t.Fatal(err)
+	}
+	if changesBefore != changesAfter {
+		t.Fatalf("published-history refusals wrote database state: before=%d after=%d", changesBefore, changesAfter)
+	}
+	if protectedAfter := liveAuthorityTreeSnapshot(t, planRoot, configurationRoot); !reflect.DeepEqual(protectedBefore, protectedAfter) {
+		t.Fatal("published-history refusals changed protected plan or configuration bundles")
+	}
+	authority.CancelNetwork(t, ctx, bound.DeploymentID)
+}
+
+func liveAuthorityTreeSnapshot(t *testing.T, roots ...string) map[string]string {
+	t.Helper()
+	result := make(map[string]string)
+	for _, root := range roots {
+		err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			relative, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			result[root+":"+relative] = string(body)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	return result
 }
 
 func liveAuthorityDatabase(t *testing.T) (*sql.DB, string) {
