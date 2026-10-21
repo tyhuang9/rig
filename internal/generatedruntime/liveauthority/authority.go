@@ -35,6 +35,8 @@ import (
 
 const fixtureCompilerVersion = "liveauthority-fixture-v1"
 
+var errPublishedComponentRoster = errors.New("live candidate published component roster changed")
+
 // Authority owns only same-database stores and repositories. Effects scopes
 // are acquired per CandidateSession so sequential fixtures cannot retain a
 // process-wide lease through constructor lifetime.
@@ -74,6 +76,7 @@ type CandidateSession struct {
 	execution   *deployments.GeneratedCandidateExecution
 	invocation  deployments.GeneratedCandidateInvocation
 	candidate   generatedruntime.Candidate
+	published   generatedruntimestate.ActiveHead
 	closed      sync.Once
 }
 
@@ -404,6 +407,110 @@ func (a *Authority) Begin(t *testing.T, parent context.Context, engine *generate
 func (s *CandidateSession) BoundSpec() generatedruntime.CandidateSpec { return copySpec(s.spec) }
 func (s *CandidateSession) Candidate() generatedruntime.Candidate     { return s.candidate }
 
+// PublishedHistory proves that this session's original bound candidate is the
+// exact completed active runtime in the caller's database. It only reads the
+// retained protected stores and immutable SQL history; it never repairs or
+// reconstructs state.
+func (s *CandidateSession) PublishedHistory(ctx context.Context, db *sql.DB) (generatedruntimestate.ActiveHead, error) {
+	if s == nil || s.authority == nil || ctx == nil || db == nil || db != s.authority.db ||
+		s.execution == nil || s.candidate.DeploymentID == "" || s.published.DeploymentID == "" {
+		return generatedruntimestate.ActiveHead{}, errors.New("live candidate has no original published history")
+	}
+	spec, candidate, published := s.spec, s.candidate, s.published
+	claim := spec.Network.Claim
+	if claim.JobID() == "" || claim.Attempt() < 1 ||
+		candidate.AppID != spec.AppID || candidate.ReleaseID != spec.ReleaseID ||
+		candidate.DeploymentID != spec.DeploymentID || candidate.ArtifactID != spec.ArtifactID ||
+		candidate.DeploymentPlanRevisionID != spec.DeploymentPlanRevisionID ||
+		candidate.Component != spec.ComponentName || candidate.Role != spec.Role ||
+		candidate.Technology != spec.Technology || candidate.ImageContentID != spec.ImageContentID ||
+		candidate.Slot == "" || candidate.ContainerName == "" || candidate.ContainerID == "" ||
+		published.AppID != spec.AppID || published.DeploymentID != spec.DeploymentID ||
+		published.ReleaseID != spec.ReleaseID || published.Slot != string(candidate.Slot) ||
+		published.Generation < 1 || published.UpdatedAt.IsZero() {
+		return generatedruntimestate.ActiveHead{}, errors.New("live candidate published identity changed")
+	}
+	var componentCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM generated_runtime_components WHERE deployment_id=?`,
+		spec.DeploymentID).Scan(&componentCount); err != nil {
+		return generatedruntimestate.ActiveHead{}, errors.Join(errPublishedComponentRoster, err)
+	}
+	if componentCount != 1 {
+		return generatedruntimestate.ActiveHead{}, errPublishedComponentRoster
+	}
+
+	plan, err := s.authority.plans.GetRevision(ctx, spec.AppID, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber)
+	if err != nil {
+		return generatedruntimestate.ActiveHead{}, err
+	}
+	technology := spec.Technology
+	if technology == "" {
+		technology = "node"
+	}
+	if !sameLiveComponentPlan(plan, deploymentplans.Component{
+		Name: spec.ComponentName, Role: spec.Role, Technology: technology,
+		RootDirectory: spec.RootDirectory, RunCommand: spec.RunCommand,
+		InternalPort: spec.InternalPort, HealthProbe: spec.HealthProbe,
+	}) {
+		return generatedruntimestate.ActiveHead{}, errors.New("live candidate protected plan changed")
+	}
+	configuration, err := s.authority.configuration.ExportComponentRuntimeForExecution(ctx,
+		spec.AppID, spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber,
+		spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber, spec.ComponentName)
+	if err != nil {
+		return generatedruntimestate.ActiveHead{}, err
+	}
+	configuration.Clear()
+
+	var matched int
+	err = db.QueryRowContext(ctx, `SELECT 1
+		FROM deployments d
+		JOIN jobs j ON j.id=d.job_id
+		JOIN releases r ON r.id=d.release_id
+		JOIN generated_runtime_deployments rd ON rd.deployment_id=d.id
+		JOIN generated_runtime_active_heads h ON h.app_id=rd.app_id
+		JOIN generated_runtime_components c ON c.deployment_id=rd.deployment_id
+		JOIN generated_image_artifacts a ON a.id=c.image_artifact_id
+		JOIN generated_candidate_intents i ON i.deployment_id=c.deployment_id AND i.component_name=c.component_name
+		WHERE d.id=? AND d.app_id=? AND d.release_id=? AND d.job_id=?
+		  AND d.status='succeeded' AND d.finished_at IS NOT NULL
+		  AND d.actual_configuration_revision_id=? AND d.actual_configuration_revision_number=?
+		  AND d.runtime_strategy='generated_node' AND d.provenance_initialized=1
+		  AND d.deployment_plan_revision_id=? AND d.deployment_plan_revision_number=?
+		  AND j.type='deploy' AND j.resource_type='application' AND j.resource_id=?
+		  AND j.status='succeeded' AND j.phase='succeeded' AND j.attempt=? AND j.finished_at IS NOT NULL
+		  AND r.app_id=? AND r.status='ready' AND r.deployment_plan_revision_id=? AND r.deployment_plan_revision_number=?
+		  AND rd.app_id=? AND rd.release_id=? AND rd.deployment_plan_revision_id=? AND rd.deployment_plan_revision_number=?
+		  AND rd.candidate_slot=? AND rd.phase='succeeded' AND rd.finished_at IS NOT NULL
+		  AND (SELECT COUNT(*) FROM generated_runtime_components roster WHERE roster.deployment_id=rd.deployment_id)=1
+		  AND h.deployment_id=? AND h.release_id=? AND h.slot=? AND h.generation=?
+		  AND c.component_name=? AND c.slot=? AND c.state='active'
+		  AND c.image_artifact_id=? AND c.container_name=? AND c.container_id=?
+		  AND a.release_id=? AND a.deployment_plan_revision_id=? AND a.deployment_plan_revision_number=?
+		  AND a.component_id=? AND a.compiler_version=? AND a.build_definition_digest=?
+		  AND a.attempt_number=1 AND a.image_content_id=? AND a.state='ready' AND a.finished_at IS NOT NULL
+		  AND i.creator_job_id=? AND i.creator_worker_attempt=?
+		  AND i.configuration_revision_id=? AND i.configuration_revision_number=?
+		  AND i.image_artifact_id=? AND i.image_artifact_attempt=1
+		  AND i.environment_operation_id=? AND i.environment_staging_attempt=?`,
+		spec.DeploymentID, spec.AppID, spec.ReleaseID, claim.JobID(),
+		spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber,
+		spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber,
+		spec.AppID, claim.Attempt(), spec.AppID,
+		spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber,
+		spec.AppID, spec.ReleaseID, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber,
+		candidate.Slot, spec.DeploymentID, spec.ReleaseID, candidate.Slot, published.Generation,
+		spec.ComponentName, candidate.Slot, spec.ArtifactID, candidate.ContainerName, candidate.ContainerID,
+		spec.ReleaseID, spec.DeploymentPlanRevisionID, spec.DeploymentPlanRevisionNumber,
+		spec.ComponentName, fixtureCompilerVersion, spec.BuildDefinitionDigest, spec.ImageContentID,
+		claim.JobID(), claim.Attempt(), spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber,
+		spec.ArtifactID, spec.ArtifactID, claim.Attempt()).Scan(&matched)
+	if err != nil || matched != 1 {
+		return generatedruntimestate.ActiveHead{}, errors.Join(err, errors.New("live candidate published history is incomplete or mismatched"))
+	}
+	return published, nil
+}
+
 // Start validates the fixture-built image, records its exact Ready artifact,
 // then crosses the real gate and candidate owner boundaries.
 func (s *CandidateSession) Start(t *testing.T, ready generatedruntime.CandidateSpec) (generatedruntime.Candidate, error) {
@@ -542,7 +649,11 @@ func (s *CandidateSession) RoutePublished(slot generatedruntime.Slot, endpoints 
 	if _, err := s.authority.repository.Transition(s.ctx, s.spec.AppID, s.spec.DeploymentID, deployments.Succeeded, ""); err != nil {
 		return err
 	}
-	return s.finishJob("succeeded", "")
+	if err := s.finishJob("succeeded", ""); err != nil {
+		return err
+	}
+	s.published = published
+	return nil
 }
 
 // Close joins execution and cleanup children before releasing accounting and
