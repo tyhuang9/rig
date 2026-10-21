@@ -86,6 +86,7 @@ type migrationAuthorityCapturedContainer struct {
 }
 
 type migrationAuthorityProcessSnapshot struct {
+	armed            bool
 	createCalls      int
 	startCalls       int
 	waitCalls        int
@@ -245,8 +246,23 @@ func (observer *migrationAuthorityProcessObserver) Snapshot() migrationAuthority
 	observer.mu.Lock()
 	defer observer.mu.Unlock()
 	return migrationAuthorityProcessSnapshot{
+		armed:       observer.expected != nil,
 		createCalls: observer.createCalls, startCalls: observer.startCalls, waitCalls: observer.waitCalls,
 		removeCalls: observer.removeCalls, attemptMutations: observer.attemptMutations, captured: observer.captured,
+	}
+}
+
+func (observer *migrationAuthorityProcessObserver) DiagnosticSnapshot() migrationJourneyProcessDiagnosticSnapshot {
+	snapshot := observer.Snapshot()
+	return migrationJourneyProcessDiagnosticSnapshot{
+		Armed:                snapshot.armed,
+		ObservationAvailable: snapshot.armed,
+		CreateCalls:          snapshot.createCalls,
+		StartCalls:           snapshot.startCalls,
+		WaitCalls:            snapshot.waitCalls,
+		RemoveCalls:          snapshot.removeCalls,
+		AttemptMutations:     snapshot.attemptMutations,
+		Captured:             snapshot.captured,
 	}
 }
 
@@ -352,10 +368,11 @@ type migrationAuthorityExecutionObservation struct {
 }
 
 type migrationAuthorityExecutionObserver struct {
-	mu       sync.Mutex
-	delegate jobs.Executor
-	jobID    string
-	returned chan migrationAuthorityExecutionObservation
+	mu          sync.Mutex
+	delegate    jobs.Executor
+	jobID       string
+	returned    chan migrationAuthorityExecutionObservation
+	observation *migrationAuthorityExecutionObservation
 }
 
 func newMigrationAuthorityExecutionObserver(delegate jobs.Executor) *migrationAuthorityExecutionObserver {
@@ -384,12 +401,18 @@ func (observer *migrationAuthorityExecutionObserver) Execute(ctx context.Context
 	executionContextErr := ctx.Err()
 	observer.mu.Lock()
 	jobID, returned := observer.jobID, observer.returned
-	observer.mu.Unlock()
 	if job.ID == jobID && returned != nil {
+		captured := migrationAuthorityExecutionObservation{job: job, err: err, contextErr: executionContextErr}
+		if observer.observation == nil {
+			observer.observation = &captured
+		}
+		observer.mu.Unlock()
 		select {
-		case returned <- migrationAuthorityExecutionObservation{job: job, err: err, contextErr: executionContextErr}:
+		case returned <- captured:
 		default:
 		}
+	} else {
+		observer.mu.Unlock()
 	}
 	return result, err
 }
@@ -409,6 +432,23 @@ func (observer *migrationAuthorityExecutionObserver) Wait(ctx context.Context, m
 	case <-waitContext.Done():
 		return migrationAuthorityExecutionObservation{}, errors.New("migration execution return was not observed")
 	}
+}
+
+func (observer *migrationAuthorityExecutionObserver) DiagnosticSnapshot() migrationJourneyExecutionDiagnosticSnapshot {
+	if observer == nil {
+		return migrationJourneyExecutionDiagnosticSnapshot{}
+	}
+	observer.mu.Lock()
+	defer observer.mu.Unlock()
+	snapshot := migrationJourneyExecutionDiagnosticSnapshot{Armed: observer.returned != nil}
+	if observer.observation == nil {
+		return snapshot
+	}
+	snapshot.ObservationAvailable = true
+	snapshot.Err = observer.observation.err
+	snapshot.ReturnContextCanceled = errors.Is(observer.observation.contextErr, context.Canceled)
+	snapshot.ReturnContextDeadline = errors.Is(observer.observation.contextErr, context.DeadlineExceeded)
+	return snapshot
 }
 
 func runMigrationAuthorityRevokedBeforeStart(t *testing.T, input migrationAuthorityRevocationInput) {
@@ -441,6 +481,18 @@ func runMigrationAuthorityRevokedBeforeStart(t *testing.T, input migrationAuthor
 		environmentPath: filepath.Join(input.dataRoot, "runtime", "generated-runtime", beforeDeployment.ID+"-"+strconv.Itoa(resumedAttempt), "runtime.env"),
 		containerName:   "rig-migration-" + strings.ReplaceAll(beforeDeployment.ID, "-", ""),
 	}
+	resumeFailureDiagnostic, resumeDiagnosticComplete := migrationJourneyResumeFailureDiagnostic(t, migrationJourneyResumeFailureDiagnosticInput{
+		Parent:      input.ctx,
+		Application: input.application.ID,
+		Job:         input.v2Mutation.Job.ID,
+		GetJob:      input.jobs.Get,
+		Deployments: deployments.New(input.db).List,
+		Runtime:     input.composition.state.Get,
+		Runner:      input.runner.DiagnosticSnapshot,
+		Execution:   input.execution.DiagnosticSnapshot,
+		Process:     input.process.DiagnosticSnapshot,
+	})
+	defer resumeFailureDiagnostic()
 	if err := input.process.Arm(expected); err != nil {
 		t.Fatal("arm exact migration process observer")
 	}
@@ -517,6 +569,7 @@ func runMigrationAuthorityRevokedBeforeStart(t *testing.T, input migrationAuthor
 	input.process.AssertRetained(t, input.ctx)
 	migrationAuthorityAssertRelationsAbsent(t, input.ctx, input.docker, input.fixtureEnvironment, input.fixtureRoot)
 	controllerJourneyRoutedRequest(t, input.ctx, input.application.ID, http.MethodGet, "/counter", "", http.StatusOK, `"value":0`)
+	resumeDiagnosticComplete()
 }
 
 func migrationAuthorityCreateMatches(args []string, expected migrationAuthorityProcessExpected) bool {

@@ -180,6 +180,35 @@ verified by the reviewer against its previous hash. The subsequent final
 platform runs cover the corrected source. No limits were increased to make
 these checks pass.
 
+## Hosted approved-resume follow-up
+
+The two retained PR #195 hosted failure logs are:
+
+- `m4-lifecycle-coordinator-verification/ci-followups-20261020/pr195-job-118910188889/raw.log`, SHA-256 `01d496d42ae2cb23bcc96dcbcc5c216e393d2bf3aeffdfcb72e9546d580da797`: the approval-and-uncertainty journey stopped at the v2 resumed-job wait with durable `failed` / `runtime_unavailable` status before its migration-runner assertion.
+- `m4-lifecycle-coordinator-verification/ci-followups-20261020/pr195-job-118910188517/raw.log`, SHA-256 `50b7344a05c79e85ec21865be75bb575b689d15c2819c7d49cb5154b30ec86d2`: the authority-revocation journey stopped at `migration executor did not return the retained authority loss` before its runner-result and retained-state assertions.
+
+Those logs do not establish a root cause, runner entry, Docker create/start,
+or SQL execution. The draft therefore adds failure-only test diagnostics before
+fixture teardown. They report only allowlisted status/code enums, boolean
+sentinel checks, bounded counters, and timestamp-presence booleans. The
+approval journey reports process-observer counters as unavailable unless that
+observer was armed, so its zero snapshot cannot be read as evidence of no
+physical entry. No production behavior, retry, timeout, or authority check is
+changed by this follow-up.
+
+Local verification of the diagnostics passed on 2026-10-21 using pinned Go
+1.26.7: both default-tag regression parents passed on Windows and native Linux
+with zero failures/skips. They check redaction/classification and failure-only
+defer ordering before worker shutdown. Live-tag controller compilation and vet
+passed on both targets; canonical generation and all three documentation
+checks passed. Evidence is retained in
+`temp/m3-lan-external-db-20261015/m4-generated-migration-authority-verification/resume-diagnostics-20261021T003952Z`.
+Source hashes were unchanged throughout that run; this result paragraph was
+added afterward. Independent observability review accepted the corrected
+ordering and output boundaries. The two-second context bounds history/runtime
+reads, while the existing job getter and snapshot locks remain outside it.
+No live Docker rerun or production root cause is claimed by these local checks.
+
 ## Hosted acceptance still required
 
 The migration workflow has two fixed Docker matrix entries: the existing
