@@ -111,6 +111,43 @@ func (runner *runtimeCompositionCommandRunner) Run(context.Context, runtimeproce
 	return runtimeprocess.CommandResult{}, nil
 }
 
+func TestHostdDaemonAssemblyRunnerComposesGeneratedRuntime(t *testing.T) {
+	compose := func(t *testing.T, assembly hostdDaemonAssemblyOptions) runtimeComposition {
+		t.Helper()
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.GeneratedRuntime = true
+		assembly = normalizeHostdDaemonAssembly(assembly)
+		composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			dockerExecutable: fixture.dockerExecutable,
+			runner:           assembly.runner,
+			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
+		})
+		if err != nil {
+			t.Fatalf("compose generated runtime: %v", err)
+		}
+		if composition.generated == nil {
+			t.Fatal("generated runtime engine was not composed")
+		}
+		return composition
+	}
+
+	t.Run("default runner", func(t *testing.T) {
+		compose(t, hostdDaemonAssemblyOptions{})
+	})
+
+	t.Run("injected runner", func(t *testing.T) {
+		injected := &runtimeCompositionCommandRunner{}
+		assembly := normalizeHostdDaemonAssembly(hostdDaemonAssemblyOptions{runner: injected})
+		if assembly.runner != injected {
+			t.Fatalf("injected daemon runner identity changed: got %p want %p", assembly.runner, injected)
+		}
+		compose(t, assembly)
+		if injected.calls != 0 {
+			t.Fatalf("composition executed %d injected commands", injected.calls)
+		}
+	})
+}
+
 type runtimeCompositionReporter struct{ updates []jobs.ProgressUpdate }
 
 func (reporter *runtimeCompositionReporter) Report(update jobs.ProgressUpdate) error {
