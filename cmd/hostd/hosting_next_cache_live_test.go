@@ -124,7 +124,7 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	// The candidate owner alone exports them for the exact selected revision.
 	firstSecret, secondSecret := "next-runtime-"+uuid.NewString(), "next-runtime-"+uuid.NewString()
 	spec.EnvironmentOperationID, spec.EnvironmentOperationAttempt = uuid.NewString(), 1
-	spec.Environment = []byte("RIG_FIXTURE_RUNTIME_SECRET=" + firstSecret + "\nRIG_FIXTURE_SLOT_MARKER=blue\n")
+	spec.Environment = []byte("APP_FIXTURE_RUNTIME_SECRET=" + firstSecret + "\nAPP_FIXTURE_SLOT_MARKER=blue\n")
 	spec = authority.PrepareCandidate(t, ctx, spec)
 	blueSession := authority.Begin(t, ctx, engine, spec)
 	defer blueSession.Close()
@@ -160,7 +160,7 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	spec.ActiveSlot, spec.DeploymentID = blue.Slot, uuid.NewString()
 	spec.EnvironmentOperationID = uuid.NewString()
 	spec.ConfigurationRevisionID, spec.ConfigurationRevisionNumber = "", 0
-	spec.Environment = []byte("RIG_FIXTURE_RUNTIME_SECRET=" + secondSecret + "\nRIG_FIXTURE_SLOT_MARKER=green\n")
+	spec.Environment = []byte("APP_FIXTURE_RUNTIME_SECRET=" + secondSecret + "\nAPP_FIXTURE_SLOT_MARKER=green\n")
 	spec = authority.PrepareCandidate(t, ctx, spec)
 	greenSession := authority.Begin(t, ctx, engine, spec)
 	defer greenSession.Close()
@@ -329,7 +329,7 @@ ENTRYPOINT ["/usr/local/bin/rig-entrypoint"]
 		t.Fatal("inspect isolated Next fixture image")
 	}
 	configuration, err := controllerJourneyDocker(ctx, docker, nil, "image", "inspect", "--format", "{{json .Config.Env}}", imageID)
-	if err != nil || bytes.Contains(configuration, []byte("RIG_FIXTURE_RUNTIME_SECRET")) || bytes.Contains(configuration, []byte("next-runtime-")) {
+	if err != nil || bytes.Contains(configuration, []byte("APP_FIXTURE_RUNTIME_SECRET")) || bytes.Contains(configuration, []byte("next-runtime-")) {
 		t.Fatal("runtime-only secret was baked into the Next fixture image")
 	}
 	return imageID
@@ -366,7 +366,7 @@ func assertNextLiveContainer(t *testing.T, ctx context.Context, docker string, c
 		!nextLiveOptions(inspected.HostConfig.Tmpfs["/tmp"], "rw", "noexec", "nosuid", "nodev", "size=67108864") {
 		t.Fatal("Next cache tmpfs ownership or quota differs")
 	}
-	if !strings.Contains(strings.Join(inspected.Config.Env, "\n"), "RIG_FIXTURE_RUNTIME_SECRET="+secret) {
+	if !strings.Contains(strings.Join(inspected.Config.Env, "\n"), "APP_FIXTURE_RUNTIME_SECRET="+secret) {
 		t.Fatal("Next candidate did not receive its scoped runtime-only secret")
 	}
 }
@@ -401,7 +401,7 @@ func nextLiveRequest(t *testing.T, ctx context.Context, base, appID, path string
 	defer response.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
 	if err != nil || len(body) > 1<<20 || response.StatusCode != want || !bytes.Contains(body, []byte(fragment)) ||
-		bytes.Contains(body, []byte(secret)) || bytes.Contains(body, []byte("RIG_FIXTURE_RUNTIME_SECRET")) {
+		bytes.Contains(body, []byte(secret)) || bytes.Contains(body, []byte("APP_FIXTURE_RUNTIME_SECRET")) {
 		t.Fatalf("Next routed %s: status=%d want=%d expected-content=%t secret-absent=%t", path, response.StatusCode, want, bytes.Contains(body, []byte(fragment)), !bytes.Contains(body, []byte(secret)))
 	}
 	return response

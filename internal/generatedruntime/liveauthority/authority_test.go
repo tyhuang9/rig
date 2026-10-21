@@ -37,7 +37,7 @@ func TestAuthorityConstructorDoesNotAcquireEffectsScope(t *testing.T) {
 func TestPrepareCandidateUsesProtectedStoresAndClearsEnvironment(t *testing.T) {
 	db, working := liveAuthorityDatabase(t)
 	authority := New(t, db, working)
-	raw := []byte("PUBLIC=value\nSECRET=top-secret\n")
+	raw := []byte("APP_FIXTURE_SLOT_MARKER=blue\nAPP_FIXTURE_RUNTIME_SECRET=top-secret\n")
 	spec := authority.PrepareCandidate(t, context.Background(), liveAuthoritySpec(raw))
 	if spec.DeploymentPlanRevisionID == "" || spec.DeploymentPlanRevisionNumber != 1 || spec.ConfigurationRevisionID == "" || spec.ConfigurationRevisionNumber != 1 || spec.Environment != nil {
 		t.Fatalf("candidate was not bound to protected revisions: %#v", spec)
@@ -56,7 +56,7 @@ func TestPrepareCandidateUsesProtectedStoresAndClearsEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer exported.Clear()
-	if string(exported.Environment) != "# hostd application configuration\nPUBLIC=value\nSECRET=top-secret\n" {
+	if string(exported.Environment) != "# hostd application configuration\nAPP_FIXTURE_RUNTIME_SECRET=top-secret\nAPP_FIXTURE_SLOT_MARKER=blue\n" {
 		t.Fatal("protected runtime export changed fixture values")
 	}
 }
@@ -86,6 +86,22 @@ func TestBindNetworkCreatesOnlyGenuineBuildingHistory(t *testing.T) {
 	if intents != 0 || artifacts != 0 {
 		t.Fatal("network binding fabricated candidate receipt or image")
 	}
+	var status deployments.Status
+	if err := db.QueryRow(`SELECT status FROM deployments WHERE id=?`, bound.DeploymentID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != deployments.Applying {
+		t.Fatalf("network binding did not cross the policy gate: status=%q", status)
+	}
+	execution, err := authority.repository.PinGeneratedNetwork(ctx, bound.Network)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.CheckBeforeCreate(); err != nil {
+		execution.Leave()
+		t.Fatalf("network binding did not authorize the create boundary: %v", err)
+	}
+	execution.Leave()
 	authority.CancelNetwork(t, ctx, bound.DeploymentID)
 	value, err = authority.runtime.Get(ctx, bound.AppID, bound.DeploymentID)
 	if err != nil || value.Phase != generatedruntimestate.PhaseCancelled {
