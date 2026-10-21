@@ -3,7 +3,8 @@
 ## Scope
 
 Move the existing generated candidate owner beside ingress and give it concrete
-protected-store dependencies, preparing for a later private domain factory.
+protected-store dependencies and verified database/file identity, preparing for
+a later private domain factory.
 This checkpoint does not implement E5 route publication, predecessor retirement,
 accounting transfer, completion, or E6 cold recovery.
 
@@ -22,8 +23,8 @@ Caller-owned bundle variables cannot retarget an existing owner or fork its
 ledger. The concrete policy method delegates to existing policy evaluation;
 it introduces no result writer, arbitrary validator or physical-success setter.
 
-This introduces no schema, HTTP API, Docker request, environment format or
-immutable receipt rewrite. External databases remain application-owned and use
+This preserves the existing schema, HTTP API, production Docker operations,
+environment format and immutable receipts. External databases remain application-owned and use
 scoped runtime secrets. There is no managed database or Neon provisioning.
 
 ## Preserved boundaries
@@ -103,10 +104,10 @@ effects directory. The bundle also revalidates its issued dependencies and the
 current object behind its repository pointer. A foreign or zero overwrite of
 that repository handle refuses. Unchanged bundle copies retain their provenance.
 
-These checks perform no filesystem or process operations and grant no effect
-authority. Physical root/database identity, daemon identity and collision
-exclusion still require the later private construction work. Existing constructor
-acceptance and E4 runtime behavior are unchanged.
+These path-configuration checks perform no filesystem or process operations and
+grant no effect authority. The physical identity prerequisite below adds file
+and daemon observations; collision reservation and fencing remain future work.
+Existing constructor acceptance and E4 runtime behavior are unchanged.
 
 Pinned Go 1.26.7 verification passed 10 parent tests and 51 subcases on each of
 Windows and native Linux, with no failures or skips. Exact discovery preceded
@@ -125,9 +126,83 @@ Evidence under `m4-generated-domain-verification/configured-domain-20261021T0221
 - The sibling source review report has SHA-256
   `50b36bb17d7a2ee53d604f9ad4f05de4e0f8069c832bd7aed714dd02e1047a64`.
 
+## Physical identity and database opening checkpoint
+
+The private identity inspector now combines protected filesystem observations,
+the exact opened controller database, and a bounded read-only Docker daemon ID
+query. Root/database overlap and daemon/fixed-namespace overlap are independent
+collision predicates. They do not yet reserve or fence a domain.
+
+`database.OpenForGeneratedDomain` requires the original live controller owner
+lease for the fixed controller working directory. It captures the root and
+database file before opening SQLite, binds the actual connection before existing
+initialization and migrations, and rechecks before issuing immutable provenance.
+The one-shot connector refuses reconnection after a bad connection. Later
+validation checks the original connection, file and lease again. Generic
+`database.Open` and current daemon startup retain their existing paths.
+
+On Linux, identity observation uses `O_PATH` handles or metadata checks so it
+does not drop SQLite's process locks. The ordinary descriptor used to create a
+new file closes before SQLite opens it, under a serialized construction gate.
+Windows uses protected handle and path identity checks. Unsupported platforms
+refuse. Path text containing DSN query/fragment syntax is rejected before file
+creation. The existing registered SQLite driver retains the gateway guard UDF.
+
+This relies on the existing protected-directory and cooperating-controller
+model. It does not protect against a hostile OS owner changing and restoring a
+path entirely inside the opening window, or arbitrary replacement of trusted
+in-process driver registrations. DataRoot itself is not required to have the
+private working directory's permissions. Validation introduces no application
+data writes; opening still performs normal initialization and migrations after
+binding, without claiming transactional rollback of earlier successful migrations.
+
+### Executed checks
+
+Final source freeze `generated-domain-provenance-20261021T032018Z` passed:
+
+| Platform | Behavioral parent tests | Subcases | Total passing cases |
+| --- | ---: | ---: | ---: |
+| Windows | 26 | 27 | 53 |
+| Native Linux through WSL | 33 | 35 | 68 |
+
+Exact discovery matched executed tests; none failed or skipped. A separate
+child-process helper invocation is excluded from these acceptance counts.
+Coverage includes existing owner contention and process-exit release, copied or
+closed lease refusal, original database replacement, actual `database/sql`
+BadConn/reconnect refusal, capture-window replacement before initialization,
+unchanged application rows and migration timestamps from DELETE/WAL inputs,
+daemon identity bounds, and independent collision predicates.
+
+The original replaced-open-database regression failed before the correction and
+passes in this freeze. The Linux lock regression holds a real transaction on a
+second connection, confirms a child process is blocked, performs successful
+direct and combined identity inspection, confirms the child remains blocked,
+then rolls back and confirms the child can acquire the lock.
+
+Pinned Go 1.26.7, readonly modules and CGO disabled were used. Both platforms
+passed scoped vet, production controller builds and live-tag compilation without
+execution. The canonical generation check passed once on the final source.
+All 26 command exit records are zero. Source and closure manifests match across
+all 1,048 Go/module files; the changed-source manifest contains 18 files.
+
+Evidence under `m4-generated-domain-verification/`:
+
+- Final `generated-domain-provenance-20261021T032018Z/verification-receipt.md`,
+  SHA-256 `584af6708504a3be6991027ecea0b56e33b62eefcf6d141a08e651edf1f85176`.
+- Source/closure manifest SHA-256
+  `4bf996dd5959bd4039f352279c9df0d317a58c7c8fbabc4a80679d2858995c11`.
+- Changed-source manifest SHA-256
+  `33ef0dffa159b357601419a493158f370ec7196c42f1de8b44de56a2619dcbe7`.
+- Bounded source security review SHA-256
+  `4a4c8893aef855c4deb2ef0af5400f433250da4e0bee2112f4f7fc74a30fbd6b`.
+
+The original failed regression, provisional lock finding, compile/setup failures
+and superseded runs remain preserved separately. These local results do not
+establish hosted Docker or race acceptance.
+
 ## Remaining implementation boundary
 
-The fixed private domain factory, physical-domain collision checks, gateway
+The fixed private domain factory, physical-domain collision reservation, gateway
 bootstrap/attestation, legacy-view fencing and complete real-consumer cutover
 remain required. Ordinary public `Switch`, `Provision` and `Recover` behavior
 has not yet been closed by this foundation. The existing candidate constructor
@@ -158,5 +233,7 @@ claimed.
 ## Rollback
 
 Revert the cohesive relocation, concrete-store bridge and consumer/test updates
-together. There are no database migrations, durable receipt changes or live
-deployment changes to reverse.
+together. The dedicated opener and private identity helpers can be reverted as
+their own prerequisite unit together with the owner-lease validation changes.
+There are no new database migrations, durable receipt changes or live deployment
+changes to reverse.
