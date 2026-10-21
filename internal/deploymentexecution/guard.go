@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 )
 
@@ -41,8 +42,20 @@ func (g *Guard) UsesDatabase(db *sql.DB) bool {
 		!nilInterface(g.positiveFence) && g.positiveFence.ConfiguredFor(db) && validWorkingDirectory(g.workingDirectory)
 }
 
+// ConfiguredForDomain reports configuration provenance for the exact database
+// handle and effects directory supplied by the domain constructor. It does not
+// acquire an effects scope or authorize an operation.
+func (g *Guard) ConfiguredForDomain(db *sql.DB, workingDirectory string) bool {
+	return g.UsesDatabase(db) && validDomainWorkingDirectory(workingDirectory) &&
+		g.workingDirectory == workingDirectory
+}
+
 func validWorkingDirectory(value string) bool {
 	return value != "" && filepath.IsAbs(value) && filepath.Clean(value) == value
+}
+
+func validDomainWorkingDirectory(value string) bool {
+	return validWorkingDirectory(value) && !pathsecurity.RejectWindowsNamespace(value)
 }
 
 func nilInterface(value any) bool {

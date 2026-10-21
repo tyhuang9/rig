@@ -24,7 +24,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/database"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -66,7 +66,7 @@ type gatewayRebindAdmissionProcessManifest struct {
 	HostPort              uint16                               `json:"hostPort"`
 	Input                 gatewayRebindCommitInput             `json:"input"`
 	PredecessorSubnet     string                               `json:"predecessorSubnet"`
-	Mutation              generatedruntime.RouteSwitchRequest  `json:"mutation"`
+	Mutation              generatedroute.RouteSwitchRequest    `json:"mutation"`
 	PinnedTopology        gatewayObservedTopology              `json:"pinnedTopology"`
 	AdmissionProof        *gatewayRebindAdmissionPhysicalProof `json:"admissionProof,omitempty"`
 }
@@ -238,8 +238,8 @@ func TestGatewayRebindAdmissionProcessSerializesContenders(t *testing.T) {
 		DataRoot: f.manager.options.DataRoot, WorkingDirectory: f.manager.options.WorkingDirectory,
 		DockerExecutable: f.manager.options.DockerExecutable, DockerConfigDirectory: f.manager.options.DockerConfigDirectory,
 		HostPort: f.manager.options.HostPort, PinnedTopology: gatewayTopologyExactFinalV2,
-		Mutation: generatedruntime.RouteSwitchRequest{AppID: inspection.Roster[0].AppID,
-			ToSlot: appRoute.Route.Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), appRoute.Route.Endpoints...)},
+		Mutation: generatedroute.RouteSwitchRequest{AppID: inspection.Roster[0].AppID,
+			ToSlot: appRoute.Route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), appRoute.Route.Endpoints...)},
 	}
 	manifestPath := gatewayRebindAdmissionWriteManifest(t, f.manager.options.DataRoot, "mutation.json", manifest)
 	blocked := gatewayRebindAdmissionStartProcess(t, "mutation-blocked", "", manifestPath)
@@ -328,8 +328,8 @@ func TestGatewayRebindAdmissionProcessRecoversCommittedClaim(t *testing.T) {
 	}
 	gatewayRebindAdmissionKillAndReap(t, crashed)
 	appRoute := f.state.Apps[inspection.Roster[0].AppID]
-	err = f.manager.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: inspection.Roster[0].AppID,
-		ToSlot: appRoute.Route.Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), appRoute.Route.Endpoints...)})
+	err = f.manager.Switch(ctx, generatedroute.RouteSwitchRequest{AppID: inspection.Roster[0].AppID,
+		ToSlot: appRoute.Route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), appRoute.Route.Endpoints...)})
 	if err == nil || !IsCode(err, DiagnosticRouteUnresolved) {
 		t.Fatalf("ordinary mutation crossed the committed prepared fence: %v", err)
 	}

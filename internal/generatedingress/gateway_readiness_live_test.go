@@ -17,7 +17,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deployments"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -62,15 +63,15 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 		appC = "78787878-7878-4787-8787-787878787878"
 		plan = "56565656-5656-4565-8565-565656565656"
 	)
-	networkA, err := generatedruntime.DescribeAppNetwork(appA)
+	networkA, err := generatedidentity.DescribeAppNetwork(appA)
 	if err != nil {
 		t.Fatal("describe first application network")
 	}
-	networkB, err := generatedruntime.DescribeAppNetwork(appB)
+	networkB, err := generatedidentity.DescribeAppNetwork(appB)
 	if err != nil {
 		t.Fatal("describe second application network")
 	}
-	networkC, err := generatedruntime.DescribeAppNetwork(appC)
+	networkC, err := generatedidentity.DescribeAppNetwork(appC)
 	if err != nil {
 		t.Fatal("describe replacement fixture network")
 	}
@@ -83,12 +84,12 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	}
 	liveGatewayRequireCleanPreflight(t, ctx, runner, docker, root, dockerConfig, []string{networkA.Name, networkB.Name, networkC.Name}, images)
 
-	limits := generatedruntime.ContainerLimits{
+	limits := liveRuntimeContainerLimits{
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
 	authority := liveGeneratedDeployments(t, working)
-	engine, err := generatedruntime.NewEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
+	engine, err := newLiveRuntimeEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
@@ -108,7 +109,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 		t.Fatal("create generated ingress")
 	}
 
-	var candidates []generatedruntime.Candidate
+	var candidates []liveRuntimeCandidate
 	t.Cleanup(func() {
 		liveGatewayCleanup(t, engine, runner, docker, root, dockerConfig, candidates, map[string]string{networkA.Name: appA, networkB.Name: appB, networkC.Name: appC}, images)
 	})
@@ -118,8 +119,8 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	blueSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[0].tag, blueSpec, "blue", "0.0.0.0")
 	blue := startLiveCandidate(t, ctx, engine, authority, blueSpec)
 	candidates = append(candidates, blue)
-	blueRoute := generatedruntime.RouteSwitchRequest{
-		AppID: appA, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(blue)},
+	blueRoute := generatedroute.RouteSwitchRequest{
+		AppID: appA, ToSlot: blue.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(blue)},
 	}
 	if err := ingress.Switch(ctx, blueRoute); err != nil {
 		failLiveIngress(t, "route healthy blue candidate", err)
@@ -141,14 +142,14 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 		failLiveGatewayRuntime(t, "loopback candidate did not pass Docker health", err)
 	}
 
-	loopbackRoute := generatedruntime.RouteSwitchRequest{
-		AppID: appA, FromSlot: blue.Slot, ToSlot: loopback.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(loopback)},
+	loopbackRoute := generatedroute.RouteSwitchRequest{
+		AppID: appA, FromSlot: blue.Slot, ToSlot: loopback.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(loopback)},
 	}
 	switchErr := ingress.Switch(ctx, loopbackRoute)
 	if !IsCode(switchErr, DiagnosticGatewayReadinessFailed) {
 		failLiveIngress(t, "loopback candidate did not report gateway readiness failure", switchErr)
 	}
-	if generatedruntime.RouteCandidateMayBeLive(switchErr) || generatedruntime.RouteGatewayReadinessFailed(switchErr) == false {
+	if testRouteCandidateMayBeLive(switchErr) || testRouteGatewayReadinessFailed(switchErr) == false {
 		t.Fatal("gateway readiness failure did not preserve its safe route contract")
 	}
 	liveGatewayAssertCommittedRoute(t, ingress, appA, blueRoute)
@@ -174,7 +175,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	baselineSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[4].tag, baselineSpec, "replacement-baseline", "0.0.0.0")
 	baseline := startLiveCandidate(t, ctx, engine, authority, baselineSpec)
 	candidates = append(candidates, baseline)
-	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appC, ToSlot: baseline.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(baseline)}}); err != nil {
+	if err := ingress.Switch(ctx, generatedroute.RouteSwitchRequest{AppID: appC, ToSlot: baseline.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(baseline)}}); err != nil {
 		failLiveIngress(t, "route replacement baseline", err)
 	}
 	authority.published(t, ctx, ingress, baseline)
@@ -189,8 +190,8 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	replacementSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[2].tag, replacementSpec, "replacement", "0.0.0.0")
 	replacement := startLiveCandidate(t, ctx, engine, authority, replacementSpec)
 	candidates = append(candidates, replacement)
-	replacementRoute := generatedruntime.RouteSwitchRequest{
-		AppID: appC, FromSlot: baseline.Slot, ToSlot: replacement.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(replacement)},
+	replacementRoute := generatedroute.RouteSwitchRequest{
+		AppID: appC, FromSlot: baseline.Slot, ToSlot: replacement.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(replacement)},
 	}
 	if err := ingress.Switch(ctx, replacementRoute); err != nil {
 		failLiveIngress(t, "route healthy replacement", err)
@@ -206,11 +207,11 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	if err := authority.waitHealthy(firstLoopback); err != nil {
 		failLiveGatewayRuntime(t, "first loopback candidate did not pass Docker health", err)
 	}
-	firstRoute := generatedruntime.RouteSwitchRequest{
-		AppID: appB, ToSlot: firstLoopback.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(firstLoopback)},
+	firstRoute := generatedroute.RouteSwitchRequest{
+		AppID: appB, ToSlot: firstLoopback.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(firstLoopback)},
 	}
 	firstErr := ingress.Switch(ctx, firstRoute)
-	if !IsCode(firstErr, DiagnosticGatewayReadinessFailed) || generatedruntime.RouteCandidateMayBeLive(firstErr) || !generatedruntime.RouteGatewayReadinessFailed(firstErr) {
+	if !IsCode(firstErr, DiagnosticGatewayReadinessFailed) || testRouteCandidateMayBeLive(firstErr) || !testRouteGatewayReadinessFailed(firstErr) {
 		failLiveIngress(t, "first loopback deployment did not fail safely", firstErr)
 	}
 	liveGatewayAssertNoCommittedRoute(t, ingress, appB)
@@ -229,13 +230,13 @@ type liveGatewayImage struct {
 	appID string
 }
 
-func buildLiveGatewayImage(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, dockerConfig, tag string, spec generatedruntime.CandidateSpec, version, bindAddress string) string {
+func buildLiveGatewayImage(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, dockerConfig, tag string, spec liveRuntimeCandidateSpec, version, bindAddress string) string {
 	t.Helper()
 	server := fmt.Sprintf("import { createServer } from 'node:http';\nconst port=Number(process.env.RIG_RUNTIME_INTERNAL_PORT);\nconst version=%q;\ncreateServer((request,response)=>{ response.writeHead(200,{ 'content-type':'text/plain' }); response.end(version); }).listen(port,%q);\n", version, bindAddress)
 	return buildLiveGatewayImageWithServer(t, ctx, runner, docker, root, dockerConfig, tag, spec, version, server)
 }
 
-func buildLiveGatewayImageWithServer(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, dockerConfig, tag string, spec generatedruntime.CandidateSpec, version, server string) string {
+func buildLiveGatewayImageWithServer(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner, docker, root, dockerConfig, tag string, spec liveRuntimeCandidateSpec, version, server string) string {
 	t.Helper()
 	// Buildx persists state below DOCKER_CONFIG. Keep fixture build state out of
 	// the intentionally empty runtime Docker configuration used by the engine.
@@ -302,7 +303,7 @@ func liveGatewayRequireLocalDocker(t *testing.T, ctx context.Context, runner run
 	}
 }
 
-func liveGatewayAssertCommittedRoute(t *testing.T, ingress *Manager, appID string, request generatedruntime.RouteSwitchRequest) {
+func liveGatewayAssertCommittedRoute(t *testing.T, ingress *Manager, appID string, request generatedroute.RouteSwitchRequest) {
 	t.Helper()
 	state, err := ingress.store.load()
 	if err != nil || state.Pending != nil {
@@ -404,7 +405,7 @@ func liveGatewayResourceExists(t *testing.T, ctx context.Context, runner runtime
 	return found
 }
 
-func liveGatewayCleanup(t *testing.T, engine *generatedruntime.Engine, runner runtimeprocess.CommandRunner, docker, directory, dockerConfig string, candidates []generatedruntime.Candidate, appNetworks map[string]string, images []liveGatewayImage) {
+func liveGatewayCleanup(t *testing.T, engine liveRuntimeEngine, runner runtimeprocess.CommandRunner, docker, directory, dockerConfig string, candidates []liveRuntimeCandidate, appNetworks map[string]string, images []liveGatewayImage) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -443,7 +444,7 @@ func liveGatewayCleanup(t *testing.T, engine *generatedruntime.Engine, runner ru
 // This is disposable fixture teardown, not controller retirement evidence.
 // The candidate ID came from the real owner's create result and every immutable
 // ownership label is checked before removing that exact Docker ID.
-func liveGatewayRemoveOwnedCandidate(t *testing.T, parent context.Context, runner runtimeprocess.CommandRunner, docker, directory, dockerConfig string, candidate generatedruntime.Candidate) {
+func liveGatewayRemoveOwnedCandidate(t *testing.T, parent context.Context, runner runtimeprocess.CommandRunner, docker, directory, dockerConfig string, candidate liveRuntimeCandidate) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
@@ -511,7 +512,7 @@ func liveGatewayRemoveOwnedNetwork(t *testing.T, ctx context.Context, runner run
 	}
 	result, err := runLiveDocker(ctx, runner, docker, directory, dockerConfig, 45*time.Second, "network", "inspect", "--format", "{{json .Labels}}", network)
 	var labels map[string]string
-	valid := err == nil && !result.StdoutTruncated && !result.StderrTruncated && json.Unmarshal(result.Stdout, &labels) == nil && labels["io.rig.managed"] == generatedruntime.NetworkOwnershipLabelValue && labels["io.rig.application"] == appID
+	valid := err == nil && !result.StdoutTruncated && !result.StderrTruncated && json.Unmarshal(result.Stdout, &labels) == nil && labels["io.rig.managed"] == generatedidentity.NetworkOwnershipLabelValue && labels["io.rig.application"] == appID
 	clearLiveResult(&result)
 	if !valid {
 		t.Error("application network ownership is uncertain; retaining resource")

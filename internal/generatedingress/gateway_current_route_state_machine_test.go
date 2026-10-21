@@ -9,7 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 type gatewayCurrentStateMachineDriver struct {
@@ -165,7 +166,7 @@ func TestGatewayCurrentStateMachineSwitchAndRecoveryUseDurablePending(t *testing
 	}
 	driver.failAttest = false
 	invalid := routeOperationSwitchRequest(t, appID, effective.Apps[appID].Route)
-	invalid.FromSlot = generatedruntime.Slot("unexpected")
+	invalid.FromSlot = generatedidentity.Slot("unexpected")
 	if err := fixture.manager.Switch(context.Background(), invalid); err == nil {
 		t.Fatal("invalid pre-physical switch accepted")
 	} else {
@@ -243,9 +244,9 @@ func TestGatewayCurrentStateMachineSwitchAndRecoveryUseDurablePending(t *testing
 		}
 	}
 	newAppID := uuid.NewString()
-	create, err := gatewayCurrentSwitchTransition(recovered, generatedruntime.RouteSwitchRequest{
-		AppID: newAppID, ToSlot: generatedruntime.SlotBlue,
-		Endpoints: append([]generatedruntime.RouteEndpoint(nil), recovered.Apps[appID].Route.Endpoints...),
+	create, err := gatewayCurrentSwitchTransition(recovered, generatedroute.RouteSwitchRequest{
+		AppID: newAppID, ToSlot: generatedidentity.SlotBlue,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), recovered.Apps[appID].Route.Endpoints...),
 	})
 	if err != nil || create.Pending.Pending == nil || create.Pending.Pending.Previous != nil {
 		t.Fatalf("new-app switch did not retain an explicit absent Before: %#v error=%v", create, err)

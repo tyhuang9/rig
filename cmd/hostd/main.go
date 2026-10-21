@@ -95,10 +95,15 @@ func runServer(args []string) int {
 	return runServerWithAssembly(args, hostdDaemonAssemblyOptions{})
 }
 
-func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) int {
+func normalizeHostdDaemonAssembly(assembly hostdDaemonAssemblyOptions) hostdDaemonAssemblyOptions {
 	if assembly.runner == nil {
-		assembly.runner = runtimeprocess.ExecRunner{}
+		assembly.runner = &runtimeprocess.ExecRunner{}
 	}
+	return assembly
+}
+
+func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) int {
+	assembly = normalizeHostdDaemonAssembly(assembly)
 	if assembly.listen == nil {
 		assembly.listen = net.Listen
 	}

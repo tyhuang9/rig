@@ -3,6 +3,7 @@ package generatedexecutor
 import (
 	"context"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -16,7 +17,7 @@ type authorizationStore interface {
 }
 
 type replacementReserver interface {
-	ReserveReplacement(context.Context, deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error)
+	ReserveReplacement(context.Context, generatedingress.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error)
 }
 
 // RepositoryAuthorizationGate revalidates immutable deployment/plan identity,
@@ -64,7 +65,7 @@ func (g *RepositoryAuthorizationGate) Authorize(ctx context.Context, request Aut
 	if plan.Plan.Migration != nil && plan.Plan.Migration.Approval.Status != deploymentplans.MigrationApprovalApproved {
 		return nil, deployments.ErrApprovalRequired
 	}
-	reservation, err := g.capacity.ReserveReplacement(ctx, deployments.GeneratedReplacementRequest{
+	reservation, err := g.capacity.ReserveReplacement(ctx, generatedingress.GeneratedReplacementRequest{
 		Claim: request.Claim, DeploymentID: request.DeploymentID, ReleaseID: request.ReleaseID,
 		ConfigurationRevisionID: request.ConfigurationRevisionID, ConfigurationRevisionNumber: request.ConfigurationRevisionNumber,
 		DeploymentPlanRevisionID: request.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: request.DeploymentPlanRevisionNumber,

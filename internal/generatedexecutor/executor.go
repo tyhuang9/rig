@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"sort"
 	"time"
 
@@ -223,8 +224,8 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 	networkRequest := generatedNetworkRequest(claim, resolved)
 
 	artifacts := make(map[string]generatedimage.Artifact, len(componentNames))
-	invocations := make(map[string]deployments.GeneratedCandidateInvocation, len(componentNames))
-	var candidateExecution *deployments.GeneratedCandidateExecution
+	invocations := make(map[string]generatedingress.GeneratedCandidateInvocation, len(componentNames))
+	var candidateExecution *generatedingress.GeneratedCandidateExecution
 	defer func() {
 		if candidateExecution != nil {
 			candidateExecution.Leave()

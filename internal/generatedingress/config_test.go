@@ -6,18 +6,19 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 	appA := "11111111-1111-4111-8111-111111111111"
 	appB := "22222222-2222-4222-8222-222222222222"
 	routes := map[string]routeRecord{
-		appB: {Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+		appB: {Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "net-b", "frontend-green", 4173, 'b'),
 			endpoint("api", "server", "net-b", "api-green", 3000, 'c'),
 		}},
-		appA: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		appA: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
 		}},
 	}
@@ -58,7 +59,7 @@ func TestBuildCaddyConfigExplicitlyDisablesAutomaticHTTPS(t *testing.T) {
 	}{
 		{name: "empty recovery", routes: map[string]routeRecord{}},
 		{name: "routed", routes: map[string]routeRecord{
-			appID: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+			appID: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 				endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
 			}},
 		}},
@@ -100,10 +101,10 @@ func TestBuildCaddyConfigScopesSharedAliasesToEachApplicationNetwork(t *testing.
 	appA := "11111111-1111-4111-8111-111111111111"
 	appB := "22222222-2222-4222-8222-222222222222"
 	routes := map[string]routeRecord{
-		appA: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		appA: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("api", "server", "rig-a-first", "api-blue", 3000, 'a'),
 		}},
-		appB: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		appB: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("api", "server", "rig-a-second", "api-blue", 3000, 'b'),
 		}},
 	}
@@ -135,10 +136,10 @@ func TestBuildCaddyConfigScopesSharedAliasesToEachApplicationNetwork(t *testing.
 func TestBuildCaddyConfigRemainsDeterministic(t *testing.T) {
 	appA := "11111111-1111-4111-8111-111111111111"
 	appB := "22222222-2222-4222-8222-222222222222"
-	routeA := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+	routeA := routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
 	}}
-	routeB := routeRecord{Slot: generatedruntime.SlotGreen, Endpoints: []generatedruntime.RouteEndpoint{
+	routeB := routeRecord{Slot: generatedidentity.SlotGreen, Endpoints: []generatedroute.RouteEndpoint{
 		endpoint("frontend", "static", "net-b", "frontend-green", 4173, 'b'),
 		endpoint("api", "server", "net-b", "api-green", 3000, 'c'),
 	}}
@@ -166,11 +167,11 @@ func TestBuildCaddyConfigRejectsWildcardOrApplicationSideListeners(t *testing.T)
 func TestBuildCaddyConfigRejectsAmbiguousOrCrossNetworkTopologies(t *testing.T) {
 	appID := "11111111-1111-4111-8111-111111111111"
 	tests := []routeRecord{
-		{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("one", "server", "net-a", "one-blue", 3000, 'a'),
 			endpoint("two", "server", "net-a", "two-blue", 3001, 'b'),
 		}},
-		{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("web", "static", "net-a", "web-blue", 4173, 'a'),
 			endpoint("api", "server", "net-b", "api-blue", 3000, 'b'),
 		}},
@@ -182,6 +183,6 @@ func TestBuildCaddyConfigRejectsAmbiguousOrCrossNetworkTopologies(t *testing.T) 
 	}
 }
 
-func endpoint(component, role, network, alias string, port uint16, id rune) generatedruntime.RouteEndpoint {
-	return generatedruntime.RouteEndpoint{Component: component, Role: role, ContainerID: strings.Repeat(string(id), 64), NetworkName: network, NetworkAlias: alias, InternalPort: port}
+func endpoint(component, role, network, alias string, port uint16, id rune) generatedroute.RouteEndpoint {
+	return generatedroute.RouteEndpoint{Component: component, Role: role, ContainerID: strings.Repeat(string(id), 64), NetworkName: network, NetworkAlias: alias, InternalPort: port}
 }

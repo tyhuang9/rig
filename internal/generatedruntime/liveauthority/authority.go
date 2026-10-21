@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"reflect"
 	"sort"
 	"strings"
@@ -70,9 +71,9 @@ type CandidateSession struct {
 	spec      generatedruntime.CandidateSpec
 	jobID     string
 
-	reservation deployments.GeneratedReplacementReservation
-	execution   *deployments.GeneratedCandidateExecution
-	invocation  deployments.GeneratedCandidateInvocation
+	reservation generatedingress.GeneratedReplacementReservation
+	execution   *generatedingress.GeneratedCandidateExecution
+	invocation  generatedingress.GeneratedCandidateInvocation
 	candidate   generatedruntime.Candidate
 	closed      sync.Once
 }
@@ -378,7 +379,7 @@ func (a *Authority) Begin(t *testing.T, parent context.Context, engine *generate
 	t.Cleanup(func() { _ = releaseAndReport() })
 	session := &CandidateSession{authority: a, engine: engine, ctx: ctx, release: releaseAndReport}
 	bound := a.BindCandidate(t, ctx, spec)
-	request := deployments.GeneratedReplacementRequest{
+	request := generatedingress.GeneratedReplacementRequest{
 		Claim: bound.Network.Claim, DeploymentID: bound.DeploymentID, ReleaseID: bound.ReleaseID,
 		ConfigurationRevisionID: bound.ConfigurationRevisionID, ConfigurationRevisionNumber: bound.ConfigurationRevisionNumber,
 		DeploymentPlanRevisionID: bound.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: bound.DeploymentPlanRevisionNumber,
@@ -426,7 +427,7 @@ func (s *CandidateSession) Start(t *testing.T, ready generatedruntime.CandidateS
 	if _, err := s.authority.runtime.Advance(s.ctx, ready.AppID, ready.DeploymentID, generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate, ""); err != nil {
 		return generatedruntime.Candidate{}, err
 	}
-	execution, err := s.engine.PinCandidates(s.ctx, deployments.GeneratedCandidateRequest{
+	execution, err := s.engine.PinCandidates(s.ctx, generatedingress.GeneratedCandidateRequest{
 		Claim: ready.Network.Claim, DeploymentID: ready.DeploymentID, ReleaseID: ready.ReleaseID,
 		ConfigurationRevisionID: ready.ConfigurationRevisionID, ConfigurationRevisionNumber: ready.ConfigurationRevisionNumber,
 		DeploymentPlanRevisionID: ready.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: ready.DeploymentPlanRevisionNumber,
@@ -755,7 +756,7 @@ func inactiveSlot(t *testing.T, active generatedruntime.Slot) generatedruntime.S
 	return slot
 }
 
-func candidateFromIdentity(spec generatedruntime.CandidateSpec, identity deployments.CandidateIdentity) generatedruntime.Candidate {
+func candidateFromIdentity(spec generatedruntime.CandidateSpec, identity generatedingress.CandidateIdentity) generatedruntime.Candidate {
 	working := "/workspace"
 	if spec.RootDirectory != "." {
 		working += "/" + spec.RootDirectory
@@ -770,7 +771,7 @@ func candidateFromIdentity(spec generatedruntime.CandidateSpec, identity deploym
 	}
 }
 
-func endpointFromIdentity(identity deployments.CandidateIdentity) generatedruntime.RouteEndpoint {
+func endpointFromIdentity(identity generatedingress.CandidateIdentity) generatedruntime.RouteEndpoint {
 	return generatedruntime.RouteEndpoint{Component: identity.ComponentName, Role: identity.Role, ContainerID: identity.ContainerID, NetworkName: identity.NetworkName, NetworkAlias: identity.NetworkAlias, InternalPort: identity.InternalPort}
 }
 

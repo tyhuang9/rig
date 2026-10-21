@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,7 +39,7 @@ func (*unusedCompilerEnvironment) Stage(string, int, []byte) (generatedruntime.E
 	return nil, errors.New("compiler attestor test unexpectedly staged runtime environment")
 }
 
-func (*unusedCompilerEnvironment) StageGeneratedCandidate(string, int, []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+func (*unusedCompilerEnvironment) StageGeneratedCandidate(string, int, []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
 	return nil, errors.New("compiler attestor test unexpectedly staged candidate environment")
 }
 

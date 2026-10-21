@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -170,6 +172,90 @@ func TestClaimAndGuardRequireExactIdentityAndComposition(t *testing.T) {
 	if bindingGuard.UsesDatabase(fixture.db) {
 		t.Fatal("guard retained a stale binding-validator configuration")
 	}
+}
+
+func TestGuardConfiguredForDomainRequiresExactDatabaseDirectoryAndDependencies(t *testing.T) {
+	fixture := newExecutionFixture(t, false)
+	foreign := newExecutionFixture(t, false)
+	workingDirectory := filepath.Clean(t.TempDir())
+	guard, err := deploymentexecution.NewGuard(fixture.db, fixture.bindings, fixture.positive, workingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !guard.ConfiguredForDomain(fixture.db, workingDirectory) {
+		t.Fatal("guard rejected its exact domain configuration")
+	}
+	alias := guardDomainWorkingDirectoryAlias(t, workingDirectory)
+	for name, request := range map[string]struct {
+		db        *sql.DB
+		directory string
+	}{
+		"foreign database": {db: foreign.db, directory: workingDirectory},
+		"wrong directory":  {db: fixture.db, directory: t.TempDir()},
+		"alias directory":  {db: fixture.db, directory: alias},
+		"noncanonical directory": {
+			db: fixture.db, directory: workingDirectory + string(filepath.Separator) + ".",
+		},
+		"relative directory": {db: fixture.db, directory: "relative"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if guard.ConfiguredForDomain(request.db, request.directory) {
+				t.Fatal("mismatched domain configuration accepted")
+			}
+		})
+	}
+
+	unsupported := guardUnsupportedDomainWorkingDirectory()
+	unsupportedGuard, err := deploymentexecution.NewGuard(fixture.db, fixture.bindings, fixture.positive, unsupported)
+	if err != nil {
+		t.Fatalf("construct legacy-compatible guard for unsupported-domain check: %v", err)
+	}
+	if unsupportedGuard.ConfiguredForDomain(fixture.db, unsupported) {
+		t.Fatal("unsupported working-directory spelling accepted for domain configuration")
+	}
+
+	mutable := &mutablePositiveFence{db: fixture.db, configured: true}
+	mutableGuard, err := deploymentexecution.NewGuard(fixture.db, fixture.bindings, mutable, workingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mutableGuard.ConfiguredForDomain(fixture.db, workingDirectory) {
+		t.Fatal("guard rejected configured concrete dependency")
+	}
+	mutable.configured = false
+	if mutableGuard.ConfiguredForDomain(fixture.db, workingDirectory) {
+		t.Fatal("guard accepted changed concrete dependency")
+	}
+	var missing *deploymentexecution.Guard
+	if missing.ConfiguredForDomain(fixture.db, workingDirectory) || guard.ConfiguredForDomain(nil, workingDirectory) {
+		t.Fatal("nil guard or database reported domain configuration")
+	}
+}
+
+func guardDomainWorkingDirectoryAlias(t *testing.T, directory string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		alias := strings.ToUpper(directory)
+		if alias == directory {
+			alias = strings.ToLower(directory)
+		}
+		if alias == directory {
+			t.Fatal("test directory has no alternate Windows case spelling")
+		}
+		return alias
+	}
+	alias := filepath.Join(t.TempDir(), "effects-alias")
+	if err := os.Symlink(directory, alias); err != nil {
+		t.Fatal(err)
+	}
+	return alias
+}
+
+func guardUnsupportedDomainWorkingDirectory() string {
+	if runtime.GOOS == "windows" {
+		return `\\domain.invalid\share\effects`
+	}
+	return `/??/effects`
 }
 
 func TestGuardPolicyGateRejectsMutableIdentityAndStageChanges(t *testing.T) {

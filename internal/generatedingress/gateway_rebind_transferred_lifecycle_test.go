@@ -19,7 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -838,7 +838,7 @@ func TestGatewayRebindMultiRunnerCurrentCommandRefusal(t *testing.T) {
 	clear(r.currentLive)
 	r.currentLive = originalLive
 	route := r.predecessorState.Apps[endpoint.appID]
-	originalEndpoints := append([]generatedruntime.RouteEndpoint(nil), route.Route.Endpoints...)
+	originalEndpoints := append([]generatedroute.RouteEndpoint(nil), route.Route.Endpoints...)
 	duplicate := endpoint.value
 	duplicate.ContainerID = strings.Repeat("e", 64)
 	duplicate.InternalPort++
@@ -848,7 +848,7 @@ func TestGatewayRebindMultiRunnerCurrentCommandRefusal(t *testing.T) {
 	route.Route.Endpoints = originalEndpoints
 	r.predecessorState.Apps[endpoint.appID] = route
 	route = r.predecessorState.Apps[endpoint.appID]
-	route.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), originalEndpoints...)
+	route.Route.Endpoints = append([]generatedroute.RouteEndpoint(nil), originalEndpoints...)
 	route.Route.Endpoints[endpoint.index].NetworkAlias = "missing-retained-alias"
 	r.predecessorState.Apps[endpoint.appID] = route
 	refuse("missing retained alias", endpointArgs)
@@ -908,7 +908,7 @@ type gatewayRebindTransferredLANRoute struct {
 type gatewayRebindTransferredEndpoint struct {
 	appID string
 	index int
-	value generatedruntime.RouteEndpoint
+	value generatedroute.RouteEndpoint
 }
 
 func gatewayRebindTransferredCurrentEndpoint(t *testing.T, runner *gatewayRebindCompositionRunner) gatewayRebindTransferredEndpoint {
@@ -924,13 +924,13 @@ func gatewayRebindTransferredCurrentEndpoint(t *testing.T, runner *gatewayRebind
 	return gatewayRebindTransferredEndpoint{}
 }
 
-func gatewayRebindTransferredCurrentEndpointArgs(finalID string, endpoint generatedruntime.RouteEndpoint) []string {
+func gatewayRebindTransferredCurrentEndpointArgs(finalID string, endpoint generatedroute.RouteEndpoint) []string {
 	return []string{"container", "exec", finalID, "curl", "--disable", "--silent", "--head", "--output", "/dev/null",
 		"--write-out", "%{http_code}", "--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1",
 		"--max-time", "2", "http://" + endpoint.NetworkAlias + "." + endpoint.NetworkName + ":" + strconv.FormatUint(uint64(endpoint.InternalPort), 10) + "/"}
 }
 
-func gatewayRebindTransferredWithoutEndpointUpstream(t *testing.T, body []byte, endpoint generatedruntime.RouteEndpoint) []byte {
+func gatewayRebindTransferredWithoutEndpointUpstream(t *testing.T, body []byte, endpoint generatedroute.RouteEndpoint) []byte {
 	t.Helper()
 	var config caddyConfig
 	if err := json.Unmarshal(body, &config); err != nil {

@@ -128,7 +128,7 @@ type Repository struct {
 	migrationProcess                           runtimeprocess.CommandRunner
 	migrationOptions                           GeneratedMigrationProcessOptions
 	migrationDockerEnv                         []string
-	candidateAuthorityRegistry                 *generatedCandidateAuthorityRegistry
+	generatedOwnerStoresRegistry               *generatedOwnerStoresRegistry
 	afterGeneratedMigrationBeginCommit         func()
 	afterGeneratedMigrationConfigurationExport func(*appconfig.ExecutionConfiguration)
 }
@@ -136,7 +136,7 @@ type Repository struct {
 func New(db *sql.DB) *Repository {
 	return &Repository{
 		db: db, now: time.Now,
-		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+		generatedOwnerStoresRegistry: &generatedOwnerStoresRegistry{},
 	}
 }
 
@@ -146,7 +146,7 @@ func NewWithExecutionGuard(db *sql.DB, guard *deploymentexecution.Guard) (*Repos
 	}
 	return &Repository{
 		db: db, executionGuard: guard, now: time.Now,
-		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+		generatedOwnerStoresRegistry: &generatedOwnerStoresRegistry{},
 	}, nil
 }
 
@@ -163,7 +163,7 @@ func NewWithExecutionGuardAndGeneratedCandidates(db *sql.DB, guard *deploymentex
 	return &Repository{
 		db: db, executionGuard: guard, now: time.Now,
 		migrationPlans: plans, migrationConfiguration: configuration,
-		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+		generatedOwnerStoresRegistry: &generatedOwnerStoresRegistry{},
 	}, nil
 }
 
@@ -188,7 +188,7 @@ func NewWithExecutionGuardAndGeneratedMigration(
 		db: db, executionGuard: guard, now: time.Now,
 		migrationPlans: plans, migrationConfiguration: configuration,
 		migrationEnvironment: environment, migrationProcess: process, migrationOptions: options,
-		candidateAuthorityRegistry: &generatedCandidateAuthorityRegistry{},
+		generatedOwnerStoresRegistry: &generatedOwnerStoresRegistry{},
 	}
 	if err := repository.initializeGeneratedMigrationProcess(); err != nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration

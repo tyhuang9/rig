@@ -9,7 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 type routeOperationSnapshotRepository struct {
@@ -61,9 +62,9 @@ func TestGatewayCurrentRouteOperationsPreserveRawBindingsAndTransferManifest(t *
 
 	nativeAppID := uuid.NewString()
 	seed := afterSwitch.Apps[transferredAppID].Route
-	create := generatedruntime.RouteSwitchRequest{
-		AppID: nativeAppID, ToSlot: generatedruntime.SlotBlue,
-		Endpoints: append([]generatedruntime.RouteEndpoint(nil), seed.Endpoints...),
+	create := generatedroute.RouteSwitchRequest{
+		AppID: nativeAppID, ToSlot: generatedidentity.SlotBlue,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), seed.Endpoints...),
 	}
 	handled, err = fixture.manager.switchGatewayCurrentRouteLocked(context.Background(), create)
 	if err != nil || !handled {
@@ -233,14 +234,14 @@ func TestGatewayCurrentRouteOperationRejectsStaleProtectedStateAndCallbackAuthor
 			func(proposed gatewayCurrentRouteState) (gatewayCurrentRouteState, error) {
 				competing := cloneGatewayCurrentOperationState(fixture.baseline)
 				competingApp := competing.Apps[appID]
-				competingApp.Route.Slot, _ = generatedruntime.InactiveSlot(competingApp.Route.Slot)
+				competingApp.Route.Slot, _ = generatedidentity.InactiveSlot(competingApp.Route.Slot)
 				competing.Apps[appID] = competingApp
 				competing.Revision++
 				competing.Digest, _ = gatewayCurrentRouteStateDigest(competing)
 				if saveErr := fixture.store.saveNext(fixture.baseline, competing); saveErr != nil {
 					t.Fatal(saveErr)
 				}
-				app.Route.Slot, _ = generatedruntime.InactiveSlot(app.Route.Slot)
+				app.Route.Slot, _ = generatedidentity.InactiveSlot(app.Route.Slot)
 				proposed.Apps[appID] = app
 				return proposed, nil
 			})
@@ -399,14 +400,14 @@ func routeOperationTransferredApp(t *testing.T, state gatewayCurrentRouteState) 
 	return "", gatewayCurrentAppRoute{}
 }
 
-func routeOperationSwitchRequest(t *testing.T, appID string, route routeRecord) generatedruntime.RouteSwitchRequest {
+func routeOperationSwitchRequest(t *testing.T, appID string, route routeRecord) generatedroute.RouteSwitchRequest {
 	t.Helper()
-	next, err := generatedruntime.InactiveSlot(route.Slot)
+	next, err := generatedidentity.InactiveSlot(route.Slot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return generatedruntime.RouteSwitchRequest{AppID: appID, FromSlot: route.Slot, ToSlot: next,
-		Endpoints: append([]generatedruntime.RouteEndpoint(nil), route.Endpoints...)}
+	return generatedroute.RouteSwitchRequest{AppID: appID, FromSlot: route.Slot, ToSlot: next,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), route.Endpoints...)}
 }
 
 func routeOperationNativeGrantRequest(t *testing.T, state gatewayCurrentRouteState,

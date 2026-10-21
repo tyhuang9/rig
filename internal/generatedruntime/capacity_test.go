@@ -3,10 +3,10 @@ package generatedruntime
 import (
 	"context"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"sync"
 	"testing"
 
-	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -153,7 +153,7 @@ func TestReplacementReservationConsumesDistinctComponentSharesConcurrently(t *te
 		func(runtimeprocess.CommandRequest) runtimeRequestResult { return runtimeRequestResult{} })
 	session.reserveAndPin(t)
 	first := session.beginCreate(t)
-	alias, err := session.engine.ReserveReplacement(session.authority.context, deployments.GeneratedReplacementRequest(session.request))
+	alias, err := session.engine.ReserveReplacement(session.authority.context, generatedingress.GeneratedReplacementRequest(session.request))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestReplacementReservationRejectsForeignRetentionAndReleasesUnattemptedAggr
 		t.Fatal("foreign candidate owner retained a sealed reservation")
 	}
 	owner.reservation.Release()
-	if _, err := owner.engine.ReserveReplacement(owner.authority.context, deployments.GeneratedReplacementRequest(owner.request)); err != nil {
+	if _, err := owner.engine.ReserveReplacement(owner.authority.context, generatedingress.GeneratedReplacementRequest(owner.request)); err != nil {
 		t.Fatalf("unattempted concrete reservation did not release: %v", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -474,7 +475,7 @@ func (f *sealedExecutorFixture) capacityCompetitor(t *testing.T) func(bool) {
 		t.Fatal(err)
 	}
 	_, authorization := other.prepareAuthorization(t)
-	request := deployments.GeneratedReplacementRequest{
+	request := generatedingress.GeneratedReplacementRequest{
 		Claim: other.claim, DeploymentID: authorization.DeploymentID, ReleaseID: other.release.ID,
 		ConfigurationRevisionID: other.configuration.RevisionID, ConfigurationRevisionNumber: other.configuration.RevisionNumber,
 		DeploymentPlanRevisionID: other.plan.ID, DeploymentPlanRevisionNumber: other.plan.RevisionNumber,
@@ -623,7 +624,7 @@ func (f *sealedExecutorFixture) seedCandidate(t *testing.T, seed sealedCandidate
 	if _, err := f.repository.FinishGeneratedImagePreparation(f.context, network); err != nil {
 		t.Fatal(err)
 	}
-	execution, err := f.engine.PinCandidates(f.context, deployments.GeneratedCandidateRequest{
+	execution, err := f.engine.PinCandidates(f.context, generatedingress.GeneratedCandidateRequest{
 		Claim: f.claim, DeploymentID: deployment.ID, ReleaseID: f.release.ID,
 		ConfigurationRevisionID: f.configuration.RevisionID, ConfigurationRevisionNumber: f.configuration.RevisionNumber,
 		DeploymentPlanRevisionID: f.plan.ID, DeploymentPlanRevisionNumber: f.plan.RevisionNumber,
@@ -851,11 +852,11 @@ type sealedRuntimeEngine struct {
 	retained        int
 	stopErrs        []error
 	stopCalls       int
-	reserveRequests []deployments.GeneratedReplacementRequest
+	reserveRequests []generatedingress.GeneratedReplacementRequest
 	pinCalls        int
 }
 
-func (s *sealedRuntimeEngine) ReserveReplacement(ctx context.Context, request deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error) {
+func (s *sealedRuntimeEngine) ReserveReplacement(ctx context.Context, request generatedingress.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error) {
 	s.reserveRequests = append(s.reserveRequests, request)
 	return s.engine.ReserveReplacement(ctx, request)
 }
@@ -871,7 +872,7 @@ func (s *sealedRuntimeEngine) EnsureAppNetwork(ctx context.Context, request depl
 	}
 	return s.engine.EnsureAppNetwork(ctx, request)
 }
-func (s *sealedRuntimeEngine) PinCandidates(ctx context.Context, request deployments.GeneratedCandidateRequest, reservation generatedruntime.ReplacementReservation) (*deployments.GeneratedCandidateExecution, error) {
+func (s *sealedRuntimeEngine) PinCandidates(ctx context.Context, request generatedingress.GeneratedCandidateRequest, reservation generatedruntime.ReplacementReservation) (*generatedingress.GeneratedCandidateExecution, error) {
 	s.pinCalls++
 	return s.engine.PinCandidates(ctx, request, reservation)
 }
@@ -1210,7 +1211,7 @@ type sealedCandidateEnvironment struct {
 func (s *sealedCandidateEnvironment) Stage(operationID string, attempt int, contents []byte) (generatedruntime.EnvironmentLease, error) {
 	return s.stage(operationID, attempt, contents)
 }
-func (s *sealedCandidateEnvironment) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+func (s *sealedCandidateEnvironment) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
 	return s.stage(operationID, attempt, contents)
 }
 func (s *sealedCandidateEnvironment) StageGeneratedMigration(operationID string, attempt int, contents []byte) (deployments.GeneratedMigrationEnvironmentLease, error) {

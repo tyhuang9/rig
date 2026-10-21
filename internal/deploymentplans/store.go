@@ -46,16 +46,29 @@ type appLock struct {
 }
 
 func New(db *sql.DB, dataRoot string) (*Store, error) {
-	if db == nil || dataRoot == "" || pathsecurity.RejectWindowsNamespace(dataRoot) || !filepath.IsAbs(dataRoot) || filepath.Clean(dataRoot) != dataRoot {
+	if db == nil || !validStoreDataRoot(dataRoot) {
 		return nil, errors.New("deployment plan data root must be absolute and clean")
 	}
 	return &Store{db: db, root: filepath.Join(dataRoot, "apps"), now: time.Now, appLocks: map[string]*appLock{}}, nil
+}
+
+func validStoreDataRoot(dataRoot string) bool {
+	return dataRoot != "" && !pathsecurity.RejectWindowsNamespace(dataRoot) &&
+		filepath.IsAbs(dataRoot) && filepath.Clean(dataRoot) == dataRoot
 }
 
 // ConfiguredFor reports whether this store is bound to the exact database
 // handle used by a caller's guarded transaction boundary.
 func (s *Store) ConfiguredFor(db *sql.DB) bool {
 	return s != nil && db != nil && s.db == db
+}
+
+// ConfiguredForDomain reports configuration provenance for the exact database
+// handle and controller root supplied by the domain constructor. It performs
+// no physical alias check and grants no read or write authority.
+func (s *Store) ConfiguredForDomain(db *sql.DB, dataRoot string) bool {
+	return s.ConfiguredFor(db) && validStoreDataRoot(dataRoot) &&
+		s.root == filepath.Join(dataRoot, "apps")
 }
 
 func (s *Store) lock(appID string) func() {

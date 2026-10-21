@@ -20,7 +20,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -593,7 +593,7 @@ func gatewayRebindCompositionCurrentEndpointHeadURL(args []string) string {
 // running endpoint reachable through an attached application network and an
 // upstream that the current live Caddy configuration actually addresses.
 func (r *gatewayRebindCompositionRunner) currentEndpointHead(endpointURL string) bool {
-	var matched generatedruntime.RouteEndpoint
+	var matched generatedroute.RouteEndpoint
 	urlMatches, aliasMatches := 0, 0
 	for _, route := range gatewayV2RouteRecords(r.predecessorState) {
 		for _, endpoint := range route.Endpoints {

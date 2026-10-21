@@ -3,6 +3,7 @@ package generatedruntime
 import (
 	"encoding/json"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appconfig"
-	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcontainer"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -40,15 +40,15 @@ func runtimeCandidateExitOne(t *testing.T) *exec.ExitError {
 
 // runtimeCandidateSession wires candidate tests through the concrete
 // repository owner. It carries only test setup; receipt, policy and cleanup
-// authority remain inside deployments.GeneratedCandidateExecution.
+// authority remain inside generatedingress.GeneratedCandidateExecution.
 type runtimeCandidateSession struct {
 	engine      *Engine
 	runner      *runtimeFakeRunner
 	environment *runtimeFakeEnvironment
 	authority   runtimeNetworkAuthority
-	request     deployments.GeneratedCandidateRequest
+	request     generatedingress.GeneratedCandidateRequest
 	reservation ReplacementReservation
-	execution   *deployments.GeneratedCandidateExecution
+	execution   *generatedingress.GeneratedCandidateExecution
 }
 
 func newRuntimeCandidateSession(
@@ -94,7 +94,7 @@ func newRuntimeCandidateSessionWithConfiguration(
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := deployments.GeneratedCandidateRequest{
+	request := generatedingress.GeneratedCandidateRequest{
 		Claim: authority.spec.Network.Claim, DeploymentID: authority.spec.DeploymentID, ReleaseID: authority.spec.ReleaseID,
 		ConfigurationRevisionID: authority.spec.ConfigurationRevisionID, ConfigurationRevisionNumber: authority.spec.ConfigurationRevisionNumber,
 		DeploymentPlanRevisionID: authority.spec.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: authority.spec.DeploymentPlanRevisionNumber,
@@ -117,7 +117,7 @@ func newPreparedRuntimeCandidate(
 	spec CandidateSpec,
 	limits ContainerLimits,
 	capacity CapacitySource,
-) (*runtimeCandidateSession, *runtimeCandidateProgram, deployments.GeneratedCandidateInvocation) {
+) (*runtimeCandidateSession, *runtimeCandidateProgram, generatedingress.GeneratedCandidateInvocation) {
 	return newPreparedRuntimeCandidateWithConfiguration(t, spec, limits, capacity, nil)
 }
 
@@ -127,7 +127,7 @@ func newPreparedRuntimeCandidateWithConfiguration(
 	limits ContainerLimits,
 	capacity CapacitySource,
 	configurationEntries []appconfig.ScopedValueInput,
-) (*runtimeCandidateSession, *runtimeCandidateProgram, deployments.GeneratedCandidateInvocation) {
+) (*runtimeCandidateSession, *runtimeCandidateProgram, generatedingress.GeneratedCandidateInvocation) {
 	t.Helper()
 	var program *runtimeCandidateProgram
 	session := newRuntimeCandidateSessionWithConfiguration(t, spec, limits, capacity, configurationEntries, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
@@ -142,7 +142,7 @@ func newPreparedRuntimeCandidateWithConfiguration(
 
 func (s *runtimeCandidateSession) reserveAndPin(t *testing.T) {
 	t.Helper()
-	reservation, err := s.engine.ReserveReplacement(s.authority.context, deployments.GeneratedReplacementRequest(s.request))
+	reservation, err := s.engine.ReserveReplacement(s.authority.context, generatedingress.GeneratedReplacementRequest(s.request))
 	if err != nil {
 		t.Fatalf("reserve receipt-bound candidate: %v", err)
 	}
@@ -156,7 +156,7 @@ func (s *runtimeCandidateSession) reserveAndPin(t *testing.T) {
 	t.Cleanup(execution.Leave)
 }
 
-func (s *runtimeCandidateSession) beginCreate(t *testing.T) deployments.GeneratedCandidateInvocation {
+func (s *runtimeCandidateSession) beginCreate(t *testing.T) generatedingress.GeneratedCandidateInvocation {
 	t.Helper()
 	value, err := s.execution.BeginCreate(s.authority.spec.ComponentName)
 	if err != nil {
@@ -165,9 +165,9 @@ func (s *runtimeCandidateSession) beginCreate(t *testing.T) deployments.Generate
 	return value
 }
 
-func (s *runtimeCandidateSession) identity(value deployments.GeneratedCandidateInvocation) deployments.CandidateIdentity {
+func (s *runtimeCandidateSession) identity(value generatedingress.GeneratedCandidateInvocation) generatedingress.CandidateIdentity {
 	identity := value.Identity()
-	return deployments.CandidateIdentity{
+	return generatedingress.CandidateIdentity{
 		ReceiptID: identity.ReceiptID, DeploymentID: s.authority.spec.DeploymentID, ReleaseID: s.authority.spec.ReleaseID,
 		ArtifactID: s.authority.spec.ArtifactID, DeploymentPlanRevisionID: s.authority.spec.DeploymentPlanRevisionID,
 		ComponentName: identity.ComponentName, Role: s.authority.spec.Role, Technology: s.authority.spec.Technology,
@@ -187,7 +187,7 @@ func (s *runtimeCandidateSession) finishStarting(t *testing.T) {
 type runtimeCandidateProgram struct {
 	t          *testing.T
 	spec       CandidateSpec
-	identity   deployments.CandidateIdentity
+	identity   generatedingress.CandidateIdentity
 	limits     ContainerLimits
 	absenceErr error
 	created    bool
@@ -207,7 +207,7 @@ func newRuntimeCandidateProgram(t *testing.T, spec CandidateSpec, limits Contain
 	return &runtimeCandidateProgram{t: t, spec: spec, limits: limits, absenceErr: runtimeCandidateExitOne(t), health: "starting"}
 }
 
-func (p *runtimeCandidateProgram) bind(value deployments.GeneratedCandidateInvocation, session *runtimeCandidateSession) {
+func (p *runtimeCandidateProgram) bind(value generatedingress.GeneratedCandidateInvocation, session *runtimeCandidateSession) {
 	p.identity = session.identity(value)
 }
 
@@ -273,7 +273,7 @@ func (p *runtimeCandidateProgram) run(request runtimeprocess.CommandRequest) run
 
 func candidateInspection(
 	spec CandidateSpec,
-	identity deployments.CandidateIdentity,
+	identity generatedingress.CandidateIdentity,
 	limits ContainerLimits,
 	containerID string,
 	status string,

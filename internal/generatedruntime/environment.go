@@ -2,6 +2,7 @@ package generatedruntime
 
 import (
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
@@ -42,7 +43,7 @@ func (s *SecureEnvironmentStager) StageGeneratedMigration(operationID string, at
 
 // StageGeneratedCandidate exposes the same protected staging implementation
 // to the repository-owned candidate lifecycle.
-func (s *SecureEnvironmentStager) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (deployments.GeneratedCandidateEnvironmentLease, error) {
+func (s *SecureEnvironmentStager) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
 	return s.Stage(operationID, attempt, contents)
 }
 

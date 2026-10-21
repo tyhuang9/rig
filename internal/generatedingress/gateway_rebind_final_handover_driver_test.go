@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -83,7 +83,7 @@ func TestGatewayRebindFinalHandoverApplicationProofRequiresExactJointRoster(t *t
 				oldName, finalName := "old-gateway", "new-gateway"
 				network := networks[networkName]
 				network.Driver, network.Scope = "bridge", "local"
-				network.Labels = map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": appID}
+				network.Labels = map[string]string{"io.rig.managed": generatedidentity.NetworkOwnershipLabelValue, "io.rig.application": appID}
 				network.Containers = map[string]caddyNetworkContainerInspection{appContainerID: {Name: "frontend", IPv4Address: "172.30.0.2/24"}}
 				proof := gatewayRebindFinalHandoverObservation{Stage: gatewayRebindHandoverContainerAbsent, Final: gatewayRebindHandoverContainerStopped, FinalID: finalID, PredecessorRunning: !finalRunning}
 				activeID, activeName := oldID, oldName

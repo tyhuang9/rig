@@ -9,7 +9,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func TestGatewayRebindRecoveryProjectorProvesOnlyStablePristineAbsence(t *testing.T) {
@@ -26,7 +27,7 @@ func TestGatewayRebindRecoveryProjectorProvesOnlyStablePristineAbsence(t *testin
 			t.Cleanup(func() { _ = db.Close() })
 			repository := &gatewayRebindCommitCurrentRepository{Repository: appaccess.New(db)}
 			operationID := uuid.NewString()
-			route := routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{runner.endpoint}}
+			route := routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}
 			saveNonemptyRoute := func() {
 				t.Helper()
 				if err := manager.store.save(routeState{Version: stateVersion,

@@ -5,7 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 func TestStateStoreRejectsPlaintextBeyondProtectedBundleLimit(t *testing.T) {
@@ -16,7 +17,7 @@ func TestStateStoreRejectsPlaintextBeyondProtectedBundleLimit(t *testing.T) {
 	state := routeState{Version: stateVersion, Active: make(map[string]routeRecord, maxStateApps)}
 	for index := 0; index < maxStateApps; index++ {
 		appID := fmt.Sprintf("11111111-1111-4111-8111-%012x", index+1)
-		state.Active[appID] = routeRecord{Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+		state.Active[appID] = routeRecord{Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
 			endpoint(strings.Repeat("a", 63)+"1", "server", "n"+strings.Repeat("a", 94), "a"+strings.Repeat("b", 94), 3000, 'a'),
 			endpoint(strings.Repeat("a", 63)+"2", "static", "n"+strings.Repeat("a", 94), "a"+strings.Repeat("c", 94), 4173, 'b'),
 		}}

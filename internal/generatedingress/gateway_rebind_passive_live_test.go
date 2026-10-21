@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -74,7 +73,7 @@ func TestLiveGatewayRebindPassiveDockerSendsNoApplicationRequests(t *testing.T) 
 }
 
 func buildLiveGatewayCountedImage(t *testing.T, ctx context.Context, runner runtimeprocess.CommandRunner,
-	docker, root, dockerConfig, tag string, spec generatedruntime.CandidateSpec, reply string,
+	docker, root, dockerConfig, tag string, spec liveRuntimeCandidateSpec, reply string,
 ) string {
 	t.Helper()
 	server := fmt.Sprintf(`import { renameSync, writeFileSync } from 'node:fs';

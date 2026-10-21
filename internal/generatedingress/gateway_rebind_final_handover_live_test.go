@@ -19,7 +19,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/database"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -62,7 +63,7 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 	fixture.request = liveGatewayV2Request(t, spec, before, fixture.port)
 	loopbackID, loopbackPlan := "f1111111-1111-4111-8111-111111111111", "f2222222-2222-4222-8222-222222222222"
 	loopbackReply := "final-handover-loopback"
-	appNetwork, err := generatedruntime.DescribeAppNetwork(loopbackID)
+	appNetwork, err := generatedidentity.DescribeAppNetwork(loopbackID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,14 +75,14 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 		t.Fatal("loopback-only fixture identities already exist")
 	}
 	authority := liveGeneratedDeployments(t, fixture.ingress.options.WorkingDirectory)
-	engine, err := generatedruntime.NewEngine(fixture.runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, generatedruntime.EngineOptions{
+	engine, err := newLiveRuntimeEngine(fixture.runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
 		DockerExecutable: fixture.docker, DockerConfigDirectory: fixture.dockerConfig, WorkingDirectory: fixture.ingress.options.WorkingDirectory,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond, OutputLimit: liveDockerOutputLimit,
-		Limits: generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128, TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2}, ReplacementDiskBytes: 96 << 20})
+		Limits: liveRuntimeContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128, TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2}, ReplacementDiskBytes: 96 << 20})
 	if err != nil {
 		t.Fatal("create second live runtime")
 	}
-	var secondCandidates []generatedruntime.Candidate
+	var secondCandidates []liveRuntimeCandidate
 	t.Cleanup(func() {
 		// Both application networks are still attached to the retained predecessor.
 		// Remove that exact bound gateway before either application network.
@@ -94,7 +95,7 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 	secondSpec.ImageContentID = buildLiveGatewayImage(t, fixture.ctx, fixture.runner, fixture.docker, fixture.root, fixture.dockerConfig, image.tag, secondSpec, loopbackReply, "0.0.0.0")
 	second := startLiveCandidate(t, fixture.ctx, engine, authority, secondSpec)
 	secondCandidates = append(secondCandidates, second)
-	if err := fixture.ingress.Switch(fixture.ctx, generatedruntime.RouteSwitchRequest{AppID: loopbackID, ToSlot: second.Slot, Endpoints: []generatedruntime.RouteEndpoint{liveEndpoint(second)}}); err != nil {
+	if err := fixture.ingress.Switch(fixture.ctx, generatedroute.RouteSwitchRequest{AppID: loopbackID, ToSlot: second.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(second)}}); err != nil {
 		failLiveIngress(t, "install loopback-only source route", err)
 	}
 	authority.published(t, fixture.ctx, fixture.ingress, second)
@@ -108,7 +109,7 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 		t.Fatal(err)
 	}
 	secondFixture := *fixture
-	secondFixture.candidates = []generatedruntime.Candidate{second}
+	secondFixture.candidates = []liveRuntimeCandidate{second}
 	seedLiveFinalHandoverLoopbackRuntime(t, db, &secondFixture)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile, appaccess.GatewayProfileSpec{
 		SelectedIPv4: after.IPv4, InterfaceID: after.InterfaceID, PortStart: fixture.port, PortEnd: fixture.port})

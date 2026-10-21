@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 )
 
@@ -271,11 +271,11 @@ func TestSwitchReleaseFailurePreservesLiveCandidate(t *testing.T) {
 	t.Cleanup(func() { managerAcquireGatewayOSLock = original })
 
 	err := manager.Switch(context.Background(), switchRequest(runner))
-	if !IsCode(err, DiagnosticRouteUnresolved) || !generatedruntime.RouteCandidateMayBeLive(err) {
-		t.Fatalf("switch error=%v candidateMayBeLive=%t", err, generatedruntime.RouteCandidateMayBeLive(err))
+	if !IsCode(err, DiagnosticRouteUnresolved) || !testRouteCandidateMayBeLive(err) {
+		t.Fatalf("switch error=%v candidateMayBeLive=%t", err, testRouteCandidateMayBeLive(err))
 	}
 	state, loadErr := manager.store.load()
-	if loadErr != nil || state.Active[runner.appID].Slot != generatedruntime.SlotBlue {
+	if loadErr != nil || state.Active[runner.appID].Slot != generatedidentity.SlotBlue {
 		t.Fatalf("serving route after release fault=%#v err=%v", state.Active[runner.appID], loadErr)
 	}
 }

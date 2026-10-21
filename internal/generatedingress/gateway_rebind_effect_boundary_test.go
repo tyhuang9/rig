@@ -14,7 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 )
 
@@ -405,7 +405,7 @@ func newGatewayRebindEffectBoundaryTwoAppFixture(t *testing.T) gatewayRebindEffe
 	}
 	state := cloneGatewayV2RouteState(fixture.state)
 	secondRoute := cloneGatewayV2AppRoute(state.Apps[fixture.proposal.Roster[0].AppID])
-	secondRoute.Route.Endpoints = []generatedruntime.RouteEndpoint{
+	secondRoute.Route.Endpoints = []generatedroute.RouteEndpoint{
 		endpoint("api", "server", "rebind-second-network", "rebind-second-blue", 3000, '4'),
 	}
 	secondRoute.LAN = &binding

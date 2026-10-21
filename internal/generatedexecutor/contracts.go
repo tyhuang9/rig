@@ -6,6 +6,7 @@ package generatedexecutor
 import (
 	"context"
 	"errors"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"time"
 
 	"github.com/hostd/hostd/internal/appconfig"
@@ -79,10 +80,10 @@ type runtimeState interface {
 }
 
 type runtimeEngine interface {
-	ReserveReplacement(context.Context, deployments.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error)
+	ReserveReplacement(context.Context, generatedingress.GeneratedReplacementRequest) (generatedruntime.ReplacementReservation, error)
 	RetainReplacementCapacity(generatedruntime.ReplacementReservation) error
 	EnsureAppNetwork(context.Context, deployments.GeneratedNetworkRequest) error
-	PinCandidates(context.Context, deployments.GeneratedCandidateRequest, generatedruntime.ReplacementReservation) (*deployments.GeneratedCandidateExecution, error)
+	PinCandidates(context.Context, generatedingress.GeneratedCandidateRequest, generatedruntime.ReplacementReservation) (*generatedingress.GeneratedCandidateExecution, error)
 	StopAndRemove(context.Context, generatedruntime.Candidate, time.Duration) error
 }
 
