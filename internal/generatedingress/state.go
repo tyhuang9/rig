@@ -9,7 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	"github.com/hostd/hostd/internal/secretfile"
 )
@@ -23,8 +24,8 @@ const (
 )
 
 type routeRecord struct {
-	Slot      generatedruntime.Slot            `json:"slot"`
-	Endpoints []generatedruntime.RouteEndpoint `json:"endpoints"`
+	Slot      generatedidentity.Slot         `json:"slot"`
+	Endpoints []generatedroute.RouteEndpoint `json:"endpoints"`
 }
 
 type pendingRoute struct {
@@ -263,7 +264,7 @@ func cloneRoutes(values map[string]routeRecord) map[string]routeRecord {
 	sort.Strings(keys)
 	for _, key := range keys {
 		value := values[key]
-		value.Endpoints = append([]generatedruntime.RouteEndpoint(nil), value.Endpoints...)
+		value.Endpoints = append([]generatedroute.RouteEndpoint(nil), value.Endpoints...)
 		result[key] = value
 	}
 	return result

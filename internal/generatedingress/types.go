@@ -6,15 +6,16 @@ import (
 	"errors"
 	"time"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 // Observation is a read-only attestation of the active local ingress route.
 // Its URL is scoped to the controller host's loopback listener.
 type Observation struct {
 	URL        string
-	Slot       generatedruntime.Slot
-	Endpoints  []generatedruntime.RouteEndpoint
+	Slot       generatedidentity.Slot
+	Endpoints  []generatedroute.RouteEndpoint
 	ObservedAt time.Time
 }
 

@@ -17,7 +17,8 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedroute"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
@@ -246,7 +247,7 @@ func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager,
 // new active route, and installs it as Caddy's restart configuration. It never
 // stops application containers or waits for connection draining; the
 // deployment coordinator owns those post-commit operations.
-func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwitchRequest) (resultErr error) {
+func (m *Manager) Switch(ctx context.Context, request generatedroute.RouteSwitchRequest) (resultErr error) {
 	if m == nil || ctx == nil || !validSwitchRequest(request) {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
@@ -278,7 +279,7 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	}
 	previous, hadPrevious := state.Active[request.AppID]
 	committedRoutes := cloneRoutes(state.Active)
-	proposed := routeRecord{Slot: request.ToSlot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)}
+	proposed := routeRecord{Slot: request.ToSlot, Endpoints: append([]generatedroute.RouteEndpoint(nil), request.Endpoints...)}
 	if hadPrevious && sameRoute(previous, proposed) {
 		if err := m.verifyEndpoints(ctx, request.AppID, proposed); err != nil {
 			return markCandidateMayBeLive(err)
@@ -319,7 +320,7 @@ func (m *Manager) Switch(ctx context.Context, request generatedruntime.RouteSwit
 	state.Pending = &pendingRoute{AppID: request.AppID, Proposed: proposed}
 	if hadPrevious {
 		copy := previous
-		copy.Endpoints = append([]generatedruntime.RouteEndpoint(nil), previous.Endpoints...)
+		copy.Endpoints = append([]generatedroute.RouteEndpoint(nil), previous.Endpoints...)
 		state.Pending.Previous = &copy
 	}
 	if err := m.store.save(state); err != nil {
@@ -895,7 +896,7 @@ func ingressNetworkCandidate(index int) (subnet, gateway, address string) {
 
 func validApplicationNetwork(value networkInspection, appID string) bool {
 	return validAppID(appID) && value.Name != caddyNetworkName && value.Driver == "bridge" && value.Scope == "local" && !value.Internal &&
-		value.Labels["io.rig.managed"] == generatedruntime.NetworkOwnershipLabelValue && value.Labels["io.rig.application"] == appID
+		value.Labels["io.rig.managed"] == generatedidentity.NetworkOwnershipLabelValue && value.Labels["io.rig.application"] == appID
 }
 
 func (m *Manager) verifyEndpoints(ctx context.Context, appID string, route routeRecord) error {
@@ -983,7 +984,7 @@ func (m *Manager) attestedCaddyForGateway(ctx context.Context, route routeRecord
 	return caddy.ID, nil
 }
 
-func (m *Manager) probeGatewayEndpoint(ctx context.Context, caddyID string, endpoint generatedruntime.RouteEndpoint) error {
+func (m *Manager) probeGatewayEndpoint(ctx context.Context, caddyID string, endpoint generatedroute.RouteEndpoint) error {
 	if !validContainerID(caddyID) || !validName(endpoint.NetworkName, 96) || !validName(endpoint.NetworkAlias, 96) || endpoint.InternalPort == 0 {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
@@ -1322,7 +1323,7 @@ func validOptions(options Options) bool {
 		localDockerEndpoint(options.DockerEndpoint)
 }
 
-func validSwitchRequest(request generatedruntime.RouteSwitchRequest) bool {
+func validSwitchRequest(request generatedroute.RouteSwitchRequest) bool {
 	if !validAppID(request.AppID) || request.ToSlot == "" || request.ToSlot == request.FromSlot || request.DrainPeriod < 0 || request.DrainPeriod > maximumDrain {
 		return false
 	}
@@ -1641,5 +1642,5 @@ func (m *Manager) observeLocked(ctx context.Context, appID string) (Observation,
 	if err != nil {
 		return Observation{}, err
 	}
-	return Observation{URL: url, Slot: route.Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), route.Endpoints...), ObservedAt: time.Now().UTC()}, nil
+	return Observation{URL: url, Slot: route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), route.Endpoints...), ObservedAt: time.Now().UTC()}, nil
 }

@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 type gatewayV2PendingLiveTopology string
@@ -56,7 +56,7 @@ func (m *Manager) attestCommittedV2Locked(ctx context.Context, state gatewayV2Ro
 	return nil
 }
 
-func (m *Manager) switchCommittedV2Locked(ctx context.Context, store *gatewayUpgradeStateStore, state gatewayV2RouteState, journal gatewayMigrationJournal, request generatedruntime.RouteSwitchRequest) error {
+func (m *Manager) switchCommittedV2Locked(ctx context.Context, store *gatewayUpgradeStateStore, state gatewayV2RouteState, journal gatewayMigrationJournal, request generatedroute.RouteSwitchRequest) error {
 	if state.Pending != nil {
 		var err error
 		state, err = m.rollbackCommittedV2PendingLocked(ctx, store, state, journal)
@@ -69,7 +69,7 @@ func (m *Manager) switchCommittedV2Locked(ctx context.Context, store *gatewayUpg
 	}
 
 	previous, hadPrevious := state.Apps[request.AppID]
-	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: request.ToSlot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)}}
+	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: request.ToSlot, Endpoints: append([]generatedroute.RouteEndpoint(nil), request.Endpoints...)}}
 	if hadPrevious {
 		proposed.LAN = cloneGatewayV2AppRoute(previous).LAN
 	}
@@ -319,7 +319,7 @@ func (m *Manager) observeCommittedV2Locked(ctx context.Context, state gatewayV2R
 		return Observation{}, &Error{Code: DiagnosticRouteInvalid}
 	}
 	url := "http://" + appID + ".rig.localhost:" + strconv.FormatUint(uint64(m.options.HostPort), 10)
-	return Observation{URL: url, Slot: app.Route.Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...), ObservedAt: time.Now().UTC()}, nil
+	return Observation{URL: url, Slot: app.Route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...), ObservedAt: time.Now().UTC()}, nil
 }
 
 func (m *Manager) applyCommittedV2Routes(ctx context.Context, state gatewayV2RouteState, finalContainerID, filename string) error {

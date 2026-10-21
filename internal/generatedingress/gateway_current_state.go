@@ -8,7 +8,7 @@ import (
 	"reflect"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 const (
@@ -395,7 +395,7 @@ func newGatewayCurrentRouteBaselineFromV1Terminal(intent gatewayRebindProtectedI
 	usedTransfers := 0
 	for appID, app := range predecessor.Apps {
 		current := gatewayCurrentAppRoute{Route: app.Route}
-		current.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+		current.Route.Endpoints = append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)
 		if app.LAN != nil {
 			transfer, ok := byApp[appID]
 			if !ok || transfer.AllocationID != app.LAN.AllocationID || transfer.GrantAttemptID != app.LAN.GrantAttemptID ||
@@ -461,7 +461,7 @@ func cloneGatewayCurrentRouteState(value gatewayCurrentRouteState) gatewayCurren
 }
 
 func cloneGatewayCurrentAppRoute(app gatewayCurrentAppRoute) gatewayCurrentAppRoute {
-	app.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+	app.Route.Endpoints = append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)
 	if app.LAN != nil {
 		binding := *app.LAN
 		if app.LAN.Transfer != nil {

@@ -6,7 +6,7 @@ import (
 	"reflect"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 type gatewayCurrentRouteMutation func(gatewayCurrentRouteState) (gatewayCurrentRouteState, error)
@@ -109,7 +109,7 @@ func (m *Manager) mutateGatewayCurrentLocked(ctx context.Context,
 // switchGatewayCurrentRouteLocked persists a route-head advance for the
 // selected rebind current. Docker publication remains the caller's effect.
 func (m *Manager) switchGatewayCurrentRouteLocked(ctx context.Context,
-	request generatedruntime.RouteSwitchRequest,
+	request generatedroute.RouteSwitchRequest,
 ) (bool, error) {
 	if !validSwitchRequest(request) {
 		return false, &Error{Code: DiagnosticValidationFailed}
@@ -120,7 +120,7 @@ func (m *Manager) switchGatewayCurrentRouteLocked(ctx context.Context,
 		}
 		previous, exists := state.Apps[request.AppID]
 		proposed := gatewayCurrentAppRoute{Route: routeRecord{
-			Slot: request.ToSlot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...),
+			Slot: request.ToSlot, Endpoints: append([]generatedroute.RouteEndpoint(nil), request.Endpoints...),
 		}}
 		if exists {
 			proposed.LAN = previous.LAN
@@ -272,7 +272,7 @@ func cloneGatewayCurrentOperationPending(value gatewayCurrentPendingRoute) gatew
 }
 
 func cloneGatewayCurrentOperationApp(value gatewayCurrentAppRoute) gatewayCurrentAppRoute {
-	value.Route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), value.Route.Endpoints...)
+	value.Route.Endpoints = append([]generatedroute.RouteEndpoint(nil), value.Route.Endpoints...)
 	if value.LAN != nil {
 		binding := cloneGatewayCurrentOperationBinding(*value.LAN)
 		value.LAN = &binding

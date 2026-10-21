@@ -5,7 +5,7 @@ import (
 	"reflect"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 // gatewayRebindAttemptView is an in-memory adapter over the immutable legacy
@@ -403,10 +403,10 @@ func cloneRouteState(value routeState) routeState {
 	result := routeState{Version: value.Version, Active: cloneRoutes(value.Active)}
 	if value.Pending != nil {
 		pending := *value.Pending
-		pending.Proposed.Endpoints = append([]generatedruntime.RouteEndpoint(nil), value.Pending.Proposed.Endpoints...)
+		pending.Proposed.Endpoints = append([]generatedroute.RouteEndpoint(nil), value.Pending.Proposed.Endpoints...)
 		if value.Pending.Previous != nil {
 			previous := *value.Pending.Previous
-			previous.Endpoints = append([]generatedruntime.RouteEndpoint(nil), value.Pending.Previous.Endpoints...)
+			previous.Endpoints = append([]generatedroute.RouteEndpoint(nil), value.Pending.Previous.Endpoints...)
 			pending.Previous = &previous
 		}
 		result.Pending = &pending

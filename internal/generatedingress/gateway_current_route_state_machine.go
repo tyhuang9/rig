@@ -6,7 +6,7 @@ import (
 	"reflect"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 // gatewayCurrentSelectedStateLocked returns the current rebind generation
@@ -89,14 +89,14 @@ func gatewayCurrentNextState(previous gatewayCurrentRouteState,
 }
 
 func gatewayCurrentSwitchTransition(before gatewayCurrentRouteState,
-	request generatedruntime.RouteSwitchRequest,
+	request generatedroute.RouteSwitchRequest,
 ) (gatewayCurrentPhysicalTransition, error) {
 	if !validSwitchRequest(request) || before.Pending != nil || before.LANRecovery != nil {
 		return gatewayCurrentPhysicalTransition{}, gatewayCurrentRouteOperationError(nil)
 	}
 	previous, exists := before.Apps[request.AppID]
 	proposed := gatewayCurrentAppRoute{Route: routeRecord{Slot: request.ToSlot,
-		Endpoints: append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)}}
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), request.Endpoints...)}}
 	if exists {
 		proposed.LAN = previous.LAN
 	}
@@ -259,7 +259,7 @@ func (m *Manager) attestGatewayCurrentStateLocked(ctx context.Context,
 // switchGatewayCurrentStateMachineLocked advances a selected rebind route
 // through durable Pending, exact physical publication, and durable Effective.
 func (m *Manager) switchGatewayCurrentStateMachineLocked(ctx context.Context,
-	request generatedruntime.RouteSwitchRequest,
+	request generatedroute.RouteSwitchRequest,
 ) (bool, error) {
 	selection, _, handled, err := m.gatewayCurrentSelectedStateLocked(ctx)
 	if err != nil {
@@ -271,7 +271,7 @@ func (m *Manager) switchGatewayCurrentStateMachineLocked(ctx context.Context,
 	before := cloneGatewayCurrentOperationState(*selection.State)
 	if current, exists := before.Apps[request.AppID]; exists {
 		proposed := gatewayCurrentAppRoute{Route: routeRecord{Slot: request.ToSlot,
-			Endpoints: append([]generatedruntime.RouteEndpoint(nil), request.Endpoints...)}, LAN: current.LAN}
+			Endpoints: append([]generatedroute.RouteEndpoint(nil), request.Endpoints...)}, LAN: current.LAN}
 		if reflect.DeepEqual(current, proposed) {
 			_, err := m.attestGatewayCurrentStateLocked(ctx, before)
 			if err != nil {

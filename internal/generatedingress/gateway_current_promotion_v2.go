@@ -9,7 +9,7 @@ import (
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/applifecycle"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 )
 
@@ -221,7 +221,7 @@ func gatewayCurrentV2BaselineFor(selection gatewayCurrentSelection,
 		value.Apps[appID] = gatewayCurrentAppRouteV2{
 			Route: cloneGatewayCurrentAppRoute(app).Route,
 			Runtime: gatewayCurrentRuntimePinV2{DeploymentID: head.DeploymentID, ReleaseID: head.ReleaseID,
-				Slot: generatedruntime.Slot(head.Slot), ActiveGeneration: head.Generation},
+				Slot: generatedidentity.Slot(head.Slot), ActiveGeneration: head.Generation},
 			Traffic:   gatewayCurrentTrafficServingV2,
 			Authority: gatewayCurrentAppliedAuthorityV2{DesiredMode: gatewayCurrentDesiredUninitializedV2},
 			LAN:       cloneGatewayCurrentAppRoute(app).LAN,

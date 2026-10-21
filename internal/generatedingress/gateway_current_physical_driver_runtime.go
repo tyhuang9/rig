@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedroute"
 )
 
 const gatewayCurrentPhysicalConfigFilename = "reconcile.json"
@@ -1289,7 +1289,7 @@ func gatewayCurrentPhysicalRoutes(state gatewayCurrentRouteState) map[string]rou
 	routes := make(map[string]routeRecord, len(state.Apps))
 	for appID, app := range state.Apps {
 		route := app.Route
-		route.Endpoints = append([]generatedruntime.RouteEndpoint(nil), app.Route.Endpoints...)
+		route.Endpoints = append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)
 		routes[appID] = route
 	}
 	return routes
