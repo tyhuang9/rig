@@ -8,6 +8,7 @@ package main
 // database state proves that its named crash boundary has been crossed.
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -416,7 +417,11 @@ func controllerProcessKillRunChild(t *testing.T) {
 		db: db, applications: apps.New(db), snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: manifest.Docker, runner: &controllerProcessKillRunner{delegate: runtimeprocess.ExecRunner{}, barrier: barrier}})
+	}, runtimeCompositionOptions{
+		dockerExecutable: manifest.Docker,
+		runner:           &controllerProcessKillRunner{delegate: runtimeprocess.ExecRunner{}, barrier: barrier},
+		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
+	})
 	if err != nil {
 		t.Fatal("reopen production generated composition")
 	}
@@ -532,7 +537,13 @@ func controllerProcessKillMatrix(
 			child := controllerProcessKillChild(t, marker, []string{
 				"RIG_LIVE_PROCESS_KILL_CHILD=1", "RIG_LIVE_PROCESS_KILL_MANIFEST=" + manifestPath,
 			})
-			t.Cleanup(func() { controllerProcessKillCleanupChild(child) })
+			childStopped := false
+			t.Cleanup(func() {
+				controllerProcessKillCleanupChild(child)
+				if t.Failed() && !childStopped {
+					controllerProcessKillReportClosedDiagnostic(t, child)
+				}
+			})
 			controllerProcessKillWaitMarker(t, apiMarker, child)
 			controllerProcessKillAssertAuthenticated(t, administratorID, request)
 			controllerProcessKillWaitMarker(t, marker, child)
@@ -573,6 +584,7 @@ func controllerProcessKillMatrix(
 				}
 			}
 			controllerProcessKillTerminate(t, child)
+			childStopped = true
 			expectedRoute := oldRuntime
 			if boundary != controllerKillBeforeBuild && boundary != controllerKillBeforeStart {
 				expectedRoute = phase
@@ -607,7 +619,13 @@ func controllerProcessKillMatrix(
 			restarted := controllerProcessKillChild(t, marker, []string{
 				"RIG_LIVE_PROCESS_KILL_CHILD=1", "RIG_LIVE_PROCESS_KILL_MANIFEST=" + manifestPath,
 			})
-			t.Cleanup(func() { controllerProcessKillCleanupChild(restarted) })
+			restartedStopped := false
+			t.Cleanup(func() {
+				controllerProcessKillCleanupChild(restarted)
+				if t.Failed() && !restartedStopped {
+					controllerProcessKillReportClosedDiagnostic(t, restarted)
+				}
+			})
 			controllerProcessKillWaitMarker(t, manifest.APIMarker, restarted)
 			controllerProcessKillAssertAuthenticated(t, administratorID, request)
 			deadline := time.Now().Add(8 * time.Minute)
@@ -642,6 +660,7 @@ func controllerProcessKillMatrix(
 				time.Sleep(250 * time.Millisecond)
 			}
 			controllerProcessKillTerminate(t, restarted)
+			restartedStopped = true
 			finalPins := controllerProcessKillPinsForJob(t, db, appID, mutation.Job.ID)
 			if finalPins != pinned {
 				t.Fatal("process restart changed deployment, release, plan or scoped configuration pins")
@@ -775,6 +794,13 @@ type controllerProcessKillProcess struct {
 	command *exec.Cmd
 	done    chan struct{}
 	err     error
+	stderr  bytes.Buffer
+}
+
+func controllerProcessKillCapture(command *exec.Cmd) *controllerProcessKillProcess {
+	child := &controllerProcessKillProcess{command: command, done: make(chan struct{})}
+	command.Stderr = &child.stderr
+	return child
 }
 
 func controllerProcessKillCleanupChild(child *controllerProcessKillProcess) {
@@ -786,6 +812,25 @@ func controllerProcessKillCleanupChild(child *controllerProcessKillProcess) {
 	default:
 		_ = child.command.Process.Kill()
 		<-child.done
+	}
+}
+
+func controllerProcessKillClosedDiagnostic(child *controllerProcessKillProcess) (string, bool) {
+	if child == nil {
+		return "", false
+	}
+	select {
+	case <-child.done:
+		return liveHostdRebindClosedDiagnostic(child.stderr.String()), true
+	default:
+		return "", false
+	}
+}
+
+func controllerProcessKillReportClosedDiagnostic(t *testing.T, child *controllerProcessKillProcess) {
+	t.Helper()
+	if diagnostic, ok := controllerProcessKillClosedDiagnostic(child); ok {
+		t.Logf("process-kill child diagnostic=%q", diagnostic)
 	}
 }
 
@@ -801,10 +846,10 @@ func controllerProcessKillChild(t *testing.T, marker string, environment []strin
 	command := exec.Command(os.Args[0], "-test.run=^TestLiveControllerGeneratedProcessKillRecovery$", "-test.timeout=48m")
 	command.Env = append(append([]string(nil), os.Environ()...), environment...)
 	command.Env = append(command.Env, "RIG_LIVE_PROCESS_KILL_MARKER="+marker)
+	child := controllerProcessKillCapture(command)
 	if err := command.Start(); err != nil {
 		t.Fatal("start process-kill child")
 	}
-	child := &controllerProcessKillProcess{command: command, done: make(chan struct{})}
 	go func() {
 		child.err = command.Wait()
 		close(child.done)

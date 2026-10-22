@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"time"
 
@@ -47,6 +48,7 @@ type runtimeCompositionDependencies struct {
 type runtimeCompositionOptions struct {
 	dockerExecutable       string
 	runner                 runtimeprocess.CommandRunner
+	routePauseLogger       *slog.Logger
 	beforeStep             func(string) error
 	recoverIngress         func(context.Context, *generatedingress.Manager) error
 	preinspectedIngress    *generatedingress.Manager
@@ -332,7 +334,8 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		}
 		result.generated, err = generatedexecutor.NewExecutor(
 			dependencies.applications, dependencies.snapshots, dependencies.configuration, runtimeDeployments,
-			dependencies.plans, compiler, artifacts, state, engine, authorization, ingress, migrationRunner, generatedexecutor.Options{},
+			dependencies.plans, compiler, artifacts, state, engine, authorization, ingress, migrationRunner,
+			generatedexecutor.Options{RoutePauseLogger: options.routePauseLogger},
 		)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated executor setup: %w", err)
