@@ -49,6 +49,43 @@ func generatedDomainRegistryIsolated(t *testing.T) bool {
 	return false
 }
 
+// generatedDomainRegistryExpectedFailureIsolated verifies the cleanup path in
+// a separate test process. The nested test intentionally fails after opening a
+// pairing epoch; this outer process accepts only that known failure.
+func generatedDomainRegistryExpectedFailureIsolated(t *testing.T, child string) bool {
+	t.Helper()
+	if os.Getenv(generatedDomainRegistryCaseEnvironment) == t.Name() {
+		return true
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	command := exec.CommandContext(commandContext, executable,
+		"-test.run", "^"+regexp.QuoteMeta(t.Name())+"$", "-test.count=1", "-test.v", "-test.timeout=90s")
+	command.Env = append(os.Environ(), generatedDomainRegistryCaseEnvironment+"="+t.Name())
+	output, err := command.CombinedOutput()
+	text := string(output)
+	childName := t.Name() + "/" + child
+	if err == nil || commandContext.Err() != nil ||
+		strings.Count(text, "=== RUN   "+t.Name()+"\n") != 1 ||
+		strings.Count(text, "=== RUN   "+childName+"\n") != 1 ||
+		strings.Count(text, "--- FAIL: "+childName) != 1 ||
+		strings.Count(text, "--- FAIL: "+t.Name()+" ") != 1 ||
+		strings.Count(text, "--- FAIL: ") != 2 ||
+		!strings.Contains(text, "intentional registry fixture cleanup failure") ||
+		strings.Count(text, "registry fixture cleanup control completed") != 1 ||
+		strings.Contains(text, "panic: test timed out") ||
+		strings.Contains(text, "cleanup did not finish") ||
+		strings.Contains(text, "later reservation did not progress") {
+		t.Fatalf("isolated registry cleanup control did not produce only its expected failure: commandContext=%v error=%v\n%s", commandContext.Err(), err, output)
+	}
+	t.Logf("isolated registry cleanup control output:\n%s", output)
+	return false
+}
+
 type generatedDomainControlledRunner struct {
 	mu sync.Mutex
 
@@ -186,6 +223,7 @@ func TestGeneratedDomainRegistryLinearizesConstructionRosterAndFullPublication(t
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { ticket.fail(context.Canceled) })
 	if err := ticket.authorizeStateCreation(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -194,11 +232,16 @@ func TestGeneratedDomainRegistryLinearizesConstructionRosterAndFullPublication(t
 		state *generatedDomainState
 		err   error
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	reservationDone := make(chan reservationResult, 1)
+	finished := make(chan struct{})
 	go func() {
-		state, err := reserveGeneratedDomain(context.Background(), domainInput)
+		defer close(finished)
+		state, err := reserveGeneratedDomain(ctx, domainInput)
 		reservationDone <- reservationResult{state: state, err: err}
 	}()
+	registerGeneratedDomainReservationCleanup(t, func() { ticket.fail(context.Canceled) }, cancel, finished, "linearized construction cleanup did not finish")
 	waitGeneratedDomainPairingEpoch(t)
 
 	if constructed, err := New(domainRunner, generatedDomainRegistryManagerOptions(domainFixture)); constructed != nil ||
