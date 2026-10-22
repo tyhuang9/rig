@@ -27,6 +27,106 @@ type CandidateIntentInput struct {
 	CandidatePolicyDigest       string
 }
 
+func readGeneratedDomainStartupCandidateIntents(ctx context.Context, tx *sql.Tx) ([]GeneratedDomainStartupCandidateIntent, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT i.id,i.deployment_id,i.component_name,i.creator_job_id,i.creator_worker_attempt,
+		i.configuration_revision_id,i.configuration_revision_number,i.image_artifact_id,i.image_artifact_attempt,
+		i.environment_operation_id,i.environment_staging_attempt,i.candidate_policy_version,i.candidate_policy_digest,i.created_at,
+		COALESCE(c.deployment_id,''),COALESCE(c.component_name,''),COALESCE(c.image_artifact_id,''),
+		COALESCE(rd.app_id,''),COALESCE(rd.release_id,''),COALESCE(rd.deployment_plan_revision_id,''),
+		COALESCE(rd.deployment_plan_revision_number,0),COALESCE(d.id,''),COALESCE(d.job_id,''),
+		COALESCE(d.actual_configuration_revision_id,''),COALESCE(d.actual_configuration_revision_number,0),
+		COALESCE(d.runtime_strategy,''),COALESCE(d.provenance_initialized,0),
+		COALESCE(j.id,''),COALESCE(j.type,''),COALESCE(j.resource_type,''),COALESCE(j.resource_id,''),
+		COALESCE(cr.id,''),COALESCE(cr.app_id,''),COALESCE(cr.revision_number,0),COALESCE(cr.bundle_version,0),
+		COALESCE(cr.deployment_plan_revision_id,''),COALESCE(cr.deployment_plan_revision_number,0),
+		COALESCE(a.id,''),COALESCE(a.release_id,''),COALESCE(a.deployment_plan_revision_id,''),
+		COALESCE(a.deployment_plan_revision_number,0),COALESCE(a.component_id,''),COALESCE(a.attempt_number,0)
+		FROM generated_candidate_intents i
+		LEFT JOIN generated_runtime_components c
+		 ON c.deployment_id=i.deployment_id AND c.component_name=i.component_name
+		LEFT JOIN generated_runtime_deployments rd ON rd.deployment_id=i.deployment_id
+		LEFT JOIN deployments d ON d.id=i.deployment_id
+		LEFT JOIN jobs j ON j.id=i.creator_job_id
+		LEFT JOIN application_configuration_revisions cr ON cr.id=i.configuration_revision_id
+		LEFT JOIN generated_image_artifacts a ON a.id=i.image_artifact_id
+		ORDER BY i.deployment_id,i.component_name,i.id`)
+	if err != nil {
+		return nil, err
+	}
+	result := []GeneratedDomainStartupCandidateIntent{}
+	for rows.Next() {
+		var value GeneratedDomainStartupCandidateIntent
+		var createdAt string
+		var componentDeployment, componentName, componentArtifact string
+		var runtimeApp, runtimeRelease, runtimePlan string
+		var runtimePlanNumber int64
+		var deploymentID, deploymentJob, deploymentConfiguration, deploymentStrategy string
+		var deploymentConfigurationNumber int64
+		var deploymentInitialized int
+		var jobID, jobType, jobResourceType, jobResourceID string
+		var configurationID, configurationApp, configurationPlan string
+		var configurationNumber, configurationBundle, configurationPlanNumber int64
+		var artifactID, artifactRelease, artifactPlan, artifactComponent string
+		var artifactPlanNumber, artifactAttempt int64
+		if err := rows.Scan(&value.ReceiptID, &value.DeploymentID, &value.ComponentName,
+			&value.CreatorJobID, &value.CreatorWorkerAttempt, &value.ConfigurationRevisionID,
+			&value.ConfigurationRevisionNumber, &value.ImageArtifactID, &value.ImageArtifactAttempt,
+			&value.EnvironmentOperationID, &value.EnvironmentStagingAttempt, &value.CandidatePolicyVersion,
+			&value.CandidatePolicyDigest, &createdAt, &componentDeployment, &componentName, &componentArtifact,
+			&runtimeApp, &runtimeRelease, &runtimePlan, &runtimePlanNumber, &deploymentID, &deploymentJob,
+			&deploymentConfiguration, &deploymentConfigurationNumber, &deploymentStrategy, &deploymentInitialized,
+			&jobID, &jobType, &jobResourceType, &jobResourceID, &configurationID, &configurationApp,
+			&configurationNumber, &configurationBundle, &configurationPlan, &configurationPlanNumber,
+			&artifactID, &artifactRelease, &artifactPlan, &artifactPlanNumber, &artifactComponent, &artifactAttempt); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if !validGeneratedDomainStartupCandidateIntent(value) {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		if _, err := parseTime(createdAt); err != nil {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		if componentDeployment != value.DeploymentID || componentName != value.ComponentName ||
+			componentArtifact != value.ImageArtifactID || !canonicalUUID(runtimeApp) || !validReleaseID(runtimeRelease) ||
+			!canonicalUUID(runtimePlan) || runtimePlanNumber < 1 || deploymentID != value.DeploymentID ||
+			deploymentJob != value.CreatorJobID || deploymentConfiguration != value.ConfigurationRevisionID ||
+			deploymentConfigurationNumber != value.ConfigurationRevisionNumber || deploymentStrategy != "generated_node" ||
+			deploymentInitialized != 1 || jobID != value.CreatorJobID || jobType != "deploy" ||
+			jobResourceType != "application" || jobResourceID != runtimeApp ||
+			configurationID != value.ConfigurationRevisionID || configurationApp != runtimeApp ||
+			configurationNumber != value.ConfigurationRevisionNumber || configurationBundle != 2 ||
+			configurationPlan != runtimePlan || configurationPlanNumber != runtimePlanNumber ||
+			artifactID != value.ImageArtifactID || artifactRelease != runtimeRelease || artifactPlan != runtimePlan ||
+			artifactPlanNumber != runtimePlanNumber || artifactComponent != value.ComponentName ||
+			artifactAttempt != value.ImageArtifactAttempt {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func validGeneratedDomainStartupCandidateIntent(value GeneratedDomainStartupCandidateIntent) bool {
+	return canonicalUUID(value.ReceiptID) && canonicalUUID(value.DeploymentID) &&
+		validText(value.ComponentName, 256) && canonicalUUID(value.CreatorJobID) && value.CreatorWorkerAttempt > 0 &&
+		canonicalUUID(value.ConfigurationRevisionID) && value.ConfigurationRevisionNumber > 0 &&
+		canonicalUUID(value.ImageArtifactID) && value.ImageArtifactAttempt > 0 &&
+		value.EnvironmentOperationID == value.ImageArtifactID &&
+		value.EnvironmentStagingAttempt == value.CreatorWorkerAttempt &&
+		validText(value.CandidatePolicyVersion, 128) && lowerHex(value.CandidatePolicyDigest, 64)
+}
+
 // BeginCandidateTx records immutable create intent and advances the exact
 // image-ready component in the caller's guarded writer transaction.
 func (r *Repository) BeginCandidateTx(ctx context.Context, tx *sql.Tx, input CandidateIntentInput) error {

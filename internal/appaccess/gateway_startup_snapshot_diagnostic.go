@@ -74,8 +74,8 @@ func (e *hostingGatewayStartupDiagnosticError) MarshalJSON() ([]byte, error) {
 }
 
 // HostingGatewayStartupDiagnostic returns finite diagnostic metadata only for
-// a direct error produced by HostingGatewayStartupSnapshot. It does not walk
-// error chains or invoke caller-provided error methods.
+// a direct error produced by HostingGatewayStartupSnapshot or its Tx reader. It
+// does not walk error chains or invoke caller-provided error methods.
 func HostingGatewayStartupDiagnostic(err error) (stage, cause string) {
 	diagnostic, ok := err.(*hostingGatewayStartupDiagnosticError)
 	if !ok || diagnostic == nil {

@@ -3,12 +3,19 @@ package deployments
 import (
 	"context"
 	"database/sql"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/generatedimagestate"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
 // GeneratedOwnerStores is the sealed set of concrete protected stores used by
@@ -33,6 +40,41 @@ type GeneratedOwnerStores struct {
 type generatedOwnerStoresRegistry struct {
 	mu     sync.Mutex
 	stores *GeneratedOwnerStores
+}
+
+// GeneratedDomainStartupSnapshot is the committed, sanitized database-side
+// description used by later startup classification. It grants no effect or
+// readiness authority.
+type GeneratedDomainStartupSnapshot struct {
+	Gateway                 appaccess.HostingGatewayStartupSnapshot
+	Runtime                 generatedruntimestate.GeneratedDomainStartupSnapshot
+	GeneratedDeployments    []GeneratedDomainStartupDeployment
+	Artifacts               []GeneratedDomainStartupArtifact
+	LifecycleOperationCount int64
+	UnresolvedLifecycleApps []string
+}
+
+type GeneratedDomainStartupDeployment struct {
+	ID                                string
+	AppID                             string
+	JobID                             string
+	ReleaseID                         string
+	Status                            Status
+	ProvenanceInitialized             bool
+	DeploymentPlanRevisionID          string
+	DeploymentPlanRevisionNumber      int64
+	ActualConfigurationRevisionID     string
+	ActualConfigurationRevisionNumber int64
+}
+
+type GeneratedDomainStartupArtifact struct {
+	ID                           string
+	ReleaseID                    string
+	DeploymentPlanRevisionID     string
+	DeploymentPlanRevisionNumber int64
+	ComponentID                  string
+	AttemptNumber                int64
+	State                        generatedimagestate.ArtifactState
 }
 
 // ValidateGeneratedOwnerFindings is the pure finding validator shared with
@@ -168,4 +210,373 @@ func (s *GeneratedOwnerStores) EvaluateGeneratedPolicyTx(ctx context.Context, tx
 		return false, false, deploymentexecution.ErrInvalidConfiguration
 	}
 	return evaluatePolicyTx(ctx, tx, appID, findings)
+}
+
+// GeneratedDomainStartupSnapshot owns one read-only transaction on the exact
+// canonical database retained by this sealed store bundle. It returns only a
+// committed descriptive value and returns the zero value on every failure.
+func (s *GeneratedOwnerStores) GeneratedDomainStartupSnapshot(ctx context.Context) (GeneratedDomainStartupSnapshot, error) {
+	if s == nil || ctx == nil {
+		return GeneratedDomainStartupSnapshot{}, deploymentexecution.ErrInvalidConfiguration
+	}
+	value := *s
+	canonical, err := generatedDomainStartupCanonicalBundle(value, nil)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	tx, err := canonical.database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	defer tx.Rollback()
+	snapshot, err := canonical.generatedDomainStartupSnapshotTx(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	if _, err := generatedDomainStartupCanonicalBundle(value, canonical); err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	if _, err := generatedDomainStartupCanonicalBundle(value, canonical); err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+func generatedDomainStartupCanonicalBundle(value GeneratedOwnerStores, expected *GeneratedOwnerStores) (*GeneratedOwnerStores, error) {
+	if value.repository == nil || value.database == nil || value.guard == nil || value.plans == nil ||
+		value.configuration == nil || value.identity == nil {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	canonical, err := value.repository.GeneratedOwnerStores()
+	if err != nil || canonical == nil || (expected != nil && canonical != expected) ||
+		canonical.identity != value.identity || canonical.repository != value.repository ||
+		canonical.database != value.database || canonical.guard != value.guard || canonical.plans != value.plans ||
+		canonical.configuration != value.configuration || !canonical.matches(value.repository) || !value.matches(value.repository) {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	return canonical, nil
+}
+
+func (s *GeneratedOwnerStores) generatedDomainStartupSnapshotTx(ctx context.Context, tx *sql.Tx) (GeneratedDomainStartupSnapshot, error) {
+	if s == nil || !s.Configured() || ctx == nil || tx == nil {
+		return GeneratedDomainStartupSnapshot{}, deploymentexecution.ErrInvalidConfiguration
+	}
+	gateway, err := appaccess.New(s.database).HostingGatewayStartupSnapshotTx(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	runtimeSnapshot, err := generatedruntimestate.New(s.database).GeneratedDomainStartupSnapshotTx(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	generatedDeployments, err := readGeneratedDomainStartupDeployments(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	artifacts, err := readGeneratedDomainStartupArtifacts(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	operationCount, unresolvedApps, err := readGeneratedDomainStartupLifecycle(ctx, tx, s.database)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	return GeneratedDomainStartupSnapshot{
+		Gateway: gateway, Runtime: runtimeSnapshot, GeneratedDeployments: generatedDeployments, Artifacts: artifacts,
+		LifecycleOperationCount: operationCount, UnresolvedLifecycleApps: unresolvedApps,
+	}, nil
+}
+
+func readGeneratedDomainStartupDeployments(ctx context.Context, tx *sql.Tx) ([]GeneratedDomainStartupDeployment, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT d.id,d.app_id,d.job_id,d.release_id,d.status,d.provenance_initialized,
+		d.deployment_plan_revision_id,d.deployment_plan_revision_number,
+		COALESCE(d.actual_configuration_revision_id,''),d.actual_configuration_revision_number,
+		COALESCE(a.id,''),COALESCE(j.id,''),COALESCE(j.resource_type,''),COALESCE(j.resource_id,''),
+		COALESCE(r.id,''),COALESCE(r.app_id,''),COALESCE(r.deployment_plan_revision_id,''),
+		COALESCE(r.deployment_plan_revision_number,0),COALESCE(p.id,''),COALESCE(p.app_id,''),
+		COALESCE(p.revision_number,0),COALESCE(p.strategy,''),COALESCE(c.id,''),COALESCE(c.app_id,''),
+		COALESCE(c.revision_number,0)
+		FROM deployments d
+		LEFT JOIN applications a ON a.id=d.app_id
+		LEFT JOIN jobs j ON j.id=d.job_id
+		LEFT JOIN releases r ON r.id=d.release_id
+		LEFT JOIN deployment_plan_revisions p ON p.id=d.deployment_plan_revision_id
+		LEFT JOIN application_configuration_revisions c ON c.id=d.actual_configuration_revision_id
+		WHERE d.runtime_strategy='generated_node'
+		ORDER BY d.app_id,d.id`)
+	if err != nil {
+		return nil, err
+	}
+	result := []GeneratedDomainStartupDeployment{}
+	for rows.Next() {
+		var value GeneratedDomainStartupDeployment
+		var initialized int
+		var applicationID, jobID, jobResourceType, jobResourceID string
+		var releaseID, releaseApp, releasePlan string
+		var releasePlanNumber int64
+		var planID, planApp, planStrategy string
+		var planNumber int64
+		var configurationID, configurationApp string
+		var configurationNumber int64
+		if err := rows.Scan(&value.ID, &value.AppID, &value.JobID, &value.ReleaseID, &value.Status, &initialized,
+			&value.DeploymentPlanRevisionID, &value.DeploymentPlanRevisionNumber,
+			&value.ActualConfigurationRevisionID, &value.ActualConfigurationRevisionNumber,
+			&applicationID, &jobID, &jobResourceType, &jobResourceID, &releaseID, &releaseApp,
+			&releasePlan, &releasePlanNumber, &planID, &planApp, &planNumber, &planStrategy,
+			&configurationID, &configurationApp, &configurationNumber); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		value.ProvenanceInitialized = initialized == 1
+		configurationValid := value.ActualConfigurationRevisionID == "" && value.ActualConfigurationRevisionNumber == 0
+		if value.ActualConfigurationRevisionID != "" {
+			configurationValid = canonicalGeneratedDomainUUID(value.ActualConfigurationRevisionID) &&
+				value.ActualConfigurationRevisionNumber > 0 && configurationID == value.ActualConfigurationRevisionID &&
+				configurationApp == value.AppID && configurationNumber == value.ActualConfigurationRevisionNumber
+		}
+		if !canonicalGeneratedDomainUUID(value.ID) || !canonicalGeneratedDomainUUID(value.AppID) ||
+			!canonicalGeneratedDomainUUID(value.JobID) || !validReleaseID(value.ReleaseID) ||
+			!knownStatus(value.Status) || !value.ProvenanceInitialized ||
+			!canonicalGeneratedDomainUUID(value.DeploymentPlanRevisionID) || value.DeploymentPlanRevisionNumber < 1 ||
+			applicationID != value.AppID || jobID != value.JobID || jobResourceType != "application" ||
+			jobResourceID != value.AppID || releaseID != value.ReleaseID || releaseApp != value.AppID ||
+			releasePlan != value.DeploymentPlanRevisionID || releasePlanNumber != value.DeploymentPlanRevisionNumber ||
+			planID != value.DeploymentPlanRevisionID || planApp != value.AppID ||
+			planNumber != value.DeploymentPlanRevisionNumber || planStrategy != "generated_node" || !configurationValid {
+			_ = rows.Close()
+			return nil, ErrInvalidDeployment
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func readGeneratedDomainStartupArtifacts(ctx context.Context, tx *sql.Tx) ([]GeneratedDomainStartupArtifact, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.release_id,a.deployment_plan_revision_id,
+		a.deployment_plan_revision_number,a.component_id,a.attempt_number,a.state,a.compiler_version,
+		a.build_definition_digest,COALESCE(a.image_content_id,''),COALESCE(a.diagnostic_code,''),
+		a.created_at,a.updated_at,COALESCE(a.finished_at,''),COALESCE(r.id,''),COALESCE(r.app_id,''),
+		COALESCE(r.deployment_plan_revision_id,''),COALESCE(r.deployment_plan_revision_number,0),
+		COALESCE(p.id,''),COALESCE(p.app_id,''),COALESCE(p.revision_number,0),COALESCE(p.strategy,'')
+		FROM generated_image_artifacts a
+		LEFT JOIN releases r ON r.id=a.release_id
+		LEFT JOIN deployment_plan_revisions p
+		 ON p.id=a.deployment_plan_revision_id AND p.revision_number=a.deployment_plan_revision_number
+		ORDER BY a.release_id,a.component_id,a.attempt_number,a.id`)
+	if err != nil {
+		return nil, err
+	}
+	result := []GeneratedDomainStartupArtifact{}
+	for rows.Next() {
+		var value GeneratedDomainStartupArtifact
+		var compilerVersion, definitionDigest, imageContentID, diagnostic, createdAt, updatedAt, finishedAt string
+		var releaseID, releaseApp, releasePlan string
+		var releasePlanNumber int64
+		var planID, planApp, planStrategy string
+		var planNumber int64
+		if err := rows.Scan(&value.ID, &value.ReleaseID, &value.DeploymentPlanRevisionID,
+			&value.DeploymentPlanRevisionNumber, &value.ComponentID, &value.AttemptNumber, &value.State,
+			&compilerVersion, &definitionDigest, &imageContentID, &diagnostic, &createdAt, &updatedAt, &finishedAt,
+			&releaseID, &releaseApp, &releasePlan, &releasePlanNumber, &planID, &planApp, &planNumber, &planStrategy); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		created, createdErr := time.Parse(time.RFC3339Nano, createdAt)
+		updated, updatedErr := time.Parse(time.RFC3339Nano, updatedAt)
+		var finished time.Time
+		var finishedErr error
+		if finishedAt != "" {
+			finished, finishedErr = time.Parse(time.RFC3339Nano, finishedAt)
+		}
+		if !canonicalGeneratedDomainUUID(value.ID) || !validReleaseID(value.ReleaseID) ||
+			!canonicalGeneratedDomainUUID(value.DeploymentPlanRevisionID) || value.DeploymentPlanRevisionNumber < 1 ||
+			!validGeneratedImageText(value.ComponentID, 256) || value.AttemptNumber < 1 ||
+			!validGeneratedImageText(compilerVersion, 128) || !lowerHex(definitionDigest, 64) ||
+			createdErr != nil || updatedErr != nil || finishedErr != nil || updated.Before(created) ||
+			(!finished.IsZero() && finished.Before(created)) ||
+			!validGeneratedDomainStartupArtifactState(value.State, imageContentID, diagnostic, updated, finished) ||
+			releaseID != value.ReleaseID || releaseApp == "" || releasePlan != value.DeploymentPlanRevisionID ||
+			releasePlanNumber != value.DeploymentPlanRevisionNumber || planID != value.DeploymentPlanRevisionID ||
+			planApp != releaseApp || planNumber != value.DeploymentPlanRevisionNumber || planStrategy != "generated_node" {
+			_ = rows.Close()
+			return nil, ErrInvalidDeployment
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func validGeneratedDomainStartupArtifactState(state generatedimagestate.ArtifactState, imageContentID, diagnostic string, updated, finished time.Time) bool {
+	validImage := len(imageContentID) == 71 && imageContentID[:7] == "sha256:" && lowerHex(imageContentID[7:], 64)
+	switch state {
+	case generatedimagestate.ArtifactBuilding:
+		return imageContentID == "" && diagnostic == "" && finished.IsZero()
+	case generatedimagestate.ArtifactReady:
+		return validImage && diagnostic == "" && !finished.IsZero() && updated.Equal(finished)
+	case generatedimagestate.ArtifactFailed:
+		return imageContentID == "" && generatedDomainArtifactFailureDiagnostic(diagnostic) &&
+			!finished.IsZero() && updated.Equal(finished)
+	case generatedimagestate.ArtifactCancelled:
+		return imageContentID == "" && diagnostic == string(generatedimagestate.DiagnosticBuildCancelled) &&
+			!finished.IsZero() && updated.Equal(finished)
+	case generatedimagestate.ArtifactUnavailable:
+		return validImage && diagnostic == string(generatedimagestate.DiagnosticImageUnavailable) && !finished.IsZero()
+	default:
+		return false
+	}
+}
+
+func generatedDomainArtifactFailureDiagnostic(value string) bool {
+	switch generatedimagestate.DiagnosticCode(value) {
+	case generatedimagestate.DiagnosticBuildFailed, generatedimagestate.DiagnosticBuildTimeout,
+		generatedimagestate.DiagnosticBuildContextInvalid, generatedimagestate.DiagnosticBuildContextTooLarge,
+		generatedimagestate.DiagnosticBuildOutputTruncated, generatedimagestate.DiagnosticBuildDiskExhausted,
+		generatedimagestate.DiagnosticBuildCapacityExceeded, generatedimagestate.DiagnosticRuntimeUnavailable,
+		generatedimagestate.DiagnosticSourceUnavailable, generatedimagestate.DiagnosticSourceIntegrityFailed,
+		generatedimagestate.DiagnosticProcessTerminationFailed, generatedimagestate.DiagnosticDaemonRestarted,
+		generatedimagestate.DiagnosticInternalError:
+		return true
+	default:
+		return false
+	}
+}
+
+func readGeneratedDomainStartupLifecycle(ctx context.Context, tx *sql.Tx, db *sql.DB) (int64, []string, error) {
+	type lifecycleOperation struct {
+		appID    string
+		jobID    string
+		revision int64
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT app_id,job_id,desired_revision
+		FROM application_lifecycle_operations ORDER BY app_id,desired_revision,job_id`)
+	if err != nil {
+		return 0, nil, err
+	}
+	operations := []lifecycleOperation{}
+	apps := map[string]struct{}{}
+	for rows.Next() {
+		var operation lifecycleOperation
+		if err := rows.Scan(&operation.appID, &operation.jobID, &operation.revision); err != nil {
+			_ = rows.Close()
+			return 0, nil, err
+		}
+		if !canonicalGeneratedDomainUUID(operation.appID) || !canonicalGeneratedDomainUUID(operation.jobID) || operation.revision < 1 {
+			_ = rows.Close()
+			return 0, nil, deploymentbinding.ErrInvalidBinding
+		}
+		operations = append(operations, operation)
+		apps[operation.appID] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, nil, err
+	}
+
+	missingCurrent := map[string]struct{}{}
+	headRows, err := tx.QueryContext(ctx, `SELECT h.app_id,h.revision_number,COALESCE(current.job_id,'')
+		FROM application_desired_lifecycle_heads h
+		LEFT JOIN application_lifecycle_operations current
+		 ON current.app_id=h.app_id AND current.desired_revision=h.revision_number
+		WHERE h.revision_number>0 ORDER BY h.app_id`)
+	if err != nil {
+		return 0, nil, err
+	}
+	for headRows.Next() {
+		var appID, currentJobID string
+		var revision int64
+		if err := headRows.Scan(&appID, &revision, &currentJobID); err != nil {
+			_ = headRows.Close()
+			return 0, nil, err
+		}
+		if !canonicalGeneratedDomainUUID(appID) || revision < 1 {
+			_ = headRows.Close()
+			return 0, nil, deploymentbinding.ErrInvalidBinding
+		}
+		if currentJobID == "" {
+			missingCurrent[appID] = struct{}{}
+		} else if !canonicalGeneratedDomainUUID(currentJobID) {
+			_ = headRows.Close()
+			return 0, nil, deploymentbinding.ErrInvalidBinding
+		}
+	}
+	if err := headRows.Err(); err != nil {
+		_ = headRows.Close()
+		return 0, nil, err
+	}
+	if err := headRows.Close(); err != nil {
+		return 0, nil, err
+	}
+
+	repository := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(repository)
+	if err != nil || !validator.ConfiguredFor(db) {
+		return 0, nil, deploymentbinding.ErrInvalidConfiguration
+	}
+	appIDs := make([]string, 0, len(apps))
+	for appID := range apps {
+		appIDs = append(appIDs, appID)
+	}
+	sort.Strings(appIDs)
+	unresolved := missingCurrent
+	for _, appID := range appIDs {
+		value, err := validator.UnresolvedHistoryTx(ctx, tx, appID)
+		if err != nil {
+			return 0, nil, err
+		}
+		if value {
+			unresolved[appID] = struct{}{}
+		}
+	}
+	for _, operation := range operations {
+		completion, err := validator.CurrentOperationTx(ctx, tx, deploymentbinding.OperationRef{
+			ApplicationID: operation.appID, OperationID: operation.jobID, DesiredRevision: operation.revision,
+		})
+		if err != nil {
+			return 0, nil, err
+		}
+		switch completion {
+		case deploymentbinding.CompletionComplete:
+		case deploymentbinding.CompletionIncomplete:
+			unresolved[operation.appID] = struct{}{}
+		default:
+			return 0, nil, deploymentbinding.ErrInvalidBinding
+		}
+	}
+	result := make([]string, 0, len(unresolved))
+	for appID := range unresolved {
+		result = append(result, appID)
+	}
+	sort.Strings(result)
+	return int64(len(operations)), result, nil
+}
+
+func canonicalGeneratedDomainUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed.String() == value
 }
