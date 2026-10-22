@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 
 	"github.com/hostd/hostd/internal/appaccess"
@@ -89,6 +90,21 @@ func gatewayCurrentUpgradeSelection(history gatewayRebindProtectedIntentHistory,
 func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtectedIntentHistory,
 	snapshot appaccess.GatewayRebindRecoverySnapshot,
 ) (gatewayCurrentSelection, error) {
+	return gatewayCurrentRebindSelectionResolved(nil, dataRoot, history, snapshot)
+}
+
+func gatewayCurrentRebindSelectionFromStore(directory *stateStore, history gatewayRebindProtectedIntentHistory,
+	snapshot appaccess.GatewayRebindRecoverySnapshot,
+) (gatewayCurrentSelection, error) {
+	if directory == nil || directory.root == "" {
+		return gatewayCurrentSelection{}, errors.New("invalid generated ingress current route store")
+	}
+	return gatewayCurrentRebindSelectionResolved(directory, "", history, snapshot)
+}
+
+func gatewayCurrentRebindSelectionResolved(directory *stateStore, dataRoot string,
+	history gatewayRebindProtectedIntentHistory, snapshot appaccess.GatewayRebindRecoverySnapshot,
+) (gatewayCurrentSelection, error) {
 	if snapshot.CurrentSource == nil || snapshot.CurrentSource.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
 		!gatewayCurrentAuthorityHasDatabaseCommit(snapshot.History, snapshot.CurrentDatabaseCommittedEvent,
 			*snapshot.CurrentSource) ||
@@ -140,7 +156,15 @@ func gatewayCurrentRebindSelection(dataRoot string, history gatewayRebindProtect
 	if err != nil || gatewayCurrentAuthority(lineage) != *snapshot.CurrentSource {
 		return gatewayCurrentSelection{}, errors.New("generated ingress current rebind authority disagrees with protected state")
 	}
-	store, err := newGatewayCurrentRouteStateStore(dataRoot, lineage)
+	var store *gatewayCurrentRouteStateStore
+	if directory == nil {
+		store, err = newGatewayCurrentRouteStateStore(dataRoot, lineage)
+	} else {
+		name, purpose := gatewayCurrentRouteStateName(lineage.ProtectedGeneration, lineage.OperationID)
+		store = &gatewayCurrentRouteStateStore{directory: directory,
+			generation: lineage.ProtectedGeneration, operationID: lineage.OperationID,
+			path: filepath.Join(directory.root, name), purpose: purpose}
+	}
 	if err != nil {
 		return gatewayCurrentSelection{}, err
 	}

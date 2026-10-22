@@ -1366,6 +1366,19 @@ func newGatewayRebindProgressStore(dataRoot string, generation uint64, operation
 	}, nil
 }
 
+func bindGatewayRebindProgressStoreReadOnly(directory *stateStore, generation uint64,
+	operationID string, sequence uint64,
+) (*gatewayRebindProgressStore, error) {
+	if directory == nil || directory.root == "" || filepath.Dir(directory.path) != directory.root ||
+		generation == 0 || generation == math.MaxUint64 || !validCanonicalUUID(operationID) ||
+		sequence == 0 || sequence > gatewayRebindProgressMaximumSequence {
+		return nil, errors.New("invalid generated ingress read-only rebind progress store")
+	}
+	name, purpose := gatewayRebindProgressName(generation, operationID, sequence)
+	return &gatewayRebindProgressStore{directory: directory, generation: generation, operationID: operationID,
+		sequence: sequence, path: filepath.Join(directory.root, name), purpose: purpose}, nil
+}
+
 func gatewayRebindProgressName(generation uint64, operationID string, sequence uint64) (string, string) {
 	token := fmt.Sprintf("%0*d.%s.s%0*d", gatewayV2GenerationDigits, generation, operationID,
 		gatewayRebindProgressSequenceDigits, sequence)
@@ -1490,6 +1503,27 @@ func gatewayRebindProgressMatchesCheckpointHistory(history gatewayRebindProtecte
 func scanGatewayRebindProgressForIntentV2(dataRoot string, intent gatewayRebindProtectedIntentV2,
 	checkpoint gatewayRebindPredecessorCheckpoint, artifacts gatewayRebindHistoryGeneration,
 ) ([]gatewayRebindProgressSelection, error) {
+	return scanGatewayRebindProgressForIntentV2Resolved(nil, dataRoot, intent, checkpoint, artifacts, nil)
+}
+
+func scanGatewayRebindProgressForIntentV2FromStore(directory *stateStore,
+	intent gatewayRebindProtectedIntentV2, checkpoint gatewayRebindPredecessorCheckpoint,
+	artifacts gatewayRebindHistoryGeneration,
+) ([]gatewayRebindProgressSelection, error) {
+	return scanGatewayRebindProgressForIntentV2Resolved(directory, "", intent, checkpoint, artifacts, nil)
+}
+
+func scanGatewayRebindProgressForIntentV2FromSnapshot(directory *stateStore,
+	reader *generatedDomainProtectedReader, intent gatewayRebindProtectedIntentV2,
+	checkpoint gatewayRebindPredecessorCheckpoint, artifacts gatewayRebindHistoryGeneration,
+) ([]gatewayRebindProgressSelection, error) {
+	return scanGatewayRebindProgressForIntentV2Resolved(directory, "", intent, checkpoint, artifacts, reader)
+}
+
+func scanGatewayRebindProgressForIntentV2Resolved(directory *stateStore, dataRoot string,
+	intent gatewayRebindProtectedIntentV2, checkpoint gatewayRebindPredecessorCheckpoint,
+	artifacts gatewayRebindHistoryGeneration, reader *generatedDomainProtectedReader,
+) ([]gatewayRebindProgressSelection, error) {
 	sequences := make([]uint64, 0, len(artifacts.progress))
 	for sequence := range artifacts.progress {
 		sequences = append(sequences, sequence)
@@ -1501,11 +1535,22 @@ func scanGatewayRebindProgressForIntentV2(dataRoot string, intent gatewayRebindP
 			return nil, errors.New("generated ingress typed rebind progress history has a sequence gap")
 		}
 		artifact := artifacts.progress[sequence]
-		store, err := newGatewayRebindProgressStore(dataRoot, intent.Generation, intent.OperationID, sequence)
+		var store *gatewayRebindProgressStore
+		var err error
+		if directory == nil {
+			store, err = newGatewayRebindProgressStore(dataRoot, intent.Generation, intent.OperationID, sequence)
+		} else {
+			store, err = bindGatewayRebindProgressStoreReadOnly(directory, intent.Generation, intent.OperationID, sequence)
+		}
 		if err != nil || store.path != artifact.path {
 			return nil, errors.New("generated ingress typed rebind progress history path is invalid")
 		}
-		value, err := store.load()
+		var value gatewayRebindProgressRecord
+		if reader != nil {
+			value, err = readGeneratedDomainRebindProgress(reader, store)
+		} else {
+			value, err = store.load()
+		}
 		if err != nil || !gatewayRebindProgressMatchesIntentV2(value, intent, result) {
 			return nil, errors.New("generated ingress typed rebind progress history is invalid")
 		}
@@ -1711,6 +1756,26 @@ func (s *gatewayRebindProgressStore) load() (gatewayRebindProgressRecord, error)
 func scanGatewayRebindProgressForIntent(dataRoot string, intent gatewayRebindProtectedIntent,
 	predecessor gatewayUpgradeGenerationSelection, artifacts gatewayRebindHistoryGeneration,
 ) ([]gatewayRebindProgressSelection, error) {
+	return scanGatewayRebindProgressForIntentResolved(nil, dataRoot, intent, predecessor, artifacts, nil)
+}
+
+func scanGatewayRebindProgressForIntentFromStore(directory *stateStore, intent gatewayRebindProtectedIntent,
+	predecessor gatewayUpgradeGenerationSelection, artifacts gatewayRebindHistoryGeneration,
+) ([]gatewayRebindProgressSelection, error) {
+	return scanGatewayRebindProgressForIntentResolved(directory, "", intent, predecessor, artifacts, nil)
+}
+
+func scanGatewayRebindProgressForIntentFromSnapshot(directory *stateStore,
+	reader *generatedDomainProtectedReader, intent gatewayRebindProtectedIntent,
+	predecessor gatewayUpgradeGenerationSelection, artifacts gatewayRebindHistoryGeneration,
+) ([]gatewayRebindProgressSelection, error) {
+	return scanGatewayRebindProgressForIntentResolved(directory, "", intent, predecessor, artifacts, reader)
+}
+
+func scanGatewayRebindProgressForIntentResolved(directory *stateStore, dataRoot string,
+	intent gatewayRebindProtectedIntent, predecessor gatewayUpgradeGenerationSelection,
+	artifacts gatewayRebindHistoryGeneration, reader *generatedDomainProtectedReader,
+) ([]gatewayRebindProgressSelection, error) {
 	sequences := make([]uint64, 0, len(artifacts.progress))
 	for sequence := range artifacts.progress {
 		sequences = append(sequences, sequence)
@@ -1722,11 +1787,22 @@ func scanGatewayRebindProgressForIntent(dataRoot string, intent gatewayRebindPro
 			return nil, errors.New("generated ingress rebind progress history has a sequence gap")
 		}
 		artifact := artifacts.progress[sequence]
-		store, err := newGatewayRebindProgressStore(dataRoot, intent.Generation, intent.OperationID, sequence)
+		var store *gatewayRebindProgressStore
+		var err error
+		if directory == nil {
+			store, err = newGatewayRebindProgressStore(dataRoot, intent.Generation, intent.OperationID, sequence)
+		} else {
+			store, err = bindGatewayRebindProgressStoreReadOnly(directory, intent.Generation, intent.OperationID, sequence)
+		}
 		if err != nil || store.path != artifact.path {
 			return nil, errors.New("generated ingress rebind progress history path is invalid")
 		}
-		value, err := store.load()
+		var value gatewayRebindProgressRecord
+		if reader != nil {
+			value, err = readGeneratedDomainRebindProgress(reader, store)
+		} else {
+			value, err = store.load()
+		}
 		if err != nil || !gatewayRebindProgressMatchesIntent(value, intent, result) ||
 			(value.Sequence >= 11 && (value.Stage == nil || value.Stage.FinalConfigIntent == nil ||
 				!gatewayRebindFinalConfigRoutePlanMatchesPredecessor(intent, predecessor,
