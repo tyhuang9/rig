@@ -416,7 +416,7 @@ func controllerProcessKillRunChild(t *testing.T) {
 		db: db, applications: apps.New(db), snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: manifest.Docker, runner: controllerProcessKillRunner{delegate: runtimeprocess.ExecRunner{}, barrier: barrier}})
+	}, runtimeCompositionOptions{dockerExecutable: manifest.Docker, runner: &controllerProcessKillRunner{delegate: runtimeprocess.ExecRunner{}, barrier: barrier}})
 	if err != nil {
 		t.Fatal("reopen production generated composition")
 	}

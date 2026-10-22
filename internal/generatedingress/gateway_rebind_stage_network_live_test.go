@@ -14,7 +14,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 )
 
 // TestLiveGatewayRebindSuccessorNetworkStage exercises the private first
@@ -32,12 +31,7 @@ func TestLiveGatewayRebindSuccessorNetworkStage(t *testing.T) {
 		applicationReply: "gateway-v2-rebind-network-stage",
 		countRequests:    true,
 	})
-	db, err := database.Open(fixture.stateRoot)
-	if err != nil {
-		t.Fatal("open live rebind network SQLite fixture")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
+	db, repository := fixture.db, fixture.repository
 	profile := prepareLiveGatewayRebindStagePredecessor(t, fixture, db, repository)
 
 	successor := appaccess.GatewayProfileSpec{

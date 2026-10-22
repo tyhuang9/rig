@@ -57,6 +57,8 @@ type liveGatewayV2Fixture struct {
 	stateRoot    string
 	db           *sql.DB
 	repository   *appaccess.Repository
+	authority    *liveGeneratedAuthority
+	engine       liveRuntimeEngine
 	ingress      *Manager
 	candidates   []liveRuntimeCandidate
 	spec         liveGatewayV2FixtureSpec
@@ -225,7 +227,13 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
-	authority := liveGeneratedDeployments(t, working)
+	db, err := database.Open(stateRoot)
+	if err != nil {
+		t.Fatal("open real live gateway-v2 control database")
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	repository := appaccess.New(db)
+	authority := liveGeneratedDeploymentsWithDatabase(t, db, working)
 	engine, err := newLiveRuntimeEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
@@ -234,12 +242,6 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	if err != nil {
 		t.Fatal("create live gateway-v2 runtime")
 	}
-	db, err := database.Open(stateRoot)
-	if err != nil {
-		t.Fatal("open real live gateway-v2 control database")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
 	ingress, err := New(runner, Options{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		DataRoot: stateRoot, HostPort: freeLoopbackPort(t), CommandTimeout: 45 * time.Second,
@@ -251,7 +253,8 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	}
 	fixture := &liveGatewayV2Fixture{
 		ctx: ctx, runner: runner, docker: docker, root: root, dockerConfig: dockerConfig,
-		stateRoot: stateRoot, db: db, repository: repository, ingress: ingress, spec: spec, interfaceIP: selected.IPv4, port: port,
+		stateRoot: stateRoot, db: db, repository: repository, authority: authority, engine: engine,
+		ingress: ingress, spec: spec, interfaceIP: selected.IPv4, port: port,
 	}
 	// LIFO cleanup removes v2 first, then candidates/v1/application resources.
 	t.Cleanup(func() {

@@ -37,6 +37,7 @@ import (
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/hostnetwork"
 	"github.com/hostd/hostd/internal/jobs"
@@ -58,6 +59,32 @@ func liveDeploymentExecutionFixture(t *testing.T, db *sql.DB, dataRoot string) (
 		t.Fatal(err)
 	}
 	return directories.WorkingDirectory, admission
+}
+
+func TestLiveRuntimeCompositionAcceptsFixtureRunnerPointers(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		runner runtimeprocess.CommandRunner
+	}{
+		{name: "exec runner", runner: &runtimeprocess.ExecRunner{}},
+		{name: "process-kill runner", runner: &controllerProcessKillRunner{delegate: runtimeprocess.ExecRunner{}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeCompositionFixture(t)
+			fixture.configuration.GeneratedRuntime = true
+			composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+				dockerExecutable: fixture.dockerExecutable,
+				runner:           test.runner,
+				recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
+			})
+			if err != nil {
+				t.Fatalf("compose generated runtime with %s: %v", test.name, err)
+			}
+			if composition.generated == nil {
+				t.Fatalf("generated runtime with %s was not composed", test.name)
+			}
+		})
+	}
 }
 
 const liveHostdGatewayRebindEnvironment = "RIG_RUN_LIVE_HOSTD_GATEWAY_REBIND"
@@ -210,7 +237,7 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 		db: db, applications: applicationStore, snapshots: snapshots, configuration: configurationStore,
 		deployments: deploymentStore, plans: planStore, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: runtimeprocess.ExecRunner{}})
+	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &runtimeprocess.ExecRunner{}})
 	if err != nil {
 		t.Fatal("compose supported hostd rebind baseline:", err)
 	}
