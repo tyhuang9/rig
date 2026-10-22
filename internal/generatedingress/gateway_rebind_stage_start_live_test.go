@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 )
 
 const liveGatewayRebindStageStartNetworkEnvironment = "RIG_RUN_LIVE_GATEWAY_REBIND_STAGE_START_NETWORK"
@@ -95,12 +94,7 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
 	fixture := newLiveGatewayV2Fixture(t, spec)
 	fixture.interfaceIP = predecessorAddress.IPv4
 	fixture.request = liveGatewayV2Request(t, spec, predecessorAddress, fixture.port)
-	db, err := database.Open(fixture.stateRoot)
-	if err != nil {
-		t.Fatal("open live stage-start SQLite fixture")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
+	db, repository := fixture.db, fixture.repository
 	profile := prepareLiveGatewayRebindStagePredecessor(t, fixture, db, repository)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile,
 		appaccess.GatewayProfileSpec{
