@@ -199,6 +199,94 @@ TestExecutorManagedWorkspaceBindIsReadOnlyForGitHubAndLocal
 TestPolicyCanonicalScopeFingerprintAndRepositoryParity
 ```
 
+## Hosted follow-up: original stage-fixture database
+
+On 2026-10-22, PR #206 at
+`a3bc51e04c3d7b79b428f2c12923c72b3646a70d` had 117 successful checks,
+17 failed checks and one skipped check. The 15 failed source jobs checked out
+merge `70f4b77db3edc5a9498ea4171330ac31f374bb2b`, whose tree
+`41a4fa1d1903e64c871cd3b5e7c1394238568a8a` equals the published head tree.
+The other two failures were aggregate jobs.
+
+Eight Docker jobs, covering eleven live parents, refused setup because six
+stage helpers reopened the same database path and constructed a second
+repository. The authority deliberately requires the original database pointer.
+Each helper now uses `fixture.db` and `fixture.repository`; its redundant open,
+close registration and database import are removed. The shared fixture retains
+database cleanup ownership. Every assertion, lost-acknowledgment/proof-failure
+case, resource cleanup and timeout remains unchanged. Independent child-process
+database opens remain intact. The production guard is unchanged.
+
+The affected helpers are network, config volume, data volume, stopped container,
+config copy and start under `internal/generatedingress/gateway_rebind_stage_*_live_test.go`.
+Final-config-copy tests use the repaired start helper indirectly. The focused
+source review found exactly six insertions and 42 deletions across those six
+test files, with no production source or workflow change.
+
+### Follow-up verification
+
+Pinned Go 1.26.7 and the same readonly, non-race environment described above were
+used. Windows and Linux live-tag ingress vet and test-binary compilation passed.
+These three selected parents passed on Windows and native WSL Linux, with zero
+subtests, failures or skips on either platform:
+
+```text
+internal/generatedingress (live_docker):
+  TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes
+  TestLiveGeneratedAuthorityUsesCallerDatabaseAcrossSequentialBindings
+internal/generatedruntime/liveauthority:
+  TestPublishedHistoryRefusesIncompleteMismatchedAndForeignStateWithoutWrites
+```
+
+Canonical generation and diff checks passed. Six-file source hashes were stable
+through verification. The original receipt is a prose command summary with raw
+logs and binary hashes, rather than a timestamped per-command ledger; silent
+vet/compile output is supported by the recorded command exit observations.
+An initial PowerShell flag-tokenization failure occurred before test execution
+and remains in its original log. Corrected discovery and execution passed.
+
+Root subsequently discovered all eleven affected hosted parents in each existing
+binary, without running Docker tests. They share the prefix
+`TestLiveGatewayRebindSuccessor` and these suffixes:
+
+```text
+NetworkStage
+ConfigVolumeStage
+DataVolumeStage
+StoppedStageContainer
+StageConfigCopy
+StageConfigCopyLostAcknowledgmentAdopts
+StageStart
+StageStartLostAcknowledgmentAdopts
+StageStartProofFailureWithdraws
+FinalConfigCopy
+FinalConfigCopyLostAcknowledgmentAdopts
+```
+
+The complete 1,048-file Go/module manifest was recorded after the tests and is
+not claimed as a pre-test full-source freeze. It records the six-file source
+transition from the earlier baseline. Documentation checks bind to this later
+manifest. The local evidence directory is
+`m4-ci-baseline-verification/stage-fixture-repair-20261022/` beneath the existing
+temporary evidence root.
+
+| Evidence | SHA256 |
+| --- | --- |
+| Worker verification receipt, `20261022T130357/verification-receipt.txt` | `973c90beb27c4ec482822f9a40df1aa15c5687a599e8222b44ff0c811f0b7e05` |
+| Worker evidence inventory, `20261022T130357/final-evidence-sha256.tsv` | `32535a2eb6b942bfeaf17e07bda6ac02e2c52c9df6ebf332553cd05cb482099d` |
+| Independent six-file source review | `93d32d460bb28d831714e9eac3b6bf3f5956b1b821ee5e097e87aac358b55ad5` |
+| Additive hosted-parent discovery and prior JSONL audit | `c93c2fd5ef3500a405b08fd8bebe88379ea170c8168b1599465f8724d202062b` |
+| Post-verification 1,048-file Go/module manifest | `d1f69833b7310684dc71be8b3343ff87bf2fa127260417e1cb1ddb1c1922677b` |
+| Exact-head hosted failure triage | `fcc67239903ac3bd34d2f4497f2d34e4446965bb4f650b124f5fa52f1598c899` |
+
+This repair needs hosted Docker execution. Six separate route/restart jobs still
+pause during reconciliation; their precise failing branch remains under
+investigation. The ingress race remainder exceeded its unchanged 32-minute
+budget after 252 parent passes, 24 skips and one interrupted parent. Its sampled
+migration stack does not establish a deadlock. The two aggregate failures follow
+those failed jobs and do not independently establish a PostgreSQL regression.
+These failures remain open; local fixture checks do not complete M4 acceptance.
+
 ## Rollback and limits
 
 Revert this topic's integration if its combined behavior is unsuitable. No data

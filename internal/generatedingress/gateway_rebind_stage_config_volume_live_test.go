@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 )
 
 // TestLiveGatewayRebindSuccessorConfigVolumeStage proves the second private
@@ -24,12 +23,7 @@ func TestLiveGatewayRebindSuccessorConfigVolumeStage(t *testing.T) {
 		applicationReply: "gateway-v2-rebind-config-volume-stage",
 		countRequests:    true,
 	})
-	db, err := database.Open(fixture.stateRoot)
-	if err != nil {
-		t.Fatal("open live rebind config-volume SQLite fixture")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
+	db, repository := fixture.db, fixture.repository
 	profile := prepareLiveGatewayRebindStagePredecessor(t, fixture, db, repository)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile,
 		appaccess.GatewayProfileSpec{
