@@ -139,6 +139,389 @@ func (r *Repository) UsesDatabase(db *sql.DB) bool {
 	return r != nil && db != nil && r.db == db
 }
 
+// GeneratedDomainStartupSnapshot is a sanitized, descriptive census of all
+// retained generated runtime state. Its slices are always non-nil and sorted.
+type GeneratedDomainStartupSnapshot struct {
+	ActiveHeads      []GeneratedDomainStartupActiveHead
+	Deployments      []GeneratedDomainStartupDeployment
+	Components       []GeneratedDomainStartupComponent
+	CandidateIntents []GeneratedDomainStartupCandidateIntent
+}
+
+type GeneratedDomainStartupActiveHead struct {
+	AppID        string
+	DeploymentID string
+	ReleaseID    string
+	Slot         string
+	Generation   int64
+}
+
+type GeneratedDomainStartupDeployment struct {
+	DeploymentID                 string
+	AppID                        string
+	ReleaseID                    string
+	DeploymentPlanRevisionID     string
+	DeploymentPlanRevisionNumber int64
+	CandidateSlot                string
+	PreviousActiveDeploymentID   string
+	PreviousActiveSlot           string
+	Phase                        Phase
+	MigrationState               MigrationState
+}
+
+type GeneratedDomainStartupComponent struct {
+	DeploymentID    string
+	ComponentName   string
+	Slot            string
+	ImageArtifactID string
+	ContainerName   string
+	ContainerID     string
+	State           ComponentState
+}
+
+type GeneratedDomainStartupCandidateIntent struct {
+	ReceiptID                   string
+	DeploymentID                string
+	ComponentName               string
+	CreatorJobID                string
+	CreatorWorkerAttempt        int
+	ConfigurationRevisionID     string
+	ConfigurationRevisionNumber int64
+	ImageArtifactID             string
+	ImageArtifactAttempt        int64
+	EnvironmentOperationID      string
+	EnvironmentStagingAttempt   int
+	CandidatePolicyVersion      string
+	CandidatePolicyDigest       string
+}
+
+// GeneratedDomainStartupSnapshotTx reads every generated runtime base table
+// independently through a caller-owned transaction. The transaction is not
+// evidence of database identity; trusted composition must establish that.
+func (r *Repository) GeneratedDomainStartupSnapshotTx(ctx context.Context, tx *sql.Tx) (GeneratedDomainStartupSnapshot, error) {
+	if r == nil || r.db == nil || ctx == nil || tx == nil {
+		return GeneratedDomainStartupSnapshot{}, ErrInvalidState
+	}
+	heads, err := readGeneratedDomainStartupActiveHeads(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	deployments, err := readGeneratedDomainStartupDeployments(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	components, err := readGeneratedDomainStartupComponents(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	intents, err := readGeneratedDomainStartupCandidateIntents(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	return GeneratedDomainStartupSnapshot{
+		ActiveHeads: heads, Deployments: deployments, Components: components, CandidateIntents: intents,
+	}, nil
+}
+
+func readGeneratedDomainStartupActiveHeads(ctx context.Context, tx *sql.Tx) ([]GeneratedDomainStartupActiveHead, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT h.app_id,h.deployment_id,h.release_id,
+		h.slot,h.generation,h.updated_at,
+		CASE WHEN a.id IS NULL THEN 0 ELSE 1 END,COALESCE(rd.release_id,''),COALESCE(rd.candidate_slot,''),
+		COALESCE(rel.app_id,'')
+		FROM generated_runtime_active_heads h
+		LEFT JOIN applications a ON a.id=h.app_id
+		LEFT JOIN generated_runtime_deployments rd ON rd.app_id=h.app_id AND rd.deployment_id=h.deployment_id
+		LEFT JOIN releases rel ON rel.id=h.release_id
+		ORDER BY h.app_id`)
+	if err != nil {
+		return nil, err
+	}
+	result := []GeneratedDomainStartupActiveHead{}
+	for rows.Next() {
+		var value GeneratedDomainStartupActiveHead
+		var deploymentID, releaseID, slot, updatedAt sql.NullString
+		var runtimeRelease, runtimeSlot, releaseApp string
+		var applicationExists int
+		if err := rows.Scan(&value.AppID, &deploymentID, &releaseID, &slot, &value.Generation,
+			&updatedAt, &applicationExists, &runtimeRelease, &runtimeSlot, &releaseApp); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if !canonicalUUID(value.AppID) || applicationExists != 1 || value.Generation < 0 {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		if value.Generation == 0 {
+			if deploymentID.Valid || releaseID.Valid || slot.Valid || updatedAt.Valid {
+				_ = rows.Close()
+				return nil, ErrInvalidState
+			}
+			continue
+		}
+		if !deploymentID.Valid || !releaseID.Valid || !slot.Valid || !updatedAt.Valid {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		value.DeploymentID = deploymentID.String
+		value.ReleaseID = releaseID.String
+		value.Slot = slot.String
+		if !canonicalUUID(value.DeploymentID) || !validReleaseID(value.ReleaseID) ||
+			(value.Slot != "blue" && value.Slot != "green") || runtimeRelease != value.ReleaseID ||
+			runtimeSlot != value.Slot || releaseApp != value.AppID {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		if _, err := parseTime(updatedAt.String); err != nil {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func readGeneratedDomainStartupDeployments(ctx context.Context, tx *sql.Tx) ([]GeneratedDomainStartupDeployment, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT rd.deployment_id,rd.app_id,rd.release_id,
+		rd.deployment_plan_revision_id,rd.deployment_plan_revision_number,rd.candidate_slot,
+		COALESCE(rd.previous_active_deployment_id,''),COALESCE(rd.previous_active_slot,''),rd.phase,rd.migration_state,
+		COALESCE(rd.diagnostic_code,''),rd.created_at,rd.updated_at,COALESCE(rd.migration_started_at,''),
+		COALESCE(rd.migration_finished_at,''),COALESCE(rd.finished_at,''),
+		COALESCE(d.id,''),COALESCE(d.app_id,''),COALESCE(d.release_id,''),COALESCE(d.runtime_strategy,''),
+		COALESCE(d.provenance_initialized,0),COALESCE(d.deployment_plan_revision_id,''),
+		COALESCE(d.deployment_plan_revision_number,0),COALESCE(d.status,''),
+		COALESCE(p.id,''),COALESCE(p.app_id,''),COALESCE(p.revision_number,0),COALESCE(p.strategy,''),
+		COALESCE(rel.id,''),COALESCE(rel.app_id,''),COALESCE(rel.deployment_plan_revision_id,''),
+		COALESCE(rel.deployment_plan_revision_number,0)
+		FROM generated_runtime_deployments rd
+		LEFT JOIN deployments d ON d.id=rd.deployment_id
+		LEFT JOIN deployment_plan_revisions p ON p.id=rd.deployment_plan_revision_id AND p.app_id=rd.app_id
+		LEFT JOIN releases rel ON rel.id=rd.release_id
+		ORDER BY rd.app_id,rd.deployment_id`)
+	if err != nil {
+		return nil, err
+	}
+	result := []GeneratedDomainStartupDeployment{}
+	for rows.Next() {
+		var value GeneratedDomainStartupDeployment
+		var diagnostic, createdAt, updatedAt, migrationStartedAt, migrationFinishedAt, finishedAt string
+		var genericID, genericApp, genericRelease, genericStrategy, genericPlan, genericStatus string
+		var genericInitialized int
+		var genericPlanNumber int64
+		var planID, planApp, planStrategy, releaseID, releaseApp, releasePlan string
+		var planNumber, releasePlanNumber int64
+		if err := rows.Scan(&value.DeploymentID, &value.AppID, &value.ReleaseID,
+			&value.DeploymentPlanRevisionID, &value.DeploymentPlanRevisionNumber, &value.CandidateSlot,
+			&value.PreviousActiveDeploymentID, &value.PreviousActiveSlot, &value.Phase, &value.MigrationState,
+			&diagnostic, &createdAt, &updatedAt, &migrationStartedAt, &migrationFinishedAt, &finishedAt,
+			&genericID, &genericApp, &genericRelease, &genericStrategy, &genericInitialized, &genericPlan,
+			&genericPlanNumber, &genericStatus, &planID, &planApp, &planNumber, &planStrategy,
+			&releaseID, &releaseApp, &releasePlan, &releasePlanNumber); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		created, createdErr := parseTime(createdAt)
+		updated, updatedErr := parseTime(updatedAt)
+		migrationStarted, startedErr := parseOptionalTime(migrationStartedAt)
+		migrationFinished, migrationErr := parseOptionalTime(migrationFinishedAt)
+		finished, finishedErr := parseOptionalTime(finishedAt)
+		if !validGeneratedDomainStartupDeployment(value, diagnostic) || createdErr != nil || updatedErr != nil ||
+			startedErr != nil || migrationErr != nil || finishedErr != nil || updated.Before(created) ||
+			(!migrationStarted.IsZero() && migrationStarted.Before(created)) ||
+			(!migrationFinished.IsZero() && (migrationStarted.IsZero() || migrationFinished.Before(migrationStarted))) ||
+			(!finished.IsZero() && finished.Before(created)) ||
+			genericID != value.DeploymentID || genericApp != value.AppID || genericRelease != value.ReleaseID ||
+			genericStrategy != "generated_node" || genericInitialized != 1 || genericPlan != value.DeploymentPlanRevisionID ||
+			genericPlanNumber != value.DeploymentPlanRevisionNumber || !knownGeneratedDomainDeploymentStatus(genericStatus) ||
+			planID != value.DeploymentPlanRevisionID || planApp != value.AppID ||
+			planNumber != value.DeploymentPlanRevisionNumber || planStrategy != "generated_node" ||
+			releaseID != value.ReleaseID || releaseApp != value.AppID || releasePlan != value.DeploymentPlanRevisionID ||
+			releasePlanNumber != value.DeploymentPlanRevisionNumber ||
+			!validGeneratedDomainMigrationTimes(value.MigrationState, migrationStarted, migrationFinished) ||
+			terminalPhase(value.Phase) != !finished.IsZero() {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func validGeneratedDomainStartupDeployment(value GeneratedDomainStartupDeployment, diagnostic string) bool {
+	if !canonicalUUID(value.DeploymentID) || !canonicalUUID(value.AppID) || !validReleaseID(value.ReleaseID) ||
+		!canonicalUUID(value.DeploymentPlanRevisionID) || value.DeploymentPlanRevisionNumber < 1 ||
+		(value.CandidateSlot != "blue" && value.CandidateSlot != "green") || !knownGeneratedDomainPhase(value.Phase) ||
+		!knownGeneratedDomainMigrationState(value.MigrationState) {
+		return false
+	}
+	if (value.PreviousActiveDeploymentID == "") != (value.PreviousActiveSlot == "") {
+		return false
+	}
+	if value.PreviousActiveDeploymentID == "" {
+		if value.CandidateSlot != "blue" {
+			return false
+		}
+	} else if !canonicalUUID(value.PreviousActiveDeploymentID) ||
+		(value.PreviousActiveSlot != "blue" && value.PreviousActiveSlot != "green") ||
+		value.PreviousActiveSlot == value.CandidateSlot {
+		return false
+	}
+	return validPhaseDiagnostic(value.Phase, DiagnosticCode(diagnostic))
+}
+
+func validGeneratedDomainMigrationTimes(state MigrationState, started, finished time.Time) bool {
+	switch state {
+	case MigrationNotRequired, MigrationPending:
+		return started.IsZero() && finished.IsZero()
+	case MigrationRunning:
+		return !started.IsZero() && finished.IsZero()
+	case MigrationSucceeded, MigrationFailed:
+		return !started.IsZero() && !finished.IsZero()
+	default:
+		return false
+	}
+}
+
+func knownGeneratedDomainPhase(value Phase) bool {
+	switch value {
+	case PhasePreflight, PhaseBuilding, PhaseMigrating, PhaseStartingCandidate, PhaseWaitingHealth,
+		PhaseSwitchingRoute, PhaseDraining, PhaseSucceeded, PhaseFailed, PhaseCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownGeneratedDomainMigrationState(value MigrationState) bool {
+	switch value {
+	case MigrationNotRequired, MigrationPending, MigrationRunning, MigrationSucceeded, MigrationFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownGeneratedDomainDeploymentStatus(value string) bool {
+	switch value {
+	case "preparing", "applying", "waiting_health", "succeeded", "failed", "cancelled", "needs_attention":
+		return true
+	default:
+		return false
+	}
+}
+
+func readGeneratedDomainStartupComponents(ctx context.Context, tx *sql.Tx) ([]GeneratedDomainStartupComponent, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT c.deployment_id,c.component_name,c.slot,COALESCE(c.image_artifact_id,''),
+		COALESCE(c.container_name,''),COALESCE(c.container_id,''),c.state,COALESCE(c.diagnostic_code,''),
+		c.created_at,c.updated_at,COALESCE(c.finished_at,''),COALESCE(rd.app_id,''),COALESCE(rd.release_id,''),
+		COALESCE(rd.deployment_plan_revision_id,''),COALESCE(rd.deployment_plan_revision_number,0),
+		COALESCE(rd.candidate_slot,''),COALESCE(a.id,''),COALESCE(a.release_id,''),
+		COALESCE(a.deployment_plan_revision_id,''),COALESCE(a.deployment_plan_revision_number,0),COALESCE(a.component_id,'')
+		FROM generated_runtime_components c
+		LEFT JOIN generated_runtime_deployments rd ON rd.deployment_id=c.deployment_id
+		LEFT JOIN generated_image_artifacts a ON a.id=c.image_artifact_id
+		ORDER BY c.deployment_id,c.component_name`)
+	if err != nil {
+		return nil, err
+	}
+	result := []GeneratedDomainStartupComponent{}
+	for rows.Next() {
+		var value GeneratedDomainStartupComponent
+		var diagnostic, createdAt, updatedAt, finishedAt string
+		var runtimeApp, runtimeRelease, runtimePlan, runtimeSlot string
+		var runtimePlanNumber int64
+		var artifactID, artifactRelease, artifactPlan, artifactComponent string
+		var artifactPlanNumber int64
+		if err := rows.Scan(&value.DeploymentID, &value.ComponentName, &value.Slot, &value.ImageArtifactID,
+			&value.ContainerName, &value.ContainerID, &value.State, &diagnostic, &createdAt, &updatedAt, &finishedAt,
+			&runtimeApp, &runtimeRelease, &runtimePlan, &runtimePlanNumber, &runtimeSlot,
+			&artifactID, &artifactRelease, &artifactPlan, &artifactPlanNumber, &artifactComponent); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		created, createdErr := parseTime(createdAt)
+		updated, updatedErr := parseTime(updatedAt)
+		finished, finishedErr := parseOptionalTime(finishedAt)
+		if !validGeneratedDomainStartupComponent(value, diagnostic) || createdErr != nil || updatedErr != nil ||
+			finishedErr != nil || updated.Before(created) || (!finished.IsZero() && finished.Before(created)) ||
+			!canonicalUUID(runtimeApp) || !validReleaseID(runtimeRelease) || !canonicalUUID(runtimePlan) ||
+			runtimePlanNumber < 1 || runtimeSlot != value.Slot ||
+			((value.State == ComponentStopped || value.State == ComponentFailed) != !finished.IsZero()) {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		if value.ImageArtifactID != "" && (artifactID != value.ImageArtifactID || artifactRelease != runtimeRelease ||
+			artifactPlan != runtimePlan || artifactPlanNumber != runtimePlanNumber || artifactComponent != value.ComponentName) {
+			_ = rows.Close()
+			return nil, ErrInvalidState
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func validGeneratedDomainStartupComponent(value GeneratedDomainStartupComponent, diagnostic string) bool {
+	if !canonicalUUID(value.DeploymentID) || !validText(value.ComponentName, 256) ||
+		(value.Slot != "blue" && value.Slot != "green") || !knownGeneratedDomainComponentState(value.State) {
+		return false
+	}
+	if value.ImageArtifactID != "" && !canonicalUUID(value.ImageArtifactID) {
+		return false
+	}
+	if value.ContainerName != "" && !validContainerName(value.ContainerName) {
+		return false
+	}
+	if value.ContainerID != "" && !lowerHex(value.ContainerID, 64) {
+		return false
+	}
+	switch value.State {
+	case ComponentPending:
+		return value.ImageArtifactID == "" && value.ContainerName == "" && value.ContainerID == "" && diagnostic == ""
+	case ComponentImageReady:
+		return value.ImageArtifactID != "" && value.ContainerName == "" && value.ContainerID == "" && diagnostic == ""
+	case ComponentStarting:
+		return value.ImageArtifactID != "" && value.ContainerName != "" && value.ContainerID == "" && diagnostic == ""
+	case ComponentRunning, ComponentHealthy, ComponentActive, ComponentDraining:
+		return value.ImageArtifactID != "" && value.ContainerName != "" && value.ContainerID != "" && diagnostic == ""
+	case ComponentStopped:
+		return diagnostic == ""
+	case ComponentFailed:
+		return componentDiagnostic(DiagnosticCode(diagnostic))
+	default:
+		return false
+	}
+}
+
+func knownGeneratedDomainComponentState(value ComponentState) bool {
+	switch value {
+	case ComponentPending, ComponentImageReady, ComponentStarting, ComponentRunning, ComponentHealthy,
+		ComponentActive, ComponentDraining, ComponentStopped, ComponentFailed:
+		return true
+	default:
+		return false
+	}
+}
+
 // RecordImageReadyTx attaches an exact ready artifact to a pending component
 // inside the caller's guarded writer transaction. Replays may only verify the
 // identical already-attached component.
