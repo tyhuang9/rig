@@ -490,6 +490,7 @@ func TestManagedStaticServerDoesNotFollowSymlinksOutsideRoot(t *testing.T) {
 	command.Dir = workspace
 	output := newManagedStaticServerOutput(managedStaticServerOutputLimit)
 	command.Stdout, command.Stderr = output, output
+	command.WaitDelay = 500 * time.Millisecond
 	if err := command.Start(); err != nil {
 		cancel()
 		t.Fatal("static server process did not start")
