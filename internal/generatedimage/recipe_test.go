@@ -2,7 +2,10 @@ package generatedimage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -276,6 +280,186 @@ func TestContainerfileEnablesCorepackBeforeNonRootUsersInBothStages(t *testing.T
 	}
 }
 
+const managedStaticServerOutputLimit = 8 << 10
+
+type managedStaticServerOutput struct {
+	mu        sync.Mutex
+	prefix    []byte
+	limit     int
+	truncated bool
+}
+
+type managedStaticServerOutputSnapshot struct {
+	bytes     int
+	truncated bool
+	digest    string
+}
+
+func newManagedStaticServerOutput(limit int) *managedStaticServerOutput {
+	return &managedStaticServerOutput{limit: limit}
+}
+
+func (output *managedStaticServerOutput) Write(value []byte) (int, error) {
+	output.mu.Lock()
+	defer output.mu.Unlock()
+	captured := 0
+	if remaining := output.limit - len(output.prefix); remaining > 0 {
+		if remaining > len(value) {
+			remaining = len(value)
+		}
+		output.prefix = append(output.prefix, value[:remaining]...)
+		captured = remaining
+	}
+	if captured < len(value) {
+		output.truncated = true
+	}
+	return len(value), nil
+}
+
+func (output *managedStaticServerOutput) snapshot() managedStaticServerOutputSnapshot {
+	output.mu.Lock()
+	prefix := append([]byte(nil), output.prefix...)
+	truncated := output.truncated
+	output.mu.Unlock()
+	sum := sha256.Sum256(prefix)
+	return managedStaticServerOutputSnapshot{
+		bytes: len(prefix), truncated: truncated, digest: hex.EncodeToString(sum[:]),
+	}
+}
+
+type managedStaticServerCompletion struct {
+	done chan struct{}
+
+	mu      sync.Mutex
+	waitErr error
+}
+
+func newManagedStaticServerCompletion() *managedStaticServerCompletion {
+	return &managedStaticServerCompletion{done: make(chan struct{})}
+}
+
+func (completion *managedStaticServerCompletion) publish(waitErr error) {
+	completion.mu.Lock()
+	completion.waitErr = waitErr
+	completion.mu.Unlock()
+	close(completion.done)
+}
+
+func (completion *managedStaticServerCompletion) completed() (error, bool) {
+	select {
+	case <-completion.done:
+		completion.mu.Lock()
+		waitErr := completion.waitErr
+		completion.mu.Unlock()
+		return waitErr, true
+	default:
+		return nil, false
+	}
+}
+
+func (completion *managedStaticServerCompletion) join() error {
+	<-completion.done
+	completion.mu.Lock()
+	waitErr := completion.waitErr
+	completion.mu.Unlock()
+	return waitErr
+}
+
+type managedStaticServerStartupCategory string
+
+const (
+	managedStaticServerChildExited     managedStaticServerStartupCategory = "child_exited"
+	managedStaticServerReadinessExpiry managedStaticServerStartupCategory = "readiness_expired"
+	managedStaticServerTransportFailed managedStaticServerStartupCategory = "transport_failure"
+)
+
+type managedStaticServerStartupDiagnostic struct {
+	category managedStaticServerStartupCategory
+	exitCode int
+	hasExit  bool
+	output   managedStaticServerOutputSnapshot
+}
+
+func (diagnostic managedStaticServerStartupDiagnostic) Error() string {
+	message := fmt.Sprintf("managed static server startup category=%s output_bytes=%d output_truncated=%t output_sha256=%s",
+		diagnostic.category, diagnostic.output.bytes, diagnostic.output.truncated, diagnostic.output.digest)
+	if diagnostic.hasExit {
+		message += fmt.Sprintf(" exit_code=%d", diagnostic.exitCode)
+	}
+	return message
+}
+
+func managedStaticServerExitCode(waitErr error) (int, bool) {
+	if waitErr == nil {
+		return 0, true
+	}
+	exitError, ok := waitErr.(*exec.ExitError)
+	if !ok || exitError.ProcessState == nil {
+		return 0, false
+	}
+	return exitError.ExitCode(), true
+}
+
+func managedStaticServerFailure(category managedStaticServerStartupCategory, waitErr error,
+	output *managedStaticServerOutput,
+) error {
+	exitCode, hasExit := 0, false
+	if category == managedStaticServerChildExited {
+		exitCode, hasExit = managedStaticServerExitCode(waitErr)
+	}
+	return managedStaticServerStartupDiagnostic{
+		category: category, exitCode: exitCode, hasExit: hasExit, output: output.snapshot(),
+	}
+}
+
+type managedStaticServerProbe func() (*http.Response, error)
+type managedStaticServerPause func(done <-chan struct{}, duration time.Duration) bool
+
+func managedStaticServerWait(done <-chan struct{}, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+// awaitManagedStaticServerReadiness retains the fixture's five-second budget,
+// one-second probe client and 25ms probe cadence while observing child exit
+// before each probe and during each inter-probe wait.
+func awaitManagedStaticServerReadiness(deadline time.Time, now func() time.Time,
+	pause managedStaticServerPause, probe managedStaticServerProbe,
+	completion *managedStaticServerCompletion, output *managedStaticServerOutput,
+) (*http.Response, error) {
+	lastTransportFailure := false
+	for {
+		if waitErr, exited := completion.completed(); exited {
+			return nil, managedStaticServerFailure(managedStaticServerChildExited, waitErr, output)
+		}
+		if !now().Before(deadline) {
+			category := managedStaticServerReadinessExpiry
+			if lastTransportFailure {
+				category = managedStaticServerTransportFailed
+			}
+			return nil, managedStaticServerFailure(category, nil, output)
+		}
+		response, err := probe()
+		if err == nil {
+			return response, nil
+		}
+		lastTransportFailure = true
+		if waitErr, exited := completion.completed(); exited {
+			return nil, managedStaticServerFailure(managedStaticServerChildExited, waitErr, output)
+		}
+		if pause(completion.done, 25*time.Millisecond) {
+			waitErr, _ := completion.completed()
+			return nil, managedStaticServerFailure(managedStaticServerChildExited, waitErr, output)
+		}
+	}
+}
+
 func TestManagedStaticServerDoesNotFollowSymlinksOutsideRoot(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -304,26 +488,27 @@ func TestManagedStaticServerDoesNotFollowSymlinksOutsideRoot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	command := exec.CommandContext(ctx, node, script, "--root", root, "--port", strconv.Itoa(port))
 	command.Dir = workspace
+	output := newManagedStaticServerOutput(managedStaticServerOutputLimit)
+	command.Stdout, command.Stderr = output, output
 	if err := command.Start(); err != nil {
 		cancel()
-		t.Fatal(err)
+		t.Fatal("static server process did not start")
 	}
+	completion := newManagedStaticServerCompletion()
+	go func() {
+		completion.publish(command.Wait())
+	}()
 	defer func() {
 		cancel()
-		_ = command.Wait()
+		_ = completion.join()
 	}()
 
 	client := &http.Client{Timeout: time.Second}
 	url := "http://127.0.0.1:" + strconv.Itoa(port) + "/leak"
-	var response *http.Response
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
-		response, err = client.Get(url)
-		if err == nil {
-			break
-		}
-	}
-	if err != nil {
-		t.Fatalf("static server did not start: %v", err)
+	response, readinessErr := awaitManagedStaticServerReadiness(time.Now().Add(5*time.Second), time.Now,
+		managedStaticServerWait, func() (*http.Response, error) { return client.Get(url) }, completion, output)
+	if readinessErr != nil {
+		t.Fatal(readinessErr)
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1024))
 	_ = response.Body.Close()
