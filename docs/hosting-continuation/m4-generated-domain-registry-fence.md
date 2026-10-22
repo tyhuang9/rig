@@ -138,6 +138,57 @@ Hosted Docker/race acceptance, exhaustive Windows regression acceptance and M4
 completion remain open.
 No live controller activation or deployment has been performed.
 
+## Integration with the published CI baseline
+
+The initial registry checkpoint is `64d1f1fe2ba934eac672666d4a87add786e75a32`.
+An ordinary merge preserves that history and incorporates published baseline
+`a3bc51e04c3d7b79b428f2c12923c72b3646a70d`
+([draft PR #206](https://github.com/tyhuang9/rig/pull/206)). The resulting tested
+commit is `36ec4f55883d8489ffdc567006d8eb1820bf132b`, tree
+`cc86ef12436765295758e623dbfff672d42e8e99`. The complete tree is the exact
+union of both parents, without source conflict resolutions. This branch targets
+PR #206; the startup database snapshot remains a separate sibling dependency.
+
+On this integrated source, each of Windows and native WSL Linux passed six
+parents and 12 unique subtests, with no failures or skips. The selected parents
+are:
+
+- `TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity`
+- `TestGeneratedDomainTypedOuterAPIFamiliesRefuseStaleViewBeforeEffects`
+- `TestGeneratedDomainTypedMutationInventoryIsClosed`
+- `TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes`
+- `TestLiveGeneratedAuthorityUsesCallerDatabaseAcrossSequentialBindings`
+- `TestLiveRuntimeCompositionAcceptsFixtureRunnerPointers`
+
+The first two parents run ten isolated subprocess cases. Those cases were
+checked separately and the outer parent was counted once. The tagged hostd
+composition parent contributes two cases using local fixture/stubbed recovery;
+it does not execute a real Docker journey. Exact discovery and complete
+RUN/PASS inventories were verified, with the existing subprocess limits retained
+and a ten-minute outer test limit.
+
+All 72 commands passed: 49 aggregate Go formatting checks, target/toolchain
+checks, selected compilation/discovery/execution, scoped ingress/liveauthority/
+hostd vet, hostd production builds, ingress/hostd live-tag compilation on both
+targets, canonical generation and aggregate diff checks. Pinned Go 1.26.7 used
+`GOTOOLCHAIN=local`, `GOFLAGS=-mod=readonly -p=1 -buildvcs=false`,
+`CGO_ENABLED=0`, explicit target OS and amd64, with count one.
+
+The complete 1,053-file Go/module inventory stayed unchanged before and after
+every command. Its SHA256 is
+`f7371f4890d3854e8f21fc7a733ef560238e3a6e9eb66f61ee8b11ee98ecbf1b`.
+The receipt is
+`08606f240f351892a8a1ed82c040001b87b292af76dedcb628fc6c462d3aee74`
+under `temp/m3-lan-external-db-20261015/m4-domain-prerequisite-integration-verification/registry-20261021T074416.265733Z/`.
+It binds the exact selectors, argv, package directories, source and binary hashes,
+raw output, nested child inventories and unchanged final tree. The reusable
+verification runner SHA256 is
+`1b7b51227aff17a5dcdbe6e9f25440d1fe2d76ae6920ce703cbe7d9e8ab8e733`.
+
+The earlier broad-suite evidence remains a separate checkpoint. This bounded
+integration run does not resolve its Windows 45-minute failure or supply live
+Docker, race, hosted, classifier, factory or route-cutover acceptance.
+
 ## Rollback
 
 Before a production reservation caller is introduced, rollback is a source revert
