@@ -233,6 +233,7 @@ func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneySce
 	}, runtimeCompositionOptions{
 		dockerExecutable: docker,
 		runner:           migrationProcess,
+		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
 		migrationRunnerFactory: func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
 			migrationRunner.SetDelegate(delegate)
 			return migrationRunner
@@ -721,6 +722,7 @@ func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneySce
 		effectsWorkingDirectory: reopenedEffectsWorkingDirectory,
 	}, runtimeCompositionOptions{
 		dockerExecutable: docker,
+		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
 		migrationRunnerFactory: func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
 			recoveryRunner.SetDelegate(delegate)
 			return recoveryRunner

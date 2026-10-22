@@ -236,7 +236,11 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: healthObserver})
+	}, runtimeCompositionOptions{
+		dockerExecutable: docker,
+		runner:           healthObserver,
+		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
+	})
 	if err != nil {
 		t.Fatal("compose production generated runtime:", err)
 	}
@@ -855,6 +859,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		}, runtimeCompositionOptions{
 			dockerExecutable: docker,
 			runner:           restartedObserver,
+			routePauseLogger: newStructuredLogger(os.Stderr, "info"),
 			capacitySourceFactory: func(source generatedruntime.CapacitySource) generatedruntime.CapacitySource {
 				capacityPressure.SetDelegate(source)
 				return capacityPressure

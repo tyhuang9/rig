@@ -137,6 +137,7 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		return waitingFor(jobs.PauseMigrationApprovalRequired), nil
 	}
 	if errors.Is(err, generatedruntimestate.ErrDeploymentInProgress) {
+		e.observeRoutePause(ctx, routePauseStageRuntimeBegin, routePauseCauseDeploymentInProgress)
 		return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 	}
 	if err != nil {
@@ -150,7 +151,12 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		// completing its deployment and job rows. Only finish the same pinned
 		// deployment while its durable active head still names this candidate.
 		head, headErr := e.state.Active(ctx, deployment.AppID)
-		if headErr != nil || head.DeploymentID != deployment.ID || head.ReleaseID != deployment.ReleaseID || head.Slot != runtimeDeployment.CandidateSlot {
+		if headErr != nil {
+			e.observeRoutePauseError(ctx, routePauseStageRuntimeSuccessHead, headErr)
+			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
+		}
+		if head.DeploymentID != deployment.ID || head.ReleaseID != deployment.ReleaseID || head.Slot != runtimeDeployment.CandidateSlot {
+			e.observeRoutePause(ctx, routePauseStageRuntimeSuccessHead, routePauseCauseActiveHeadMismatch)
 			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 		}
 		if deployment.Status != deployments.Succeeded {
@@ -334,6 +340,7 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			if switchErr != nil {
 				// FinishHealth irreversibly closed inactive cleanup before route
 				// publication. Route failures always preserve these candidates.
+				e.observeRoutePauseError(ctx, routePauseStageRouteSwitch, switchErr)
 				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			runtimeDeployment = advanced
@@ -342,10 +349,12 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			if err = e.drainPrevious(ctx, resolved, runtimeDeployment); err != nil {
 				// The new slot is already active. Keep the deployment and job
 				// nonterminal so retry or restart recovery can finish old-slot cleanup.
+				e.observeRoutePauseError(ctx, routePauseStagePreviousRetirement, err)
 				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, "")
 			if advanceErr != nil {
+				e.observeRoutePauseError(ctx, routePauseStageRuntimeSuccessAdvance, advanceErr)
 				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			runtimeDeployment = advanced

@@ -338,7 +338,7 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 		deployments: deploymentRepository, plans: planStore, bindings: deploymentBindings,
 		effectsWorkingDirectory: ownerDirectories.WorkingDirectory,
 	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, runner: assembly.runner,
-		preinspectedIngress: gate.ingress})
+		routePauseLogger: logger, preinspectedIngress: gate.ingress})
 	if err != nil {
 		logger.Error("runtime composition failed", "error", err)
 		return 1
