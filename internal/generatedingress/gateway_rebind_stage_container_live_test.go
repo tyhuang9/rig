@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 )
 
 func equalGatewayRebindStageContainerSnapshot(intent gatewayRebindProtectedIntent,
@@ -38,12 +37,7 @@ func TestLiveGatewayRebindSuccessorStoppedStageContainer(t *testing.T) {
 		applicationReply: "gateway-v2-rebind-stopped-stage-container",
 		countRequests:    true,
 	})
-	db, err := database.Open(fixture.stateRoot)
-	if err != nil {
-		t.Fatal("open live rebind stopped-container SQLite fixture")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
+	db, repository := fixture.db, fixture.repository
 	profile := prepareLiveGatewayRebindStagePredecessor(t, fixture, db, repository)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile,
 		appaccess.GatewayProfileSpec{

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 )
 
 type liveGatewayRebindStageConfigCopyCountingDriver struct {
@@ -64,12 +63,7 @@ func liveGatewayRebindSuccessorStageConfigCopy(t *testing.T, lostAcknowledgment 
 		spec.applicationReply = "gateway-v2-rebind-stage-config-copy-lost-ack"
 	}
 	fixture := newLiveGatewayV2Fixture(t, spec)
-	db, err := database.Open(fixture.stateRoot)
-	if err != nil {
-		t.Fatal("open live rebind stage-config-copy SQLite fixture")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
+	db, repository := fixture.db, fixture.repository
 	profile := prepareLiveGatewayRebindStagePredecessor(t, fixture, db, repository)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile,
 		appaccess.GatewayProfileSpec{
