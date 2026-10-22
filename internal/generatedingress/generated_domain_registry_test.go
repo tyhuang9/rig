@@ -113,16 +113,86 @@ func generatedDomainRegistryInput(
 
 func waitGeneratedDomainPairingEpoch(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
 		generatedDomains.mu.Lock()
 		active := generatedDomains.pairingEpoch != 0
 		generatedDomains.mu.Unlock()
 		if active {
 			return
 		}
+		select {
+		case <-timeout.C:
+			t.Fatal("generated-domain pairing epoch did not become active")
+		case <-ticker.C:
+		}
 	}
-	t.Fatal("generated-domain pairing epoch did not become active")
+}
+
+func registerGeneratedDomainReservationCleanup(
+	t *testing.T,
+	release func(),
+	cancel context.CancelFunc,
+	finished <-chan struct{},
+	failure string,
+) {
+	t.Helper()
+	t.Cleanup(func() {
+		release()
+		cancel()
+		timeout := time.NewTimer(5 * time.Second)
+		defer timeout.Stop()
+		select {
+		case <-finished:
+		case <-timeout.C:
+			t.Error(failure)
+		}
+	})
+}
+
+func TestGeneratedDomainRegistryFixtureCleanupAfterFatalAllowsLaterReservation(t *testing.T) {
+	const intentionalFailure = "intentional_fatal_after_pairing_epoch"
+	if !generatedDomainRegistryExpectedFailureIsolated(t, intentionalFailure) {
+		return
+	}
+
+	t.Run(intentionalFailure, func(t *testing.T) {
+		fixture := newGeneratedDomainIdentityFixture(t)
+		runner := &generatedDomainRegistryRunner{daemonID: "registry-cleanup-fatal-daemon"}
+		root, err := inspectGeneratedLegacyRootObservation(runner, generatedDomainRegistryManagerOptions(fixture))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ticket, err := admitGeneratedLegacyConstruction(newGeneratedManagerView(root), root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ticket.fail(context.Canceled) })
+		input := generatedDomainRegistryInput(t, fixture, runner, &candidateFactoryEnvironment{})
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+			_, _ = reserveGeneratedDomain(ctx, input)
+		}()
+		registerGeneratedDomainReservationCleanup(t, func() { ticket.fail(context.Canceled) }, cancel, finished, "cleanup did not finish")
+		waitGeneratedDomainPairingEpoch(t)
+		t.Fatal("intentional registry fixture cleanup failure")
+	})
+
+	laterFixture := newGeneratedDomainIdentityFixture(t)
+	laterRunner := &generatedDomainRegistryRunner{daemonID: "registry-cleanup-later-daemon"}
+	laterInput := generatedDomainRegistryInput(t, laterFixture, laterRunner, &candidateFactoryEnvironment{})
+	state, err := reserveGeneratedDomain(context.Background(), laterInput)
+	if err != nil || state == nil || !state.fenceReady || state.failed {
+		t.Errorf("later reservation did not progress: state=%+v error=%v", state, err)
+		return
+	}
+	t.Log("registry fixture cleanup control completed")
 }
 
 func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *testing.T) {
@@ -266,16 +336,22 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { ticket.fail(context.Canceled) })
 		input := generatedDomainRegistryInput(t, fixture, runner, &candidateFactoryEnvironment{})
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
 		type reservationResult struct {
 			state *generatedDomainState
 			err   error
 		}
 		result := make(chan reservationResult, 1)
+		finished := make(chan struct{})
 		go func() {
-			state, err := reserveGeneratedDomain(context.Background(), input)
+			defer close(finished)
+			state, err := reserveGeneratedDomain(ctx, input)
 			result <- reservationResult{state: state, err: err}
 		}()
+		registerGeneratedDomainReservationCleanup(t, func() { ticket.fail(context.Canceled) }, cancel, finished, "reservation cleanup did not finish")
 		waitGeneratedDomainPairingEpoch(t)
 		if _, err := admitGeneratedLegacyConstruction(newGeneratedManagerView(root), root); !IsCode(err, DiagnosticRouteUnresolved) {
 			t.Fatalf("constructor admitted after roster closed: %v", err)
@@ -315,15 +391,21 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(leave)
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
 		type reservationResult struct {
 			state *generatedDomainState
 			err   error
 		}
 		result := make(chan reservationResult, 1)
+		finished := make(chan struct{})
 		go func() {
-			state, err := reserveGeneratedDomain(context.Background(), input)
+			defer close(finished)
+			state, err := reserveGeneratedDomain(ctx, input)
 			result <- reservationResult{state: state, err: err}
 		}()
+		registerGeneratedDomainReservationCleanup(t, leave, cancel, finished, "pairing cleanup did not finish")
 		waitGeneratedDomainPairingEpoch(t)
 		select {
 		case value := <-result:
@@ -356,13 +438,18 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(func() { ticket.fail(context.Canceled) })
 		input := generatedDomainRegistryInput(t, fixture, runner, &candidateFactoryEnvironment{})
 		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
 		result := make(chan *generatedDomainState, 1)
+		finished := make(chan struct{})
 		go func() {
+			defer close(finished)
 			state, _ := reserveGeneratedDomain(ctx, input)
 			result <- state
 		}()
+		registerGeneratedDomainReservationCleanup(t, func() { ticket.fail(context.Canceled) }, cancel, finished, "canceled pairing cleanup did not finish")
 		waitGeneratedDomainPairingEpoch(t)
 		cancel()
 		state := <-result
