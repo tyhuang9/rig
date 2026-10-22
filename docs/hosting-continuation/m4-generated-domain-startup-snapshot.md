@@ -132,6 +132,45 @@ This targeted run verifies the interaction with the shared baseline. The earlier
 37-parent suites remain separate evidence and were not repeated. Live Docker,
 race detection, hosted acceptance and M4 completion remain open.
 
+## Original-database stage fixture integration
+
+Recorded 2026-10-22. A history-preserving merge incorporates PR #206's
+`5e6c130e9b42dfa736c448ea905f76ed1291b829`: six test fixture helpers now use
+their original database/repository instead of reopening the database. The
+integrated source is `47d979c66e723cb4ced37335c38fddf7f1703ab2`, tree
+`aa74252ce6f05b7b1772ee5319577c41e026197d`. The incoming seven paths (six fixtures and
+their evidence document) equal the published inputs; production and other
+Go/module sources retain their prior contents. Whole-parent-union audit:
+`706231497e8e9a28c45bb920c21dab207e0dbeecb43792712e0637efa745ebd2`.
+
+For this delta, Windows and native WSL Linux each passed these two parents,
+with zero children, failures or skips:
+
+- `TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes`
+- `TestLiveGeneratedAuthorityUsesCallerDatabaseAcrossSequentialBindings`
+
+Both platforms' live-tag ingress compilation and exact parent discovery passed.
+Canonical generation and final diff checks passed. Across both prerequisite
+branches this is 16 planned command groups and eight parent executions. The
+initial final-diff guard used a mistyped 39-character registry revision; its
+failure remains recorded. Correcting only that invocation literal allowed both
+final checks to pass. The saved plan and repository source were unchanged.
+
+Evidence is under
+`temp/m3-lan-external-db-20261015/m4-domain-prerequisite-integration-verification/stage-delta-20261022T182918Z/rs-post-stage-verification-20261022T140103/`.
+Receipt `018-rs-post-stage-receipt.md` SHA256:
+`12b2b2299fc7e8d338c7bbdb6d3d358b32b5f68b160b67400c5e6e263e902906`.
+Evidence manifest SHA256:
+`dedb566d1151398e6ae3dd0c2430591d59dbac36e9d07808f95f37ead0fafe1e`.
+The post-integration Go/module inventory is
+`ecf25a266697f292dc4a357d29df024e31c0d1953fc95b5194cd1bd8013e8b16`; documentation checks recheck that inventory.
+
+Earlier six-parent integration results and broader suites remain bound to their
+recorded revisions and were not repeated. These two local authority controls
+and live compilation do not establish real Docker or race acceptance on this
+branch. PR #206's route failures remain open; this prerequisite adds no runtime
+repair or M4 completion claim.
+
 ## Rollback
 
 Before a production caller is introduced, rollback is a source revert of the
