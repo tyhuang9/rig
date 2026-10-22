@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"github.com/hostd/hostd/internal/generatedingress"
+	"log/slog"
 	"time"
 
 	"github.com/hostd/hostd/internal/appconfig"
@@ -113,4 +114,7 @@ type AuthorizationGate interface {
 type Options struct {
 	DrainPeriod    time.Duration
 	CleanupTimeout time.Duration
+	// RoutePauseLogger receives only the closed stage and cause observation.
+	// A nil logger disables the observation without changing execution.
+	RoutePauseLogger *slog.Logger
 }

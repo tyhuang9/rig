@@ -146,7 +146,11 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &runtimeprocess.ExecRunner{}})
+	}, runtimeCompositionOptions{
+		dockerExecutable: docker,
+		runner:           &runtimeprocess.ExecRunner{},
+		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
+	})
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
 	}
@@ -425,7 +429,11 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 		db: reopenedDB, applications: reopenedApps, snapshots: reopenedSnapshots, configuration: reopenedConfiguration,
 		deployments: reopenedDeployments, plans: reopenedPlans, bindings: reopenedBindings,
 		effectsWorkingDirectory: reopenedEffectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &runtimeprocess.ExecRunner{}})
+	}, runtimeCompositionOptions{
+		dockerExecutable: docker,
+		runner:           &runtimeprocess.ExecRunner{},
+		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
+	})
 	if err != nil {
 		t.Fatal("reopen production runtime:", err)
 	}

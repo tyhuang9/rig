@@ -54,7 +54,29 @@ current_runtime_pattern='^Test(ManagedGatewayCurrent|GatewayCurrent)(Physical|Se
 current_serving_emergency_pattern='^TestGatewayCurrent(Typed|Native|Startup|Terminal)Emergency'
 current_serving_predecessor_pattern='^TestGatewayCurrentPredecessor'
 case "$suite" in
+  runtime-packages-core)
+    packages=(
+      ./internal/projectanalysis
+      ./internal/deploymentplans
+      ./internal/generatedimage
+      ./internal/generatedimagestate
+      ./internal/generatedmigration
+      ./internal/generatedruntime
+      ./internal/autodeploy
+    )
+    ;;
+  runtime-packages-executor)
+    packages=(./internal/generatedexecutor)
+    ;;
+  runtime-packages-state)
+    packages=(./internal/generatedruntimestate)
+    ;;
+  runtime-packages-recovery)
+    packages=(./internal/generatedrecovery)
+    ;;
   runtime-packages)
+    # Retain the established all-package selector for direct callers. Hosted
+    # CI uses the four complementary package-only selectors above.
     packages=(
       ./internal/projectanalysis
       ./internal/deploymentplans

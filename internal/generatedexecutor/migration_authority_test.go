@@ -15,7 +15,6 @@ import (
 
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -30,6 +29,7 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 type executorMigrationAuthority struct {
@@ -423,7 +423,7 @@ func TestGeneratedExecutorRetainsCandidateRiskOnSucceededHandoffUncertainty(t *t
 func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Component) *executorMigrationAuthority {
 	t.Helper()
 	dataRoot := filepath.Join(t.TempDir(), "state")
-	db, err := database.Open(dataRoot)
+	db, err := databasefixture.Open(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
