@@ -88,6 +88,50 @@ recovery action, schema migration, production caller, route cutover or database
 provisioning is included. Successful SQL inspection alone cannot establish
 physical ownership or safe recovery.
 
+## Integration with the published CI baseline
+
+The accepted initial snapshot commit is
+`5a0d2449027c01954807434656ca1acb99ddf294`. An ordinary merge incorporates
+published baseline `a3bc51e04c3d7b79b428f2c12923c72b3646a70d`
+([draft PR #206](https://github.com/tyhuang9/rig/pull/206)) while preserving
+both histories. The tested integration is
+`a4aefdf87ea4b936aadc78c92ca6f4decc5d3bd7`, tree
+`db904b0023bbe717e6ceb40c324c2a937868add7`. Its entire tree equals the exact
+union of both parents, without source conflict resolutions. The registry remains
+an independent sibling prerequisite.
+
+Each of Windows and native WSL Linux passed these six composite-reader parents
+and all nine subtests, with no failures or skips:
+
+- `TestGeneratedOwnerStoresStartupSnapshotRequiresExactCanonicalBundle`
+- `TestGeneratedOwnerStoresStartupSnapshotDistinguishesOrdinaryHistoryAndEveryGeneratedCensus`
+- `TestGeneratedOwnerStoresStartupSnapshotUsesOneRealSQLiteSnapshotAcrossReaders`
+- `TestGeneratedOwnerStoresStartupSnapshotLifecycleSummaryUsesCanonicalValidation`
+- `TestGeneratedOwnerStoresStartupSnapshotIsReadOnlyStableAndSecretFree`
+- `TestGeneratedOwnerStoresStartupSnapshotFailsClosedForCancellationClosedDatabaseAndMalformedRows`
+
+All 48 commands passed: aggregate formatting, target/toolchain checks, exact
+test discovery and execution, appaccess/deployments/generatedruntimestate vet,
+hostd builds and live-tag compilation on both targets, canonical generation
+and aggregate diff checks. Pinned Go 1.26.7 used `GOTOOLCHAIN=local`,
+`GOFLAGS=-mod=readonly -p=1 -buildvcs=false`, `CGO_ENABLED=0`, explicit target
+OS and amd64, with count one and the unchanged ten-minute test limit.
+The same physical SQLite database is retained in the two-handle WAL case.
+
+The complete 1,051-file Go/module inventory was unchanged before and after every
+command; SHA256
+`638f524a9ff18a9099cdb76340290354dc69cf351e7ba73df41d1a52911585a5`.
+The receipt SHA256 is
+`efcdcde3f84e6655b3d8d1edc4c9b07ff97e74e820b8e3bd36abcad9a9091622`
+under `temp/m3-lan-external-db-20261015/m4-domain-prerequisite-integration-verification/snapshot-20261021T074755.556878Z/`.
+It records exact selectors, argv, package directories, complete RUN/PASS
+inventories, source and binary hashes, and raw results. Runner SHA256:
+`1b7b51227aff17a5dcdbe6e9f25440d1fe2d76ae6920ce703cbe7d9e8ab8e733`.
+
+This targeted run verifies the interaction with the shared baseline. The earlier
+37-parent suites remain separate evidence and were not repeated. Live Docker,
+race detection, hosted acceptance and M4 completion remain open.
+
 ## Rollback
 
 Before a production caller is introduced, rollback is a source revert of the
