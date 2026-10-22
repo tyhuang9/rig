@@ -90,7 +90,11 @@ type Manager struct {
 	options                  Options
 	dockerEnv                []string
 	workingDirectoryIdentity os.FileInfo
-	mu                       contextMutex
+	// domainView is shared by every Manager value copy. It tracks only legacy
+	// construction and typed-effect activity for the private generated-domain
+	// collision fence; it grants no route or deployment authority.
+	domainView *generatedManagerView
+	mu         contextMutex
 	// gatewayRebindFailStop points at the process-wide latch in production.
 	// Tests may replace it with a private latch to avoid cross-test state.
 	gatewayRebindFailStop *atomic.Bool
@@ -188,10 +192,36 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 	if options.RebindFenceCheck == nil {
 		return nil, errors.New("generated ingress rebind fence check is required")
 	}
+	options = normalizeManagerOptions(options)
+	if runner == nil || !validOptions(options) {
+		return nil, errors.New("generated ingress options are invalid")
+	}
+	if err := securetemp.ValidatePrivateDirectory(options.WorkingDirectory); err != nil {
+		return nil, fmt.Errorf("generated ingress working directory is unsafe: %w", err)
+	}
+	root, err := inspectGeneratedLegacyRootObservation(runner, options)
+	if err != nil {
+		return nil, err
+	}
+	view := newGeneratedManagerView(root)
+	ticket, err := admitGeneratedLegacyConstruction(view, root)
+	if err != nil {
+		return nil, err
+	}
+	published := false
+	defer func() {
+		if !published {
+			ticket.fail(errors.New("generated ingress construction did not publish"))
+		}
+	}()
+	if err := ticket.authorizeStateCreation(context.Background()); err != nil {
+		return nil, err
+	}
 	manager, err := newManager(runner, options)
 	if err != nil {
 		return nil, err
 	}
+	manager.domainView = view
 	// A supported Manager always owns one coherent pair of physical adapters.
 	// Both adapters retain this exact manager, runner, protected store, lock and
 	// fail-stop identity. Interactive commit/reconcile still wrap the rebind
@@ -200,13 +230,14 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 	rebind, current := newGatewayRebindRuntimeDrivers(manager)
 	manager.gatewayRebindCrossStoreDriver = rebind
 	manager.gatewayCurrentPhysicalDriver = current
+	if err := ticket.publish(manager); err != nil {
+		return nil, err
+	}
+	published = true
 	return manager, nil
 }
 
-func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager, error) {
-	if runner == nil {
-		return nil, errors.New("generated ingress runner is required")
-	}
+func normalizeManagerOptions(options Options) Options {
 	if options.HostPort == 0 {
 		options.HostPort = defaultHostPort
 	}
@@ -219,6 +250,14 @@ func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager,
 	if options.OutputLimit == 0 {
 		options.OutputLimit = defaultOutputLimit
 	}
+	return options
+}
+
+func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager, error) {
+	if runner == nil {
+		return nil, errors.New("generated ingress runner is required")
+	}
+	options = normalizeManagerOptions(options)
 	if !validOptions(options) {
 		return nil, errors.New("generated ingress options are invalid")
 	}

@@ -37,6 +37,11 @@ func (m *Manager) TransferGatewayV2(ctx context.Context, operationID string) (re
 	if m == nil || ctx == nil || !validCanonicalUUID(operationID) {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	release, err := m.lockGateway(ctx)
 	if err != nil {
 		return err

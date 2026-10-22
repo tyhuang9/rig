@@ -72,6 +72,11 @@ func (m *Manager) UpgradeGatewayV2(ctx context.Context, request GatewayV2Upgrade
 	if m == nil || ctx == nil || err != nil || authorize == nil {
 		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err
+	}
+	defer leaveDomain()
 	release, err := m.lockGateway(ctx)
 	if err != nil {
 		return GatewayV2UpgradeResult{Outcome: GatewayV2UpgradeUnresolved}, err

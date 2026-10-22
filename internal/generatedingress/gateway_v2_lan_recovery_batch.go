@@ -38,6 +38,11 @@ func (m *Manager) QuarantineGatewayV2LANAccessRecoveryBatch(ctx context.Context,
 	if m == nil || ctx == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return err
+	}
+	defer leaveDomain()
 	lockCtx, cancelLock := context.WithTimeout(ctx, observationTimeout)
 	defer cancelLock()
 	release, err := m.lockGateway(lockCtx)

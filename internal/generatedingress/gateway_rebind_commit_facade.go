@@ -41,10 +41,15 @@ func (m *Manager) CommitGatewayRebind(ctx context.Context, repository GatewayReb
 		!validCanonicalUUID(request.Proposal.OperationID) {
 		return GatewayRebindCommitResponse{}, &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return GatewayRebindCommitResponse{}, err
+	}
+	defer leaveDomain()
 	var response GatewayRebindCommitResponse
 	driver, _ := newGatewayRebindRuntimeDrivers(m)
 	driver.forwardSessionGuard = liveSession
-	err := m.runGatewayRebindCommitLocked(ctx, func() (bool, error) {
+	err = m.runGatewayRebindCommitLocked(ctx, func() (bool, error) {
 		if err := checkGatewayRebindAdmissionSession(ctx, liveSession); err != nil {
 			return false, err
 		}

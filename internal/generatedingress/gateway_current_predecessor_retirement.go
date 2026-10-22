@@ -222,6 +222,11 @@ func (m *Manager) RetireGatewayCurrentPredecessorsStartup(ctx context.Context,
 	if m == nil || ctx == nil || repository == nil {
 		return false, &Error{Code: DiagnosticValidationFailed}
 	}
+	leaveDomain, err := m.enterGeneratedDomainTypedMutation(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer leaveDomain()
 	releaseEffects, err := gatewayRebindAcquireDeploymentEffects(ctx, m.options.WorkingDirectory)
 	if err != nil {
 		return false, gatewayRebindEffectBoundaryError(ctx)
