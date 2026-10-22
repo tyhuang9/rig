@@ -72,7 +72,37 @@ func scanGatewayCurrentV2Census(store *stateStore) (gatewayCurrentV2Census, erro
 	if err != nil {
 		return gatewayCurrentV2Census{}, err
 	}
-	result := gatewayCurrentV2Census{files: make(map[string]gatewayCurrentV2CensusEntry)}
+	return scanGatewayCurrentV2CensusEntries(store, before, entries, 0)
+}
+
+func scanGatewayCurrentV2CensusBounded(store *stateStore) (gatewayCurrentV2Census, error) {
+	if store == nil {
+		return gatewayCurrentV2Census{}, errors.New("generated ingress current V2 census store is unavailable")
+	}
+	before, err := store.directoryIdentity()
+	if err != nil {
+		return gatewayCurrentV2Census{}, err
+	}
+	entries, err := readGeneratedDomainProtectedDirectoryBounded(store.root)
+	if err != nil {
+		return gatewayCurrentV2Census{}, err
+	}
+	return scanGatewayCurrentV2CensusEntries(store, before, entries, generatedDomainStartupMaximumBytes)
+}
+
+type gatewayCurrentV2CensusScanEntry struct {
+	name        string
+	path        string
+	generation  uint64
+	operationID string
+	fingerprint gatewayHistoryFileFingerprint
+}
+
+func scanGatewayCurrentV2CensusEntries(store *stateStore, before os.FileInfo, entries []os.DirEntry,
+	maximumBytes int64,
+) (gatewayCurrentV2Census, error) {
+	scanned := make([]gatewayCurrentV2CensusScanEntry, 0, len(entries))
+	var total int64
 	for _, entry := range entries {
 		if !gatewayCurrentRouteV2NamespaceName(entry.Name()) {
 			continue
@@ -89,16 +119,46 @@ func scanGatewayCurrentV2Census(store *stateStore) (gatewayCurrentV2Census, erro
 		if fingerprintErr != nil {
 			return gatewayCurrentV2Census{}, fingerprintErr
 		}
-		_, purpose := gatewayCurrentRouteStateNameV2(generation, operationID)
-		unbound := &gatewayCurrentRouteStateV2Store{directory: store, path: path, purpose: purpose}
-		state, readErr := unbound.readCanonical()
+		if maximumBytes > 0 && fingerprint.size > maximumBytes-total {
+			return gatewayCurrentV2Census{}, errors.New("generated ingress current V2 census exceeds its aggregate byte bound")
+		}
+		total += fingerprint.size
+		scanned = append(scanned, gatewayCurrentV2CensusScanEntry{
+			name: entry.Name(), path: path, generation: generation, operationID: operationID,
+			fingerprint: fingerprint,
+		})
+	}
+	var reader *generatedDomainProtectedReader
+	if maximumBytes > 0 {
+		captured := make(map[string]gatewayHistoryFileFingerprint, len(scanned))
+		for _, entry := range scanned {
+			captured[entry.path] = entry.fingerprint
+		}
+		var readerErr error
+		reader, readerErr = newGeneratedDomainProtectedReader(store, before, captured)
+		if readerErr != nil {
+			return gatewayCurrentV2Census{}, readerErr
+		}
+		defer reader.clear()
+	}
+	result := gatewayCurrentV2Census{files: make(map[string]gatewayCurrentV2CensusEntry)}
+	for _, entry := range scanned {
+		_, purpose := gatewayCurrentRouteStateNameV2(entry.generation, entry.operationID)
+		unbound := &gatewayCurrentRouteStateV2Store{directory: store, path: entry.path, purpose: purpose}
+		var state gatewayCurrentRouteStateV2
+		var readErr error
+		if reader != nil {
+			state, readErr = readGeneratedDomainCurrentRouteStateV2(reader, unbound)
+		} else {
+			state, readErr = unbound.readCanonical()
+		}
 		if readErr != nil || !validGatewayCurrentRouteStateV2(state) ||
-			state.Lineage.ProtectedGeneration != generation || state.Lineage.OperationID != operationID ||
-			(generation == 0 && state.Lineage.Kind != appaccess.GatewayRebindSourceGatewayUpgrade) {
+			state.Lineage.ProtectedGeneration != entry.generation || state.Lineage.OperationID != entry.operationID ||
+			(entry.generation == 0 && state.Lineage.Kind != appaccess.GatewayRebindSourceGatewayUpgrade) {
 			return gatewayCurrentV2Census{}, errors.New("generated ingress current V2 filename lineage is invalid")
 		}
-		result.files[entry.Name()] = gatewayCurrentV2CensusEntry{
-			Generation: generation, OperationID: operationID, Fingerprint: fingerprint,
+		result.files[entry.name] = gatewayCurrentV2CensusEntry{
+			Generation: entry.generation, OperationID: entry.operationID, Fingerprint: entry.fingerprint,
 			State: cloneGatewayCurrentRouteStateV2(state),
 		}
 	}

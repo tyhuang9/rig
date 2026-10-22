@@ -109,6 +109,7 @@ type gatewayHistorySnapshot struct {
 	generations   map[uint64]gatewayHistoryGeneration
 	rebindIntents map[uint64]gatewayRebindHistoryGeneration
 	files         map[string]gatewayHistoryFileFingerprint
+	reader        *generatedDomainProtectedReader
 }
 
 type gatewayHistoryFileFingerprint struct {
@@ -167,6 +168,42 @@ func newGatewayUpgradeGenerationStore(dataRoot string, generation uint64, operat
 		receiptPurpose: receiptPurpose,
 		abortPath:      filepath.Join(directory.root, abortName),
 		abortPurpose:   abortPurpose,
+	}, nil
+}
+
+// bindGatewayUpgradeStateStoreReadOnly describes one upgrade generation below
+// an already verified read-only namespace. It performs no path creation or
+// permission change and is shared by the startup classifier and the canonical
+// history validator below.
+func bindGatewayUpgradeStateStoreReadOnly(directory *stateStore, generation uint64,
+	operationID string,
+) (*gatewayUpgradeStateStore, error) {
+	if directory == nil || directory.root == "" ||
+		filepath.Dir(directory.path) != directory.root || (generation > 0 && !validCanonicalUUID(operationID)) ||
+		(generation == 0 && operationID != "") {
+		return nil, errors.New("invalid generated ingress read-only upgrade generation")
+	}
+	if generation == 0 {
+		return &gatewayUpgradeStateStore{
+			directory:      directory,
+			v2Path:         filepath.Join(directory.root, v2RouteStateFilename),
+			v2Purpose:      v2RouteStatePurpose,
+			journalPath:    filepath.Join(directory.root, gatewayMigrationFilename),
+			journalPurpose: gatewayMigrationPurpose,
+			receiptPath:    filepath.Join(directory.root, gatewayRollbackRetirementFilename),
+			receiptPurpose: gatewayRollbackRetirementPurpose,
+			abortPath:      filepath.Join(directory.root, gatewayPreJournalAbortFilename),
+			abortPurpose:   gatewayPreJournalAbortPurpose,
+		}, nil
+	}
+	stateName, journalName, receiptName, abortName, statePurpose, journalPurpose, receiptPurpose, abortPurpose :=
+		gatewayUpgradeGenerationNames(generation, operationID)
+	return &gatewayUpgradeStateStore{
+		directory: directory, generation: generation, operationID: operationID,
+		v2Path: filepath.Join(directory.root, stateName), v2Purpose: statePurpose,
+		journalPath: filepath.Join(directory.root, journalName), journalPurpose: journalPurpose,
+		receiptPath: filepath.Join(directory.root, receiptName), receiptPurpose: receiptPurpose,
+		abortPath: filepath.Join(directory.root, abortName), abortPurpose: abortPurpose,
 	}, nil
 }
 
@@ -494,6 +531,145 @@ func (m *Manager) scanGatewayUpgradeHistoryLockedModeWithSnapshotPolicy(allowCur
 func (m *Manager) scanGatewayUpgradeHistorySnapshot(before gatewayHistorySnapshot,
 	allowCurrentTail bool, partialOperationID string,
 ) (gatewayUpgradeHistory, error) {
+	if m == nil || m.store == nil {
+		return gatewayUpgradeHistory{}, errors.New("generated ingress history store is unavailable")
+	}
+	return scanGatewayUpgradeHistorySnapshotReadOnly(m.store, before, allowCurrentTail, partialOperationID)
+}
+
+func loadGeneratedDomainUpgradeSource(store *stateStore, reader *generatedDomainProtectedReader) (routeState, error) {
+	if reader == nil {
+		return store.load()
+	}
+	return readGeneratedDomainRouteState(reader, store)
+}
+
+func loadGeneratedDomainUpgradeState(store *gatewayUpgradeStateStore,
+	reader *generatedDomainProtectedReader,
+) (gatewayV2RouteState, error) {
+	if reader == nil {
+		return store.loadV2State()
+	}
+	var value gatewayV2RouteState
+	if store == nil || store.directory == nil {
+		return value, errors.New("generated ingress v2 state store is invalid")
+	}
+	if _, err := reader.readStrict(store.v2Path, store.v2Purpose, maxV2RouteStateBytes, &value); err != nil ||
+		!validGatewayV2RouteState(value) {
+		return gatewayV2RouteState{}, errors.New("generated ingress v2 state is invalid")
+	}
+	return cloneGatewayV2RouteState(value), nil
+}
+
+func loadGeneratedDomainMigrationJournal(store *gatewayUpgradeStateStore,
+	reader *generatedDomainProtectedReader,
+) (gatewayMigrationJournal, error) {
+	if reader == nil {
+		return store.loadMigrationJournal()
+	}
+	var value gatewayMigrationJournal
+	if store == nil || store.directory == nil {
+		return value, errors.New("generated ingress migration journal store is invalid")
+	}
+	if _, err := reader.readStrict(store.journalPath, store.journalPurpose, maxGatewayMigrationBytes, &value); err != nil ||
+		!validGatewayMigrationJournal(value) {
+		return gatewayMigrationJournal{}, errors.New("generated ingress migration journal is invalid")
+	}
+	return value, nil
+}
+
+func loadGeneratedDomainHistoricalBoundUpgrade(store *gatewayUpgradeStateStore,
+	reader *generatedDomainProtectedReader, operationID string,
+) (gatewayV2RouteState, gatewayMigrationJournal, error) {
+	if reader == nil {
+		return store.loadHistoricalBoundUpgrade(operationID)
+	}
+	if store == nil || !validCanonicalUUID(operationID) || (store.operationID != "" && store.operationID != operationID) {
+		return gatewayV2RouteState{}, gatewayMigrationJournal{}, errors.New("invalid generated ingress operation")
+	}
+	state, err := loadGeneratedDomainUpgradeState(store, reader)
+	if err != nil {
+		return gatewayV2RouteState{}, gatewayMigrationJournal{}, err
+	}
+	journal, err := loadGeneratedDomainMigrationJournal(store, reader)
+	if err != nil {
+		return gatewayV2RouteState{}, gatewayMigrationJournal{}, err
+	}
+	if state.OperationID != operationID || journal.OperationID != operationID ||
+		!historicallyBoundGatewayUpgrade(state, journal) {
+		return gatewayV2RouteState{}, gatewayMigrationJournal{}, errors.New("generated ingress upgrade binding is invalid")
+	}
+	return state, journal, nil
+}
+
+func loadGeneratedDomainBoundUpgrade(store *gatewayUpgradeStateStore, reader *generatedDomainProtectedReader,
+	operationID string,
+) (gatewayV2RouteState, gatewayMigrationJournal, error) {
+	if reader == nil {
+		return store.loadBoundUpgrade(operationID)
+	}
+	state, journal, err := loadGeneratedDomainHistoricalBoundUpgrade(store, reader, operationID)
+	if err != nil {
+		return gatewayV2RouteState{}, gatewayMigrationJournal{}, err
+	}
+	bound := journalMatchesInitialV2State(journal, state)
+	if journal.Phase == gatewayPhaseCommitted {
+		bound = journalMatchesV2Plan(journal, state)
+	}
+	if !bound {
+		return gatewayV2RouteState{}, gatewayMigrationJournal{}, errors.New("generated ingress upgrade binding is invalid")
+	}
+	source, err := loadGeneratedDomainUpgradeSource(store.directory, reader)
+	if err != nil {
+		return gatewayV2RouteState{}, gatewayMigrationJournal{}, err
+	}
+	sourceDigest, err := canonicalDigest(source)
+	if err != nil || sourceDigest != journal.Source.StateDigest || sourceDigest != state.SourceV1StateDigest {
+		return gatewayV2RouteState{}, gatewayMigrationJournal{}, errors.New("generated ingress v1 source state changed")
+	}
+	return state, journal, nil
+}
+
+func loadGeneratedDomainRollbackRetirementReceipt(store *gatewayUpgradeStateStore,
+	reader *generatedDomainProtectedReader, state gatewayV2RouteState, journal gatewayMigrationJournal,
+) (gatewayRollbackRetirementReceipt, error) {
+	if reader == nil {
+		return store.loadRollbackRetirementReceipt(state, journal)
+	}
+	var value gatewayRollbackRetirementReceipt
+	if store == nil || store.directory == nil || store.receiptPath == "" || store.receiptPurpose == "" {
+		return value, errors.New("generated ingress rollback retirement receipt store is invalid")
+	}
+	if _, err := reader.readStrict(store.receiptPath, store.receiptPurpose, maxGatewayRollbackReceiptBytes, &value); err != nil ||
+		!validGatewayRollbackRetirementReceipt(value, store.generation, state, journal) {
+		return gatewayRollbackRetirementReceipt{}, errors.New("generated ingress rollback retirement receipt is invalid")
+	}
+	return value, nil
+}
+
+func loadGeneratedDomainPreJournalAbortReceipt(store *gatewayUpgradeStateStore,
+	reader *generatedDomainProtectedReader,
+) (gatewayPreJournalAbortReceipt, error) {
+	if reader == nil {
+		return store.loadPreJournalAbortReceipt()
+	}
+	var value gatewayPreJournalAbortReceipt
+	if store == nil || store.directory == nil || store.abortPath == "" || store.abortPurpose == "" {
+		return value, errors.New("generated ingress pre-journal abort receipt store is invalid")
+	}
+	if _, err := reader.readStrict(store.abortPath, store.abortPurpose, maxGatewayAbortReceiptBytes, &value); err != nil ||
+		!store.validPreJournalAbortReceipt(value) {
+		return gatewayPreJournalAbortReceipt{}, errors.New("generated ingress pre-journal abort receipt is invalid")
+	}
+	return value, nil
+}
+
+func scanGatewayUpgradeHistorySnapshotReadOnly(source *stateStore, before gatewayHistorySnapshot,
+	allowCurrentTail bool, partialOperationID string,
+) (gatewayUpgradeHistory, error) {
+	if source == nil {
+		return gatewayUpgradeHistory{}, errors.New("generated ingress history store is unavailable")
+	}
 	generations := make([]uint64, 0, len(before.generations))
 	for generation := range before.generations {
 		generations = append(generations, generation)
@@ -506,19 +682,13 @@ func (m *Manager) scanGatewayUpgradeHistorySnapshot(before gatewayHistorySnapsho
 	}
 
 	var result gatewayUpgradeHistory
-	var err error
 	seenOperations := make(map[string]struct{}, len(generations))
 	for index, generation := range generations {
 		artifacts := before.generations[generation]
-		var store *gatewayUpgradeStateStore
-		if generation == 0 {
-			store, err = newGatewayUpgradeStateStore(m.options.DataRoot)
-		} else {
-			if artifacts.operationID == "" {
-				return gatewayUpgradeHistory{}, errors.New("generated ingress upgrade history operation is missing")
-			}
-			store, err = newGatewayUpgradeGenerationStore(m.options.DataRoot, generation, artifacts.operationID)
+		if generation > 0 && artifacts.operationID == "" {
+			return gatewayUpgradeHistory{}, errors.New("generated ingress upgrade history operation is missing")
 		}
+		store, err := bindGatewayUpgradeStateStoreReadOnly(source, generation, artifacts.operationID)
 		if err != nil || (artifacts.state.path != "" && store.v2Path != artifacts.state.path) ||
 			(artifacts.journal.path != "" && store.journalPath != artifacts.journal.path) ||
 			(artifacts.receipt.path != "" && store.receiptPath != artifacts.receipt.path) ||
@@ -529,13 +699,13 @@ func (m *Manager) scanGatewayUpgradeHistorySnapshot(before gatewayHistorySnapsho
 			if artifacts.journal.path != "" || artifacts.receipt.path != "" {
 				return gatewayUpgradeHistory{}, errors.New("generated ingress pre-journal abort conflicts with migration history")
 			}
-			receipt, loadErr := store.loadPreJournalAbortReceipt()
+			receipt, loadErr := loadGeneratedDomainPreJournalAbortReceipt(store, before.reader)
 			if loadErr != nil || (artifacts.operationID != "" && receipt.OperationID != artifacts.operationID) {
 				return gatewayUpgradeHistory{}, errors.New("generated ingress pre-journal abort receipt is invalid")
 			}
 			var state gatewayV2RouteState
 			if artifacts.state.path != "" {
-				state, loadErr = store.loadV2State()
+				state, loadErr = loadGeneratedDomainUpgradeState(store, before.reader)
 				if loadErr != nil {
 					return gatewayUpgradeHistory{}, loadErr
 				}
@@ -556,13 +726,13 @@ func (m *Manager) scanGatewayUpgradeHistorySnapshot(before gatewayHistorySnapsho
 			if partialOperationID == "" || index != len(generations)-1 || artifacts.receipt.path != "" {
 				return gatewayUpgradeHistory{}, errors.New("generated ingress upgrade history is partial")
 			}
-			state, sourceErr := store.loadV2State()
+			state, sourceErr := loadGeneratedDomainUpgradeState(store, before.reader)
 			if sourceErr != nil || state.OperationID != partialOperationID ||
 				(store.operationID != "" && store.operationID != state.OperationID) {
 				return gatewayUpgradeHistory{}, errors.New("generated ingress partial state operation is invalid")
 			}
-			source, sourceErr := m.store.load()
-			if sourceErr != nil || !gatewayV2InitialStateMatchesSource(state, source) {
+			sourceState, sourceErr := loadGeneratedDomainUpgradeSource(source, before.reader)
+			if sourceErr != nil || !gatewayV2InitialStateMatchesSource(state, sourceState) {
 				return gatewayUpgradeHistory{}, errors.New("generated ingress partial state source is stale")
 			}
 			if _, duplicate := seenOperations[state.OperationID]; duplicate {
@@ -576,13 +746,13 @@ func (m *Manager) scanGatewayUpgradeHistorySnapshot(before gatewayHistorySnapsho
 		}
 		operationID := artifacts.operationID
 		if generation == 0 {
-			journal, loadErr := store.loadMigrationJournal()
+			journal, loadErr := loadGeneratedDomainMigrationJournal(store, before.reader)
 			if loadErr != nil {
 				return gatewayUpgradeHistory{}, loadErr
 			}
 			operationID = journal.OperationID
 		}
-		state, journal, loadErr := store.loadHistoricalBoundUpgrade(operationID)
+		state, journal, loadErr := loadGeneratedDomainHistoricalBoundUpgrade(store, before.reader, operationID)
 		if loadErr != nil {
 			return gatewayUpgradeHistory{}, loadErr
 		}
@@ -594,7 +764,7 @@ func (m *Manager) scanGatewayUpgradeHistorySnapshot(before gatewayHistorySnapsho
 			if index != len(generations)-1 || artifacts.receipt.path != "" {
 				return gatewayUpgradeHistory{}, errors.New("generated ingress committed generation is not the active tail")
 			}
-			activeState, activeJournal, activeErr := store.loadBoundUpgrade(operationID)
+			activeState, activeJournal, activeErr := loadGeneratedDomainBoundUpgrade(store, before.reader, operationID)
 			if activeErr != nil || !reflect.DeepEqual(activeState, state) || !reflect.DeepEqual(activeJournal, journal) {
 				return gatewayUpgradeHistory{}, errors.New("generated ingress committed generation source is stale")
 			}
@@ -625,7 +795,7 @@ func (m *Manager) scanGatewayUpgradeHistorySnapshot(before gatewayHistorySnapsho
 			result.generations = append(result.generations, selection)
 			continue
 		}
-		if _, loadErr := store.loadRollbackRetirementReceipt(state, journal); loadErr != nil {
+		if _, loadErr := loadGeneratedDomainRollbackRetirementReceipt(store, before.reader, state, journal); loadErr != nil {
 			return gatewayUpgradeHistory{}, loadErr
 		}
 		selection.Retired = true
@@ -655,25 +825,77 @@ func readGatewayHistorySnapshotPolicy(store *stateStore, allowRebind, allowCurre
 	if err != nil {
 		return gatewayHistorySnapshot{}, err
 	}
-	snapshot := gatewayHistorySnapshot{
-		generations:   make(map[uint64]gatewayHistoryGeneration),
-		rebindIntents: make(map[uint64]gatewayRebindHistoryGeneration),
-		files:         make(map[string]gatewayHistoryFileFingerprint),
+	return readGatewayHistorySnapshotPolicyEntries(store, before, entries, allowRebind, allowCurrentV2, 0)
+}
+
+func readGatewayHistorySnapshotPolicyBounded(store *stateStore, allowRebind, allowCurrentV2 bool) (
+	gatewayHistorySnapshot, error,
+) {
+	if store == nil {
+		return gatewayHistorySnapshot{}, errors.New("generated ingress history store is unavailable")
 	}
+	before, err := store.directoryIdentity()
+	if err != nil {
+		return gatewayHistorySnapshot{}, err
+	}
+	entries, err := readGeneratedDomainProtectedDirectoryBounded(store.root)
+	if err != nil {
+		return gatewayHistorySnapshot{}, err
+	}
+	return readGatewayHistorySnapshotPolicyEntries(store, before, entries, allowRebind, allowCurrentV2,
+		generatedDomainStartupMaximumBytes)
+}
+
+type gatewayHistorySnapshotScanEntry struct {
+	name        string
+	path        string
+	generation  uint64
+	operationID string
+	sequence    uint64
+	kind        gatewayHistoryArtifactKind
+	currentV2   bool
+	readerOnly  bool
+	fingerprint gatewayHistoryFileFingerprint
+}
+
+func readGatewayHistorySnapshotPolicyEntries(store *stateStore, before os.FileInfo, entries []os.DirEntry,
+	allowRebind, allowCurrentV2 bool, maximumBytes int64,
+) (gatewayHistorySnapshot, error) {
+	scanned := make([]gatewayHistorySnapshotScanEntry, 0, len(entries))
+	var total int64
 	for _, entry := range entries {
-		if gatewayCurrentRouteV2NamespaceName(entry.Name()) {
+		name := entry.Name()
+		if maximumBytes > 0 && name == stateFilename {
+			path := filepath.Join(store.root, name)
+			fingerprint, readErr := fingerprintGatewayHistoryArtifactBound(path, maxStateBytes)
+			if readErr != nil || fingerprint.size > maximumBytes-total {
+				return gatewayHistorySnapshot{}, errors.New("generated ingress history source exceeds its aggregate byte bound")
+			}
+			total += fingerprint.size
+			scanned = append(scanned, gatewayHistorySnapshotScanEntry{
+				name: name, path: path, readerOnly: true, fingerprint: fingerprint,
+			})
+			continue
+		}
+		if gatewayCurrentRouteV2NamespaceName(name) {
 			if !allowCurrentV2 {
 				return gatewayHistorySnapshot{}, errors.New("generated ingress current V2 state requires a format-aware scanner")
 			}
-			path := filepath.Join(store.root, entry.Name())
+			path := filepath.Join(store.root, name)
 			fingerprint, readErr := fingerprintGatewayHistoryArtifactBound(path, maxGatewayCurrentRouteStateBytes)
 			if readErr != nil {
 				return gatewayHistorySnapshot{}, readErr
 			}
-			snapshot.files[entry.Name()] = fingerprint
+			if maximumBytes > 0 && fingerprint.size > maximumBytes-total {
+				return gatewayHistorySnapshot{}, errors.New("generated ingress history exceeds its aggregate byte bound")
+			}
+			total += fingerprint.size
+			scanned = append(scanned, gatewayHistorySnapshotScanEntry{
+				name: name, path: path, currentV2: true, fingerprint: fingerprint,
+			})
 			continue
 		}
-		generation, operationID, sequence, kind, relevant, parseErr := parseGatewayHistoryArtifactName(entry.Name())
+		generation, operationID, sequence, kind, relevant, parseErr := parseGatewayHistoryArtifactName(name)
 		if parseErr != nil {
 			return gatewayHistorySnapshot{}, parseErr
 		}
@@ -684,7 +906,7 @@ func readGatewayHistorySnapshotPolicy(store *stateStore, allowRebind, allowCurre
 			kind == gatewayHistoryRebindTerminal || kind == gatewayHistoryRebindPredecessorCheckpoint) && !allowRebind {
 			return gatewayHistorySnapshot{}, errors.New("generated ingress rebind history requires a rebind-aware scanner")
 		}
-		path := filepath.Join(store.root, entry.Name())
+		path := filepath.Join(store.root, name)
 		if filepath.Dir(path) != store.root || filepath.Clean(path) != path {
 			return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade history path is invalid")
 		}
@@ -692,45 +914,67 @@ func readGatewayHistorySnapshotPolicy(store *stateStore, allowRebind, allowCurre
 		if readErr != nil {
 			return gatewayHistorySnapshot{}, readErr
 		}
-		artifact := gatewayHistoryArtifact{path: path}
-		if kind == gatewayHistoryRebindIntent || kind == gatewayHistoryRebindProgress ||
-			kind == gatewayHistoryRebindTerminal || kind == gatewayHistoryRebindPredecessorCheckpoint {
-			artifacts := snapshot.rebindIntents[generation]
-			if (artifacts.operationID != "" && artifacts.operationID != operationID) ||
-				(kind == gatewayHistoryRebindPredecessorCheckpoint && artifacts.checkpoint.path != "") ||
-				(kind == gatewayHistoryRebindIntent && artifacts.intent.path != "") ||
-				(kind == gatewayHistoryRebindTerminal && artifacts.terminal.path != "") {
+		if maximumBytes > 0 && fingerprint.size > maximumBytes-total {
+			return gatewayHistorySnapshot{}, errors.New("generated ingress history exceeds its aggregate byte bound")
+		}
+		total += fingerprint.size
+		scanned = append(scanned, gatewayHistorySnapshotScanEntry{
+			name: name, path: path, generation: generation, operationID: operationID,
+			sequence: sequence, kind: kind, fingerprint: fingerprint,
+		})
+	}
+	snapshot := gatewayHistorySnapshot{
+		generations:   make(map[uint64]gatewayHistoryGeneration),
+		rebindIntents: make(map[uint64]gatewayRebindHistoryGeneration),
+		files:         make(map[string]gatewayHistoryFileFingerprint),
+	}
+	for _, entry := range scanned {
+		if entry.readerOnly {
+			continue
+		}
+		if entry.currentV2 {
+			snapshot.files[entry.name] = entry.fingerprint
+			continue
+		}
+		artifact := gatewayHistoryArtifact{path: entry.path}
+		if entry.kind == gatewayHistoryRebindIntent || entry.kind == gatewayHistoryRebindProgress ||
+			entry.kind == gatewayHistoryRebindTerminal || entry.kind == gatewayHistoryRebindPredecessorCheckpoint {
+			artifacts := snapshot.rebindIntents[entry.generation]
+			if (artifacts.operationID != "" && artifacts.operationID != entry.operationID) ||
+				(entry.kind == gatewayHistoryRebindPredecessorCheckpoint && artifacts.checkpoint.path != "") ||
+				(entry.kind == gatewayHistoryRebindIntent && artifacts.intent.path != "") ||
+				(entry.kind == gatewayHistoryRebindTerminal && artifacts.terminal.path != "") {
 				return gatewayHistorySnapshot{}, errors.New("generated ingress rebind generation has conflicting artifacts")
 			}
-			artifacts.generation, artifacts.operationID = generation, operationID
-			if kind == gatewayHistoryRebindPredecessorCheckpoint {
+			artifacts.generation, artifacts.operationID = entry.generation, entry.operationID
+			if entry.kind == gatewayHistoryRebindPredecessorCheckpoint {
 				artifacts.checkpoint = artifact
-			} else if kind == gatewayHistoryRebindIntent {
+			} else if entry.kind == gatewayHistoryRebindIntent {
 				artifacts.intent = artifact
-			} else if kind == gatewayHistoryRebindTerminal {
+			} else if entry.kind == gatewayHistoryRebindTerminal {
 				artifacts.terminal = artifact
 			} else {
 				if artifacts.progress == nil {
 					artifacts.progress = make(map[uint64]gatewayHistoryArtifact)
 				}
-				if _, duplicate := artifacts.progress[sequence]; duplicate {
+				if _, duplicate := artifacts.progress[entry.sequence]; duplicate {
 					return gatewayHistorySnapshot{}, errors.New("generated ingress rebind generation has duplicate progress")
 				}
-				artifacts.progress[sequence] = artifact
+				artifacts.progress[entry.sequence] = artifact
 			}
-			snapshot.rebindIntents[generation] = artifacts
-			snapshot.files[entry.Name()] = fingerprint
+			snapshot.rebindIntents[entry.generation] = artifacts
+			snapshot.files[entry.name] = entry.fingerprint
 			continue
 		}
-		artifacts := snapshot.generations[generation]
-		artifacts.generation = generation
-		if artifacts.operationID != "" && operationID != "" && artifacts.operationID != operationID {
+		artifacts := snapshot.generations[entry.generation]
+		artifacts.generation = entry.generation
+		if artifacts.operationID != "" && entry.operationID != "" && artifacts.operationID != entry.operationID {
 			return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade generation has duplicate operations")
 		}
-		if operationID != "" {
-			artifacts.operationID = operationID
+		if entry.operationID != "" {
+			artifacts.operationID = entry.operationID
 		}
-		switch kind {
+		switch entry.kind {
 		case gatewayHistoryState:
 			if artifacts.state.path != "" {
 				return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade generation has duplicate state")
@@ -754,11 +998,22 @@ func readGatewayHistorySnapshotPolicy(store *stateStore, allowRebind, allowCurre
 		default:
 			return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade history artifact kind is invalid")
 		}
-		snapshot.generations[generation] = artifacts
-		snapshot.files[entry.Name()] = fingerprint
+		snapshot.generations[entry.generation] = artifacts
+		snapshot.files[entry.name] = entry.fingerprint
 	}
 	if store.sameDirectory(before) != nil {
 		return gatewayHistorySnapshot{}, errors.New("generated ingress upgrade history directory changed")
+	}
+	if maximumBytes > 0 {
+		captured := make(map[string]gatewayHistoryFileFingerprint, len(scanned))
+		for _, entry := range scanned {
+			captured[entry.path] = entry.fingerprint
+		}
+		reader, readerErr := newGeneratedDomainProtectedReader(store, before, captured)
+		if readerErr != nil {
+			return gatewayHistorySnapshot{}, readerErr
+		}
+		snapshot.reader = reader
 	}
 	return snapshot, nil
 }

@@ -88,6 +88,24 @@ func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (Hosting
 			hostingGatewayStartupStageBegin, err)
 	}
 	defer tx.Rollback()
+	snapshot, err := r.HostingGatewayStartupSnapshotTx(ctx, tx)
+	if err != nil {
+		return HostingGatewayStartupSnapshot{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
+			hostingGatewayStartupStageCommit, err)
+	}
+	return snapshot, nil
+}
+
+// HostingGatewayStartupSnapshotTx reads the fixed gateway startup census from
+// a caller-owned transaction. The transaction is only a descriptive
+// integration boundary: accepting it does not prove which database created it.
+func (r *Repository) HostingGatewayStartupSnapshotTx(ctx context.Context, tx *sql.Tx) (HostingGatewayStartupSnapshot, error) {
+	if r == nil || r.db == nil || ctx == nil || tx == nil {
+		return HostingGatewayStartupSnapshot{}, ErrInvalidInput
+	}
 	gateway, err := r.readGatewayUpgradeStartupSnapshot(ctx, tx)
 	if err != nil {
 		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
@@ -122,10 +140,6 @@ func (r *Repository) HostingGatewayStartupSnapshot(ctx context.Context) (Hosting
 	if err != nil {
 		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
 			hostingGatewayStartupStageActiveApprovalAuthority, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return HostingGatewayStartupSnapshot{}, newHostingGatewayStartupDiagnosticError(
-			hostingGatewayStartupStageCommit, err)
 	}
 	return HostingGatewayStartupSnapshot{Upgrades: gateway, Grants: grants, Disables: disables, Rebind: rebind,
 		RuntimeHeads: heads, RuntimeComponents: components, ActiveRebindApprovalAuthority: approvals}, nil

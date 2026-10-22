@@ -471,6 +471,81 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryCurrentV2AwareLocked(ch
 	return m.scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint, true)
 }
 
+func validGatewayRebindReadOnlyDirectory(directory *stateStore, generation uint64, operationID string) bool {
+	return directory != nil && directory.root != "" && filepath.Dir(directory.path) == directory.root &&
+		generation > 0 && generation != math.MaxUint64 && validCanonicalUUID(operationID)
+}
+
+func bindGatewayRebindPredecessorCheckpointStoreResolved(directory *stateStore, dataRoot string,
+	generation uint64, operationID string, readOnly bool,
+) (*gatewayRebindPredecessorCheckpointStore, error) {
+	if !readOnly {
+		return newGatewayRebindPredecessorCheckpointStore(dataRoot, generation, operationID)
+	}
+	if !validGatewayRebindReadOnlyDirectory(directory, generation, operationID) {
+		return nil, errors.New("invalid generated ingress read-only predecessor checkpoint store")
+	}
+	name, purpose := gatewayRebindPredecessorCheckpointName(generation, operationID)
+	return &gatewayRebindPredecessorCheckpointStore{directory: directory, generation: generation,
+		operationID: operationID, path: filepath.Join(directory.root, name), purpose: purpose}, nil
+}
+
+func bindGatewayRebindProtectedIntentStoreResolved(directory *stateStore, dataRoot string,
+	generation uint64, operationID string, readOnly bool,
+) (*gatewayRebindProtectedIntentStore, error) {
+	if !readOnly {
+		return newGatewayRebindProtectedIntentStore(dataRoot, generation, operationID)
+	}
+	if !validGatewayRebindReadOnlyDirectory(directory, generation, operationID) {
+		return nil, errors.New("invalid generated ingress read-only rebind intent store")
+	}
+	name, purpose := gatewayRebindProtectedIntentName(generation, operationID)
+	return &gatewayRebindProtectedIntentStore{directory: directory, generation: generation,
+		operationID: operationID, path: filepath.Join(directory.root, name), purpose: purpose}, nil
+}
+
+func bindGatewayRebindProtectedIntentV2StoreResolved(directory *stateStore, dataRoot string,
+	generation uint64, operationID string, readOnly bool,
+) (*gatewayRebindProtectedIntentV2Store, error) {
+	if !readOnly {
+		return newGatewayRebindProtectedIntentV2Store(dataRoot, generation, operationID)
+	}
+	if !validGatewayRebindReadOnlyDirectory(directory, generation, operationID) {
+		return nil, errors.New("invalid generated ingress read-only typed rebind intent store")
+	}
+	name, purpose := gatewayRebindProtectedIntentV2Name(generation, operationID)
+	return &gatewayRebindProtectedIntentV2Store{directory: directory, generation: generation,
+		operationID: operationID, path: filepath.Join(directory.root, name), purpose: purpose}, nil
+}
+
+func bindGatewayRebindTerminalStoreV2Resolved(directory *stateStore, dataRoot string,
+	generation uint64, operationID string, readOnly bool,
+) (*gatewayRebindTerminalStoreV2, error) {
+	if !readOnly {
+		return newGatewayRebindTerminalStoreV2(dataRoot, generation, operationID)
+	}
+	if !validGatewayRebindReadOnlyDirectory(directory, generation, operationID) || generation > math.MaxInt64 {
+		return nil, errors.New("invalid generated ingress read-only typed rebind terminal store")
+	}
+	name, purpose := gatewayRebindTerminalNameV2(generation, operationID)
+	return &gatewayRebindTerminalStoreV2{directory: directory, generation: generation,
+		operationID: operationID, path: filepath.Join(directory.root, name), purpose: purpose}, nil
+}
+
+func bindGatewayRebindFinalHandoverTerminalStoreResolved(directory *stateStore, dataRoot string,
+	generation uint64, operationID string, readOnly bool,
+) (*gatewayRebindFinalHandoverTerminalStore, error) {
+	if !readOnly {
+		return newGatewayRebindFinalHandoverTerminalStore(dataRoot, generation, operationID)
+	}
+	if !validGatewayRebindReadOnlyDirectory(directory, generation, operationID) {
+		return nil, errors.New("invalid generated ingress read-only rebind terminal store")
+	}
+	name, purpose := gatewayRebindFinalHandoverTerminalName(generation, operationID)
+	return &gatewayRebindFinalHandoverTerminalStore{directory: directory, generation: generation,
+		operationID: operationID, path: filepath.Join(directory.root, name), purpose: purpose}, nil
+}
+
 func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint func(), allowCurrentV2 bool) (
 	gatewayRebindProtectedIntentHistory, error,
 ) {
@@ -485,6 +560,23 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 	if err != nil || !upgrade.committed || len(upgrade.generations) == 0 {
 		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor history is invalid")
 	}
+	return scanGatewayRebindProtectedIntentHistoryPolicyResolved(m.store, m.options.DataRoot, upgrade, before,
+		checkpoint, allowCurrentV2, false)
+}
+
+func scanGatewayRebindProtectedIntentHistoryReadOnly(source *stateStore, upgrade gatewayUpgradeHistory,
+	before gatewayHistorySnapshot, checkpoint func(), allowCurrentV2 bool,
+) (gatewayRebindProtectedIntentHistory, error) {
+	if source == nil || !upgrade.committed || len(upgrade.generations) == 0 {
+		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor history is invalid")
+	}
+	return scanGatewayRebindProtectedIntentHistoryPolicyResolved(source, "", upgrade, before,
+		checkpoint, allowCurrentV2, true)
+}
+
+func scanGatewayRebindProtectedIntentHistoryPolicyResolved(sourceStore *stateStore, dataRoot string,
+	upgrade gatewayUpgradeHistory, before gatewayHistorySnapshot, checkpoint func(), allowCurrentV2, readOnly bool,
+) (gatewayRebindProtectedIntentHistory, error) {
 	predecessor := upgrade.generations[len(upgrade.generations)-1]
 	if predecessor.Generation == math.MaxUint64 {
 		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind generation is exhausted")
@@ -494,7 +586,7 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 		generations = append(generations, generation)
 	}
 	sort.Slice(generations, func(i, j int) bool { return generations[i] < generations[j] })
-	source, err := m.store.load()
+	source, err := loadGeneratedDomainUpgradeSource(sourceStore, before.reader)
 	if err != nil {
 		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor source is invalid")
 	}
@@ -516,12 +608,12 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 		artifactPredecessor := predecessor
 		var installedCheckpoint *gatewayRebindPredecessorCheckpoint
 		if artifact.checkpoint.path != "" {
-			checkpointStore, checkpointStoreErr := newGatewayRebindPredecessorCheckpointStore(
-				m.options.DataRoot, generation, artifact.operationID)
+			checkpointStore, checkpointStoreErr := bindGatewayRebindPredecessorCheckpointStoreResolved(
+				sourceStore, dataRoot, generation, artifact.operationID, readOnly)
 			if checkpointStoreErr != nil || checkpointStore.path != artifact.checkpoint.path {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor checkpoint path is invalid")
 			}
-			checkpoint, checkpointErr := checkpointStore.load()
+			checkpoint, checkpointErr := readGeneratedDomainRebindCheckpoint(before.reader, checkpointStore)
 			if checkpointErr != nil || !gatewayRebindCheckpointMatchesProtectedHistory(checkpoint, predecessor, result) {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor checkpoint history is invalid")
 			}
@@ -551,11 +643,12 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 			if !gatewayRebindTerminalArtifactV2(artifact.terminal.path) {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind no-intent terminal format is invalid")
 			}
-			terminalStore, storeErr := newGatewayRebindTerminalStoreV2(m.options.DataRoot, generation, artifact.operationID)
+			terminalStore, storeErr := bindGatewayRebindTerminalStoreV2Resolved(
+				sourceStore, dataRoot, generation, artifact.operationID, readOnly)
 			if storeErr != nil || terminalStore.path != artifact.terminal.path {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind terminal path is invalid")
 			}
-			receipt, receiptErr := terminalStore.load()
+			receipt, receiptErr := readGeneratedDomainRebindTerminalV2(before.reader, terminalStore)
 			if receiptErr != nil || !gatewayRebindTerminalV2MatchesNoIntentHistory(receipt, *installedCheckpoint) {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed no-effect terminal history is invalid")
 			}
@@ -568,11 +661,12 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 			if installedCheckpoint == nil {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind intent history is incomplete")
 			}
-			store, storeErr := newGatewayRebindProtectedIntentV2Store(m.options.DataRoot, generation, artifact.operationID)
+			store, storeErr := bindGatewayRebindProtectedIntentV2StoreResolved(
+				sourceStore, dataRoot, generation, artifact.operationID, readOnly)
 			if storeErr != nil || store.path != artifact.intent.path {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind intent history path is invalid")
 			}
-			intent, loadErr := store.load()
+			intent, loadErr := readGeneratedDomainRebindIntentV2(before.reader, store)
 			if loadErr != nil || intent.Generation != installedCheckpoint.Generation ||
 				intent.Predecessor != installedCheckpoint.sourceRef() {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind intent history is invalid")
@@ -580,8 +674,15 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 			result.IntentsV2 = append(result.IntentsV2, gatewayRebindProtectedIntentV2Selection{
 				Store: store, Generation: generation, Intent: intent, Existing: true,
 			})
-			progress, progressErr := scanGatewayRebindProgressForIntentV2(m.options.DataRoot, intent,
-				*installedCheckpoint, artifact)
+			var progress []gatewayRebindProgressSelection
+			var progressErr error
+			if readOnly {
+				progress, progressErr = scanGatewayRebindProgressForIntentV2FromSnapshot(sourceStore, before.reader,
+					intent, *installedCheckpoint, artifact)
+			} else {
+				progress, progressErr = scanGatewayRebindProgressForIntentV2(dataRoot, intent,
+					*installedCheckpoint, artifact)
+			}
 			if progressErr != nil {
 				return gatewayRebindProtectedIntentHistory{}, progressErr
 			}
@@ -593,11 +694,12 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 				if !gatewayRebindTerminalArtifactV2(artifact.terminal.path) {
 					return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind terminal format is invalid")
 				}
-				terminalStore, terminalStoreErr := newGatewayRebindTerminalStoreV2(m.options.DataRoot, generation, artifact.operationID)
+				terminalStore, terminalStoreErr := bindGatewayRebindTerminalStoreV2Resolved(
+					sourceStore, dataRoot, generation, artifact.operationID, readOnly)
 				if terminalStoreErr != nil || terminalStore.path != artifact.terminal.path {
 					return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind terminal path is invalid")
 				}
-				receipt, receiptErr := terminalStore.load()
+				receipt, receiptErr := readGeneratedDomainRebindTerminalV2(before.reader, terminalStore)
 				if receiptErr != nil || !gatewayRebindTerminalV2MatchesIntentHistory(receipt, intent, *installedCheckpoint, progress) {
 					return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress typed rebind terminal history is invalid")
 				}
@@ -609,15 +711,23 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 			}
 			continue
 		}
-		store, storeErr := newGatewayRebindProtectedIntentStore(m.options.DataRoot, generation, artifact.operationID)
+		store, storeErr := bindGatewayRebindProtectedIntentStoreResolved(
+			sourceStore, dataRoot, generation, artifact.operationID, readOnly)
 		if storeErr != nil || store.path != artifact.intent.path {
 			return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind intent history path is invalid")
 		}
-		intent, loadErr := store.load()
+		intent, loadErr := readGeneratedDomainRebindIntent(before.reader, store)
 		if loadErr != nil || !gatewayRebindProtectedIntentMatchesPredecessor(intent, artifactPredecessor) {
 			return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind intent history is invalid")
 		}
-		progress, progressErr := scanGatewayRebindProgressForIntent(m.options.DataRoot, intent, artifactPredecessor, artifact)
+		var progress []gatewayRebindProgressSelection
+		var progressErr error
+		if readOnly {
+			progress, progressErr = scanGatewayRebindProgressForIntentFromSnapshot(sourceStore, before.reader,
+				intent, artifactPredecessor, artifact)
+		} else {
+			progress, progressErr = scanGatewayRebindProgressForIntent(dataRoot, intent, artifactPredecessor, artifact)
+		}
 		if progressErr != nil {
 			return gatewayRebindProtectedIntentHistory{}, progressErr
 		}
@@ -642,12 +752,12 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 		})
 		result.Progress = append(result.Progress, progress...)
 		if artifact.terminal.path != "" {
-			terminalStore, terminalStoreErr := newGatewayRebindFinalHandoverTerminalStore(
-				m.options.DataRoot, generation, artifact.operationID)
+			terminalStore, terminalStoreErr := bindGatewayRebindFinalHandoverTerminalStoreResolved(
+				sourceStore, dataRoot, generation, artifact.operationID, readOnly)
 			if terminalStoreErr != nil || terminalStore.path != artifact.terminal.path {
 				return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind terminal history path is invalid")
 			}
-			receipt, receiptErr := terminalStore.load()
+			receipt, receiptErr := readGeneratedDomainRebindTerminalLegacy(before.reader, terminalStore)
 			terminalHistory := result
 			terminalHistory.Predecessor = artifactPredecessor
 			if receiptErr != nil || !gatewayRebindFinalHandoverTerminalInstallPermitted(terminalHistory, receipt) {
@@ -664,11 +774,19 @@ func (m *Manager) scanGatewayRebindProtectedIntentHistoryLockedPolicy(checkpoint
 	if checkpoint != nil {
 		checkpoint()
 	}
-	after, err := readGatewayHistorySnapshotPolicy(m.store, true, allowCurrentV2)
+	var after gatewayHistorySnapshot
+	if readOnly {
+		after, err = readGatewayHistorySnapshotPolicyBounded(sourceStore, true, allowCurrentV2)
+	} else {
+		after, err = readGatewayHistorySnapshotPolicy(sourceStore, true, allowCurrentV2)
+	}
 	if err != nil || !sameGatewayHistorySnapshot(before, after) {
 		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind intent history changed during inspection")
 	}
-	confirmedSource, err := m.store.load()
+	if after.reader != nil {
+		defer after.reader.clear()
+	}
+	confirmedSource, err := loadGeneratedDomainUpgradeSource(sourceStore, after.reader)
 	if err != nil || !reflect.DeepEqual(source, confirmedSource) {
 		return gatewayRebindProtectedIntentHistory{}, errors.New("generated ingress rebind predecessor source changed during inspection")
 	}
