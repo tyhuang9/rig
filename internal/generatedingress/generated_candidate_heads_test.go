@@ -88,8 +88,18 @@ func TestCandidateHeadInitialEmptyRequiresExactZero(t *testing.T) {
 
 func TestCandidateHeadSelfIsReadOnlyAndNeverInfersPredecessor(t *testing.T) {
 	pins, predecessor := candidateHeadFixture()
-	self := candidateHeadSnapshot{appID: pins.appID, deploymentID: pins.deploymentID, releaseID: pins.releaseID, slot: pins.slot, generation: 42}
+	self := candidateHeadSnapshot{
+		appID: pins.appID, deploymentID: pins.deploymentID, releaseID: pins.releaseID, slot: pins.slot,
+		generation: 42, activationReceiptID: "00000000-0000-4000-8000-000000000001",
+	}
 	registry := newCandidateHeadRegistry()
+	for name, receiptID := range map[string]string{"missing": "", "malformed": "not-a-receipt"} {
+		invalid := self
+		invalid.activationReceiptID = receiptID
+		if _, err := registry.bindSelf(pins, invalid); !errors.Is(err, deploymentexecution.ErrAuthorityStale) {
+			t.Fatalf("%s activation receipt error=%v", name, err)
+		}
+	}
 	anchor, err := registry.bindSelf(pins, self)
 	if err != nil || anchor.checkRouteObservation(self) != nil || anchor.checkPredecessor(self) == nil {
 		t.Fatal("self head granted wrong authority")
@@ -116,7 +126,10 @@ func TestCandidateHeadSelfRequiresKnownSuccessorWithoutOverflow(t *testing.T) {
 		if _, err := registry.bindPredecessor(pins, predecessor); err != nil {
 			t.Fatal(err)
 		}
-		self := candidateHeadSnapshot{appID: pins.appID, deploymentID: pins.deploymentID, releaseID: pins.releaseID, slot: pins.slot, generation: generation}
+		self := candidateHeadSnapshot{
+			appID: pins.appID, deploymentID: pins.deploymentID, releaseID: pins.releaseID, slot: pins.slot,
+			generation: generation, activationReceiptID: "00000000-0000-4000-8000-000000000001",
+		}
 		if _, err := registry.bindSelf(pins, self); err == nil {
 			t.Fatal("non-successor self accepted")
 		}

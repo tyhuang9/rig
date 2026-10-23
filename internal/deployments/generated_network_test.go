@@ -83,6 +83,14 @@ func newGeneratedNetworkFixture(t *testing.T, phase generatedruntimestate.Phase,
 	if err != nil || !wasCreated {
 		t.Fatalf("begin generated state: created=%t error=%v", wasCreated, err)
 	}
+	if phase == generatedruntimestate.PhaseDraining || phase == generatedruntimestate.PhaseSucceeded {
+		// These downstream refusal cases deliberately construct terminal phases
+		// without a gateway. Keep the production receipt guard enabled everywhere
+		// else and remove it only from this disposable phase fixture.
+		if _, err := base.repository.db.Exec(`DROP TRIGGER generated_runtime_draining_activation_guard`); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, next := range generatedNetworkPhasePath(phase) {
 		diagnostic := generatedruntimestate.DiagnosticCode("")
 		if next == generatedruntimestate.PhaseFailed {
@@ -302,6 +310,9 @@ func TestGeneratedNetworkExecutionRefusesAttemptSlotHeadAndPlanDrift(t *testing.
 		{name: "active predecessor drift", cause: deploymentexecution.ErrAuthorityStale, mutate: func(t *testing.T, fixture *generatedNetworkFixture, _ *GeneratedNetworkRequest) {
 			stamp := time.Now().UTC().Format(time.RFC3339Nano)
 			if _, err := fixture.guarded.repository.db.Exec(`DROP TRIGGER generated_runtime_active_head_valid_update`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.guarded.repository.db.Exec(`DROP TRIGGER generated_runtime_active_head_activation_guard`); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := fixture.guarded.repository.db.Exec(`UPDATE generated_runtime_active_heads SET deployment_id=?,release_id=?,slot='blue',generation=1,updated_at=? WHERE app_id=?`, fixture.deployment.ID, fixture.request.ReleaseID, stamp, fixture.claim.ApplicationID()); err != nil {

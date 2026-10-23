@@ -89,6 +89,9 @@ func TestGeneratedImageFinishRefusesChangedAuthorityAndIncompleteAggregate(t *te
 			if _, err := f.guarded.repository.db.Exec(`DROP TRIGGER generated_runtime_active_head_valid_update`); err != nil {
 				t.Fatal(err)
 			}
+			if _, err := f.guarded.repository.db.Exec(`DROP TRIGGER generated_runtime_active_head_activation_guard`); err != nil {
+				t.Fatal(err)
+			}
 			if _, err := f.guarded.repository.db.Exec(`UPDATE generated_runtime_active_heads SET deployment_id=?,release_id=?,slot='blue',generation=1,updated_at='2026-10-19T00:00:00Z' WHERE app_id=?`, f.deployment.ID, f.request.ReleaseID, f.claim.ApplicationID()); err != nil {
 				t.Fatal(err)
 			}

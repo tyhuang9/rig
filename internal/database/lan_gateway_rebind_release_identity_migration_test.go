@@ -62,7 +62,7 @@ func TestLANGatewayRebindReleaseIdentityMigrationFreshAcceptsSupportedReleaseIDs
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := openMemoryDatabase(t)
-			if err := migrateFS(db, migrations); err != nil {
+			if err := migrateFS(db, migrationSetBefore(t, "038_")); err != nil {
 				t.Fatalf("migrate fresh schema: %v", err)
 			}
 			fixture := seedLANGatewayRebindReleaseIdentityFixture(t, db, test.releaseID)
@@ -100,7 +100,7 @@ func TestLANGatewayRebindReleaseIdentityMigrationRejectsMalformedReleaseIDsWithE
 	} {
 		t.Run(name, func(t *testing.T) {
 			db := openMemoryDatabase(t)
-			if err := migrateFS(db, migrations); err != nil {
+			if err := migrateFS(db, migrationSetBefore(t, "038_")); err != nil {
 				t.Fatalf("migrate fresh schema: %v", err)
 			}
 			fixture := seedLANGatewayRebindReleaseIdentityFixture(t, db, releaseID)
@@ -118,7 +118,7 @@ func TestLANGatewayRebindReleaseIdentityMigrationRejectsMalformedReleaseIDsWithE
 
 func TestLANGatewayRebindReleaseIdentityMigrationPreservesCrossedHeadGuards(t *testing.T) {
 	db := openMemoryDatabase(t)
-	if err := migrateFS(db, migrations); err != nil {
+	if err := migrateFS(db, migrationSetBefore(t, "038_")); err != nil {
 		t.Fatalf("migrate fresh schema: %v", err)
 	}
 	fixture := seedLANGatewayRebindReleaseIdentityFixture(t, db, releaseIdentityHex)
@@ -164,7 +164,7 @@ func TestLANGatewayRebindReleaseIdentityMigrationRejectsBlobReleaseIDsWithExactP
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			db := openMemoryDatabase(t)
-			if err := migrateFS(db, migrations); err != nil {
+			if err := migrateFS(db, migrationSetBefore(t, "038_")); err != nil {
 				t.Fatalf("migrate fresh schema: %v", err)
 			}
 			fixture := seedLANGatewayRebindReleaseIdentityFixture(t, db, test.releaseID)
