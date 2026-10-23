@@ -67,7 +67,7 @@ func buildCaddyConfig(routes map[string]routeRecord, listenAddress string) ([]by
 	}
 	sort.Strings(appIDs)
 	result := caddyConfig{Admin: caddyAdmin{Listen: "localhost:2019"}, Apps: caddyApps{HTTP: caddyHTTP{Servers: map[string]caddyServer{
-		"generated": {Listen: []string{listenAddress}, AutomaticHTTPS: caddyAutomaticHTTPS{Disable: true}, Routes: make([]caddyRoute, 0, len(routes)*2)},
+		"generated": {Listen: []string{listenAddress}, AutomaticHTTPS: caddyAutomaticHTTPS{Disable: true}, Routes: make([]caddyRoute, 0, len(routes)*2+1)},
 	}}}}
 	server := result.Apps.HTTP.Servers["generated"]
 	for _, appID := range appIDs {
@@ -90,8 +90,13 @@ func buildCaddyConfig(routes map[string]routeRecord, listenAddress string) ([]by
 			proxyRoute(host, nil, static),
 		)
 	}
+	server.Routes = append(server.Routes, notFoundRoute())
 	result.Apps.HTTP.Servers["generated"] = server
 	return json.Marshal(result)
+}
+
+func notFoundRoute() caddyRoute {
+	return caddyRoute{Handle: []caddyHandle{{Handler: "static_response", StatusCode: 404}}}
 }
 
 func proxyRoute(host string, paths []string, endpoint generatedroute.RouteEndpoint) caddyRoute {

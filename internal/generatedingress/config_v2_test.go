@@ -144,7 +144,6 @@ func TestBuildCaddyConfigV2KeepsLocalRoutesAndIsolatesLANPorts(t *testing.T) {
 		t.Fatal(err)
 	}
 	v1Local := v1.Apps.HTTP.Servers["generated"]
-	v1Local.Routes = append(v1Local.Routes, notFoundRoute())
 	if !reflect.DeepEqual(config.Apps.HTTP.Servers["generated"], v1Local) {
 		t.Fatal("v2 changed a local app route or omitted the wrong-Host 404 fallback")
 	}

@@ -1274,8 +1274,12 @@ func TestProvisionRepairsStoppedCaddyBeforeReconnectingApplicationNetwork(t *tes
 	}
 	boot := runner.startConfig
 	var config caddyConfig
-	if json.Unmarshal(boot, &config) != nil || len(config.Apps.HTTP.Servers["generated"].Routes) != 0 {
-		t.Fatalf("stopped Caddy was not seeded with an empty boot config: %s", boot)
+	if json.Unmarshal(boot, &config) != nil {
+		t.Fatalf("stopped Caddy boot config is invalid: %s", boot)
+	}
+	routes := config.Apps.HTTP.Servers["generated"].Routes
+	if len(routes) != 1 || !reflect.DeepEqual(routes[0], notFoundRoute()) {
+		t.Fatalf("stopped Caddy was not seeded with a terminal-404 boot config: %s", boot)
 	}
 }
 

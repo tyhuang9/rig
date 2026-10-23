@@ -44,8 +44,9 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 		return nil, errors.New("invalid generated ingress LAN profile")
 	}
 
-	// Building the local server first deliberately reuses every v1 validation
-	// and app routing rule. The v2 server adds only an unmatched-Host fallback.
+	// Building the local server first deliberately reuses every v1 validation,
+	// app routing rule, and terminal unmatched-Host fallback. The v2 server
+	// prepends only its state-bound probes.
 	localBody, err := buildCaddyConfig(routes, localListenAddress)
 	if err != nil {
 		return nil, err
@@ -80,7 +81,6 @@ func buildCaddyConfigV2(routes map[string]routeRecord, localListenAddress string
 		}
 		local.Routes = append(probes, local.Routes...)
 	}
-	local.Routes = append(local.Routes, notFoundRoute())
 	result.Apps.HTTP.Servers["generated"] = local
 
 	for port := profile.PortStart; ; port++ {
@@ -206,8 +206,4 @@ func hostRestrictedRoutes(route routeRecord, selectedIPv4 string) []caddyRoute {
 
 func lanServerName(port uint16) string {
 	return "lan-" + strconv.FormatUint(uint64(port), 10)
-}
-
-func notFoundRoute() caddyRoute {
-	return caddyRoute{Handle: []caddyHandle{{Handler: "static_response", StatusCode: 404}}}
 }

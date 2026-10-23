@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -34,8 +35,8 @@ func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 	if len(server.Listen) != 1 || server.Listen[0] != "10.203.0.2:8080" {
 		t.Fatalf("listener = %#v, want dedicated ingress address", server.Listen)
 	}
-	if len(server.Routes) != 3 {
-		t.Fatalf("routes = %d, want 3", len(server.Routes))
+	if len(server.Routes) != 4 {
+		t.Fatalf("routes = %d, want 3 proxy routes and terminal 404", len(server.Routes))
 	}
 	if got := server.Routes[0].Match[0].Host[0]; got != appA+".rig.localhost" {
 		t.Fatalf("first host = %q", got)
@@ -48,6 +49,47 @@ func TestBuildCaddyConfigSupportsServerStaticAndStaticAPI(t *testing.T) {
 	}
 	if got := server.Routes[2].Handle[0].Upstreams[0].Dial; got != "frontend-green.net-b:4173" {
 		t.Fatalf("static upstream = %q", got)
+	}
+	if !reflect.DeepEqual(server.Routes[3], notFoundRoute()) {
+		t.Fatalf("terminal route = %#v, want empty 404", server.Routes[3])
+	}
+}
+
+func TestBuildCaddyConfigTerminatesUnmatchedHostsWithEmpty404(t *testing.T) {
+	appID := "11111111-1111-4111-8111-111111111111"
+	tests := []struct {
+		name        string
+		routes      map[string]routeRecord
+		proxyRoutes int
+	}{
+		{name: "empty", routes: map[string]routeRecord{}, proxyRoutes: 0},
+		{name: "routed", routes: map[string]routeRecord{
+			appID: {Slot: generatedidentity.SlotBlue, Endpoints: []generatedroute.RouteEndpoint{
+				endpoint("web", "server", "net-a", "web-blue", 3000, 'a'),
+			}},
+		}, proxyRoutes: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body, err := buildCaddyConfig(test.routes, "10.203.0.2:8080")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var config caddyConfig
+			if err := json.Unmarshal(body, &config); err != nil {
+				t.Fatal(err)
+			}
+			routes := config.Apps.HTTP.Servers["generated"].Routes
+			if len(routes) != test.proxyRoutes+1 || !reflect.DeepEqual(routes[len(routes)-1], notFoundRoute()) {
+				t.Fatalf("routes = %#v, want %d matched proxies followed by one empty 404", routes, test.proxyRoutes)
+			}
+			for index, route := range routes[:test.proxyRoutes] {
+				if len(route.Match) != 1 || len(route.Match[0].Host) != 1 || route.Match[0].Host[0] != appID+".rig.localhost" ||
+					len(route.Handle) != 1 || route.Handle[0].Handler != "reverse_proxy" {
+					t.Fatalf("route %d = %#v, want intended-host proxy before fallback", index, route)
+				}
+			}
+		})
 	}
 }
 
@@ -117,7 +159,11 @@ func TestBuildCaddyConfigScopesSharedAliasesToEachApplicationNetwork(t *testing.
 		t.Fatal(err)
 	}
 	actual := map[string]string{}
-	for _, route := range config.Apps.HTTP.Servers["generated"].Routes {
+	generatedRoutes := config.Apps.HTTP.Servers["generated"].Routes
+	if !reflect.DeepEqual(generatedRoutes[len(generatedRoutes)-1], notFoundRoute()) {
+		t.Fatalf("terminal route = %#v, want empty 404", generatedRoutes[len(generatedRoutes)-1])
+	}
+	for _, route := range generatedRoutes[:len(generatedRoutes)-1] {
 		actual[route.Match[0].Host[0]] = route.Handle[0].Upstreams[0].Dial
 	}
 	for host, want := range map[string]string{
