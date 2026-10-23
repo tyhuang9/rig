@@ -27,6 +27,7 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 type executorMigrationAuthority struct {
@@ -419,7 +420,7 @@ func TestGeneratedExecutorRetainsCandidateRiskOnSucceededHandoffUncertainty(t *t
 
 func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Component) *executorMigrationAuthority {
 	t.Helper()
-	dataRoot := filepath.Join(t.TempDir(), "state")
+	dataRoot := generateddomain.NewRetainedRoot(t)
 	prepareExecutorDomainDatabase(t, dataRoot)
 	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {

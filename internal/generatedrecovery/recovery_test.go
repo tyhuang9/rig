@@ -386,6 +386,9 @@ func newRecoveryActivationFixture(t *testing.T, reviewedCurrent bool) *recoveryF
 func newRecoveryFixtureWithDomain(t *testing.T, migration, reviewedCurrent bool, configurationMode jobs.ConfigurationMode, configurationBundleVersion int, foreignConfigurationPlan, authentic bool) *recoveryFixture {
 	t.Helper()
 	root := t.TempDir()
+	if authentic {
+		root = generateddomain.NewRetainedRoot(t)
+	}
 	var db *sql.DB
 	var err error
 	var directories runtimedocker.ControllerDirectories

@@ -692,7 +692,7 @@ func compilerImageObservation(t *testing.T, fixture *compilerFixture, observedCo
 // persistence remain in each test's separate compiler fixture.
 func newCompilerAttestorEngine(t *testing.T, runner runtimeprocess.CommandRunner) *generatedruntime.Engine {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)

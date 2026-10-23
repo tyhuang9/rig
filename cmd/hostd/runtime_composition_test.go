@@ -816,10 +816,7 @@ type runtimeCompositionFixture struct {
 
 func newRuntimeCompositionFixture(t *testing.T) runtimeCompositionFixture {
 	t.Helper()
-	root := filepath.Join(t.TempDir(), "state")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	root := generateddomaintest.NewRetainedRoot(t)
 	directories, err := docker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)

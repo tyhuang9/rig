@@ -19,7 +19,7 @@ type fixedDomainCapacity struct{ memory, disk uint64 }
 
 func newCapacityDomainFixture(t *testing.T, capacity fixedDomainCapacity) runtimeDomainFixture {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)

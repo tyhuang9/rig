@@ -62,7 +62,7 @@ type generatedDomainRuntimeFixture struct {
 func newGeneratedDomainRuntimeFixture(t *testing.T) appaccess.GeneratedDomainRuntimeFixture {
 	t.Helper()
 	ctx := context.Background()
-	dataRoot := t.TempDir()
+	dataRoot := generateddomaintest.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {
 		t.Fatal(err)

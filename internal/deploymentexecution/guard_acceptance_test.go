@@ -763,7 +763,7 @@ func (v *mappingLifecycleValidator) UnresolvedHistoryTx(context.Context, *sql.Tx
 
 func newExecutionFixture(t *testing.T, running bool) *executionFixture {
 	t.Helper()
-	dataRoot := t.TempDir()
+	dataRoot := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {
 		t.Fatal(err)

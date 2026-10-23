@@ -161,7 +161,7 @@ func TestGeneratedDomainRegistryFixtureCleanupAfterFatalAllowsLaterReservation(t
 	}
 
 	t.Run(intentionalFailure, func(t *testing.T) {
-		fixture := newGeneratedDomainIdentityFixture(t)
+		fixture := newGeneratedDomainRetainedRegistryFixture(t)
 		runner := &generatedDomainRegistryRunner{daemonID: "registry-cleanup-fatal-daemon"}
 		root, err := inspectGeneratedLegacyRootObservation(runner, generatedDomainRegistryManagerOptions(fixture))
 		if err != nil {
@@ -185,7 +185,7 @@ func TestGeneratedDomainRegistryFixtureCleanupAfterFatalAllowsLaterReservation(t
 		t.Fatal("intentional registry fixture cleanup failure")
 	})
 
-	laterFixture := newGeneratedDomainIdentityFixture(t)
+	laterFixture := newGeneratedDomainRetainedRegistryFixture(t)
 	laterRunner := &generatedDomainRegistryRunner{daemonID: "registry-cleanup-later-daemon"}
 	laterInput := generatedDomainRegistryInput(t, laterFixture, laterRunner, &candidateFactoryEnvironment{})
 	state, err := reserveGeneratedDomain(context.Background(), laterInput)
@@ -200,7 +200,7 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 	if !generatedDomainRegistryIsolated(t) {
 		return
 	}
-	managerFixture := newGeneratedDomainIdentityFixture(t)
+	managerFixture := newGeneratedDomainRetainedRegistryFixture(t)
 	managerRunner := &generatedDomainRegistryRunner{daemonID: "registry-manager-daemon"}
 	manager, err := New(managerRunner, generatedDomainRegistryManagerOptions(managerFixture))
 	if err != nil {
@@ -224,13 +224,13 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 	leaveCopy()
 	leaveCopy()
 	leaveOriginal()
-	noncollidingFixture := newGeneratedDomainIdentityFixture(t)
+	noncollidingFixture := newGeneratedDomainRetainedRegistryFixture(t)
 	noncollidingRunner := &generatedDomainRegistryRunner{
 		daemonID: "registry-noncolliding-daemon-" + filepath.Base(filepath.Dir(noncollidingFixture.dataRoot)),
 	}
 
 	t.Run("exact join and independent collision predicates", func(t *testing.T) {
-		fixture := newGeneratedDomainIdentityFixture(t)
+		fixture := newGeneratedDomainRetainedRegistryFixture(t)
 		runner := &generatedDomainRegistryRunner{daemonID: "registry-exact-daemon-" + filepath.Base(filepath.Dir(fixture.dataRoot))}
 		environment := &candidateFactoryEnvironment{}
 		input := generatedDomainRegistryInput(t, fixture, runner, environment)
@@ -300,7 +300,7 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 			t.Fatalf("zero aliases did not normalize to the existing explicit defaults: zero=%v explicit=%v", err, explicitErr)
 		}
 
-		separate := newGeneratedDomainIdentityFixture(t)
+		separate := newGeneratedDomainRetainedRegistryFixture(t)
 		separateRunner := &generatedDomainRegistryRunner{daemonID: input.physical.manager.daemonID}
 		separateInput := generatedDomainRegistryInput(t, separate, separateRunner, &candidateFactoryEnvironment{})
 		if generatedDomainRootOrDatabaseConflict(input.physical, separateInput.physical) ||
@@ -326,6 +326,11 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 			generatedDomainDaemonNamespaceConflict(input.physical, databaseOnly.physical) {
 			t.Fatal("database collision depended on the daemon+namespace predicate")
 		}
+		if state, err := reserveGeneratedDomain(context.Background(), databaseOnly); state != nil ||
+			!errors.Is(err, deploymentexecution.ErrInvalidConfiguration) ||
+			!errors.Is(err, generatedDomainReservationRetainedRootOrDatabase) {
+			t.Fatalf("database collision attribution: state=%v error=%v", state, err)
+		}
 		if state, err := reserveGeneratedDomain(context.Background(), separateInput); state != nil ||
 			!errors.Is(err, deploymentexecution.ErrInvalidConfiguration) ||
 			!errors.Is(err, generatedDomainReservationRetainedDaemonNamespace) {
@@ -347,7 +352,7 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 	})
 
 	t.Run("admission closes roster before protected state creation", func(t *testing.T) {
-		fixture := newGeneratedDomainIdentityFixture(t)
+		fixture := newGeneratedDomainRetainedRegistryFixture(t)
 		runner := &generatedDomainRegistryRunner{daemonID: "registry-admission-daemon-" + filepath.Base(filepath.Dir(fixture.dataRoot))}
 		root, err := inspectGeneratedLegacyRootObservation(runner, generatedDomainRegistryManagerOptions(fixture))
 		if err != nil {
@@ -450,7 +455,7 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 	})
 
 	t.Run("canceled pairing is sticky", func(t *testing.T) {
-		fixture := newGeneratedDomainIdentityFixture(t)
+		fixture := newGeneratedDomainRetainedRegistryFixture(t)
 		runner := &generatedDomainRegistryRunner{daemonID: "registry-cancel-daemon-" + filepath.Base(filepath.Dir(fixture.dataRoot))}
 		root, err := inspectGeneratedLegacyRootObservation(runner, generatedDomainRegistryManagerOptions(fixture))
 		if err != nil {
@@ -486,7 +491,7 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 	})
 
 	t.Run("conditional observation refuses ambiguity before typed activity", func(t *testing.T) {
-		fixture := newGeneratedDomainIdentityFixture(t)
+		fixture := newGeneratedDomainRetainedRegistryFixture(t)
 		runner := &generatedDomainRegistryRunner{daemonID: "registry-observation-daemon-" + filepath.Base(filepath.Dir(fixture.dataRoot))}
 		constructed, err := New(runner, generatedDomainRegistryManagerOptions(fixture))
 		if err != nil {

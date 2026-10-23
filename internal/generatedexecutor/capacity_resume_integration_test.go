@@ -253,7 +253,7 @@ type capacityResumeFixture struct {
 
 func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	t.Helper()
-	dataRoot := t.TempDir()
+	dataRoot := generateddomain.NewRetainedRoot(t)
 	prepareExecutorDomainDatabase(t, dataRoot)
 	runner := newSealedCandidateRunner(t)
 	environment := &sealedCandidateEnvironment{root: filepath.Join(dataRoot, "candidate-environments")}

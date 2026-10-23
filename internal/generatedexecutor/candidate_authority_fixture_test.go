@@ -109,7 +109,7 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 	if len(components) == 0 {
 		t.Fatal("candidate fixture needs a component")
 	}
-	dataRoot := t.TempDir()
+	dataRoot := generateddomain.NewRetainedRoot(t)
 	prepareExecutorDomainDatabase(t, dataRoot)
 	runner := newSealedCandidateRunner(t)
 	environment := &sealedCandidateEnvironment{root: filepath.Join(dataRoot, "candidate-environments")}

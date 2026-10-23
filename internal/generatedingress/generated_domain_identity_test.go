@@ -23,6 +23,8 @@ import (
 	"github.com/hostd/hostd/internal/deployments"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
+	generateddomaintest "github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 type generatedDomainIdentityFixture struct {
@@ -65,6 +67,24 @@ func newGeneratedDomainIdentityFixture(t *testing.T) generatedDomainIdentityFixt
 	if err := os.Mkdir(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	return newGeneratedDomainIdentityFixtureAtRoot(t, dataRoot)
+}
+
+func newGeneratedDomainRetainedRegistryFixture(t *testing.T) generatedDomainIdentityFixture {
+	t.Helper()
+	dataRoot := generateddomaintest.NewRetainedRoot(t)
+	prepared, err := databasefixture.Open(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return newGeneratedDomainIdentityFixtureAtRoot(t, dataRoot)
+}
+
+func newGeneratedDomainIdentityFixtureAtRoot(t *testing.T, dataRoot string) generatedDomainIdentityFixture {
+	t.Helper()
 	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {
 		t.Fatal(err)
