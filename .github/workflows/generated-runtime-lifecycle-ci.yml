@@ -321,6 +321,11 @@ jobs:
           - current-serving-emergency
           - current-serving-predecessor
           - current-serving
+          - domain-construction
+          - domain-startup-stable
+          - domain-startup
+          - ingress-capacity
+          - gateway-operations
           - ingress-remainder
     steps:
       - name: Check out source

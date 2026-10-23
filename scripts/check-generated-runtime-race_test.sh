@@ -46,9 +46,17 @@ typed='^TestGatewayRebindTyped'
 withdrawal='^TestGatewayRebindTyped(Rollback|ForwardOnly)'
 completed='^TestGatewayRebindTyped(Completed|Committed|Recovery|Undurable)'
 handover='^TestGatewayRebindTypedHandover'
+domain='^TestGeneratedDomain'
+domain_startup='^TestGeneratedDomain(Startup|ProtectedStartup)'
+domain_stable='^TestGeneratedDomainStartupClassifiesStableGateway'
+capacity='^TestGeneratedIngressCapacity'
+gateway_operations='^Test(Prepare|Observe|Recover|Commit|Retire)Gateway'
+old_remainder_skip='^TestGatewayV2|^Test(GatewayRebind|InspectGatewayRebind)|^Test(ManagedGatewayCurrent|GatewayCurrent|InspectGatewayCurrent)'
+remainder_skip="$old_remainder_skip|$domain|$capacity|$gateway_operations"
 typed_suites=(rebind-typed-withdrawal rebind-typed-completed rebind-typed-handover rebind-typed-runtime)
 composition_suites=(rebind-composition-native rebind-composition-startup rebind-composition-transferred rebind-composition-second-generation rebind-composition-legacy-source)
-suites=("${typed_suites[@]}" "${composition_suites[@]}")
+remainder_suites=(domain-construction domain-startup-stable domain-startup ingress-capacity gateway-operations ingress-remainder)
+suites=("${typed_suites[@]}" "${composition_suites[@]}" "${remainder_suites[@]}")
 runtime_packages=(
   ./internal/projectanalysis
   ./internal/deploymentplans
@@ -88,6 +96,11 @@ ingress_suites=(
   current-serving-emergency
   current-serving-predecessor
   current-serving
+  domain-construction
+  domain-startup-stable
+  domain-startup
+  ingress-capacity
+  gateway-operations
   ingress-remainder
 )
 runtime_packages_for_suite() {
@@ -129,7 +142,8 @@ for mode in default race plain; do
     if [[ "$mode" == default ]]; then run "$suite"; else run "$suite" "$mode"; fi
     expected=(test -json)
     if [[ "$mode" != plain ]]; then expected+=(-race); fi
-    expected+=(-count=1 -timeout=32m -run)
+    expected+=(-count=1 -timeout=32m)
+    if [[ "$suite" != ingress-remainder ]]; then expected+=(-run); fi
     case "$suite" in
       rebind-typed-withdrawal) expected+=("$withdrawal") ;;
       rebind-typed-completed) expected+=("$completed") ;;
@@ -140,12 +154,75 @@ for mode in default race plain; do
       rebind-composition-transferred) expected+=("$transferred") ;;
       rebind-composition-second-generation) expected+=("$second") ;;
       rebind-composition-legacy-source) expected+=("$legacy") ;;
+      domain-construction) expected+=("$domain" -skip "$domain_startup") ;;
+      domain-startup-stable) expected+=("$domain_stable") ;;
+      domain-startup) expected+=("$domain_startup" -skip "$domain_stable") ;;
+      ingress-capacity) expected+=("$capacity") ;;
+      gateway-operations) expected+=("$gateway_operations") ;;
+      ingress-remainder) expected+=(-skip "$remainder_skip") ;;
     esac
     expected+=(./internal/generatedingress)
     printf '%s\n' "${expected[@]}" > "$temp/expected"
     cmp "$temp/expected" "$temp/args"
   done
 done
+
+# Exercise the actual emitted filters against parent names, including future
+# family members and names already owned by older partitions. Subtests inherit
+# each complete parent; no slash selector may split those trees.
+for suite in "${remainder_suites[@]}"; do
+  run "$suite"
+  cp "$temp/args" "$temp/args-$suite"
+done
+selected_by() {
+  local name="$1" suite="$2" include='' exclude='' index
+  local -a args
+  mapfile -t args < "$temp/args-$suite"
+  for ((index=0; index<${#args[@]}; index++)); do
+    case "${args[index]}" in
+      -run) include="${args[index+1]}" ;;
+      -skip) exclude="${args[index+1]}" ;;
+    esac
+  done
+  [[ "$include" != */* && "$exclude" != */* ]] || return 1
+  [[ -z "$include" || "$name" =~ $include ]] && [[ -z "$exclude" || ! "$name" =~ $exclude ]]
+}
+while read -r name expected_suite; do
+  actual=()
+  for suite in "${remainder_suites[@]}"; do
+    if selected_by "$name" "$suite"; then actual+=("$suite"); fi
+  done
+  if [[ "$expected_suite" == none ]]; then
+    [[ "${#actual[@]}" == 0 ]]
+  else
+    [[ "${#actual[@]}" == 1 && "${actual[0]}" == "$expected_suite" ]]
+  fi
+done <<'EOF'
+TestGeneratedDomainEmptyBootstrapEffectBoundaries domain-construction
+TestGeneratedDomainConstructionReconstructsColdAccounting domain-construction
+TestGeneratedDomainRegistryFutureControl domain-construction
+TestGeneratedDomainStartupClassifiesStableGateway domain-startup-stable
+TestGeneratedDomainStartupClassifiesStableGatewayFutureControl domain-startup-stable
+TestGeneratedDomainStartupRequiresExactTypedRecovery domain-startup
+TestGeneratedDomainProtectedStartupCoversEveryArtifactFamily domain-startup
+TestGeneratedDomainStartupFutureControl domain-startup
+TestGeneratedIngressCapacitySnapshotRefusesUnstableRebindCurrentAuthority ingress-capacity
+TestGeneratedIngressCapacityFutureControl ingress-capacity
+TestPrepareGatewayCurrentV2 gateway-operations
+TestObserveGatewayRebindRollbackServingUsesRetainedAttemptWithoutEffects gateway-operations
+TestRecoverGatewayRebindStartupReprovesRetainedNoEffectReceiptBeforeSQLRollback gateway-operations
+TestCommitGatewayRebindClassifiesActiveReplayWithoutAdmission gateway-operations
+TestRetireGatewayCurrentPredecessorsStartupUsesSelectedRebindAuthority gateway-operations
+TestPrepareGatewayFutureControl gateway-operations
+TestCandidateHeadSelfIsReadOnlyAndNeverInfersPredecessor ingress-remainder
+TestUnrelatedIngressFutureControl ingress-remainder
+TestGatewayV2FutureControl none
+TestGatewayRebindFutureControl none
+TestInspectGatewayRebindFutureControl none
+TestManagedGatewayCurrentFutureControl none
+TestGatewayCurrentFutureControl none
+TestInspectGatewayCurrentFutureControl none
+EOF
 
 # The generated-runtime workflow selects each exact package batch once. The
 # two ingress-only workflows retain the complete matching ingress list.
@@ -212,12 +289,15 @@ for output in empty child; do
   must_fail run rebind-composition-startup
   must_fail run rebind-typed-handover
   must_fail run rebind-typed-runtime
+  for suite in "${remainder_suites[@]}"; do must_fail run "$suite"; done
 done
 unset RIG_INGRESS_SELECTOR_OUTPUT
 export RIG_INGRESS_SELECTOR_FAIL_GO=1
 must_fail run rebind-composition-transferred
+for suite in "${remainder_suites[@]}"; do must_fail run "$suite"; done
 unset RIG_INGRESS_SELECTOR_FAIL_GO
 export RIG_INGRESS_SELECTOR_FAIL_TEE=1
 must_fail run rebind-composition-native
+for suite in "${remainder_suites[@]}"; do must_fail run "$suite"; done
 unset RIG_INGRESS_SELECTOR_FAIL_TEE
-printf 'Generated runtime selector contract passed: 42 invocations, three matrices, sixteen refusal/failure cases.\n'
+printf 'Generated runtime selector contract passed: 60 argument checks, 24 partition controls, three matrices, 40 refusal/failure cases.\n'
