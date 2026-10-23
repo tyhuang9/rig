@@ -3,8 +3,12 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
+
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 )
 
 func TestGatewayCurrentLANCommitRecoveryWithdrawsAfterAuthorityLoss(t *testing.T) {
@@ -95,12 +99,42 @@ func newGatewayCurrentCommitRecoveryFixture(t *testing.T, kind gatewayV2PendingK
 ) {
 	t.Helper()
 	fixture, driver, request := newGatewayCurrentGrantOperationFixture(t)
+	previous := fixture.manager
+	controllerRoot := t.TempDir()
+	directories, err := runtimedocker.PrepareControllerDirectories(controllerRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &gatewayCurrentNoCommandRunner{}
+	manager, err := New(runner, Options{
+		DockerExecutable:             filepath.Join(controllerRoot, "docker"),
+		DockerEndpoint:               "",
+		DockerConfigDirectory:        directories.DockerConfigDirectory,
+		WorkingDirectory:             directories.WorkingDirectory,
+		DataRoot:                     fixture.dataRoot,
+		HostPort:                     8080,
+		CommandTimeout:               time.Second,
+		PullTimeout:                  time.Second,
+		OutputLimit:                  1024,
+		RebindFenceCheck:             func(context.Context) error { return nil },
+		RebindCurrentStateRepository: previous.options.RebindCurrentStateRepository,
+	})
+	if err != nil {
+		t.Fatalf("admit current commit recovery manager: %v", err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("current commit recovery manager daemon calls = %d, want 0", runner.calls)
+	}
+	manager.gatewayRebindFailStop = previous.gatewayRebindFailStop
+	manager.gatewayRebindCommitBarrier = previous.gatewayRebindCommitBarrier
+	manager.gatewayCurrentPhysicalDriver = driver
+	fixture.manager = manager
 	authorize, _ := allowGatewayV2LANGrant(t, fixture.manager, request, func(lease *fakeGatewayV2LANGrantLease) {
 		if kind == gatewayV2PendingLANGrant {
 			lease.activateErr = errors.New("uncertain commit")
 		}
 	})
-	_, err := fixture.manager.GrantGatewayV2LAN(context.Background(), request, authorize)
+	_, err = fixture.manager.GrantGatewayV2LAN(context.Background(), request, authorize)
 	if kind == gatewayV2PendingLANGrant {
 		if !IsCode(err, DiagnosticRouteUnresolved) {
 			t.Fatalf("expected uncertain grant: %v", err)
