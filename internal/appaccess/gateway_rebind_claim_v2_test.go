@@ -174,6 +174,16 @@ func TestGatewayRebindRuntimeHeadHistoryIsSealedAndValidated(t *testing.T) {
 		head := proposal.RuntimeHeads[0]
 		if _, err := fixture.db.Exec(`UPDATE generated_runtime_active_heads
 			SET generation=generation WHERE app_id=?`, head.AppID); err == nil ||
+			!strings.Contains(err.Error(), "generated runtime active head requires an exact activation receipt") {
+			t.Fatalf("active receipt guard=%v", err)
+		}
+		// This disposable negative fixture removes only the newer activation
+		// guard so the independently retained rebind fence remains observable.
+		if _, err := fixture.db.Exec(`DROP TRIGGER generated_runtime_active_head_activation_guard`); err != nil {
+			t.Fatal("drop active-head activation guard:", err)
+		}
+		if _, err := fixture.db.Exec(`UPDATE generated_runtime_active_heads
+			SET generation=generation WHERE app_id=?`, head.AppID); err == nil ||
 			!strings.Contains(err.Error(), "rebind fence is active") {
 			t.Fatalf("active live-head mutation=%v", err)
 		}
