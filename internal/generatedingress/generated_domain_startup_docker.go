@@ -527,7 +527,9 @@ func generatedDomainRecoveryDockerObjectMatches(object generatedDomainDockerObje
 	expected generatedDomainRecoveryDockerDescriptor,
 ) bool {
 	if object.kind != expected.kind || strings.TrimPrefix(object.name, "/") != expected.name ||
-		!generatedDomainExactRigLabels(object.labels, expected.labels) {
+		!(object.kind == "volume" && expected.name == caddyVolumeName &&
+			validGeneratedDomainNativeV1VolumeLabels(object.labels)) &&
+			!generatedDomainExactRigLabels(object.labels, expected.labels) {
 		return false
 	}
 	if object.kind != "volume" {
@@ -1025,8 +1027,7 @@ func generatedDomainUpgradeV1StaticValid(source routeState, journal gatewayMigra
 	if !validCaddyInspection(observation.V1Container, observation.Image.ID, hostPort) ||
 		observation.V1Volume.Name != caddyVolumeName || observation.V1Volume.Driver != "local" ||
 		observation.V1Volume.Scope != "local" || len(observation.V1Volume.Options) != 0 ||
-		observation.V1Volume.Labels[gatewayV2ManagedLabelKey] != gatewayV2ManagedContainerLabel ||
-		observation.V1Volume.Labels[gatewayV2IdentityLabelKey] != gatewayV1IdentityVersion {
+		!validGeneratedDomainNativeV1VolumeLabels(observation.V1Volume.Labels) {
 		return false
 	}
 	listenIP, valid := caddyIngressAddress(observation.V1Network, observation.V1Container.ID)
@@ -1269,8 +1270,7 @@ func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadl
 	}
 	volume, _, err := r.readDetailedVolume(ctx, deadline, volumeObject.name)
 	if err != nil || volume.Name != caddyVolumeName || volume.Driver != "local" || volume.Scope != "local" ||
-		len(volume.Options) != 0 || volume.Labels[gatewayV2ManagedLabelKey] != gatewayV2ManagedContainerLabel ||
-		volume.Labels[gatewayV2IdentityLabelKey] != gatewayV1IdentityVersion {
+		len(volume.Options) != 0 || !validGeneratedDomainNativeV1VolumeLabels(volume.Labels) {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 volume is invalid")
 	}
 	network, networkID, err := r.readDetailedNetwork(ctx, deadline, networkObject.id)

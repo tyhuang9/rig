@@ -3,10 +3,42 @@ package generatedingress
 import (
 	"errors"
 	"reflect"
+	"strings"
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/deployments"
 )
+
+const generatedDomainBootstrapVolumeNonceLabel = "io.rig.bootstrap-volume-nonce"
+
+func validGeneratedDomainBootstrapVolumeNonce(value string) bool {
+	if len(value) != 64 || strings.ToLower(value) != value {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validGeneratedDomainNativeV1VolumeLabels admits the published legacy label
+// pair and the one constructor-owned additive nonce. No other Rig label is
+// compatible with native-v1 startup or typed recovery.
+func validGeneratedDomainNativeV1VolumeLabels(labels map[string]string) bool {
+	expected := map[string]string{
+		gatewayV2ManagedLabelKey:  gatewayV2ManagedContainerLabel,
+		gatewayV2IdentityLabelKey: gatewayV1IdentityVersion,
+	}
+	if nonce, present := labels[generatedDomainBootstrapVolumeNonceLabel]; present {
+		if !validGeneratedDomainBootstrapVolumeNonce(nonce) {
+			return false
+		}
+		expected[generatedDomainBootstrapVolumeNonceLabel] = nonce
+	}
+	return generatedDomainExactRigLabels(labels, expected)
+}
 
 func classifyGeneratedDomainStartup(database deployments.GeneratedDomainStartupSnapshot,
 	protected generatedDomainProtectedStartupSnapshot, docker generatedDomainDockerStartupSnapshot,

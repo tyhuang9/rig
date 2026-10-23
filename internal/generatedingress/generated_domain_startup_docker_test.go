@@ -339,6 +339,44 @@ func TestGeneratedDomainStartupClassifiesStableGateway(t *testing.T) {
 	t.Run("sealed_outer_supported_forms", func(t *testing.T) {
 		generatedDomainAssertOuterStableForms(t)
 	})
+
+	t.Run("native_v1_bootstrap_nonce_compatibility", func(t *testing.T) {
+		state, journal, observation := generatedDomainNativeV1AttestationFixture(t)
+		digest, err := canonicalDigest(state)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expected := generatedDomainGatewayExpectation{kind: generatedDomainGatewayNativeV1,
+			stateDigest: digest, nativeV1: &state}
+		expected.names = generatedDomainGatewayExpectedNames(expected)
+		expected.ids, err = generatedDomainGatewayExpectedIDs(expected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assert := func(t *testing.T, nonce string, wantExact bool) {
+			t.Helper()
+			candidate := observation
+			candidate.V1Volume.Labels = cloneStringMap(observation.V1Volume.Labels)
+			candidate.V1Volume.Labels[generatedDomainBootstrapVolumeNonceLabel] = nonce
+			runner := generatedDomainNativeV1OuterGatewayRunner(candidate)
+			reader := &generatedDomainStartupReader{runner: runner,
+				options: generatedDomainOptions{DockerExecutable: `C:\docker.exe`, WorkingDirectory: `C:\work`,
+					HostPort: journal.Source.LocalHostPort, CommandTimeout: time.Minute, OutputLimit: 1 << 20},
+				expectation: expected}
+			snapshot := generatedDomainDockerStartupSnapshot{objects: []generatedDomainDockerObject{
+				{kind: "container", id: candidate.V1Container.ID, name: caddyContainerName},
+				{kind: "volume", name: caddyVolumeName},
+				{kind: "network", id: candidate.V1NetworkID, name: caddyNetworkName},
+			}}
+			got, attestErr := reader.attestGateway(context.Background(), time.Now().Add(time.Minute), snapshot)
+			if wantExact != (attestErr == nil && got.kind == generatedDomainGatewayNativeV1 && got.exact) {
+				t.Fatalf("nonce %q attestation = %#v, %v", nonce, got, attestErr)
+			}
+		}
+		assert(t, strings.Repeat("a", 64), true)
+		assert(t, strings.Repeat("A", 64), false)
+		assert(t, strings.Repeat("a", 63), false)
+	})
 }
 
 func generatedDomainAssertOuterStableForms(t *testing.T) {
@@ -1394,6 +1432,39 @@ func TestGeneratedDomainDockerStartupCensusCannotHideResources(t *testing.T) {
 				t.Fatalf("malformed image census accepted: %q", malformed)
 			}
 		}
+	})
+
+	t.Run("bootstrap_nonce_is_native_v1_volume_only", func(t *testing.T) {
+		nonce := strings.Repeat("a", 64)
+		labels := map[string]string{
+			gatewayV2ManagedLabelKey:                 gatewayV2ManagedContainerLabel,
+			gatewayV2IdentityLabelKey:                gatewayV1IdentityVersion,
+			generatedDomainBootstrapVolumeNonceLabel: nonce,
+		}
+		if !validGeneratedDomainNativeV1VolumeLabels(labels) {
+			t.Fatal("exact native-v1 bootstrap nonce labels were rejected")
+		}
+		for name, mutate := range map[string]func(map[string]string){
+			"uppercase_nonce": func(value map[string]string) {
+				value[generatedDomainBootstrapVolumeNonceLabel] = strings.Repeat("A", 64)
+			},
+			"extra_Rig_label": func(value map[string]string) { value["io.rig.unexpected"] = "present" },
+			"wrong_identity":  func(value map[string]string) { value[gatewayV2IdentityLabelKey] = gatewayV2IdentityVersion },
+		} {
+			t.Run(name, func(t *testing.T) {
+				candidate := cloneStringMap(labels)
+				mutate(candidate)
+				if validGeneratedDomainNativeV1VolumeLabels(candidate) {
+					t.Fatalf("noncanonical nonce labels were accepted: %#v", candidate)
+				}
+			})
+		}
+		wrongVolume := generatedDomainDockerObject{kind: "volume", name: "renamed-bootstrap-volume",
+			labels: labels, data: generatedDomainDockerObjectData{driver: "local", scope: "local", options: map[string]string{}}}
+		if !reader.generatedDomainDockerObjectSelected(wrongVolume.kind, wrongVolume.id, wrongVolume.name, wrongVolume.labels) {
+			t.Fatal("nonce-labeled wrong volume was hidden from the census")
+		}
+		classifySelected(t, wrongVolume)
 	})
 }
 

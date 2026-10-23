@@ -65,17 +65,9 @@ func NewGeneratedCandidateAuthority(
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
 
-	dockerEnv, err := generatedCandidateDockerEnvironment(options)
+	authority, err := newGeneratedCandidateAuthorityConcrete(stores, process, environment, budget, options)
 	if err != nil {
-		return nil, deploymentexecution.ErrInvalidConfiguration
-	}
-	ledger, err := newCandidateCapacityLedger(budget)
-	if err != nil {
-		return nil, deploymentexecution.ErrInvalidConfiguration
-	}
-	authority := &GeneratedCandidateAuthority{
-		stores: stores, process: process, environment: environment, budget: budget,
-		options: options, ledger: ledger, heads: newCandidateHeadRegistry(), dockerEnv: dockerEnv,
+		return nil, err
 	}
 
 	generatedCandidateAuthorityRegistries.Lock()
@@ -98,6 +90,39 @@ func NewGeneratedCandidateAuthority(
 	}
 	registry.authority = authority
 	return authority, nil
+}
+
+// newGeneratedCandidateAuthorityConcrete builds one complete candidate owner
+// without consulting or publishing through the temporary public repository
+// registry. The private generated-domain constructor uses this once after it
+// has created the raw budget; NewGeneratedCandidateAuthority preserves the
+// public join behavior around the same concrete assembly.
+func newGeneratedCandidateAuthorityConcrete(
+	stores *deployments.GeneratedOwnerStores,
+	process runtimeprocess.CommandRunner,
+	environment GeneratedCandidateEnvironmentStager,
+	budget *generatedcapacity.Budget,
+	options GeneratedCandidateProcessOptions,
+) (*GeneratedCandidateAuthority, error) {
+	if !generatedCandidateRepositoryConfigured(stores) ||
+		!generatedCandidatePointerIdentity(process) ||
+		!generatedCandidatePointerIdentity(environment) ||
+		budget == nil || !budget.Configured() ||
+		!validGeneratedCandidateProcessOptions(options) {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	dockerEnv, err := generatedCandidateDockerEnvironment(options)
+	if err != nil {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	ledger, err := newCandidateCapacityLedger(budget)
+	if err != nil {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	return &GeneratedCandidateAuthority{
+		stores: stores, process: process, environment: environment, budget: budget,
+		options: options, ledger: ledger, heads: newCandidateHeadRegistry(), dockerEnv: dockerEnv,
+	}, nil
 }
 
 func generatedCandidateRepositoryConfigured(stores *deployments.GeneratedOwnerStores) bool {
