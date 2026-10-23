@@ -141,8 +141,16 @@ func TestGeneratedDomainRetainedCapacityRejectsCancelledCaller(t *testing.T) {
 	fixture := newCapacityDomainFixture(t, fixedDomainCapacity{memory: uint64(share.MemoryBytes), disk: 256 << 20})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := fixture.engine.candidates.ReserveRetainedCapacity(ctx, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancelled context diagnostic = %v", err)
+	reservation, err := fixture.engine.candidates.ReserveRetainedCapacity(ctx, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1)
+	if reservation != nil || !generatedingress.IsCode(err, generatedingress.DiagnosticCancelled) {
+		t.Fatalf("cancelled context result = %T, %v", reservation, err)
+	}
+	fresh, err := fixture.engine.candidates.ReserveRetainedCapacity(context.Background(), "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 1)
+	if err != nil {
+		t.Fatalf("cancelled caller retained capacity: %v", err)
+	}
+	if err := fixture.engine.candidates.ReleaseRetainedCapacity("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", fresh); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -206,7 +214,9 @@ func TestReplacementReservationConsumesDistinctComponentSharesConcurrently(t *te
 
 func TestReplacementReservationRetentionIsIrreversibleAcrossAliasesAndReleases(t *testing.T) {
 	limits := ContainerLimits{MemoryBytes: 64 << 20, MilliCPUs: 100, PIDs: 32, TmpfsBytes: 1 << 20, LogSize: "1m", LogFiles: 2}
-	session := newRuntimeCandidateSession(t, candidateSpec(), limits,
+	spec := candidateSpec()
+	spec.ActiveSlot = ""
+	session := newRuntimeCandidateSession(t, spec, limits,
 		fixedDomainCapacity{memory: 64 << 20, disk: 256 << 20},
 		func(runtimeprocess.CommandRequest) runtimeRequestResult { return runtimeRequestResult{} })
 	session.reserveAndPin(t)

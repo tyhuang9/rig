@@ -207,7 +207,9 @@ func TestOrdinaryManagerMutatorsRefuseEveryShapeBeforeGatewayWork(t *testing.T) 
 			if committed {
 				installCommittedV2Pair(t, manager)
 			}
-			copied := *manager
+			copiedValue := reflect.New(reflect.TypeOf(manager).Elem())
+			copiedValue.Elem().Set(reflect.ValueOf(manager).Elem())
+			copied := copiedValue.Interface().(*Manager)
 			shapes := []struct {
 				name    string
 				manager *Manager
@@ -215,7 +217,7 @@ func TestOrdinaryManagerMutatorsRefuseEveryShapeBeforeGatewayWork(t *testing.T) 
 				{name: "nil"},
 				{name: "zero", manager: &Manager{}},
 				{name: "constructed", manager: manager},
-				{name: "copied", manager: &copied},
+				{name: "copied", manager: copied},
 			}
 			original := managerAcquireGatewayOSLock
 			lockCalls := 0

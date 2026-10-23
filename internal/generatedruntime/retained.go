@@ -396,6 +396,9 @@ func (e *Engine) enterRetained(ctx context.Context) (func(), error) {
 	if e == nil || ctx == nil {
 		return nil, &Error{Code: DiagnosticValidationFailed}
 	}
+	if ctx.Err() != nil {
+		return nil, &Error{Code: DiagnosticCancelled}
+	}
 	leave, err := deploymenteffects.EnterScope(ctx, e.options.WorkingDirectory)
 	if err != nil {
 		return nil, &Error{Code: DiagnosticValidationFailed}

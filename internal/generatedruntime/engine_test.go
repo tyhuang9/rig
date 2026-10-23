@@ -262,7 +262,9 @@ func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
 	limits := defaultLimits()
 	limits.LogSize = "50m"
 	limits.LogFiles = 10
-	session := newRuntimeCandidateSession(t, candidateSpec(), limits, fixedDomainCapacity{memory: 4 << 30, disk: 550 << 20}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	spec := candidateSpec()
+	spec.ActiveSlot = ""
+	session := newRuntimeCandidateSession(t, spec, limits, fixedDomainCapacity{memory: 4 << 30, disk: 550 << 20}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		t.Fatalf("under-reserved replacement reached Docker: %#v", request.Args)
 		return runtimeRequestResult{}
 	})
@@ -588,7 +590,9 @@ func TestGeneratedRuntimeReconcilesAmbiguousCreateByDeterministicName(t *testing
 
 func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t *testing.T) {
 	limits := defaultLimits()
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), limits,
+	spec := candidateSpec()
+	spec.ActiveSlot = ""
+	session, program, invocation := newPreparedRuntimeCandidate(t, spec, limits,
 		fixedDomainCapacity{memory: uint64(limits.MemoryBytes), disk: 1 << 30})
 	program.create = func() runtimeRequestResult { return runtimeRequestResult{err: context.DeadlineExceeded} }
 	program.inspect = func(inspection generatedcontainer.Inspection) generatedcontainer.Inspection {

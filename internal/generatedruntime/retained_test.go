@@ -204,15 +204,23 @@ func TestRetainedRuntimeRequiresOwnedNetworkForStoppedAndRunningTargets(t *testi
 func TestRetainedRuntimeReservesTheWholeStoppedRosterAtomically(t *testing.T) {
 	targetA, stoppedA := retainedRuntimeFixture()
 	stoppedA.Status, stoppedA.Running, stoppedA.Networks = "exited", false, nil
-	targetB, stoppedB := retainedRuntimeFixtureFor("web", strings.Repeat("c", 64))
+	targetB, stoppedB := retainedRuntimeFixtureFor("web", strings.Repeat("f", 64))
 	stoppedB.Status, stoppedB.Running, stoppedB.Networks = "exited", false, nil
+	inspections := map[string]containerInspection{targetA.ContainerID: stoppedA, targetB.ContainerID: stoppedB}
+	for id, inspection := range inspections {
+		if inspection.ID != id || inspection.Status != "exited" || inspection.Running || inspection.Paused || inspection.Restarting || inspection.Dead {
+			t.Fatalf("stopped retained fixture %s = %#v", id, inspection)
+		}
+	}
 	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 768 << 20, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
-			if request.Args[len(request.Args)-1] == targetB.ContainerID {
-				return runtimeJSON(stoppedB)
+			identity := request.Args[len(request.Args)-1]
+			inspection, ok := inspections[identity]
+			if !ok {
+				t.Fatalf("unexpected retained container identity %q", identity)
 			}
-			return runtimeJSON(stoppedA)
+			return runtimeJSON(inspection)
 		case "network inspect":
 			return runtimeJSON(retainedNetworkInspection(targetA))
 		default:
@@ -433,7 +441,7 @@ func TestRetainedRuntimeCancelledCallerReleasesAdmission(t *testing.T) {
 	target, stopped := retainedRuntimeFixture()
 	stopped.Status, stopped.Running, stopped.Networks = "exited", false, nil
 	parent, cancel := context.WithCancel(context.Background())
-	engine, _, _, scope, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, _, scope, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
 			return runtimeJSON(stopped)
@@ -449,6 +457,9 @@ func TestRetainedRuntimeCancelledCallerReleasesAdmission(t *testing.T) {
 	cancelledContext := deploymenteffects.WithScope(parent, scope)
 	if _, _, err := engine.ObserveAndReserveRetained(cancelledContext, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", []RetainedTarget{target}); !IsCode(err, DiagnosticCancelled) {
 		t.Fatalf("cancelled retained admission error = %v", err)
+	}
+	if len(runner.requests) != 0 {
+		t.Fatalf("pre-cancelled retained admission reached Docker: %#v", runner.requests)
 	}
 	freshContext := deploymenteffects.WithScope(context.Background(), scope)
 	_, reservation, err := engine.ObserveAndReserveRetained(freshContext, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", []RetainedTarget{target})

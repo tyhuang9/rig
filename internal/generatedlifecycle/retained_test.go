@@ -374,6 +374,12 @@ func newRetainedAdapterFixture(t *testing.T, componentCount int, action applifec
 			PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: "apps/" + name,
 			NodeVersion: "20", BuildCommand: "npm run build", RunCommand: "node server.js", InternalPort: 8080, HealthProbe: "/health",
 		}
+		if name == "web" {
+			component.Role = generatedruntime.RoleStatic
+			component.Technology = "static"
+			component.StaticOutputDirectory = "dist"
+			component.RunCommand = projectanalysis.ManagedStaticCommand(component.StaticOutputDirectory, int(component.InternalPort))
+		}
 		planComponents = append(planComponents, component)
 		configurationTargets = append(configurationTargets, appconfig.ComponentTarget{Name: name, Role: component.Role})
 		for _, field := range []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "buildCommand", "runCommand", "internalPort", "healthProbe", "technology", "staticOutputDirectory"} {
@@ -445,8 +451,9 @@ func newRetainedAdapterFixture(t *testing.T, componentCount int, action applifec
 		t.Fatal(err)
 	}
 	t.Cleanup(reservation.Release)
-	components := make([]applifecycle.RetainedComponent, 0, len(names))
-	for _, name := range names {
+	components := make([]applifecycle.RetainedComponent, 0, len(planComponents))
+	for _, protected := range planComponents {
+		name := protected.Name
 		artifactID, containerID := uuid.NewString(), retainedDigest(name+"-container")
 		network := "rig-a-" + strings.ReplaceAll(appID, "-", "")
 		containerName := network + "-c-" + retainedDigest(name)[:12] + "-" + string(generatedruntime.SlotBlue)
@@ -458,16 +465,17 @@ func newRetainedAdapterFixture(t *testing.T, componentCount int, action applifec
 			t.Fatal(err)
 		}
 		component := applifecycle.RetainedComponent{
-			Name: name, Role: generatedruntime.RoleServer, Technology: "node", ContainerID: containerID,
+			Name: name, Role: protected.Role, Technology: protected.Technology, ContainerID: containerID,
 			ContainerName: containerName, ArtifactID: artifactID, ImageContentID: image,
-			BuildDefinitionDigest: definition, NetworkName: network, NetworkAlias: alias, InternalPort: 8080,
-			WorkingDirectory: "/workspace/apps/" + name, RunCommandDigest: retainedDigest("node server.js"),
+			BuildDefinitionDigest: definition, NetworkName: network, NetworkAlias: alias, InternalPort: protected.InternalPort,
+			WorkingDirectory: "/workspace/" + protected.RootDirectory, RunCommandDigest: retainedDigest(protected.RunCommand),
 			Limits: applifecycle.RetainedLimits{MemoryBytes: 512 << 20, MemorySwapBytes: 512 << 20,
 				CPUQuota: 100000, CPUPeriod: 100000, PIDsLimit: 256, TmpfsBytes: 64 << 20,
 				LogDriver: "local", LogMaxSize: "10m", LogMaxFiles: 3, HardeningPolicyVersion: "v1"},
 		}
 		components = append(components, component)
-		runner.components[containerID] = &adapterContainer{pin: component, appID: appID, deploymentID: deploymentID, releaseID: releaseID, planID: plan.ID, status: "absent"}
+		runner.components[containerID] = &adapterContainer{pin: component, runCommand: protected.RunCommand,
+			appID: appID, deploymentID: deploymentID, releaseID: releaseID, planID: plan.ID, status: "absent"}
 	}
 	if err := deploymentRepository.Gate(ctx, deployments.GateRequest{Claim: originalClaim, DeploymentID: deploymentID}); err != nil {
 		t.Fatal(err)
@@ -671,6 +679,7 @@ type retainedAdapterRunner struct {
 
 type adapterContainer struct {
 	pin          applifecycle.RetainedComponent
+	runCommand   string
 	appID        string
 	deploymentID string
 	releaseID    string
@@ -802,7 +811,7 @@ func (c *adapterContainer) inspection() map[string]any {
 		"labels": map[string]string{"io.rig.managed": "generated-runtime", "io.rig.application": c.appID,
 			"io.rig.release": c.releaseID, "io.rig.deployment": c.deploymentID, "io.rig.artifact": c.pin.ArtifactID,
 			"io.rig.plan": c.planID, "io.rig.component": c.pin.Name, "io.rig.role": c.pin.Role, "io.rig.slot": "blue", generatedcontainer.ReceiptLabel: c.receiptID},
-		"user": "node", "workingDir": c.pin.WorkingDirectory, "cmd": []string{"/bin/sh", "-lc", "node server.js"},
+		"user": "node", "workingDir": c.pin.WorkingDirectory, "cmd": []string{"/bin/sh", "-lc", c.runCommand},
 		"healthTest":     []string{"CMD-SHELL", `node -e "const h=require('node:http');const q=h.get({host:'127.0.0.1',port:process.env.RIG_RUNTIME_INTERNAL_PORT,path:process.env.RIG_RUNTIME_HEALTH_PATH,timeout:1500},r=>{r.resume();process.exit(r.statusCode>=200&&r.statusCode<400?0:1)});q.on('error',()=>process.exit(1));q.on('timeout',()=>{q.destroy();process.exit(1)})"`},
 		"healthInterval": int64(2 * time.Second), "healthTimeout": int64(2 * time.Second), "healthStartPeriod": int64(5 * time.Second), "healthRetries": 3,
 		"memory": int64(512 << 20), "memorySwap": int64(512 << 20), "nanoCpus": int64(1_000_000_000), "pidsLimit": int64(256),
