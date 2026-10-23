@@ -856,7 +856,18 @@ func newGeneratedDomainUpgradeFixtureAtPhase(t *testing.T, target gatewayMigrati
 	}
 	identity := newGeneratedDomainIdentityFixture(t)
 	runner := &ingressRunner{files: map[string][]byte{}}
-	manager, err := newManager(runner, Options{
+	if retainedApp {
+		_, _, ingressIP := ingressNetworkCandidate(0)
+		runner.caddyNetworks = map[string]*networkAttachment{caddyNetworkName: {
+			GwPriority: caddyGatewayPriority, IPAddress: ingressIP}}
+		runner.ingressContainers = map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {
+			Name: caddyContainerName, IPv4Address: ingressIP + "/28"}}
+	}
+	constructManager := newManager
+	if retainedApp {
+		constructManager = New
+	}
+	manager, err := constructManager(runner, Options{
 		DockerExecutable:             identity.options.DockerExecutable,
 		DockerEndpoint:               identity.options.DockerEndpoint,
 		DockerConfigDirectory:        identity.options.DockerConfigDirectory,

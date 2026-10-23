@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
@@ -135,36 +134,22 @@ func newGatewayRebindCurrentAttestationTwoAppCompositionFixture(t *testing.T) (g
 	gatewayRebindCommitInput, *gatewayRebindCurrentAttestationCompositionBoundaryDriver,
 ) {
 	t.Helper()
-	f := newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t, false, '3', uuid.NewString())
-	migration, _ := newGeneratedRouteCanonicalMigrationOnDatabase(t, f.db, f.manager.options.DataRoot,
-		f.manager.options.WorkingDirectory)
+	f := newGatewayRebindPredecessorFixtureWithLoopbackRuntime(t, false, '3', uuid.NewString())
+	if f.loopback == nil || f.loopback.migration == nil {
+		t.Fatal("two-app composition fixture lacks authentic loopback runtime")
+	}
+	migration := f.loopback.migration
 	loopbackID := migration.guarded.appID
-	head, loopbackEndpoint := seedGatewayRebindPredecessorRuntimeWithContainerID(t, f.manager, f.runner,
-		migration, strings.Repeat("7", 64))
-	var loopbackJobID string
-	if err := f.db.QueryRow(`SELECT job_id FROM deployments
-		WHERE id=? AND app_id=? AND status='preparing'`, head.DeploymentID, loopbackID).Scan(&loopbackJobID); err != nil {
-		t.Fatal("two-app composition fixture cannot find preparing loopback deployment")
-	}
-	completed := time.Now().UTC().Format(time.RFC3339Nano)
-	jobResult, err := f.db.Exec(`UPDATE jobs SET status='succeeded',phase='completed',updated_at=?,finished_at=?
-		WHERE id=? AND resource_type='application' AND resource_id=? AND status='running'`,
-		completed, completed, loopbackJobID, loopbackID)
-	if err != nil {
-		t.Fatal("two-app composition fixture cannot settle loopback job")
-	}
-	jobRows, err := jobResult.RowsAffected()
-	if err != nil || jobRows != 1 {
-		t.Fatal("two-app composition fixture did not settle exactly one loopback job")
-	}
-	deploymentResult, err := f.db.Exec(`UPDATE deployments SET status='succeeded',finished_at=?
-		WHERE id=? AND app_id=? AND job_id=? AND status='preparing'`, completed, head.DeploymentID, loopbackID, loopbackJobID)
-	if err != nil {
-		t.Fatal("two-app composition fixture cannot settle loopback deployment")
-	}
-	deploymentRows, err := deploymentResult.RowsAffected()
-	if err != nil || deploymentRows != 1 {
-		t.Fatal("two-app composition fixture did not settle exactly one loopback deployment")
+	head, loopbackEndpoint := f.loopback.head, f.loopback.endpoint
+	var jobStatus, jobPhase, deploymentStatus string
+	if err := f.db.QueryRow(`SELECT j.status,j.phase,d.status FROM deployments d JOIN jobs j ON j.id=d.job_id
+		WHERE d.id=? AND d.app_id=? AND j.id=? AND j.attempt=?
+		AND j.resource_type='application' AND j.resource_id=?`, head.DeploymentID, loopbackID,
+		migration.claim.JobID(), migration.claim.Attempt(), loopbackID).
+		Scan(&jobStatus, &jobPhase, &deploymentStatus); err != nil || jobStatus != "succeeded" ||
+		jobPhase != "succeeded" || deploymentStatus != "succeeded" {
+		t.Fatalf("two-app composition fixture did not retain exact completed state: job=%s/%s deployment=%s err=%v",
+			jobStatus, jobPhase, deploymentStatus, err)
 	}
 	state := cloneGatewayV2RouteState(f.state)
 	lanAppID := f.stateAppID()
@@ -172,15 +157,12 @@ func newGatewayRebindCurrentAttestationTwoAppCompositionFixture(t *testing.T) (g
 	if !found || lanRoute.LAN == nil {
 		t.Fatal("two-app composition fixture lacks original LAN source")
 	}
-	loopbackRoute := cloneGatewayV2AppRoute(lanRoute)
-	loopbackRoute.LAN = nil
-	loopbackRoute.Route.Slot = generatedidentity.Slot(head.Slot)
-	loopbackRoute.Route.Endpoints = []generatedroute.RouteEndpoint{loopbackEndpoint}
-	state.Apps[loopbackID] = loopbackRoute
-	if err := f.store.writeExact(f.store.v2Path, f.store.v2Purpose, state, false, maxV2RouteStateBytes); err != nil {
-		t.Fatal(err)
+	loopbackRoute, found := state.Apps[loopbackID]
+	if !found || loopbackRoute.LAN != nil || loopbackRoute.Route.Slot != generatedidentity.Slot(head.Slot) ||
+		!reflect.DeepEqual(loopbackRoute.Route.Endpoints, []generatedroute.RouteEndpoint{loopbackEndpoint}) ||
+		len(state.Apps) != 2 {
+		t.Fatal("two-app composition fixture did not retain exact pre-upgrade loopback route")
 	}
-	f.state = state
 	f, input, template := newGatewayRebindCoordinatorFixtureWithPredecessor(t, f)
 	if len(input.Inspection.Roster) != 1 || len(input.Inspection.RuntimeHeads) != 2 {
 		t.Fatal("two-app composition proposal changed LAN roster or runtime-head census")

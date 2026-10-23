@@ -14,7 +14,7 @@ import (
 // This integration test uses the real repository and protected files. The
 // fixture's Docker runner is simulated; physical acceptance is a separate gate.
 func TestGatewayRebindProposalAndAdmissionUseRealRepository(t *testing.T) {
-	f := newGatewayRebindPredecessorFixtureWithClaim(t, false)
+	f := newGatewayRebindNonterminalPredecessorFixture(t)
 	ctx := context.Background()
 	f.manager.options.RebindFenceCheck = f.repository.CheckGatewayRebindFence
 	beforeSQL, err := f.repository.GatewayRebindRecoverySnapshot(ctx)
@@ -70,9 +70,9 @@ func TestGatewayRebindProposalAndAdmissionUseRealRepository(t *testing.T) {
 	if err := f.repository.CheckGatewayRebindFence(ctx); err != nil {
 		t.Fatal("refused approval left a rebind fence")
 	}
-	// The predecessor fixture stops after switching the serving head, leaving
-	// its job running and deployment preparing. Admission must refuse that
-	// boundary before this test finishes those exact fixture rows.
+	// This fixture deliberately retains the exact route activation at its
+	// nonterminal Draining/Applying/Running boundary. Admission must refuse it
+	// before the same sealed execution is completed below.
 	if _, _, err := f.repository.ClaimGatewayRebindV2(ctx, proposal); !errors.Is(err, appaccess.ErrGatewayRebindNotQuiescent) {
 		t.Fatalf("nonterminal deployment must refuse admission: %v", err)
 	}
@@ -80,6 +80,8 @@ func TestGatewayRebindProposalAndAdmissionUseRealRepository(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(beforeSQL, afterBusy) || f.repository.CheckGatewayRebindFence(ctx) != nil {
 		t.Fatal("refused nonterminal deployment changed authority or left a fence")
 	}
+	f.seeded.complete(t)
+	f.seeded = nil
 	completeCrossStoreRepositoryFixture(t, f, inspection.Roster[0])
 	claim, created, err := f.repository.ClaimGatewayRebindV2(ctx, proposal)
 	if err != nil || !created || claim.State != appaccess.GatewayRebindPrepared || claim.StateSequence != 1 ||
@@ -272,23 +274,17 @@ func TestGatewayRebindPreparedAdmissionAndRecoveryUseRealRepository(t *testing.T
 func completeCrossStoreRepositoryFixture(t *testing.T, f gatewayRebindPredecessorFixture, entry appaccess.GatewayRebindRosterEntryV2) {
 	t.Helper()
 	ctx := context.Background()
-	completed := time.Now().UTC().Format(time.RFC3339Nano)
-	jobResult, err := f.db.ExecContext(ctx, `UPDATE jobs SET status='succeeded',phase='completed',updated_at=?,finished_at=?
-		WHERE status='running' AND id=(SELECT job_id FROM deployments WHERE id=? AND app_id=?)`,
-		completed, completed, entry.ServingDeploymentID, entry.AppID)
-	if err != nil {
-		t.Fatal(err)
+	var jobStatus, jobPhase, deploymentStatus string
+	var attempt int
+	if err := f.db.QueryRowContext(ctx, `SELECT j.status,j.phase,j.attempt,d.status
+		FROM deployments d JOIN jobs j ON j.id=d.job_id
+		WHERE d.id=? AND d.app_id=?`, entry.ServingDeploymentID, entry.AppID).
+		Scan(&jobStatus, &jobPhase, &attempt, &deploymentStatus); err != nil {
+		t.Fatalf("read exact completed fixture state: %v", err)
 	}
-	if rows, err := jobResult.RowsAffected(); err != nil || rows != 1 {
-		t.Fatalf("complete exact fixture job: rows=%d err=%v", rows, err)
-	}
-	deploymentResult, err := f.db.ExecContext(ctx, `UPDATE deployments SET status='succeeded',finished_at=?
-		WHERE id=? AND app_id=? AND status='preparing'`, completed, entry.ServingDeploymentID, entry.AppID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rows, err := deploymentResult.RowsAffected(); err != nil || rows != 1 {
-		t.Fatalf("complete exact fixture deployment: rows=%d err=%v", rows, err)
+	if jobStatus != "succeeded" || jobPhase != "succeeded" || attempt != 2 || deploymentStatus != "succeeded" {
+		t.Fatalf("exact fixture is not terminal: job=%s/%s attempt=%d deployment=%s",
+			jobStatus, jobPhase, attempt, deploymentStatus)
 	}
 	census, err := f.repository.GatewayRebindQuiescenceCensus(ctx)
 	if err != nil || census.Jobs.Total != 1 || census.Jobs.Succeeded != 1 ||

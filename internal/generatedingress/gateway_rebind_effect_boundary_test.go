@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 )
@@ -30,6 +31,21 @@ type gatewayRebindEffectBoundaryFixture struct {
 func newGatewayRebindEffectBoundaryFixture(t *testing.T) gatewayRebindEffectBoundaryFixture {
 	t.Helper()
 	fixture, snapshot, predecessor, observation := gatewayRebindProtectedIntentFixture(t)
+	return newGatewayRebindEffectBoundaryFixtureFromInputs(t, fixture, snapshot, predecessor, observation)
+}
+
+func newGatewayRebindEffectBoundaryFixtureWithLoopback(t *testing.T) gatewayRebindEffectBoundaryFixture {
+	t.Helper()
+	predecessor := newGatewayRebindPredecessorFixtureWithLoopbackRuntime(t, true, '4', "")
+	fixture, snapshot, selection, observation := gatewayRebindProtectedIntentFixtureFromPredecessor(t, predecessor)
+	return newGatewayRebindEffectBoundaryFixtureFromInputs(t, fixture, snapshot, selection, observation)
+}
+
+func newGatewayRebindEffectBoundaryFixtureFromInputs(t *testing.T, fixture gatewayRebindPredecessorFixture,
+	snapshot appaccess.GatewayRebindStartupSnapshot, predecessor gatewayUpgradeGenerationSelection,
+	observation gatewayRebindSuccessorPreflightObservation,
+) gatewayRebindEffectBoundaryFixture {
+	t.Helper()
 	selection, err := fixture.manager.resolveGatewayRebindProtectedIntentLocked(observation.result.RebindOperationID)
 	if err != nil {
 		t.Fatal(err)
@@ -336,15 +352,17 @@ func TestGatewayRebindEffectBoundaryAttestsExactTwoAppRoster(t *testing.T) {
 
 func newGatewayRebindEffectBoundaryTwoAppFixture(t *testing.T) gatewayRebindEffectBoundaryFixture {
 	t.Helper()
-	fixture := newGatewayRebindPredecessorFixtureWithClaim(t, false)
+	fixture := newGatewayRebindPredecessorFixtureWithLoopbackRuntime(t, false, '4', "")
 	ctx := context.Background()
 	preclaim, err := fixture.repository.GatewayRebindPreclaimSnapshot(ctx, fixture.proposal)
 	if err != nil {
 		t.Fatal(err)
 	}
 	profile := preclaim.CurrentProfile
-	migration, _ := newGeneratedRouteCanonicalMigrationOnDatabase(t, fixture.db, fixture.manager.options.DataRoot,
-		fixture.manager.options.WorkingDirectory)
+	if fixture.loopback == nil || fixture.loopback.migration == nil {
+		t.Fatal("two-app effect boundary fixture lacks authentic loopback runtime")
+	}
+	migration := fixture.loopback.migration
 	appID := migration.guarded.appID
 	allocation, _, err := fixture.repository.ReserveAppAccess(ctx, appaccess.ReserveAppAccessInput{
 		AppID: appID, OperationID: uuid.NewString(), GatewayProfileRevisionID: profile.ID,
@@ -389,7 +407,7 @@ func newGatewayRebindEffectBoundaryTwoAppFixture(t *testing.T) gatewayRebindEffe
 	if err != nil {
 		t.Fatal(err)
 	}
-	active, activeEndpoint := seedGatewayRebindPredecessorRuntime(t, fixture.manager, fixture.runner, migration)
+	active, activeEndpoint := fixture.loopback.head, fixture.loopback.endpoint
 	binding, err := gatewayV2LANBindingForRequest(gatewayV2LANGrantRequest{
 		AttemptID: grant.AttemptID, ClaimRequestDigest: grant.RequestDigest, AppID: appID,
 		AllocationID: revision.Allocation.ID, OwnerOperationID: revision.OperationID, Port: revision.Allocation.Port,
@@ -402,8 +420,12 @@ func newGatewayRebindEffectBoundaryTwoAppFixture(t *testing.T) gatewayRebindEffe
 		t.Fatal(err)
 	}
 	state := cloneGatewayV2RouteState(fixture.state)
-	secondRoute := cloneGatewayV2AppRoute(state.Apps[fixture.proposal.Roster[0].AppID])
-	secondRoute.Route.Endpoints = []generatedroute.RouteEndpoint{activeEndpoint}
+	secondRoute, found := state.Apps[appID]
+	if !found || secondRoute.LAN != nil || secondRoute.Route.Slot != generatedidentity.Slot(active.Slot) ||
+		!reflect.DeepEqual(secondRoute.Route.Endpoints, []generatedroute.RouteEndpoint{activeEndpoint}) {
+		t.Fatal("two-app effect boundary fixture lost authentic loopback route")
+	}
+	secondRoute = cloneGatewayV2AppRoute(secondRoute)
 	secondRoute.LAN = &binding
 	state.Apps[appID] = secondRoute
 	if err := fixture.store.writeExact(fixture.store.v2Path, fixture.store.v2Purpose,
@@ -582,6 +604,7 @@ func TestGatewayRebindEffectBoundaryRejectsProtectedSQLiteAndExternalDrift(t *te
 		fixture := newGatewayRebindEffectBoundaryFixture(t)
 		for _, trigger := range []string{
 			"lan_gateway_rebind_fence_runtime_head_update", "generated_runtime_active_head_valid_update",
+			"generated_runtime_active_head_activation_guard",
 		} {
 			if _, err := fixture.predecessor.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
 				t.Fatal(err)

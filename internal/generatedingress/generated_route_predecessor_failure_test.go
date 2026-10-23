@@ -454,6 +454,19 @@ func (r *generatedRoutePredecessorRunner) Run(ctx context.Context,
 	request runtimeprocess.CommandRequest,
 ) (runtimeprocess.CommandResult, error) {
 	args := request.Args
+	if len(args) >= 3 && args[0] == "network" && args[1] == "inspect" {
+		target := args[len(args)-1]
+		for _, snapshot := range r.endpoints {
+			if target == snapshot.endpoint.NetworkName {
+				r.commands = append(r.commands, append([]string(nil), args...))
+				return jsonResult(networkInspection{Name: target, Driver: "bridge", Scope: "local",
+					Options: map[string]string{}, Labels: map[string]string{
+						"io.rig.managed":     generatedidentity.NetworkOwnershipLabelValue,
+						"io.rig.application": snapshot.appID,
+					}}), nil
+			}
+		}
+	}
 	if len(args) >= 3 && args[0] == "container" && args[1] == "inspect" {
 		snapshot, exists := r.endpoints[args[len(args)-1]]
 		if !exists {

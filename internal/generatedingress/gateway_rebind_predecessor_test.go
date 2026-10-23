@@ -32,6 +32,28 @@ type gatewayRebindPredecessorFixture struct {
 	state      gatewayV2RouteState
 	journal    gatewayMigrationJournal
 	proposal   appaccess.GatewayRebindPreclaimProposal
+	seeded     *gatewayRebindSeededRuntime
+	loopback   *gatewayRebindSeededRuntime
+}
+
+type gatewayRebindSeededRuntime struct {
+	head      generatedruntimestate.ActiveHead
+	endpoint  generatedroute.RouteEndpoint
+	owner     *candidateOwnerFixture
+	execution *GeneratedCandidateExecution
+	migration *generatedMigrationFixture
+}
+
+func (s *gatewayRebindSeededRuntime) complete(t *testing.T) {
+	t.Helper()
+	if s == nil || s.owner == nil || s.execution == nil || s.migration == nil {
+		t.Fatal("gateway rebind seeded runtime is incomplete")
+	}
+	completeGeneratedRouteSequentialCandidateState(t, s.owner, s.head)
+	s.execution.Leave()
+	if err := s.migration.releaseEffects(); err != nil {
+		t.Fatalf("release predecessor deployment effects: %v", err)
+	}
 }
 
 func TestInspectGatewayRebindPredecessorAcceptsExactReadOnlyPair(t *testing.T) {
@@ -273,7 +295,28 @@ func newGatewayRebindPredecessorFixtureWithEndpoint(t *testing.T, insertClaim bo
 func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, insertClaim bool,
 	endpointID rune, lanApproverID string,
 ) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpointLANApproverAndCompletion(t, insertClaim,
+		endpointID, lanApproverID, true, false)
+}
+
+func newGatewayRebindPredecessorFixtureWithLoopbackRuntime(t *testing.T, insertClaim bool,
+	endpointID rune, lanApproverID string,
+) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpointLANApproverAndCompletion(t, insertClaim,
+		endpointID, lanApproverID, true, true)
+}
+
+func newGatewayRebindNonterminalPredecessorFixture(t *testing.T) gatewayRebindPredecessorFixture {
+	return newGatewayRebindPredecessorFixtureWithEndpointLANApproverAndCompletion(t, false, '4', "", false, false)
+}
+
+func newGatewayRebindPredecessorFixtureWithEndpointLANApproverAndCompletion(t *testing.T, insertClaim bool,
+	endpointID rune, lanApproverID string, completeRuntime, includeLoopback bool,
+) gatewayRebindPredecessorFixture {
 	t.Helper()
+	if includeLoopback && !completeRuntime {
+		t.Fatal("loopback predecessor fixture requires completed serving runtimes")
+	}
 	manager, runner := newManagerFixture(t, false)
 	db, err := openGatewayRebindFixtureDatabase(manager.options.DataRoot)
 	if err != nil {
@@ -298,6 +341,29 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 	}
 	repository := appaccess.New(db)
 	ctx := context.Background()
+	var migration *generatedMigrationFixture
+	var seeded, loopback *gatewayRebindSeededRuntime
+	var active generatedruntimestate.ActiveHead
+	var activeEndpoint generatedroute.RouteEndpoint
+	if includeLoopback {
+		// Both serving runtimes must be activated before any synthetic gateway
+		// profile, grant, upgrade, or rebind state exists. A later activation
+		// would have to reconcile against that protected state and would no
+		// longer represent an ordinary pre-upgrade serving route.
+		migration, _ = newGeneratedRouteCanonicalMigrationOnDatabase(t, db, manager.options.DataRoot,
+			manager.options.WorkingDirectory)
+		seeded = seedGatewayRebindPredecessorRuntimeWithContainerIDUnfinished(t, manager, runner, migration,
+			strings.Repeat(string(endpointID), 64))
+		active, activeEndpoint = seeded.head, seeded.endpoint
+		seeded.complete(t)
+		seeded = nil
+
+		loopbackMigration, _ := newGeneratedRouteCanonicalMigrationOnDatabase(t, db, manager.options.DataRoot,
+			manager.options.WorkingDirectory)
+		loopback = seedGatewayRebindPredecessorRuntimeWithContainerIDUnfinished(t, manager, runner,
+			loopbackMigration, strings.Repeat("7", 64))
+		loopback.complete(t)
+	}
 	profileSpec := appaccess.GatewayProfileSpec{
 		SelectedIPv4: "192.168.96.8", InterfaceID: "rebind-predecessor", PortStart: 8100, PortEnd: 8119,
 	}
@@ -314,8 +380,10 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	migration, _ := newGeneratedRouteCanonicalMigrationOnDatabase(t, db, manager.options.DataRoot,
-		manager.options.WorkingDirectory)
+	if migration == nil {
+		migration, _ = newGeneratedRouteCanonicalMigrationOnDatabase(t, db, manager.options.DataRoot,
+			manager.options.WorkingDirectory)
+	}
 	appID := migration.guarded.appID
 	allocation, _, err := repository.ReserveAppAccess(ctx, appaccess.ReserveAppAccessInput{
 		AppID: appID, OperationID: uuid.NewString(), GatewayProfileRevisionID: profile.ID,
@@ -361,8 +429,15 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	active, activeEndpoint := seedGatewayRebindPredecessorRuntimeWithContainerID(t, manager, runner, migration,
-		strings.Repeat(string(endpointID), 64))
+	if active.DeploymentID == "" {
+		seeded = seedGatewayRebindPredecessorRuntimeWithContainerIDUnfinished(t, manager, runner, migration,
+			strings.Repeat(string(endpointID), 64))
+		active, activeEndpoint = seeded.head, seeded.endpoint
+		if completeRuntime {
+			seeded.complete(t)
+			seeded = nil
+		}
+	}
 
 	upgradeSpec := appaccess.GatewayProfileUpgradeSpec{
 		ProfileRevisionID: profile.ID, ProfileRevisionNumber: profile.RevisionNumber, ProfileSpecDigest: profile.SpecDigest,
@@ -400,6 +475,12 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 			Endpoints: []generatedroute.RouteEndpoint{activeEndpoint},
 		},
 	}}
+	if loopback != nil {
+		source.Active[loopback.migration.guarded.appID] = routeRecord{
+			Slot:      generatedidentity.Slot(loopback.head.Slot),
+			Endpoints: []generatedroute.RouteEndpoint{loopback.endpoint},
+		}
+	}
 	if err := manager.store.save(source); err != nil {
 		t.Fatal(err)
 	}
@@ -557,7 +638,7 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 	}
 	return gatewayRebindPredecessorFixture{
 		manager: manager, store: store, repository: repository, db: db, migration: migration, runner: runner,
-		state: loadedState, journal: loadedJournal,
+		state: loadedState, journal: loadedJournal, seeded: seeded, loopback: loopback,
 		proposal: appaccess.GatewayRebindPreclaimProposal{
 			Spec: rebindSpec, RebindApproval: rebindApproval,
 			ConfigureApproval: configureApproval, Roster: []appaccess.GatewayRebindRosterEntry{entry},
@@ -586,11 +667,21 @@ func seedGatewayRebindPredecessorRuntimeWithContainerID(t *testing.T, manager *M
 	migration *generatedMigrationFixture, containerID string,
 ) (generatedruntimestate.ActiveHead, generatedroute.RouteEndpoint) {
 	t.Helper()
+	seeded := seedGatewayRebindPredecessorRuntimeWithContainerIDUnfinished(t, manager, runner, migration, containerID)
+	seeded.complete(t)
+	return seeded.head, seeded.endpoint
+}
+
+func seedGatewayRebindPredecessorRuntimeWithContainerIDUnfinished(t *testing.T, manager *Manager, runner *ingressRunner,
+	migration *generatedMigrationFixture, containerID string,
+) *gatewayRebindSeededRuntime {
+	t.Helper()
 	if manager == nil || runner == nil || migration == nil {
 		t.Fatal("gateway rebind predecessor runtime dependencies are incomplete")
 	}
 	owner, _ := newGeneratedRouteSequentialCandidateOwnerForMigrationWithContainerID(t, migration, containerID)
 	execution, identity := prepareGeneratedRouteSequentialCandidate(t, owner)
+	t.Cleanup(execution.Leave)
 	endpoint := generatedRouteEndpoint(identity)
 	endpoints := make(map[string]generatedRouteEndpointSnapshot)
 	if installed, ok := manager.runner.(*generatedRoutePredecessorRunner); ok {
@@ -623,15 +714,8 @@ func seedGatewayRebindPredecessorRuntimeWithContainerID(t *testing.T, manager *M
 	if err != nil {
 		t.Fatalf("read predecessor active head: %v", err)
 	}
-	// Gateway rebind fixtures model completed deploy SQL/runtime authority but
-	// deliberately retain no application lifecycle operation. Current-V2
-	// promotion tests assert that this lifecycle head remains uninitialized.
-	completeGeneratedRouteSequentialCandidateState(t, owner, head)
-	execution.Leave()
-	if err := migration.releaseEffects(); err != nil {
-		t.Fatalf("release predecessor deployment effects: %v", err)
-	}
-	return head, endpoint
+	return &gatewayRebindSeededRuntime{head: head, endpoint: endpoint, owner: owner,
+		execution: execution, migration: migration}
 }
 
 func insertGatewayRebindPredecessorClaim(t *testing.T, db *sql.DB, claim appaccess.GatewayRebindClaim) {

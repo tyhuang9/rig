@@ -242,7 +242,7 @@ func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobS
 	appID := uuid.NewString()
 	machineID := uuid.NewString()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, "owner", "hash", now, now); err != nil {
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, "owner-"+actorID, "hash", now, now); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,?,'local','ready','test','test','test','test',?,?)`, machineID, "local", now, now); err != nil {

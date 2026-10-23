@@ -223,9 +223,16 @@ func TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy(t *test
 	redeployed, err := selection.Store.load()
 	if err != nil || redeployed.Revision != selection.State.Revision+2 || redeployed.Pending != nil ||
 		redeployed.Apps[entry.AppID].Route.Slot != generatedidentity.Slot(head.Slot) ||
-		!reflect.DeepEqual(redeployed.Apps[entry.AppID].LAN, selection.State.Apps[entry.AppID].LAN) ||
-		physical.applyCalls != 1 || physical.attestCalls != 1 || physical.restoreCalls+physical.stopCalls != 0 {
-		t.Fatalf("ordinary redeploy did not preserve transferred binding: %v", err)
+		!reflect.DeepEqual(redeployed.Apps[entry.AppID].LAN, selection.State.Apps[entry.AppID].LAN) {
+		t.Fatalf("ordinary redeploy did not preserve exact head and transferred binding: state=%#v error=%v", redeployed, err)
+	}
+	// The explicit predecessor observation, Pin observation, pre-activation
+	// observation, state-machine proof and post-switch observation each attest
+	// the same selected current authority. Only the state-machine apply mutates.
+	if physical.applyCalls != 1 || physical.attestCalls != 5 ||
+		physical.restoreCalls != 0 || physical.stopCalls != 0 {
+		t.Fatalf("ordinary redeploy physical sequence: apply=%d attest=%d restore=%d stop=%d",
+			physical.applyCalls, physical.attestCalls, physical.restoreCalls, physical.stopCalls)
 	}
 	files, err := readGatewayHistorySnapshotMode(f.manager.store, true)
 	if err != nil {
