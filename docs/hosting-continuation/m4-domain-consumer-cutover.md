@@ -5,14 +5,143 @@ published at `c676c5ca669ca3162fcdb3bdfb183e264aa78a8b`. The selected local Wind
 native Linux matrix and four added regression tests passed with explicit
 environment/live-test skips. The first hosted run subsequently finished with
 68 failed checks, 61 successful checks and two skipped checks. Repairs are in
-progress. The reviewed successor source is `8ee108102a984a4916883d85640f74ff41eeb042`,
-following the published `9117de63327afd02d6043b8a465253b30c955344` checkpoint;
-this is not hosted acceptance. Receipt-owned predecessor retirement
+progress. The published repair checkpoint is
+`f4a0165f1f3560dbe12c85af94bc8b77f4161a45`. Its hosted run still refuses domain
+construction. Local diagnostic repairs are recorded below; they do not establish
+hosted acceptance. Receipt-owned predecessor retirement
 remains open. M4 is incomplete.
 
 The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
+
+## Current startup and relay diagnostics
+
+At 23:24:30 UTC on 23 October, the `f4a0165` hosted run had 25 failed checks,
+20 successful checks, 11 running, 84 queued and one skipped. Snapshot SHA-256:
+`22c4e5c33cc35cac4bdb0b5fe34b7d0b021eb4a84cb746c3b1c9906a2f642947`.
+All 25 completed failure logs were retained once. The synthetic merge is
+`7b10839bffdc48fabb3b5930438702bbcad34b5e`, with the unchanged PR #220 base and
+this published head as parents; tree `f9585c8a2162d802f2bc74662812656d30dfe806`
+equals the head tree.
+
+The Docker projection correction has not resolved the construction refusal.
+The [controller TLS job](https://github.com/tyhuang9/rig/actions/runs/40037388827/job/120700099882)
+and rebind jobs still return the generic refusal. Several constructor branches
+produce that error, so these logs do not identify a failed database, root or
+Docker predicate. The image-authority `BuildAndReuse` child passed, while its
+following `AuthorityLostBeforeBuildLoad` child failed construction; this is not
+a passing image-authority parent. LAN and migration fixtures still require
+complete domain composition. These are check outcomes, not distinct defect counts.
+
+The runtime core race job also reports retained-identity conflicts in 47 outer
+parents and 19 children, without a reported data race or timeout. Source review
+found authentic candidate, retained-runtime and network fixtures still using
+test-scoped roots. Their missing process-lifetime retention requires a separate
+test-only correction; the log does not prove which physical identity was reused.
+The existing Windows loopback-head drift fixture also still updates zero rows.
+
+### Windows diagnostic fixture
+
+Commit `c374e3927b89ea526422016c78f9b57a31f5eafa` gives the diagnostic fixture
+the supported pointer runner. It retains the original malformed upgrade-claim,
+typed diagnostic and wrapped-error assertions. The exact discovered parent
+`TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult` passes locally.
+The hosted Windows failure on the earlier published head is preserved separately.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `windows-diagnostic-successor-20261023T230631Z/receipt.json`, SHA-256
+  `c378aa4bae989bfef6b5b3e85bbaf38e0905a10491b241b087f51c626a378e20`.
+- `windows-diagnostic-root-audit-20261023.json`, SHA-256
+  `6456316cb28132d3ee7b9e7e11d1e93d22441755e07ddd7f6157ad116ff15971`.
+
+### Closed relay seed failure projection
+
+Commit `aab482704b093ba24f9eca23a5c7fb9676a18706` stops the seven-statement
+controller seed at its first error and emits only the fixed `controller_seed`
+phase and one of `deadline`, `canceled`, `constraint` or `other`. Classification
+uses context sentinels, a concrete SQLite constraint, then observed context state.
+Context fallback attributes an opaque interruption; it does not prove that a
+deadline caused the hosted failure. The setup deadline and race timeout remain
+unchanged. SQL, arguments, identifiers, paths and driver error text are excluded.
+
+The workflow projects only the exact test/package/output event and an anchored
+closed diagnostic. Its shell contract retains the original three accepted and
+22 rejected cases and adds five accepted and 25 rejected cases. The Go controls
+pass three outer parents and eight direct children, including first-error stop,
+classification precedence and a fatal-helper subprocess privacy check.
+
+Evidence under the same directory:
+
+- `relay-seed-diagnostic-successor-20261023T231000Z/receipt.json`, SHA-256
+  `6a505adedc4d13059290638f83cd0d8a94a6aba0cfd91d09affcc964600039c9`.
+- `relay-seed-projection-changed-20261023T223658Z/receipt.json`, SHA-256
+  `7b63cd19b8341ad33df13077f69772629bde66ca98c15cbb587585713195a9df`.
+- Source security review in the Go successor directory, SHA-256
+  `be76b93c4c7d0f4dd005b35fbe36aa5fe3d90683076ea1759e68788e84971927`.
+- `relay-checkpoint-root-audit-20261023.json`, SHA-256
+  `fd3fb728b8dd4242c9393f592a3e57679773a32db6bd3abd8f93a85c790a9841`.
+
+Both diagnostic Go files pass formatting, two-package vet and canonical
+generation checks. Static receipt
+`windows-relay-static-20261023T231230Z/receipt.json` has SHA-256
+`7c7bdff2e7fb20778cb0a68d5c3fd1864669e177328ce9b5f02e57f937de5c81`.
+Execution used Windows/amd64, local toolchain selection, empty `GOFLAGS` and
+`CGO_ENABLED=0`; shell projection ran under native Linux with pinned jq 1.8.1.
+Original harness and compilation failures remain retained. These focused
+results do not establish PostgreSQL, Docker, race, full CI or M4 acceptance.
+
+### Closed startup-construction attribution
+
+Commit `a4dcbff734a287dc2a06d0c83d79b905afb748d7` labels factory stages and finite observation
+reasons, including Docker image, container, volume, network, restart config,
+live config and static response. Empty construction distinguishes its locked
+and released final checks. Native V1 outer predicates retain the nested reason.
+The change preserves checks, read order, locks, capacity and authority behavior.
+
+Boundaries that previously replaced an underlying error still replace it. Only
+the closed reason crosses those boundaries; the previous sentinel or fixed error
+remains available through unwrapping. Direct reader boundaries preserve causes
+only where they were already observable. No arbitrary error text, paths, command
+arguments, SQL or identities are added to the diagnostic. There is no exported
+diagnostic extractor or new authority input.
+
+The original source review and its erratum rejected missing final-stage labels,
+newly exposed collapsed causes and lost Native V1 reasons. Those findings were
+corrected before acceptance. Successor source security review
+`startup-construction-attribution-successor-source-security-review.md` under
+the same evidence directory has SHA-256
+`649fe1c17f9eb6b52e0bae823cf67a3346862b93bf024f2458161ed66cc1bdd5`.
+
+The retained Windows binary run in
+`construction-attribution-corrected-20261023T2332Z/` passes exactly two discovered
+parents: the new closed-attribution test and the existing canonical-input/sticky
+classification test. The new parent has four direct and eleven nested child
+passes; the canonical parent has four distinct subprocess-owned child passes.
+Echoed subprocess output is not counted as additional tests. Raw SHA-256 is
+`56b893894e39dd67992664a2d3ec908983c1b04d3359d5fdb8949f99443782c8`.
+Both five-file manifests match
+`48ba9204fb950580cc3ffb9816bd95ad7042307020d702f3cdf8d9ebd4def8ae`.
+Controls inject failures at real reader boundaries, verify recursive absence of
+discarded causes and preserve the existing sentinel identities and sticky refusal.
+This diagnostic evidence does not resolve the hosted failure; the next Docker
+run must supply the actual stage and reason.
+
+The post-execution behavior receipt has SHA-256
+`e8966d1232dff74dcbd9656c7afc4bd5a428078b41c3010dce4ad55f76d08246`.
+Original command text, environment, statuses, binary and source/raw hashes are
+retained; no standalone runner script was saved before execution. Root audit
+`construction-attribution-root-audit-20261023.json` has SHA-256
+`ad511659ac2b343e16614e2152398c53380734b28ea7d2a24ad069e6e88bd331`.
+Formatting, ingress vet, live-tagged compilation and canonical generation pass.
+The initial canonical command used an absent PowerShell path; its harness
+failure remains recorded, followed by a successful run using bundled PowerShell
+7.6.5. Static receipt
+`construction-attribution-static-successor-20261023T2336Z/receipt.json` has
+SHA-256 `096715c3a17273ddbe8af5c187152c25cc26f4e85d6b10297b627d2b6612e2f9`.
+Both gates used Windows/amd64, local toolchain selection, empty `GOFLAGS` and
+`CGO_ENABLED=0`. Tagged compilation executed no Docker tests.
 
 ## Current Docker reader and fixture-lifetime checkpoint
 
