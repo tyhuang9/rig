@@ -31,7 +31,8 @@ func newCandidatePolicyFixture(t *testing.T) candidatePolicyFixture {
 	network := newGeneratedMigrationFixture(t)
 	artifactID := uuid.NewString()
 	pins := candidateValidationPins{
-		claim: network.claim, deploymentID: network.request.DeploymentID,
+		claim: network.claim, identity: candidateValidationIdentity{applicationID: network.claim.ApplicationID(),
+			jobID: network.claim.JobID(), attempt: network.claim.Attempt()}, deploymentID: network.request.DeploymentID,
 		releaseID:                    network.request.ReleaseID,
 		configurationRevisionID:      network.request.ConfigurationRevisionID,
 		configurationRevisionNumber:  network.request.ConfigurationRevisionNumber,

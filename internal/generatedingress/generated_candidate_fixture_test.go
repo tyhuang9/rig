@@ -84,13 +84,14 @@ type candidateMigrationRequestFixture struct {
 }
 
 type generatedMigrationFixture struct {
-	repository    *candidateTestRepository
-	configuration *appconfig.Store
-	guarded       *candidateTestGuarded
-	request       candidateMigrationRequestFixture
-	plan          deploymentplans.Plan
-	claim         deploymentexecution.Claim
-	binding       deploymentbinding.Binding
+	repository     *candidateTestRepository
+	configuration  *appconfig.Store
+	guarded        *candidateTestGuarded
+	releaseEffects func() error
+	request        candidateMigrationRequestFixture
+	plan           deploymentplans.Plan
+	claim          deploymentexecution.Claim
+	binding        deploymentbinding.Binding
 }
 
 func newGeneratedMigrationFixture(t *testing.T) *generatedMigrationFixture {
@@ -114,20 +115,6 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if db == nil {
 		t.Fatal("generated migration fixture requires a database")
 	}
-	actorID := uuid.NewString()
-	appID := uuid.NewString()
-	machineID := uuid.NewString()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, "owner", "hash", now, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,?,'local','ready','test','test','test','test',?,?)`, machineID, "local", now, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?, 'draft',?,?)`, appID, appID, appID, machineID, now, now); err != nil {
-		t.Fatal(err)
-	}
-
 	lifecycle := applifecycle.New(db)
 	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
 	if err != nil {
@@ -153,17 +140,6 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := release(); err != nil {
-			t.Errorf("release deployment effects scope: %v", err)
-		}
-	})
-	guarded := &candidateTestGuarded{context: deploymenteffects.WithScope(context.Background(), scope), appID: appID, actorID: actorID}
-
 	plans, err := deploymentplans.New(db, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -172,6 +148,114 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if err != nil {
 		t.Fatal(err)
 	}
+	repository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores, err := repository.GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, repository, stores, plans,
+		configuration, directories.WorkingDirectory, planComponentNames, runtimeComponentNames)
+}
+
+func newGeneratedMigrationFixtureOnDomainWithComponents(t *testing.T, identity generatedDomainIdentityFixture,
+	planComponentNames, runtimeComponentNames []string,
+) *generatedMigrationFixture {
+	t.Helper()
+	if identity.stores == nil || !identity.stores.ConfiguredForDomain(identity.dataRoot,
+		identity.options.WorkingDirectory) {
+		t.Fatal("generated migration domain fixture requires exact sealed stores")
+	}
+	db := identity.stores.Database()
+	lifecycle := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, identity.options.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := deploymentplans.New(db, identity.dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := appconfig.New(db, identity.dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores, err := repository.GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stores.ConfiguredForDomain(identity.dataRoot, identity.options.WorkingDirectory) {
+		t.Fatal("generated migration fixture did not retain exact domain provenance")
+	}
+	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, repository,
+		stores, plans, configuration,
+		identity.options.WorkingDirectory, planComponentNames, runtimeComponentNames)
+}
+
+func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobService *jobs.Service,
+	repository *deployments.Repository, stores *deployments.GeneratedOwnerStores,
+	plans *deploymentplans.Store, configuration *appconfig.Store, workingDirectory string,
+	planComponentNames, runtimeComponentNames []string,
+) *generatedMigrationFixture {
+	t.Helper()
+	if db == nil || jobService == nil || repository == nil || stores == nil || plans == nil ||
+		configuration == nil || workingDirectory == "" {
+		t.Fatal("generated migration fixture dependencies are incomplete")
+	}
+	actorID := uuid.NewString()
+	appID := uuid.NewString()
+	machineID := uuid.NewString()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, "owner", "hash", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,?,'local','ready','test','test','test','test',?,?)`, machineID, "local", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?, 'draft',?,?)`, appID, appID, appID, machineID, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), workingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	releaseEffects := func() error {
+		if released {
+			return nil
+		}
+		released = true
+		return release()
+	}
+	t.Cleanup(func() {
+		if err := releaseEffects(); err != nil {
+			t.Errorf("release deployment effects scope: %v", err)
+		}
+	})
+	guarded := &candidateTestGuarded{context: deploymenteffects.WithScope(context.Background(), scope), appID: appID, actorID: actorID}
 	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "runCommand", "internalPort", "healthProbe"}
 	components := make([]deploymentplans.Component, 0, len(planComponentNames))
 	provenance := make([]deploymentplans.FieldProvenance, 0, len(planComponentNames)*len(fields))
@@ -223,14 +307,6 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'github',7,?,'ready',?,?,?,?,?)`, releaseID, appID, now, strings.Repeat("c", 64), workspace, configurationRevision.RevisionID, configurationRevision.RevisionNumber, revision.ID, revision.RevisionNumber); err != nil {
 		t.Fatal(err)
 	}
-	repository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stores, err := repository.GeneratedOwnerStores()
-	if err != nil {
-		t.Fatal(err)
-	}
 	testRepository := &candidateTestRepository{Repository: repository, db: db, stores: stores}
 	deployment, _, err := repository.GetOrCreateByJob(context.Background(), appID, created.Job.ID, "current")
 	if err != nil {
@@ -278,7 +354,8 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 		t.Fatal(err)
 	}
 	return &generatedMigrationFixture{
-		repository: testRepository, configuration: configuration, guarded: guarded, plan: plan, claim: claim, binding: created.Binding,
+		repository: testRepository, configuration: configuration, guarded: guarded,
+		releaseEffects: releaseEffects, plan: plan, claim: claim, binding: created.Binding,
 		request: candidateMigrationRequestFixture{
 			DeploymentID: deployment.ID, ReleaseID: releaseID,
 			ConfigurationRevisionID: configurationRevision.RevisionID, ConfigurationRevisionNumber: configurationRevision.RevisionNumber,

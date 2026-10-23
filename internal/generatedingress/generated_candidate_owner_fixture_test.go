@@ -35,15 +35,22 @@ func newCandidateOwnerFixture(t *testing.T) *candidateOwnerFixture {
 
 func newCandidateOwnerFixtureWithValidation(t *testing.T, validation *candidateValidationFixture) *candidateOwnerFixture {
 	t.Helper()
-	if validation == nil || validation.migration == nil {
-		t.Fatal("candidate owner fixture requires prepared validation authority")
-	}
 	options := GeneratedCandidateProcessOptions{
 		DockerExecutable: filepath.Join(t.TempDir(), "docker"), DockerConfigDirectory: t.TempDir(),
 		WorkingDirectory: t.TempDir(), CommandTimeout: time.Minute, HealthTimeout: time.Minute,
 		HealthPollInterval: 100 * time.Millisecond, OutputLimit: 16 << 10,
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20,
 		LogSize: "1m", LogFiles: 2, ReplacementDiskBytes: 128 << 20,
+	}
+	return newCandidateOwnerFixtureWithValidationAndOptions(t, validation, options)
+}
+
+func newCandidateOwnerFixtureWithValidationAndOptions(t *testing.T, validation *candidateValidationFixture,
+	options GeneratedCandidateProcessOptions,
+) *candidateOwnerFixture {
+	t.Helper()
+	if validation == nil || validation.migration == nil {
+		t.Fatal("candidate owner fixture requires prepared validation authority")
 	}
 	source := &candidateOwnerCapacitySource{value: generatedcapacity.Snapshot{
 		MemoryAvailableBytes: uint64(options.MemoryBytes), DiskAvailableBytes: options.ReplacementDiskBytes,

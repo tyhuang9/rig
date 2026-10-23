@@ -60,7 +60,23 @@ func (r *generatedDomainRecoveryCensusRunner) Run(ctx context.Context,
 	case reflect.DeepEqual(args, []string{"volume", "ls", "--format", generatedDomainVolumeListFormat}):
 		return generatedDomainRecoveryCensusList(r.objects, "volume"), nil
 	case reflect.DeepEqual(args, []string{"image", "ls", "--all", "--no-trunc", "--quiet"}):
-		return runtimeprocess.CommandResult{Stdout: []byte(r.imageID + "\n")}, nil
+		ids := make([]string, 0, 1+len(r.objects))
+		seen := make(map[string]struct{})
+		if r.imageID != "" {
+			ids = append(ids, r.imageID)
+			seen[r.imageID] = struct{}{}
+		}
+		for _, object := range r.objects {
+			if object.kind != "image" {
+				continue
+			}
+			if _, duplicate := seen[object.id]; duplicate {
+				continue
+			}
+			ids = append(ids, object.id)
+			seen[object.id] = struct{}{}
+		}
+		return runtimeprocess.CommandResult{Stdout: []byte(strings.Join(ids, "\n") + "\n")}, nil
 	case len(args) == 5 && args[1] == "inspect" && args[2] == "--format" &&
 		args[3] == generatedDomainContainerInspectFormat && args[0] == "container":
 		return generatedDomainRecoveryCensusProjection(r.objects, "container", args[4])
@@ -74,6 +90,8 @@ func (r *generatedDomainRecoveryCensusRunner) Run(ctx context.Context,
 		args[4] == r.imageID:
 		return jsonResult(generatedDomainDockerInspectProjection{ID: r.imageID,
 			Labels: map[string]string{}, ContentID: r.imageID}), nil
+	case len(args) == 5 && reflect.DeepEqual(args[:4], []string{"image", "inspect", "--format", generatedDomainImageInspectFormat}):
+		return generatedDomainRecoveryCensusProjection(r.objects, "image", args[4])
 	default:
 		if r.gateway == nil {
 			return runtimeprocess.CommandResult{}, errors.New("unexpected generated-domain recovery command")

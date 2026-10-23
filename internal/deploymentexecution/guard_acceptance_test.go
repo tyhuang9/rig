@@ -110,6 +110,37 @@ func TestGuardComposeChecksUseSeparateClosedStagePolicies(t *testing.T) {
 	}
 }
 
+func TestGuardRouteActivationUsesExactWaitingHealthStage(t *testing.T) {
+	for _, test := range []struct {
+		status string
+		want   error
+	}{
+		{status: "waiting_health"},
+		{status: "applying", want: deploymentexecution.ErrStageInvalid},
+		{status: "preparing", want: deploymentexecution.ErrStageInvalid},
+		{status: "succeeded", want: deploymentexecution.ErrStageInvalid},
+	} {
+		t.Run(test.status, func(t *testing.T) {
+			fixture := newExecutionFixture(t, false)
+			fixture.exec(t, `UPDATE deployments SET status=? WHERE id=?`, test.status, fixture.deploymentID)
+			pin, claim, release := fixture.pinWithRelease(t)
+			defer func() { pin.Leave(); _ = release() }()
+			tx, err := fixture.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			err = pin.CheckRouteActivationTx(tx, claim, fixture.deploymentID)
+			if test.want == nil && err != nil {
+				t.Fatalf("route activation check error=%v", err)
+			}
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("route activation check error=%v want=%v", err, test.want)
+			}
+		})
+	}
+}
+
 func TestClaimAndGuardRequireExactIdentityAndComposition(t *testing.T) {
 	fixture := newExecutionFixture(t, false)
 	if _, err := deploymentexecution.NewClaim(fixture.binding, fixture.job.ID, fixture.appID, 0); !errors.Is(err, deploymentexecution.ErrInvalidClaim) {

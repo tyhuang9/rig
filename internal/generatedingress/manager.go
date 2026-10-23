@@ -323,11 +323,15 @@ func assembleManagerInto(manager *Manager, runner runtimeprocess.CommandRunner, 
 	return nil
 }
 
-// Switch atomically reloads the aggregate Caddy route set, durably records the
-// new active route, and installs it as Caddy's restart configuration. It never
-// stops application containers or waits for connection draining; the
-// deployment coordinator owns those post-commit operations.
-func (m *Manager) Switch(ctx context.Context, request generatedroute.RouteSwitchRequest) (resultErr error) {
+// Switch is closed for every ordinary Manager shape. Generated route changes
+// are available only through the domain-owned sealed route execution.
+func (m *Manager) Switch(context.Context, generatedroute.RouteSwitchRequest) error {
+	return &Error{Code: DiagnosticValidationFailed}
+}
+
+// switchGeneratedDomainRoute is the private physical route primitive. Its
+// caller must be the exact GeneratedRouteAuthority paired with this Manager.
+func (m *Manager) switchGeneratedDomainRoute(ctx context.Context, request generatedroute.RouteSwitchRequest) (resultErr error) {
 	if m == nil || ctx == nil || !validSwitchRequest(request) {
 		return &Error{Code: DiagnosticValidationFailed}
 	}

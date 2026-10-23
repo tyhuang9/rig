@@ -182,6 +182,14 @@ type candidateReceiptTombstone struct {
 	state atomic.Uint64
 }
 
+// candidateColdReceiptSeed is private reconstruction evidence. It installs no
+// command token and grants no cleanup or release authority.
+type candidateColdReceiptSeed struct {
+	id       string
+	physical candidatePhysicalState
+	unknown  bool
+}
+
 type candidateOperationLifecycle struct {
 	done atomic.Bool
 }
@@ -303,6 +311,62 @@ func newCandidateCapacityGroup(spec candidateGroupSpec) *candidateCapacityGroup 
 		group.byName[name] = &candidateCapacityComponent{name: name}
 	}
 	return group
+}
+
+// seedColdOwnership records exact immutable group and receipt identity after a
+// complete startup read. It may populate a charge-free group for a quiescent or
+// proved-absent deployment. Risky groups are reserved through reserve first;
+// this method only makes their already-retained receipts exact.
+func (l *candidateCapacityLedger) seedColdOwnership(spec candidateGroupSpec,
+	receipts map[string]candidateColdReceiptSeed,
+) error {
+	if l == nil || l.budget == nil {
+		return errCandidateCapacityInvalid
+	}
+	normalized, err := normalizeCandidateGroupSpec(spec)
+	if err != nil {
+		return err
+	}
+	key := candidateCapacityGroupKey{appID: normalized.appID, deploymentID: normalized.deploymentID}
+	l.mu.Lock()
+	group := l.groups[key]
+	if group == nil {
+		group = newCandidateCapacityGroup(normalized)
+		l.groups[key] = group
+	}
+	l.mu.Unlock()
+
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if group.reserving || group.pins != normalized.pins || group.limits != normalized.limits ||
+		!equalCandidateRoster(group.components, normalized.components) || len(receipts) > len(group.components) {
+		return errCandidateCapacityPinsChanged
+	}
+	for name, seed := range receipts {
+		component := group.byName[name]
+		if component == nil || seed.id == "" ||
+			(seed.physical != candidatePhysicalAttemptedUnknown && seed.physical != candidatePhysicalPresent &&
+				seed.physical != candidatePhysicalConfirmedAbsent && seed.physical != candidatePhysicalHandedToRoute) {
+			return errCandidateCapacityInvalid
+		}
+		if component.receipt == nil {
+			component.receipt = &candidateReceiptTombstone{id: seed.id}
+		} else if component.receipt.id != seed.id {
+			return errCandidateReceiptMismatch
+		}
+		word := uint64(seed.physical) | candidateReceiptAcknowledged | candidateReceiptObserved
+		if seed.unknown {
+			word |= candidateReceiptUnknown | candidateReceiptUnquiesced
+		}
+		component.receipt.state.Store(word)
+		if component.charge != nil {
+			if component.charge.state != candidateChargeActive || component.charge.logicallyRetired {
+				return errCandidateCapacityStale
+			}
+			component.charge.receiptRetained = true
+		}
+	}
+	return nil
 }
 
 func (g *candidateCapacityGroup) reserve(

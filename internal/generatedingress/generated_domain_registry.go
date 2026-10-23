@@ -36,13 +36,22 @@ type generatedDomainState struct {
 	fenceReady bool
 	err        error
 
-	constructionPhase generatedDomainConstructionPhase
-	constructionDone  chan struct{}
-	construction      *generatedDomainConstruction
-	constructionErr   error
-	constructionView  *generatedManagerView
-	transition        *generatedDomainConstructionTransition
+	constructionPhase    generatedDomainConstructionPhase
+	constructionDone     chan struct{}
+	construction         *generatedDomainConstruction
+	constructionErr      error
+	constructionView     *generatedManagerView
+	constructionActivity generatedDomainConstructionActivityKind
+	transition           *generatedDomainConstructionTransition
 }
+
+type generatedDomainConstructionActivityKind uint8
+
+const (
+	generatedDomainConstructionActivityNone generatedDomainConstructionActivityKind = iota
+	generatedDomainConstructionActivityEmpty
+	generatedDomainConstructionActivityCold
+)
 
 type generatedDomainConstructionPhase uint8
 
@@ -622,6 +631,7 @@ func recordGeneratedDomainConstructionTransition(
 	}
 	if state == nil || state.constructionPhase != generatedDomainConstructionRunning || state.transition != nil ||
 		state.constructionView == nil || !viewActive ||
+		state.constructionActivity != generatedDomainConstructionActivityEmpty ||
 		!sameGeneratedDomainPhysicalIdentity(physical, generatedDomainPhysicalIdentity{
 			manager: generatedManagerPhysicalIdentity{dataRoot: proof.dataRoot, ingressRoot: proof.ingressRoot,
 				daemonID: reservation.input.physical.manager.daemonID, namespace: fixedGeneratedGatewayNamespace()},
@@ -641,6 +651,21 @@ func beginGeneratedDomainConstructionActivity(
 	reservation *generatedDomainReservation,
 	view *generatedManagerView,
 ) (func() error, error) {
+	return beginGeneratedDomainConstructionActivityMode(reservation, view, generatedDomainConstructionActivityEmpty)
+}
+
+func beginGeneratedDomainColdConstructionActivity(
+	reservation *generatedDomainReservation,
+	view *generatedManagerView,
+) (func() error, error) {
+	return beginGeneratedDomainConstructionActivityMode(reservation, view, generatedDomainConstructionActivityCold)
+}
+
+func beginGeneratedDomainConstructionActivityMode(
+	reservation *generatedDomainReservation,
+	view *generatedManagerView,
+	kind generatedDomainConstructionActivityKind,
+) (func() error, error) {
 	if reservation == nil || view == nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
@@ -648,14 +673,16 @@ func beginGeneratedDomainConstructionActivity(
 	defer generatedDomains.mu.Unlock()
 	state := reservation.state
 	if state == nil || state.constructionPhase != generatedDomainConstructionRunning ||
-		state.constructionView != nil || state.transition != nil {
+		state.constructionView != nil || state.constructionActivity != generatedDomainConstructionActivityNone ||
+		state.transition != nil ||
+		(kind != generatedDomainConstructionActivityEmpty && kind != generatedDomainConstructionActivityCold) {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
 	view.mu.Lock()
 	root := view.root
 	if view.manager != nil || view.stale || view.pairing || view.typedActive != 0 || view.inspectionActive != 0 ||
 		root.dataRootPath != reservation.input.options.DataRoot ||
-		root.ingressPath != reservation.input.proof.ingressPath || root.ingressRoot != nil ||
+		root.ingressPath != reservation.input.proof.ingressPath ||
 		!sameGeneratedDomainFileIdentity(root.dataRoot, reservation.input.proof.dataRoot) ||
 		!sameGeneratedDomainPathIdentityMap(root.ancestors, reservation.input.proof.ancestors, false) ||
 		!sameGeneratedPointer(root.runner, reservation.input.runner) ||
@@ -664,8 +691,16 @@ func beginGeneratedDomainConstructionActivity(
 		view.mu.Unlock()
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
+	if kind == generatedDomainConstructionActivityEmpty && root.ingressRoot != nil ||
+		kind == generatedDomainConstructionActivityCold && (root.ingressRoot == nil ||
+			reservation.input.proof.ingressRoot == nil ||
+			!sameGeneratedDomainFileIdentity(root.ingressRoot, reservation.input.proof.ingressRoot)) {
+		view.mu.Unlock()
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
 	beginGeneratedTypedActivityLocked(view)
 	state.constructionView = view
+	state.constructionActivity = kind
 	view.mu.Unlock()
 	var once sync.Once
 	return func() (releaseErr error) {
@@ -675,7 +710,7 @@ func beginGeneratedDomainConstructionActivity(
 			view.mu.Lock()
 			defer view.mu.Unlock()
 			if reservation.state != state || state.constructionPhase != generatedDomainConstructionRunning ||
-				state.constructionView != view || view.typedActive != 1 {
+				state.constructionView != view || state.constructionActivity != kind || view.typedActive != 1 {
 				releaseErr = deploymentexecution.ErrInvalidConfiguration
 				return
 			}
@@ -699,10 +734,14 @@ func completeGeneratedDomainConstruction(reservation *generatedDomainReservation
 		viewReleased = state.constructionView.typedActive == 0
 		state.constructionView.mu.Unlock()
 	}
+	validActivity := state != nil && ((state.constructionActivity == generatedDomainConstructionActivityNone &&
+		state.constructionView == nil && state.transition == nil) ||
+		(state.constructionActivity == generatedDomainConstructionActivityEmpty && state.transition != nil &&
+			state.constructionView == result.manager.domainView && viewReleased) ||
+		(state.constructionActivity == generatedDomainConstructionActivityCold && state.transition == nil &&
+			state.constructionView == result.manager.domainView && viewReleased))
 	if state == nil || state.constructionPhase != generatedDomainConstructionRunning || state.construction != nil ||
-		(state.transition == nil && state.constructionView != nil) ||
-		(state.transition != nil && (state.constructionView != result.manager.domainView ||
-			!viewReleased)) {
+		!validActivity {
 		return deploymentexecution.ErrInvalidConfiguration
 	}
 	state.construction = result

@@ -682,11 +682,11 @@ func (r *generatedDomainStartupReader) attestGateway(ctx context.Context, deadli
 	}
 	switch expected.kind {
 	case generatedDomainGatewayNativeV1:
-		return r.attestNativeV1(ctx, deadline, snapshot, expected)
+		return r.attestNativeV1(ctx, deadline, snapshot, expected, false)
 	case generatedDomainGatewayNativeV2:
-		return r.attestNativeV2(ctx, deadline, snapshot, expected)
+		return r.attestNativeV2(ctx, deadline, snapshot, expected, false)
 	case generatedDomainGatewayCurrentV1, generatedDomainGatewayCurrentV2:
-		return r.attestCurrent(ctx, deadline, snapshot, expected)
+		return r.attestCurrent(ctx, deadline, snapshot, expected, false)
 	default:
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain gateway expectation is invalid")
 	}
@@ -1248,8 +1248,9 @@ func (r *generatedDomainStartupReader) proveGatewayStaticResponse(ctx context.Co
 
 func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
-	if expected.nativeV1 == nil || len(expected.nativeV1.Active) != 0 {
+	if expected.nativeV1 == nil || !allowApplicationRoutes && len(expected.nativeV1.Active) != 0 {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 gateway is unsupported")
 	}
 	containerObject, containerFound := generatedDomainObjectByName(snapshot, "container", caddyContainerName)
@@ -1310,8 +1311,9 @@ func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadl
 
 func (r *generatedDomainStartupReader) attestNativeV2(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
-	if expected.nativeV2 == nil || expected.journal == nil || len(expected.nativeV2.Apps) != 0 ||
+	if expected.nativeV2 == nil || expected.journal == nil || !allowApplicationRoutes && len(expected.nativeV2.Apps) != 0 ||
 		expected.journal.Phase != gatewayPhaseCommitted {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V2 gateway is unsupported")
 	}
@@ -1386,9 +1388,10 @@ func (r *generatedDomainStartupReader) attestNativeV2(ctx context.Context, deadl
 
 func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
 	if expected.currentV2 != nil && expected.currentV2.Lineage.Kind == appaccess.GatewayRebindSourceGatewayUpgrade {
-		return r.attestCurrentV2Upgrade(ctx, deadline, snapshot, expected)
+		return r.attestCurrentV2Upgrade(ctx, deadline, snapshot, expected, allowApplicationRoutes)
 	}
 	if expected.terminal == nil {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway terminal is unavailable")
@@ -1403,7 +1406,7 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 	var err error
 	if expected.currentV1 != nil {
 		state := *expected.currentV1
-		if len(state.Apps) != 0 {
+		if !allowApplicationRoutes && len(state.Apps) != 0 {
 			return generatedDomainGatewayAttestation{}, errors.New("generated domain current V1 gateway has application routes")
 		}
 		lineage, profile, networkPlan, identity = state.Lineage, state.Profile, state.Network, state.Identity
@@ -1411,7 +1414,7 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 		token, _ = gatewayCurrentPhysicalProbeToken(state)
 	} else if expected.currentV2 != nil {
 		state := *expected.currentV2
-		if len(state.Apps) != 0 {
+		if !allowApplicationRoutes && len(state.Apps) != 0 {
 			return generatedDomainGatewayAttestation{}, errors.New("generated domain current V2 gateway has application routes")
 		}
 		lineage, profile, networkPlan, identity = state.Lineage, state.Profile, state.Network, state.Identity
@@ -1488,10 +1491,12 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 
 func (r *generatedDomainStartupReader) attestCurrentV2Upgrade(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
 	if !generatedDomainCurrentV2UpgradeExpectationValid(expected) || expected.currentV2 == nil ||
-		expected.nativeV2 == nil || expected.journal == nil || len(expected.currentV2.Apps) != 0 ||
-		len(expected.nativeV2.Apps) != 0 || expected.journal.Phase != gatewayPhaseCommitted {
+		expected.nativeV2 == nil || expected.journal == nil ||
+		!allowApplicationRoutes && (len(expected.currentV2.Apps) != 0 || len(expected.nativeV2.Apps) != 0) ||
+		expected.journal.Phase != gatewayPhaseCommitted {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current V2 upgrade gateway is unsupported")
 	}
 	current, source, journal := *expected.currentV2, *expected.nativeV2, *expected.journal

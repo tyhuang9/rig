@@ -111,12 +111,13 @@ type Component struct {
 }
 
 type ActiveHead struct {
-	AppID        string
-	DeploymentID string
-	ReleaseID    string
-	Slot         string
-	Generation   int64
-	UpdatedAt    time.Time
+	AppID               string
+	DeploymentID        string
+	ReleaseID           string
+	Slot                string
+	Generation          int64
+	ActivationReceiptID string
+	UpdatedAt           time.Time
 }
 
 type BeginInput struct {
@@ -146,14 +147,16 @@ type GeneratedDomainStartupSnapshot struct {
 	Deployments      []GeneratedDomainStartupDeployment
 	Components       []GeneratedDomainStartupComponent
 	CandidateIntents []GeneratedDomainStartupCandidateIntent
+	RouteActivations []GeneratedDomainStartupRouteActivation
 }
 
 type GeneratedDomainStartupActiveHead struct {
-	AppID        string
-	DeploymentID string
-	ReleaseID    string
-	Slot         string
-	Generation   int64
+	AppID               string
+	DeploymentID        string
+	ReleaseID           string
+	Slot                string
+	Generation          int64
+	ActivationReceiptID string
 }
 
 type GeneratedDomainStartupDeployment struct {
@@ -218,14 +221,19 @@ func (r *Repository) GeneratedDomainStartupSnapshotTx(ctx context.Context, tx *s
 	if err != nil {
 		return GeneratedDomainStartupSnapshot{}, err
 	}
+	activations, err := readGeneratedDomainStartupRouteActivations(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
 	return GeneratedDomainStartupSnapshot{
 		ActiveHeads: heads, Deployments: deployments, Components: components, CandidateIntents: intents,
+		RouteActivations: activations,
 	}, nil
 }
 
 func readGeneratedDomainStartupActiveHeads(ctx context.Context, tx *sql.Tx) ([]GeneratedDomainStartupActiveHead, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT h.app_id,h.deployment_id,h.release_id,
-		h.slot,h.generation,h.updated_at,
+		h.slot,h.generation,h.updated_at,COALESCE(h.activation_receipt_id,''),
 		CASE WHEN a.id IS NULL THEN 0 ELSE 1 END,COALESCE(rd.release_id,''),COALESCE(rd.candidate_slot,''),
 		COALESCE(rel.app_id,'')
 		FROM generated_runtime_active_heads h
@@ -243,7 +251,7 @@ func readGeneratedDomainStartupActiveHeads(ctx context.Context, tx *sql.Tx) ([]G
 		var runtimeRelease, runtimeSlot, releaseApp string
 		var applicationExists int
 		if err := rows.Scan(&value.AppID, &deploymentID, &releaseID, &slot, &value.Generation,
-			&updatedAt, &applicationExists, &runtimeRelease, &runtimeSlot, &releaseApp); err != nil {
+			&updatedAt, &value.ActivationReceiptID, &applicationExists, &runtimeRelease, &runtimeSlot, &releaseApp); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
@@ -252,7 +260,7 @@ func readGeneratedDomainStartupActiveHeads(ctx context.Context, tx *sql.Tx) ([]G
 			return nil, ErrInvalidState
 		}
 		if value.Generation == 0 {
-			if deploymentID.Valid || releaseID.Valid || slot.Valid || updatedAt.Valid {
+			if deploymentID.Valid || releaseID.Valid || slot.Valid || updatedAt.Valid || value.ActivationReceiptID != "" {
 				_ = rows.Close()
 				return nil, ErrInvalidState
 			}
@@ -267,7 +275,8 @@ func readGeneratedDomainStartupActiveHeads(ctx context.Context, tx *sql.Tx) ([]G
 		value.Slot = slot.String
 		if !canonicalUUID(value.DeploymentID) || !validReleaseID(value.ReleaseID) ||
 			(value.Slot != "blue" && value.Slot != "green") || runtimeRelease != value.ReleaseID ||
-			runtimeSlot != value.Slot || releaseApp != value.AppID {
+			runtimeSlot != value.Slot || releaseApp != value.AppID ||
+			(value.ActivationReceiptID != "" && !canonicalUUID(value.ActivationReceiptID)) {
 			_ = rows.Close()
 			return nil, ErrInvalidState
 		}
@@ -1068,7 +1077,7 @@ func migrationApprovalMissing(ctx context.Context, query queryer, input BeginInp
 
 const deploymentSelect = `SELECT deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,candidate_slot,COALESCE(previous_active_deployment_id,''),COALESCE(previous_active_slot,''),phase,migration_state,COALESCE(diagnostic_code,''),created_at,updated_at,COALESCE(migration_started_at,''),COALESCE(migration_finished_at,''),COALESCE(finished_at,'') FROM generated_runtime_deployments`
 const componentSelect = `SELECT c.deployment_id,c.component_name,c.slot,COALESCE(c.image_artifact_id,''),COALESCE(c.container_name,''),COALESCE(c.container_id,''),c.state,COALESCE(c.diagnostic_code,''),c.created_at,c.updated_at,COALESCE(c.finished_at,'') FROM generated_runtime_components c JOIN generated_runtime_deployments d ON d.deployment_id=c.deployment_id`
-const activeHeadSelect = `SELECT app_id,COALESCE(deployment_id,''),COALESCE(release_id,''),COALESCE(slot,''),generation,COALESCE(updated_at,'') FROM generated_runtime_active_heads`
+const activeHeadSelect = `SELECT app_id,COALESCE(deployment_id,''),COALESCE(release_id,''),COALESCE(slot,''),generation,COALESCE(activation_receipt_id,''),COALESCE(updated_at,'') FROM generated_runtime_active_heads`
 
 type scanner interface{ Scan(...any) error }
 type queryer interface {
@@ -1148,7 +1157,7 @@ func scanComponent(row scanner) (Component, error) {
 func scanActiveHead(row scanner) (ActiveHead, error) {
 	var value ActiveHead
 	var updated string
-	if err := row.Scan(&value.AppID, &value.DeploymentID, &value.ReleaseID, &value.Slot, &value.Generation, &updated); errors.Is(err, sql.ErrNoRows) {
+	if err := row.Scan(&value.AppID, &value.DeploymentID, &value.ReleaseID, &value.Slot, &value.Generation, &value.ActivationReceiptID, &updated); errors.Is(err, sql.ErrNoRows) {
 		return ActiveHead{}, ErrNotFound
 	} else if err != nil {
 		return ActiveHead{}, err

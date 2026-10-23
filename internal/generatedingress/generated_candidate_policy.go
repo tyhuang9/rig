@@ -106,7 +106,7 @@ func buildCandidatePolicy(
 	receipt candidateIntentSnapshot,
 	options GeneratedCandidateProcessOptions,
 ) (candidatePolicy, error) {
-	if err := validateCandidateRequest(pins); err != nil ||
+	if err := validateCandidateIdentityPins(pins); err != nil ||
 		!validGeneratedCandidateFixedOptions(options) ||
 		!validCandidatePolicyComponent(component) ||
 		!validCandidatePolicyArtifact(pins, component, artifact) ||
@@ -122,14 +122,14 @@ func buildCandidatePolicy(
 	runDigest := candidatePolicySHA256(component.RunCommand)
 	policy := candidatePolicy{
 		identity: generatedcontainer.Identity{
-			AppID: pins.claim.ApplicationID(), ReleaseID: pins.releaseID,
+			AppID: pins.applicationID(), ReleaseID: pins.releaseID,
 			DeploymentID: pins.deploymentID, ArtifactID: artifact.id,
 			DeploymentPlanRevisionID: pins.deploymentPlanRevisionID,
 			Component:                component.Name, Role: component.Role,
 			Technology: component.Technology, Slot: pins.candidateSlot,
 			ReceiptID:        receipt.id,
-			ContainerName:    generatedidentity.ContainerName(pins.claim.ApplicationID(), component.Name, slot),
-			NetworkName:      generatedidentity.NetworkName(pins.claim.ApplicationID()),
+			ContainerName:    generatedidentity.ContainerName(pins.applicationID(), component.Name, slot),
+			NetworkName:      generatedidentity.NetworkName(pins.applicationID()),
 			NetworkAlias:     generatedidentity.ContainerAlias(component.Name, slot),
 			ImageContentID:   artifact.imageContentID,
 			WorkingDirectory: workingDirectory, RunCommandDigest: runDigest,
@@ -149,7 +149,7 @@ func buildCandidatePolicy(
 	}
 	material := candidatePolicyDigestV1{
 		Version:       generatedCandidatePolicyVersion,
-		ApplicationID: pins.claim.ApplicationID(), DeploymentID: pins.deploymentID,
+		ApplicationID: pins.applicationID(), DeploymentID: pins.deploymentID,
 		ReleaseID:                    pins.releaseID,
 		ConfigurationRevisionID:      pins.configurationRevisionID,
 		ConfigurationRevisionNumber:  pins.configurationRevisionNumber,
@@ -324,7 +324,7 @@ func validCandidatePolicyArtifact(pins candidateValidationPins, component deploy
 }
 
 func validCandidatePolicyReceipt(pins candidateValidationPins, artifact candidateArtifactSnapshot, receipt candidateIntentSnapshot) bool {
-	return candidatePolicyUUID(receipt.id) && receipt.creatorJobID == pins.claim.JobID() &&
+	return candidatePolicyUUID(receipt.id) && receipt.creatorJobID == pins.jobID() &&
 		receipt.creatorWorkerAttempt > 0 && receipt.configurationRevisionID == pins.configurationRevisionID &&
 		receipt.configurationRevisionNumber == pins.configurationRevisionNumber &&
 		receipt.imageArtifactID == artifact.id && receipt.imageArtifactAttempt == artifact.attemptNumber &&

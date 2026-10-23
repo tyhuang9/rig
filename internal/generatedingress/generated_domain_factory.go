@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
@@ -22,6 +23,23 @@ type generatedDomainConstruction struct {
 	manager     *Manager
 	budget      *generatedcapacity.Budget
 	candidates  *GeneratedCandidateAuthority
+	routes      *GeneratedRouteAuthority
+	domain      *GeneratedDomain
+	cold        *generatedDomainColdManifest
+	manifest    *generatedDomainConstructionManifest
+}
+
+type generatedDomainConstructionManifest struct {
+	startup  generatedDomainStartupObservation
+	physical generatedDomainPhysicalIdentity
+	proof    generatedDomainPathProof
+	owners   generatedDomainOwnerManifest
+	cold     *generatedDomainColdManifest
+}
+
+type generatedDomainOwnerManifest struct {
+	capacityGroups int
+	headGroups     int
 }
 
 var (
@@ -63,7 +81,7 @@ func newGeneratedDomainConstruction(
 		return nil, err
 	}
 	if !owner {
-		return joined, nil
+		return reattestGeneratedDomainConstructionJoin(ctx, reservation, input, joined)
 	}
 	completed := false
 	defer func() {
@@ -76,27 +94,162 @@ func newGeneratedDomainConstruction(
 	// This complete classifier pass precedes every Manager allocation, path or
 	// lock creation, Docker effect, and capacity object. Recovery and refusal
 	// become sticky construction failures for every exact joiner.
-	classification, err := inspectGeneratedDomainStartup(ctx, input.stores, runner, options)
+	observation, err := inspectGeneratedDomainStartupObservation(ctx, input.stores, runner, options)
 	if err != nil {
 		return nil, err
 	}
-	switch classification.disposition {
-	case generatedDomainStartupStable:
+	switch {
+	case observation.classification.disposition == generatedDomainStartupStable:
 		result, err = constructGeneratedDomainStable(ctx, reservation, input)
-	case generatedDomainStartupEmpty:
+	case observation.classification.disposition == generatedDomainStartupEmpty:
 		result, err = constructGeneratedDomainEmpty(ctx, reservation, input)
-	case generatedDomainStartupRecoveryRequired:
+	case observation.classification.disposition == generatedDomainStartupRecoveryRequired:
 		err = errGeneratedDomainConstructionRecovery
+	case observation.classification.disposition == generatedDomainStartupRefused &&
+		observation.classification.reason == generatedDomainStartupReasonColdAccounting &&
+		len(observation.classification.recovery) == 0:
+		result, err = constructGeneratedDomainCold(ctx, reservation, input, observation)
 	default:
 		err = errGeneratedDomainConstructionRefused
 	}
 	if err != nil {
 		return nil, err
 	}
+	manifest, err := captureGeneratedDomainConstructionManifest(ctx, reservation, input, result)
+	if err != nil {
+		return nil, err
+	}
+	result.manifest = &manifest
 	if err := completeGeneratedDomainConstruction(reservation, result); err != nil {
 		return nil, err
 	}
 	completed = true
+	return result, nil
+}
+
+func constructGeneratedDomainCold(
+	ctx context.Context,
+	reservation *generatedDomainReservation,
+	input generatedDomainReservationInput,
+	initial generatedDomainStartupObservation,
+) (_ *generatedDomainConstruction, resultErr error) {
+	if initial.classification.disposition != generatedDomainStartupRefused ||
+		initial.classification.reason != generatedDomainStartupReasonColdAccounting ||
+		len(initial.classification.recovery) != 0 || input.proof.ingressRoot == nil {
+		return nil, errGeneratedDomainConstructionRefused
+	}
+	releaseEffects, err := deploymenteffects.Acquire(ctx, input.options.WorkingDirectory)
+	if err != nil {
+		return nil, err
+	}
+	effectsHeld := true
+	root, err := inspectGeneratedLegacyRootObservation(input.runner, generatedDomainManagerOptions(input))
+	if err != nil || root.ingressRoot == nil ||
+		!sameGeneratedDomainFileIdentity(root.dataRoot, input.proof.dataRoot) ||
+		!sameGeneratedDomainFileIdentity(root.ingressRoot, input.proof.ingressRoot) {
+		releaseErr := releaseEffects()
+		effectsHeld = false
+		return nil, errors.Join(errGeneratedDomainConstructionRefused, err, releaseErr)
+	}
+	view := newGeneratedManagerView(root)
+	releaseActivity, err := beginGeneratedDomainColdConstructionActivity(reservation, view)
+	if err != nil {
+		releaseErr := releaseEffects()
+		effectsHeld = false
+		return nil, errors.Join(err, releaseErr)
+	}
+	activityHeld := true
+	var releaseGateway func() error
+	var manager *Manager
+	defer func() {
+		if releaseGateway != nil {
+			if err := releaseGateway(); err != nil {
+				resultErr = errors.Join(resultErr, err)
+				if manager != nil {
+					manager.gatewayRebindFailStopLatch().Store(true)
+				}
+			}
+			releaseGateway = nil
+		}
+		if activityHeld {
+			if err := releaseActivity(); err != nil {
+				resultErr = errors.Join(resultErr, err)
+				if manager != nil {
+					manager.gatewayRebindFailStopLatch().Store(true)
+				}
+			}
+			activityHeld = false
+		}
+		if effectsHeld {
+			if err := releaseEffects(); err != nil {
+				resultErr = errors.Join(resultErr, err)
+				if manager != nil {
+					manager.gatewayRebindFailStopLatch().Store(true)
+				}
+			}
+			effectsHeld = false
+		}
+	}()
+
+	store, present, _, err := inspectStateStoreReadOnly(input.options.DataRoot)
+	if err != nil || !present || store == nil {
+		return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+	}
+	manager, err = assembleGeneratedDomainManager(input, store)
+	if err != nil {
+		return nil, err
+	}
+	if err := bindGeneratedDomainManagerViewInto(manager, input.physical.manager, view); err != nil {
+		return nil, err
+	}
+	result, err := assembleGeneratedDomainOwners(reservation, input, manager)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkGeneratedDomainManagerRebindFence(ctx, manager); err != nil {
+		return nil, err
+	}
+	observed, err := inspectGeneratedDomainStartupObservation(ctx, input.stores, input.runner, input.options)
+	if err != nil || !sameGeneratedDomainStartupObservation(initial, observed) {
+		return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+	}
+	cold, err := reconstructGeneratedDomainCold(ctx, result, observed)
+	if err != nil {
+		return nil, err
+	}
+	result.cold = &cold
+
+	// Raw capacity acquisition above invokes Manager.Snapshot and therefore
+	// owns the Manager/gateway lock itself. Acquire the construction-wide lock
+	// only after every risky share is retained and seeded.
+	releaseGateway, err = manager.lockGateway(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyGeneratedDomainColdConstruction(ctx, reservation, input, result, initial); err != nil {
+		return nil, err
+	}
+	if err := releaseGateway(); err != nil {
+		releaseGateway = nil
+		manager.gatewayRebindFailStopLatch().Store(true)
+		return nil, err
+	}
+	releaseGateway = nil
+	if err := releaseActivity(); err != nil {
+		activityHeld = false
+		manager.gatewayRebindFailStopLatch().Store(true)
+		return nil, err
+	}
+	activityHeld = false
+	if err := releaseEffects(); err != nil {
+		effectsHeld = false
+		manager.gatewayRebindFailStopLatch().Store(true)
+		return nil, err
+	}
+	effectsHeld = false
+	if err := verifyGeneratedDomainColdConstruction(ctx, reservation, input, result, initial); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -354,15 +507,24 @@ func assembleGeneratedDomainOwners(
 	if err != nil {
 		return nil, err
 	}
-	return &generatedDomainConstruction{reservation: reservation, manager: manager,
-		budget: budget, candidates: candidates}, nil
+	routes, err := newGeneratedRouteAuthority(manager, candidates, input.stores)
+	if err != nil {
+		return nil, err
+	}
+	result := &generatedDomainConstruction{reservation: reservation, manager: manager,
+		budget: budget, candidates: candidates, routes: routes}
+	result.domain = &GeneratedDomain{construction: result}
+	return result, nil
 }
 
 func validGeneratedDomainConstructionResult(reservation *generatedDomainReservation,
 	result *generatedDomainConstruction,
 ) bool {
 	if reservation == nil || result == nil || result.reservation != reservation || result.manager == nil ||
-		result.budget == nil || !result.budget.Configured() || result.candidates == nil {
+		result.budget == nil || !result.budget.Configured() || result.candidates == nil ||
+		result.routes == nil || !result.routes.configuredFor(result) || result.domain == nil ||
+		result.domain.construction != result || result.manifest == nil ||
+		!sameGeneratedDomainColdManifest(result.cold, result.manifest.cold) {
 		return false
 	}
 	manager, candidates, input := result.manager, result.candidates, reservation.input
@@ -380,6 +542,131 @@ func validGeneratedDomainConstructionResult(reservation *generatedDomainReservat
 		sameGeneratedPointer(candidates.environment, input.environment) && candidates.budget == result.budget &&
 		candidates.ledger != nil && candidates.heads != nil &&
 		candidates.options == generatedDomainCandidateOptions(input.options)
+}
+
+func captureGeneratedDomainConstructionManifest(
+	ctx context.Context,
+	reservation *generatedDomainReservation,
+	input generatedDomainReservationInput,
+	result *generatedDomainConstruction,
+) (generatedDomainConstructionManifest, error) {
+	var empty generatedDomainConstructionManifest
+	if ctx == nil || reservation == nil || result == nil || result.reservation != reservation ||
+		result.manager == nil || result.candidates == nil || !generatedDomainConstructionInputMatches(reservation, input) {
+		return empty, deploymentexecution.ErrInvalidConfiguration
+	}
+	if err := checkGeneratedDomainManagerRebindFence(ctx, result.manager); err != nil {
+		return empty, err
+	}
+	startup, err := inspectGeneratedDomainStartupObservation(ctx, input.stores, input.runner, input.options)
+	if err != nil || len(startup.classification.recovery) != 0 {
+		return empty, errors.Join(errGeneratedDomainConstructionRefused, err)
+	}
+	var cold *generatedDomainColdManifest
+	switch {
+	case result.cold == nil && startup.classification.disposition == generatedDomainStartupStable:
+	case result.cold != nil && startup.classification.disposition == generatedDomainStartupRefused &&
+		startup.classification.reason == generatedDomainStartupReasonColdAccounting:
+		if err := reattestGeneratedDomainCold(ctx, result.manager, result.candidates, startup, *result.cold); err != nil {
+			return empty, err
+		}
+		cold = cloneGeneratedDomainColdManifest(*result.cold)
+	default:
+		return empty, errGeneratedDomainConstructionRefused
+	}
+	physical, proof, err := inspectGeneratedDomainPhysicalIdentity(ctx, input.stores, input.runner, input.options)
+	if err != nil {
+		return empty, err
+	}
+	expectedPhysical, expectedProof, ok := generatedDomainConstructionExpectedIdentity(reservation)
+	if !ok || !sameGeneratedDomainPhysicalIdentity(physical, expectedPhysical) ||
+		!sameGeneratedDomainPathObservation(proof, expectedProof, false) {
+		return empty, errors.New("generated domain construction identity changed")
+	}
+	owners, err := inspectGeneratedDomainOwnerManifest(result)
+	expectedOwners := generatedDomainOwnerManifest{}
+	if cold != nil {
+		expectedOwners = generatedDomainColdOwnerManifest(*cold)
+	}
+	if err != nil || owners != expectedOwners {
+		return empty, errors.Join(deploymentexecution.ErrInvalidConfiguration, err)
+	}
+	if gatewayRebindProcessFailStop.Load() || gatewayRebindProcessCommitBarrier.Load() {
+		return empty, errors.New("generated domain process latch is closed")
+	}
+	if err := checkGeneratedDomainManagerRebindFence(ctx, result.manager); err != nil {
+		return empty, err
+	}
+	return generatedDomainConstructionManifest{startup: startup, physical: physical, proof: proof,
+		owners: owners, cold: cold}, nil
+}
+
+func reattestGeneratedDomainConstructionJoin(
+	ctx context.Context,
+	reservation *generatedDomainReservation,
+	input generatedDomainReservationInput,
+	joined *generatedDomainConstruction,
+) (*generatedDomainConstruction, error) {
+	if !validGeneratedDomainConstructionResult(reservation, joined) ||
+		!generatedDomainConstructionInputMatches(reservation, input) {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	observed, err := captureGeneratedDomainConstructionManifest(ctx, reservation, input, joined)
+	if err != nil {
+		return nil, err
+	}
+	manifest := joined.manifest
+	if manifest == nil || !sameGeneratedDomainStartupObservation(manifest.startup, observed.startup) ||
+		!sameGeneratedDomainPhysicalIdentity(manifest.physical, observed.physical) ||
+		!sameGeneratedDomainPathObservation(manifest.proof, observed.proof, false) ||
+		manifest.owners != observed.owners || !sameGeneratedDomainColdManifest(manifest.cold, observed.cold) {
+		return nil, errGeneratedDomainConstructionRefused
+	}
+	return joined, nil
+}
+
+func generatedDomainConstructionInputMatches(
+	reservation *generatedDomainReservation,
+	input generatedDomainReservationInput,
+) bool {
+	if reservation == nil || reservation.state == nil || !sameGeneratedDomainReservationProvenance(reservation.input, input) {
+		return false
+	}
+	generatedDomains.mu.Lock()
+	defer generatedDomains.mu.Unlock()
+	if sameGeneratedDomainReservationInput(reservation.input, input) {
+		return true
+	}
+	transition := reservation.state.transition
+	return transition != nil && sameGeneratedDomainPhysicalIdentity(transition.physical, input.physical) &&
+		sameGeneratedDomainPathObservation(transition.proof, input.proof, false)
+}
+
+func generatedDomainConstructionExpectedIdentity(
+	reservation *generatedDomainReservation,
+) (generatedDomainPhysicalIdentity, generatedDomainPathProof, bool) {
+	if reservation == nil || reservation.state == nil {
+		return generatedDomainPhysicalIdentity{}, generatedDomainPathProof{}, false
+	}
+	generatedDomains.mu.Lock()
+	defer generatedDomains.mu.Unlock()
+	if transition := reservation.state.transition; transition != nil {
+		return transition.physical, transition.proof, true
+	}
+	return reservation.input.physical, reservation.input.proof, true
+}
+
+func inspectGeneratedDomainOwnerManifest(result *generatedDomainConstruction) (generatedDomainOwnerManifest, error) {
+	if result == nil || result.candidates == nil || result.candidates.ledger == nil || result.candidates.heads == nil {
+		return generatedDomainOwnerManifest{}, deploymentexecution.ErrInvalidConfiguration
+	}
+	result.candidates.ledger.mu.Lock()
+	capacityGroups := len(result.candidates.ledger.groups)
+	result.candidates.ledger.mu.Unlock()
+	result.candidates.heads.mu.Lock()
+	headGroups := len(result.candidates.heads.groups)
+	result.candidates.heads.mu.Unlock()
+	return generatedDomainOwnerManifest{capacityGroups: capacityGroups, headGroups: headGroups}, nil
 }
 
 func verifyGeneratedDomainConstructionFinal(

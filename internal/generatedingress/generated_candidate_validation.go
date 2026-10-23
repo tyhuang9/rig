@@ -19,6 +19,9 @@ import (
 type candidateValidationPins struct {
 	claim deploymentexecution.Claim
 
+	identity candidateValidationIdentity
+	cold     bool
+
 	deploymentID                 string
 	releaseID                    string
 	configurationRevisionID      string
@@ -28,6 +31,16 @@ type candidateValidationPins struct {
 	candidateSlot                string
 	findings                     []Finding
 }
+
+type candidateValidationIdentity struct {
+	applicationID string
+	jobID         string
+	attempt       int
+}
+
+func (p candidateValidationPins) applicationID() string { return p.identity.applicationID }
+func (p candidateValidationPins) jobID() string         { return p.identity.jobID }
+func (p candidateValidationPins) attempt() int          { return p.identity.attempt }
 
 type candidateProtectedSnapshot struct {
 	revision   deploymentplans.DeploymentPlanRevision
@@ -148,7 +161,9 @@ type candidateAdmissionSnapshot struct {
 
 func candidatePinsFromRequest(request GeneratedCandidateRequest) (candidateValidationPins, error) {
 	pins := candidateValidationPins{
-		claim:                        request.Claim,
+		claim: request.Claim,
+		identity: candidateValidationIdentity{applicationID: request.Claim.ApplicationID(),
+			jobID: request.Claim.JobID(), attempt: request.Claim.Attempt()},
 		deploymentID:                 request.DeploymentID,
 		releaseID:                    request.ReleaseID,
 		configurationRevisionID:      request.ConfigurationRevisionID,
@@ -165,35 +180,50 @@ func candidatePinsFromRequest(request GeneratedCandidateRequest) (candidateValid
 }
 
 func validateCandidateRequest(pins candidateValidationPins) error {
-	if uuid.Validate(pins.deploymentID) != nil || pins.claim.JobID() == "" ||
-		uuid.Validate(pins.claim.ApplicationID()) != nil || pins.claim.Attempt() < 1 ||
-		!validReleaseID(pins.releaseID) || uuid.Validate(pins.configurationRevisionID) != nil ||
-		pins.configurationRevisionNumber < 1 || uuid.Validate(pins.deploymentPlanRevisionID) != nil ||
-		pins.deploymentPlanRevisionNumber < 1 || (pins.candidateSlot != "blue" && pins.candidateSlot != "green") {
+	if pins.cold || pins.claim.JobID() != pins.jobID() || pins.claim.ApplicationID() != pins.applicationID() ||
+		pins.claim.Attempt() != pins.attempt() || validateCandidateIdentityPins(pins) != nil {
 		return ErrInvalidDeployment
 	}
 	return deployments.ValidateGeneratedOwnerFindings(pins.findings)
 }
 
+func validateCandidateIdentityPins(pins candidateValidationPins) error {
+	if uuid.Validate(pins.deploymentID) != nil || pins.jobID() == "" ||
+		uuid.Validate(pins.applicationID()) != nil || pins.attempt() < 1 ||
+		!validReleaseID(pins.releaseID) || uuid.Validate(pins.configurationRevisionID) != nil ||
+		pins.configurationRevisionNumber < 1 || uuid.Validate(pins.deploymentPlanRevisionID) != nil ||
+		pins.deploymentPlanRevisionNumber < 1 || (pins.candidateSlot != "blue" && pins.candidateSlot != "green") {
+		return ErrInvalidDeployment
+	}
+	return nil
+}
+
 // loadCandidateProtectedSnapshot reads the command-bearing accepted plan
 // outside SQL. Configuration export remains a separate owner operation.
 func (a *GeneratedCandidateAuthority) loadCandidateProtectedSnapshot(ctx context.Context, pins candidateValidationPins) (candidateProtectedSnapshot, error) {
+	if err := validateCandidateRequest(pins); err != nil {
+		return candidateProtectedSnapshot{}, err
+	}
+	return a.loadCandidateProtectedSnapshotIdentity(ctx, pins)
+}
+
+func (a *GeneratedCandidateAuthority) loadCandidateProtectedSnapshotIdentity(ctx context.Context, pins candidateValidationPins) (candidateProtectedSnapshot, error) {
 	if a == nil || a.stores == nil || a.stores.Plans() == nil ||
 		!a.stores.Plans().ConfiguredFor(a.stores.Database()) {
 		return candidateProtectedSnapshot{}, deploymentexecution.ErrInvalidConfiguration
 	}
-	if err := validateCandidateRequest(pins); err != nil {
+	if err := validateCandidateIdentityPins(pins); err != nil {
 		return candidateProtectedSnapshot{}, err
 	}
 	if err := contextError(ctx); err != nil {
 		return candidateProtectedSnapshot{}, err
 	}
-	revision, err := a.stores.Plans().GetRevision(ctx, pins.claim.ApplicationID(), pins.deploymentPlanRevisionID, pins.deploymentPlanRevisionNumber)
+	revision, err := a.stores.Plans().GetRevision(ctx, pins.applicationID(), pins.deploymentPlanRevisionID, pins.deploymentPlanRevisionNumber)
 	if err != nil {
 		return candidateProtectedSnapshot{}, err
 	}
 	if (revision.State != deploymentplans.RevisionAccepted && revision.State != deploymentplans.RevisionSuperseded) ||
-		revision.ID != pins.deploymentPlanRevisionID || revision.AppID != pins.claim.ApplicationID() ||
+		revision.ID != pins.deploymentPlanRevisionID || revision.AppID != pins.applicationID() ||
 		revision.RevisionNumber != pins.deploymentPlanRevisionNumber ||
 		revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode {
 		return candidateProtectedSnapshot{}, ErrInvalidDeployment
@@ -226,11 +256,20 @@ func (a *GeneratedCandidateAuthority) loadCandidateProtectedSnapshot(ctx context
 // deployment roster, then surfaces every durable receipt/name/ID/state before
 // later policy, head, lifecycle, artifact, or receipt refusal.
 func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins candidateValidationPins, protected candidateProtectedSnapshot) (candidateAdmissionSnapshot, error) {
+	if err := validateCandidateRequest(pins); err != nil {
+		return candidateAdmissionSnapshot{}, err
+	}
+	return readCandidateAdmissionSnapshotIdentityTx(ctx, tx, pins, protected)
+}
+
+func readCandidateAdmissionSnapshotIdentityTx(ctx context.Context, tx *sql.Tx, pins candidateValidationPins,
+	protected candidateProtectedSnapshot,
+) (candidateAdmissionSnapshot, error) {
 	var snapshot candidateAdmissionSnapshot
 	if tx == nil || ctx == nil {
 		return snapshot, deploymentexecution.ErrInvalidConfiguration
 	}
-	if err := validateCandidateRequest(pins); err != nil {
+	if err := validateCandidateIdentityPins(pins); err != nil {
 		return snapshot, err
 	}
 	if err := validateProtectedCandidateSnapshot(pins, protected); err != nil {
@@ -251,7 +290,7 @@ func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins cand
 	if err != nil {
 		return snapshot, candidateIdentityReadError(ctx, err)
 	}
-	if snapshot.main.appID != pins.claim.ApplicationID() || snapshot.main.jobID != pins.claim.JobID() {
+	if snapshot.main.appID != pins.applicationID() || snapshot.main.jobID != pins.jobID() {
 		return candidateAdmissionSnapshot{}, deploymentexecution.ErrIdentityLost
 	}
 
@@ -266,7 +305,7 @@ func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins cand
 	if err != nil {
 		return snapshot, candidateIdentityReadError(ctx, err)
 	}
-	if snapshot.runtime.appID != pins.claim.ApplicationID() {
+	if snapshot.runtime.appID != pins.applicationID() {
 		return candidateAdmissionSnapshot{}, deploymentexecution.ErrIdentityLost
 	}
 
@@ -337,14 +376,14 @@ func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins cand
 	// for strict post-admission refusal instead of hiding discovered risk.
 	if snapshot.runtime.previousDeploymentID != "" {
 		err = tx.QueryRowContext(ctx, `SELECT release_id FROM generated_runtime_deployments
-			WHERE deployment_id=? AND app_id=?`, snapshot.runtime.previousDeploymentID, pins.claim.ApplicationID()).
+			WHERE deployment_id=? AND app_id=?`, snapshot.runtime.previousDeploymentID, pins.applicationID()).
 			Scan(&snapshot.runtime.previousReleaseID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return snapshot, gateDatabaseError(ctx, err)
 		}
 	}
 	snapshot.pins = candidateImmutablePins{
-		jobID: pins.claim.JobID(), releaseID: pins.releaseID,
+		jobID: pins.jobID(), releaseID: pins.releaseID,
 		configurationRevisionID:      pins.configurationRevisionID,
 		configurationRevisionNumber:  pins.configurationRevisionNumber,
 		deploymentPlanRevisionID:     pins.deploymentPlanRevisionID,
@@ -354,7 +393,7 @@ func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins cand
 		previousSlot:                 snapshot.runtime.previousSlot,
 	}
 	snapshot.headPins = candidateHeadPins{
-		appID: pins.claim.ApplicationID(), deploymentID: pins.deploymentID,
+		appID: pins.applicationID(), deploymentID: pins.deploymentID,
 		releaseID: pins.releaseID, slot: pins.candidateSlot,
 		previousDeploymentID: snapshot.runtime.previousDeploymentID,
 		previousReleaseID:    snapshot.runtime.previousReleaseID,
@@ -370,7 +409,7 @@ func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins cand
 					AND original.revision_number=r.configuration_revision_number
 			)) THEN 1 ELSE 0 END,
 		COALESCE(r.deployment_plan_revision_id,''),COALESCE(r.deployment_plan_revision_number,0)
-		FROM releases r WHERE r.id=? AND r.app_id=?`, pins.releaseID, pins.claim.ApplicationID()).Scan(
+		FROM releases r WHERE r.id=? AND r.app_id=?`, pins.releaseID, pins.applicationID()).Scan(
 		&snapshot.release.sourceProvider, &snapshot.release.repositoryID, &snapshot.release.resolvedSHA,
 		&snapshot.release.archiveSHA256, &snapshot.release.workspaceTreeSHA256, &snapshot.release.workspaceState,
 		&snapshot.release.configurationRevisionID, &snapshot.release.configurationRevisionNumber,
@@ -383,7 +422,7 @@ func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins cand
 	err = tx.QueryRowContext(ctx, `SELECT canonical_digest,analyzed_source_provider,analyzed_repository_id,
 		analyzed_resolved_digest,acceptance_status,component_count
 		FROM deployment_plan_revisions WHERE id=? AND app_id=? AND revision_number=?`,
-		pins.deploymentPlanRevisionID, pins.claim.ApplicationID(), pins.deploymentPlanRevisionNumber).Scan(
+		pins.deploymentPlanRevisionID, pins.applicationID(), pins.deploymentPlanRevisionNumber).Scan(
 		&snapshot.plan.canonicalDigest, &snapshot.plan.sourceProvider, &snapshot.plan.sourceRepositoryID,
 		&snapshot.plan.sourceResolvedDigest, &snapshot.plan.acceptanceStatus, &snapshot.plan.componentCount,
 	)
@@ -393,7 +432,7 @@ func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins cand
 	err = tx.QueryRowContext(ctx, `SELECT bundle_version,COALESCE(deployment_plan_revision_id,''),
 		COALESCE(deployment_plan_revision_number,0) FROM application_configuration_revisions
 		WHERE id=? AND app_id=? AND revision_number=?`, pins.configurationRevisionID,
-		pins.claim.ApplicationID(), pins.configurationRevisionNumber).Scan(
+		pins.applicationID(), pins.configurationRevisionNumber).Scan(
 		&snapshot.configuration.formatVersion, &snapshot.configuration.deploymentPlanRevisionID,
 		&snapshot.configuration.deploymentPlanRevisionNumber,
 	)
@@ -401,22 +440,22 @@ func readCandidateAdmissionSnapshotTx(ctx context.Context, tx *sql.Tx, pins cand
 		return snapshot, gateDatabaseError(ctx, err)
 	}
 	err = tx.QueryRowContext(ctx, `SELECT COALESCE(deployment_id,''),COALESCE(release_id,''),
-		COALESCE(slot,''),generation FROM generated_runtime_active_heads WHERE app_id=?`, pins.claim.ApplicationID()).Scan(
+		COALESCE(slot,''),generation,COALESCE(activation_receipt_id,'') FROM generated_runtime_active_heads WHERE app_id=?`, pins.applicationID()).Scan(
 		&snapshot.observedHead.deploymentID, &snapshot.observedHead.releaseID,
-		&snapshot.observedHead.slot, &snapshot.observedHead.generation,
+		&snapshot.observedHead.slot, &snapshot.observedHead.generation, &snapshot.observedHead.activationReceiptID,
 	)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return snapshot, gateDatabaseError(ctx, err)
 	}
-	snapshot.observedHead.appID = pins.claim.ApplicationID()
+	snapshot.observedHead.appID = pins.applicationID()
 
-	snapshot.persistedFindings, err = candidateFindingsRawTx(ctx, tx, pins.claim.ApplicationID(), pins.deploymentID)
+	snapshot.persistedFindings, err = candidateFindingsRawTx(ctx, tx, pins.applicationID(), pins.deploymentID)
 	if err != nil {
 		return snapshot, gateDatabaseError(ctx, err)
 	}
 	var retained int
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM application_lifecycle_operations
-		WHERE app_id=? AND deployment_id=?)`, pins.claim.ApplicationID(), pins.deploymentID).Scan(&retained); err != nil {
+		WHERE app_id=? AND deployment_id=?)`, pins.applicationID(), pins.deploymentID).Scan(&retained); err != nil {
 		return snapshot, gateDatabaseError(ctx, err)
 	}
 	snapshot.lifecycleRetained = retained != 0
@@ -460,7 +499,7 @@ func validateCandidateSnapshotCommon(pins candidateValidationPins, protected can
 	if err := validateProtectedCandidateSnapshot(pins, protected); err != nil {
 		return err
 	}
-	if baseline.pins != current.pins || baseline.pins.jobID != pins.claim.JobID() ||
+	if baseline.pins != current.pins || baseline.pins.jobID != pins.jobID() ||
 		baseline.pins.releaseID != pins.releaseID || baseline.pins.configurationRevisionID != pins.configurationRevisionID ||
 		baseline.pins.configurationRevisionNumber != pins.configurationRevisionNumber ||
 		baseline.pins.deploymentPlanRevisionID != pins.deploymentPlanRevisionID ||
@@ -470,7 +509,7 @@ func validateCandidateSnapshotCommon(pins candidateValidationPins, protected can
 		!sameProtectedCandidateSnapshot(current.protected, protected) {
 		return deploymentexecution.ErrAuthorityStale
 	}
-	if current.main.appID != pins.claim.ApplicationID() || current.main.jobID != pins.claim.JobID() ||
+	if current.main.appID != pins.applicationID() || current.main.jobID != pins.jobID() ||
 		current.main.releaseID != pins.releaseID || current.main.configurationRevisionID != pins.configurationRevisionID ||
 		current.main.configurationRevisionNumber != pins.configurationRevisionNumber ||
 		current.main.planRevisionID != pins.deploymentPlanRevisionID ||
@@ -482,7 +521,7 @@ func validateCandidateSnapshotCommon(pins candidateValidationPins, protected can
 		!candidateAdmissionStatus(current.main.status) {
 		return deploymentexecution.ErrStageInvalid
 	}
-	if current.runtime.appID != pins.claim.ApplicationID() || current.runtime.releaseID != pins.releaseID ||
+	if current.runtime.appID != pins.applicationID() || current.runtime.releaseID != pins.releaseID ||
 		current.runtime.planRevisionID != pins.deploymentPlanRevisionID ||
 		current.runtime.planRevisionNumber != pins.deploymentPlanRevisionNumber ||
 		current.runtime.candidateSlot != pins.candidateSlot ||
@@ -638,8 +677,8 @@ func validateCandidateComponentProvenance(pins candidateValidationPins, componen
 		return nil
 	}
 	receipt := *component.receipt
-	if uuid.Validate(receipt.id) != nil || receipt.creatorJobID != pins.claim.JobID() ||
-		receipt.creatorWorkerAttempt < 1 || (pins.claim.Attempt() > 0 && receipt.creatorWorkerAttempt > pins.claim.Attempt()) ||
+	if uuid.Validate(receipt.id) != nil || receipt.creatorJobID != pins.jobID() ||
+		receipt.creatorWorkerAttempt < 1 || receipt.creatorWorkerAttempt > pins.attempt() ||
 		receipt.configurationRevisionID != pins.configurationRevisionID ||
 		receipt.configurationRevisionNumber != pins.configurationRevisionNumber ||
 		receipt.imageArtifactID != artifact.id || receipt.imageArtifactAttempt != artifact.attemptNumber ||
@@ -665,7 +704,7 @@ func validateCandidatePolicyTx(ctx context.Context, stores *deployments.Generate
 	if len(findings) == 0 {
 		findings = pins.findings
 	}
-	rejected, missingApproval, err := stores.EvaluateGeneratedPolicyTx(ctx, tx, pins.claim.ApplicationID(), findings)
+	rejected, missingApproval, err := stores.EvaluateGeneratedPolicyTx(ctx, tx, pins.applicationID(), findings)
 	if err != nil {
 		return gateDatabaseError(ctx, err)
 	}
@@ -703,7 +742,7 @@ func candidateFindingsRawTx(ctx context.Context, tx *sql.Tx, appID, deploymentID
 func validateProtectedCandidateSnapshot(pins candidateValidationPins, protected candidateProtectedSnapshot) error {
 	revision := protected.revision
 	if (revision.State != deploymentplans.RevisionAccepted && revision.State != deploymentplans.RevisionSuperseded) ||
-		revision.ID != pins.deploymentPlanRevisionID || revision.AppID != pins.claim.ApplicationID() ||
+		revision.ID != pins.deploymentPlanRevisionID || revision.AppID != pins.applicationID() ||
 		revision.RevisionNumber != pins.deploymentPlanRevisionNumber || revision.Plan.Strategy != deploymentplans.StrategyGeneratedNode ||
 		len(protected.components) < 1 || len(protected.components) > 2 || len(revision.Plan.Components) != len(protected.components) {
 		return ErrInvalidDeployment

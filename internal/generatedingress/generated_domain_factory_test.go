@@ -14,6 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostd/hostd/internal/generatedcontainer"
+	"github.com/hostd/hostd/internal/generatedruntimestate"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -24,13 +27,29 @@ type generatedDomainConstructionFixture struct {
 }
 
 type generatedDomainConstructionRunner struct {
-	mu       sync.Mutex
-	delegate *generatedDomainRecoveryCensusRunner
-	block    []string
-	started  chan struct{}
-	release  <-chan struct{}
-	blocked  bool
-	commands [][]string
+	mu        sync.Mutex
+	delegate  *generatedDomainRecoveryCensusRunner
+	block     []string
+	started   chan struct{}
+	release   <-chan struct{}
+	blocked   bool
+	commands  [][]string
+	candidate *candidateOwnerRunner
+	capacity  []byte
+}
+
+type generatedDomainRouteSeedRunner struct {
+	daemonID string
+	delegate *ingressRunner
+}
+
+func (r *generatedDomainRouteSeedRunner) Run(ctx context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	if reflect.DeepEqual(request.Args, []string{"info", "--format", "{{json .ID}}"}) {
+		return jsonResult(r.daemonID), nil
+	}
+	return r.delegate.Run(ctx, request)
 }
 
 func (r *generatedDomainConstructionRunner) Run(ctx context.Context,
@@ -55,7 +74,38 @@ func (r *generatedDomainConstructionRunner) Run(ctx context.Context,
 		case <-release:
 		}
 	}
+	if r.delegate != nil && r.delegate.gateway != nil && len(args) == 5 &&
+		args[0] == "container" && args[1] == "inspect" && args[2] == "--format" &&
+		args[3] == caddyInspectFormat && args[4] == caddyContainerName {
+		return jsonResult(r.delegate.gateway.container), nil
+	}
+	if r.candidate != nil && generatedDomainCandidateInspectionCommand(args) {
+		candidateCommand := true
+		if args[0] == "container" {
+			physical := r.candidate.snapshot()
+			target := args[len(args)-1]
+			candidateCommand = target == physical.containerID || target == physical.policy.identity.ContainerName
+		}
+		if candidateCommand {
+			return r.candidate.Run(ctx, request)
+		}
+	}
+	if len(args) == 6 && args[0] == "container" && args[1] == "exec" &&
+		args[3] == "sh" && args[4] == "-c" && args[5] == capacityProbeCommand {
+		output := r.capacity
+		if output == nil {
+			output = []byte("2147483648 8589934592\n")
+		}
+		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), output...)}, nil
+	}
 	return r.delegate.Run(ctx, request)
+}
+
+func generatedDomainCandidateInspectionCommand(args []string) bool {
+	return len(args) == 5 && args[2] == "--format" &&
+		(args[0] == "image" && args[1] == "inspect" && args[3] == generatedCandidateImageInspectFormat ||
+			args[0] == "network" && args[1] == "inspect" && args[3] == generatedCandidateNetworkInspectFormat ||
+			args[0] == "container" && args[1] == "inspect" && args[3] == generatedcontainer.InspectFormat)
 }
 
 func (r *generatedDomainConstructionRunner) snapshot() [][]string {
@@ -332,14 +382,75 @@ func TestGeneratedDomainConstructionJoinsOneCompleteOwner(t *testing.T) {
 	if owner.err != nil || owner.result == nil {
 		t.Fatalf("construction owner = %#v, %v", owner.result, owner.err)
 	}
-	joined, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+	statePath := filepath.Join(fixture.identity.dataRoot, "runtime", "generated-ingress", stateFilename)
+	stateBefore, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerCommands := len(fixture.runner.snapshot())
+	outerCtx, cancelOuter := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelOuter()
+	releaseOuter, err := deploymenteffects.Acquire(outerCtx, fixture.identity.options.WorkingDirectory)
+	if err != nil {
+		t.Fatalf("acquire outer startup effects lease: %v", err)
+	}
+	joined, err := newGeneratedDomainConstruction(outerCtx, fixture.identity.stores,
 		fixture.runner, fixture.environment, fixture.identity.options)
+	releaseErr := releaseOuter()
 	if err != nil || joined != owner.result || joined.manager != owner.result.manager ||
 		joined.budget != owner.result.budget || joined.candidates != owner.result.candidates ||
 		joined.candidates.ledger != owner.result.candidates.ledger ||
-		joined.candidates.heads != owner.result.candidates.heads {
-		t.Fatalf("completed join did not retain one owner family: %#v, %v", joined, err)
+		joined.candidates.heads != owner.result.candidates.heads || releaseErr != nil {
+		t.Fatalf("completed join under outer lease did not retain one owner family: %#v, %v release=%v",
+			joined, err, releaseErr)
 	}
+	stateAfter, err := os.ReadFile(statePath)
+	if err != nil || !reflect.DeepEqual(stateBefore, stateAfter) {
+		t.Fatalf("completed join changed protected state: %v", err)
+	}
+	joined.candidates.ledger.mu.Lock()
+	capacityGroups := len(joined.candidates.ledger.groups)
+	joined.candidates.ledger.mu.Unlock()
+	joined.candidates.heads.mu.Lock()
+	headGroups := len(joined.candidates.heads.groups)
+	joined.candidates.heads.mu.Unlock()
+	if capacityGroups != 0 || headGroups != 0 {
+		t.Fatalf("completed join reseeded owner registries: capacity=%d heads=%d", capacityGroups, headGroups)
+	}
+	for _, command := range fixture.runner.snapshot()[ownerCommands:] {
+		if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+			t.Fatalf("completed join dispatched constructor effect/capacity probe: %#v", command)
+		}
+	}
+	originalObjects := append([]generatedDomainDockerObject(nil), fixture.runner.delegate.objects...)
+	fixture.runner.delegate.objects = append(fixture.runner.delegate.objects, generatedDomainDockerObject{
+		kind: "volume", name: "rig-completed-join-drift",
+		labels: map[string]string{"io.rig.unexpected": "completed-join-drift"},
+		data: generatedDomainDockerObjectData{driver: "local", scope: "local", options: map[string]string{},
+			mountpoint: "/var/lib/docker/volumes/rig-completed-join-drift/_data",
+			createdAt:  "2026-10-23T01:00:00Z"},
+	})
+	if drifted, driftErr := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+		fixture.runner, fixture.environment, fixture.identity.options); driftErr == nil || drifted != nil {
+		t.Fatalf("completed join accepted Docker census drift: %#v, %v", drifted, driftErr)
+	}
+	fixture.runner.delegate.objects = originalObjects
+	joinedAfterDrift, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+		fixture.runner, fixture.environment, fixture.identity.options)
+	if err != nil || joinedAfterDrift != owner.result {
+		t.Fatalf("local join refusal poisoned completed owner: %#v, %v", joinedAfterDrift, err)
+	}
+	joined.candidates.ledger.mu.Lock()
+	joined.candidates.ledger.groups[candidateCapacityGroupKey{appID: "drift", deploymentID: "drift"}] =
+		&candidateCapacityGroup{}
+	joined.candidates.ledger.mu.Unlock()
+	if drifted, driftErr := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+		fixture.runner, fixture.environment, fixture.identity.options); driftErr == nil || drifted != nil {
+		t.Fatalf("completed join accepted ledger drift: %#v, %v", drifted, driftErr)
+	}
+	joined.candidates.ledger.mu.Lock()
+	delete(joined.candidates.ledger.groups, candidateCapacityGroupKey{appID: "drift", deploymentID: "drift"})
+	joined.candidates.ledger.mu.Unlock()
 	foreignEnvironment := &candidateFactoryEnvironment{path: fixture.environment.path}
 	if collided, collisionErr := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
 		fixture.runner, foreignEnvironment, fixture.identity.options); collisionErr == nil || collided != nil {
@@ -350,6 +461,21 @@ func TestGeneratedDomainConstructionJoinsOneCompleteOwner(t *testing.T) {
 	if err != nil || retained != owner.result {
 		t.Fatalf("crossed environment changed exact completed join: %#v, %v", retained, err)
 	}
+}
+
+func generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command []string) bool {
+	if len(command) >= 2 && command[0] == "container" {
+		switch command[1] {
+		case "create", "start", "stop", "rm", "pull":
+			return true
+		case "cp":
+			return len(command) < 4 || command[len(command)-1] != "-"
+		case "exec":
+			return len(command) >= 6 && command[len(command)-3] == "sh" && command[len(command)-2] == "-c" &&
+				command[len(command)-1] == capacityProbeCommand
+		}
+	}
+	return false
 }
 
 func TestGeneratedDomainConstructionAssemblesCompletePrivateManager(t *testing.T) {
@@ -450,6 +576,306 @@ func TestGeneratedDomainConstructionAssemblesCompletePrivateManager(t *testing.T
 		}
 		t.Fatalf("physical-identity forged alias was admitted: %v", err)
 	}
+}
+
+func TestGeneratedDomainConstructionReconstructsColdAccounting(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	t.Run("quiescent_current", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			identity := newGeneratedDomainIdentityFixture(t)
+			migration := newGeneratedMigrationFixtureOnDomainWithComponents(t, identity,
+				[]string{"api"}, []string{"api"})
+			identity.stores = migration.repository.stores
+			validation := newCandidateOwnerValidationFixtureWithMigration(t, migration)
+			candidate := newCandidateOwnerFixtureWithValidationAndOptions(t, validation,
+				generatedDomainCandidateOptions(identity.options))
+			reservation := candidate.reserve(t)
+			execution := candidate.pin(t, reservation)
+			defer func() {
+				execution.Leave()
+				reservation.Release()
+				_ = migration.releaseEffects()
+			}()
+			invocation := candidate.beginCreate(t, execution)
+			candidate.bindInvocation(t, invocation)
+			candidateIdentity, err := execution.CreateAndRecord(invocation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := execution.StartCandidate(invocation); err != nil {
+				t.Fatal(err)
+			}
+			candidate.moveToWaitingHealth(t, execution)
+			if err := execution.WaitHealthyAndRecord(invocation); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := execution.FinishHealth(); err != nil {
+				t.Fatal(err)
+			}
+
+			store, err := newStateStore(identity.dataRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, ingressIP := ingressNetworkCandidate(0)
+			routeRunner := &generatedDomainRouteSeedRunner{
+				daemonID: "generated-domain-cold-daemon",
+				delegate: &ingressRunner{
+					appID: migration.guarded.appID, network: candidateIdentity.NetworkName,
+					endpoint: generatedRouteEndpoint(candidateIdentity),
+					caddyNetworks: map[string]*networkAttachment{
+						caddyNetworkName: {GwPriority: caddyGatewayPriority, IPAddress: ingressIP},
+					},
+					ingressContainers: map[string]caddyNetworkContainerInspection{
+						strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: ingressIP + "/28"},
+					},
+					files: map[string][]byte{},
+				},
+			}
+			input := generatedDomainReservationInput{database: identity.database, runner: routeRunner,
+				options: identity.options}
+			manager, err := assembleGeneratedDomainManager(input, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			physical, _, err := inspectGeneratedDomainPhysicalIdentity(context.Background(), identity.stores,
+				routeRunner, identity.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := bindGeneratedDomainManagerView(manager, physical.manager); err != nil {
+				t.Fatal(err)
+			}
+			routes, err := newGeneratedRouteAuthority(manager, candidate.authority, candidate.authority.stores)
+			if err != nil {
+				t.Fatalf("route authority: %v configured-stores=%t same-stores=%t ledger=%t heads=%t view=%t",
+					err, identity.stores.Configured(), candidate.authority.stores == identity.stores,
+					candidate.authority.ledger != nil, candidate.authority.heads != nil,
+					manager.domainView != nil && manager.domainView.manager == manager)
+			}
+			sealed, err := routes.Pin(migration.guarded.context, execution,
+				generatedRouteRequest(migration.guarded.appID, candidateIdentity))
+			if err != nil {
+				t.Fatal(err)
+			}
+			activated, err := sealed.Activate(migration.guarded.context)
+			if err != nil || activated.Phase != generatedruntimestate.PhaseDraining {
+				t.Fatalf("activate cold current route = %#v, %v", activated, err)
+			}
+			runtime := generatedruntimestate.New(identity.database)
+			if _, err := runtime.Advance(context.Background(), migration.guarded.appID,
+				migration.request.DeploymentID, generatedruntimestate.PhaseDraining,
+				generatedruntimestate.PhaseSucceeded, ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := migration.repository.Transition(context.Background(), migration.guarded.appID,
+				migration.request.DeploymentID, Succeeded, ""); err != nil {
+				t.Fatal(err)
+			}
+			execution.Leave()
+			reservation.Release()
+			if err := migration.releaseEffects(); err != nil {
+				t.Fatal(err)
+			}
+
+			state, err := store.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, v2, journal := gatewayV2IdentityTestState(t)
+			observation := gatewayV2IdentityTestObservation(t, state, v2, journal,
+				gatewayTopologyExactV1Only)
+			observation.V1Container.ID = strings.Repeat("d", 64)
+			observation.V1NetworkID = strings.Repeat("e", 64)
+			for id, member := range observation.V1Network.Containers {
+				delete(observation.V1Network.Containers, id)
+				observation.V1Network.Containers[observation.V1Container.ID] = member
+			}
+			gateway := generatedDomainNativeV1OuterGatewayRunner(observation)
+			objects := generatedDomainDockerObjectsForDescriptors(generatedDomainNativeV1DockerDescriptors())
+			for index := range objects {
+				switch objects[index].name {
+				case caddyContainerName:
+					objects[index].id = observation.V1Container.ID
+				case caddyNetworkName:
+					objects[index].id = observation.V1NetworkID
+					objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Network.Driver,
+						scope: observation.V1Network.Scope, options: cloneStringMap(observation.V1Network.Options)}
+				case caddyVolumeName:
+					objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Volume.Driver,
+						scope: observation.V1Volume.Scope, options: cloneStringMap(observation.V1Volume.Options),
+						mountpoint: observation.V1VolumeIdentity.Mountpoint,
+						createdAt:  observation.V1VolumeIdentity.CreatedAt}
+				}
+			}
+			policy := candidate.runner.snapshot().policy
+			objects = append(objects,
+				generatedDomainDockerObject{kind: "image", id: policy.identity.ImageContentID,
+					labels: map[string]string{
+						"io.rig.managed": "generated-image", "io.rig.application": policy.identity.AppID,
+						"io.rig.release": policy.identity.ReleaseID, "io.rig.artifact": policy.identity.ArtifactID,
+						"io.rig.plan":      policy.identity.DeploymentPlanRevisionID,
+						"io.rig.component": policy.identity.Component, "io.rig.role": policy.identity.Role,
+						"io.rig.definition": policy.buildDefinitionDigest,
+					}, data: generatedDomainDockerObjectData{contentID: policy.identity.ImageContentID}},
+				generatedDomainDockerObject{kind: "network", id: strings.Repeat("6", 64),
+					name: policy.identity.NetworkName, labels: map[string]string{
+						"io.rig.managed": "generated-runtime-network", "io.rig.application": policy.identity.AppID,
+					}, data: generatedDomainDockerObjectData{driver: "bridge", scope: "local", options: map[string]string{}}},
+				generatedDomainDockerObject{kind: "container", id: candidateIdentity.ContainerID,
+					name: policy.identity.ContainerName, labels: generatedDomainColdContainerLabels(policy.identity)},
+			)
+			identity.options.HostPort = journal.Source.LocalHostPort
+			runner := &generatedDomainConstructionRunner{candidate: candidate.runner,
+				delegate: &generatedDomainRecoveryCensusRunner{
+					daemonID: "generated-domain-cold-daemon", objects: objects,
+					imageID: observation.Image.ID, gateway: gateway,
+				}}
+			result, err := newGeneratedDomainConstruction(context.Background(), identity.stores, runner,
+				&candidateFactoryEnvironment{path: t.TempDir()}, identity.options)
+			if err != nil || result == nil || result.cold == nil || len(result.cold.groups) != 1 {
+				diagnostic := generatedDomainDiagnoseOuterStable(t, identity, runner.delegate)
+				t.Fatalf("cold current construction = %#v, %v diagnostic=%s commands=%#v",
+					result, err, diagnostic, runner.snapshot())
+			}
+			group := result.cold.groups[0]
+			if group.appID != migration.guarded.appID || group.deploymentID != migration.request.DeploymentID ||
+				group.head == nil || group.head.deploymentID != migration.request.DeploymentID ||
+				len(group.components) != 1 || group.components[0].charged || group.components[0].retained {
+				t.Fatalf("cold current manifest = %#v", group)
+			}
+			for _, command := range runner.snapshot() {
+				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+					t.Fatalf("quiescent current reconstruction dispatched an effect/capacity probe: %#v", command)
+				}
+			}
+		})
+	})
+	t.Run("retained_risk", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			identity := newGeneratedDomainIdentityFixture(t)
+			migration := newGeneratedMigrationFixtureOnDomainWithComponents(t, identity,
+				[]string{"api"}, []string{"api"})
+			identity.stores = migration.repository.stores
+			validation := newCandidateOwnerValidationFixtureWithMigration(t, migration)
+			candidate := newCandidateOwnerFixtureWithValidationAndOptions(t, validation,
+				generatedDomainCandidateOptions(identity.options))
+			reservation := candidate.reserve(t)
+			execution := candidate.pin(t, reservation)
+			invocation := candidate.beginCreate(t, execution)
+			candidate.bindInvocation(t, invocation)
+			candidateIdentity, err := execution.CreateAndRecord(invocation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := execution.StartCandidate(invocation); err != nil {
+				t.Fatal(err)
+			}
+			candidate.moveToWaitingHealth(t, execution)
+			execution.Leave()
+			reservation.Release()
+			if err := migration.releaseEffects(); err != nil {
+				t.Fatal(err)
+			}
+
+			store, err := newStateStore(identity.dataRoot)
+			if err != nil || store.createInitialEmpty() != nil {
+				t.Fatalf("install exact empty native V1 state: %v", err)
+			}
+			state, err := store.load()
+			if err != nil || len(state.Active) != 0 {
+				t.Fatalf("load exact empty native V1 state: %#v, %v", state, err)
+			}
+			_, v2, journal := gatewayV2IdentityTestState(t)
+			observation := gatewayV2IdentityTestObservation(t, state, v2, journal,
+				gatewayTopologyExactV1Only)
+			observation.V1Container.ID = strings.Repeat("d", 64)
+			observation.V1NetworkID = strings.Repeat("e", 64)
+			for id, member := range observation.V1Network.Containers {
+				delete(observation.V1Network.Containers, id)
+				observation.V1Network.Containers[observation.V1Container.ID] = member
+			}
+			gateway := generatedDomainNativeV1OuterGatewayRunner(observation)
+			objects := generatedDomainDockerObjectsForDescriptors(generatedDomainNativeV1DockerDescriptors())
+			for index := range objects {
+				switch objects[index].name {
+				case caddyContainerName:
+					objects[index].id = observation.V1Container.ID
+				case caddyNetworkName:
+					objects[index].id = observation.V1NetworkID
+					objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Network.Driver,
+						scope: observation.V1Network.Scope, options: cloneStringMap(observation.V1Network.Options)}
+				case caddyVolumeName:
+					objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Volume.Driver,
+						scope: observation.V1Volume.Scope, options: cloneStringMap(observation.V1Volume.Options),
+						mountpoint: observation.V1VolumeIdentity.Mountpoint,
+						createdAt:  observation.V1VolumeIdentity.CreatedAt}
+				}
+			}
+			policy := candidate.runner.snapshot().policy
+			objects = append(objects,
+				generatedDomainDockerObject{kind: "image", id: policy.identity.ImageContentID,
+					labels: map[string]string{
+						"io.rig.managed": "generated-image", "io.rig.application": policy.identity.AppID,
+						"io.rig.release": policy.identity.ReleaseID, "io.rig.artifact": policy.identity.ArtifactID,
+						"io.rig.plan":      policy.identity.DeploymentPlanRevisionID,
+						"io.rig.component": policy.identity.Component, "io.rig.role": policy.identity.Role,
+						"io.rig.definition": policy.buildDefinitionDigest,
+					}, data: generatedDomainDockerObjectData{contentID: policy.identity.ImageContentID}},
+				generatedDomainDockerObject{kind: "network", id: strings.Repeat("6", 64),
+					name: policy.identity.NetworkName, labels: map[string]string{
+						"io.rig.managed": "generated-runtime-network", "io.rig.application": policy.identity.AppID,
+					}, data: generatedDomainDockerObjectData{driver: "bridge", scope: "local", options: map[string]string{}}},
+				generatedDomainDockerObject{kind: "container", id: candidateIdentity.ContainerID,
+					name: policy.identity.ContainerName, labels: generatedDomainColdContainerLabels(policy.identity)},
+			)
+			identity.options.HostPort = journal.Source.LocalHostPort
+			runner := &generatedDomainConstructionRunner{candidate: candidate.runner,
+				delegate: &generatedDomainRecoveryCensusRunner{
+					daemonID: "generated-domain-cold-risk-daemon", objects: objects,
+					imageID: observation.Image.ID, gateway: gateway,
+				}}
+			priorManager, err := assembleGeneratedDomainManager(generatedDomainReservationInput{
+				database: identity.database, stores: identity.stores, runner: runner, options: identity.options,
+			}, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			releasePriorLock, err := priorManager.lockGateway(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := releasePriorLock(); err != nil {
+				t.Fatal(err)
+			}
+			result, err := newGeneratedDomainConstruction(context.Background(), identity.stores, runner,
+				&candidateFactoryEnvironment{path: t.TempDir()}, identity.options)
+			if err != nil || result == nil || result.cold == nil || len(result.cold.groups) != 1 {
+				diagnostic := generatedDomainDiagnoseOuterStable(t, identity, runner.delegate)
+				t.Fatalf("cold retained-risk construction = %#v, %v diagnostic=%s commands=%#v",
+					result, err, diagnostic, runner.snapshot())
+			}
+			group := result.cold.groups[0]
+			if group.appID != migration.guarded.appID || group.deploymentID != migration.request.DeploymentID ||
+				group.head == nil || group.head.deploymentID != "" || group.head.generation != 0 ||
+				len(group.components) != 1 || !group.components[0].charged || !group.components[0].retained ||
+				group.components[0].receiptID == "" {
+				t.Fatalf("cold retained-risk manifest = %#v", group)
+			}
+			capacityProbes := 0
+			for _, command := range runner.snapshot() {
+				if len(command) >= 6 && command[0] == "container" && command[1] == "exec" &&
+					command[len(command)-1] == capacityProbeCommand {
+					capacityProbes++
+				}
+			}
+			if capacityProbes != 1 {
+				t.Fatalf("cold retained-risk capacity probes = %d commands=%#v", capacityProbes, runner.snapshot())
+			}
+		})
+	})
 }
 
 func TestGeneratedDomainConstructionOwnsExactPathTransition(t *testing.T) {

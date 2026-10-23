@@ -397,6 +397,13 @@ func (p *Pinned) CheckPolicyGateTx(tx *sql.Tx, claim Claim, deploymentID string)
 	return p.checkTx(tx, claim, deploymentID, policyGateStatus)
 }
 
+// CheckRouteActivationTx revalidates the original deployment Claim inside
+// the one fixed generated-route activation transaction. It grants no route,
+// receipt, or transaction capability on its own.
+func (p *Pinned) CheckRouteActivationTx(tx *sql.Tx, claim Claim, deploymentID string) error {
+	return p.checkTx(tx, claim, deploymentID, generatedRouteActivationStatus)
+}
+
 // CheckComposeUpTx revalidates the original execution authority at the fixed
 // Compose mutation boundary. An acknowledged waiting-health deployment can
 // never authorize another up command.
@@ -552,6 +559,8 @@ func composeObservationStatus(status string) bool {
 func generatedNetworkStatus(status string) bool { return status == "applying" }
 
 func generatedImageStatus(status string) bool { return status == "applying" }
+
+func generatedRouteActivationStatus(status string) bool { return status == "waiting_health" }
 
 func policyGateStatus(status string) bool {
 	switch status {
