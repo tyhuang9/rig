@@ -85,14 +85,17 @@ func inspectGeneratedDomainStartupObservation(ctx context.Context, stores *deplo
 ) (generatedDomainStartupObservation, error) {
 	var empty generatedDomainStartupObservation
 	if ctx == nil || stores == nil || !generatedCandidatePointerIdentity(runner) {
-		return empty, errGeneratedDomainStartupInvalid
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonInput, errGeneratedDomainStartupInvalid, nil)
 	}
 	normalized, ok := normalizeGeneratedDomainOptions(options)
 	if !ok {
-		return empty, errGeneratedDomainStartupInvalid
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonInput, errGeneratedDomainStartupInvalid, nil)
 	}
 	if err := ctx.Err(); err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonInput, errGeneratedDomainStartupRead, err)
 	}
 	readCtx, cancel := context.WithTimeout(ctx, generatedDomainStartupObservationTimeout)
 	defer cancel()
@@ -100,91 +103,110 @@ func inspectGeneratedDomainStartupObservation(ctx context.Context, stores *deplo
 	storesCopy := *stores
 	identity, paths, err := inspectGeneratedDomainPhysicalIdentity(readCtx, &storesCopy, runner, normalized)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonPhysicalIdentity, errGeneratedDomainStartupRead, err)
 	}
 	if _, err := paths.recheck(false); err != nil {
-		return empty, errGeneratedDomainStartupChanged
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonPathIdentity, errGeneratedDomainStartupChanged, err)
 	}
 	reader, err := newGeneratedDomainStartupReader(runner, normalized, identity.manager.daemonID)
 	if err != nil {
-		return empty, errGeneratedDomainStartupInvalid
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonInput, errGeneratedDomainStartupInvalid, err)
 	}
 
 	database1, err := storesCopy.GeneratedDomainStartupSnapshot(readCtx)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonDatabase, errGeneratedDomainStartupRead, err)
 	}
 	protected1, err := readGeneratedDomainProtectedStartup(readCtx, normalized.DataRoot)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonProtectedState, errGeneratedDomainStartupRead, err)
 	}
 	expectation1, err := resolveGeneratedDomainGatewayExpectation(database1, protected1)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonGatewayExpectation, errGeneratedDomainStartupRead, err)
 	}
 	recovery1 := resolveGeneratedDomainRecoveryDockerExpectation(database1, protected1)
 	census1, err := resolveGeneratedDomainDockerCensus(protected1)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonDockerCensus, errGeneratedDomainStartupRead, err)
 	}
 	reader.expectation = generatedDomainStartupObservationGateway(expectation1, recovery1)
 	reader.census = census1
 	reader.recovery = recovery1
 	docker1, err := readGeneratedDomainDockerStartup(readCtx, reader)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonDockerAttestation, errGeneratedDomainStartupRead, err)
 	}
 	database2, err := storesCopy.GeneratedDomainStartupSnapshot(readCtx)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonDatabase, errGeneratedDomainStartupRead, err)
 	}
 	protected2, err := readGeneratedDomainProtectedStartup(readCtx, normalized.DataRoot)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonProtectedState, errGeneratedDomainStartupRead, err)
 	}
 	expectation2, err := resolveGeneratedDomainGatewayExpectation(database2, protected2)
 	recovery2 := resolveGeneratedDomainRecoveryDockerExpectation(database2, protected2)
 	census2, censusErr := resolveGeneratedDomainDockerCensus(protected2)
 	if err != nil || censusErr != nil || !reflect.DeepEqual(expectation1, expectation2) ||
 		!reflect.DeepEqual(recovery1, recovery2) || !reflect.DeepEqual(census1, census2) {
-		return empty, errGeneratedDomainStartupChanged
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonStability, errGeneratedDomainStartupChanged, errors.Join(err, censusErr))
 	}
 	reader.expectation = generatedDomainStartupObservationGateway(expectation2, recovery2)
 	reader.census = census2
 	reader.recovery = recovery2
 	docker2, err := readGeneratedDomainDockerStartup(readCtx, reader)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonDockerAttestation, errGeneratedDomainStartupRead, err)
 	}
 	if !reflect.DeepEqual(database1, database2) ||
 		!sameGeneratedDomainProtectedStartup(protected1, protected2) ||
 		!sameGeneratedDomainDockerStartup(docker1, docker2) {
-		return empty, errGeneratedDomainStartupChanged
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonStability, errGeneratedDomainStartupChanged, nil)
 	}
 	if _, err := paths.recheck(false); err != nil ||
 		generatedCandidateValidateCommandDirectories(generatedDomainCandidateOptions(normalized)) != nil {
-		return empty, errGeneratedDomainStartupChanged
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonPathIdentity, errGeneratedDomainStartupChanged, err)
 	}
 	daemonID, err := inspectGeneratedDockerDaemonIdentity(readCtx, runner, normalized.DockerExecutable,
 		reader.environment, normalized.CommandTimeout)
 	if err != nil || daemonID != identity.manager.daemonID {
-		return empty, errGeneratedDomainStartupChanged
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonDockerDaemon, errGeneratedDomainStartupChanged, err)
 	}
 	database3, err := storesCopy.GeneratedDomainStartupSnapshot(readCtx)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonDatabase, errGeneratedDomainStartupRead, err)
 	}
 	protected3, err := readGeneratedDomainProtectedStartup(readCtx, normalized.DataRoot)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonProtectedState, errGeneratedDomainStartupRead, err)
 	}
 	if !reflect.DeepEqual(database2, database3) ||
 		!sameGeneratedDomainProtectedStartup(protected2, protected3) || readCtx.Err() != nil {
-		return empty, errGeneratedDomainStartupChanged
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonStability, errGeneratedDomainStartupChanged, readCtx.Err())
 	}
 	classification, err := classifyGeneratedDomainStartup(database3, protected3, docker2)
 	if err != nil {
-		return empty, errGeneratedDomainStartupRead
+		return empty, generatedDomainStartupObservationDiagnostic(
+			generatedDomainConstructionReasonClassification, errGeneratedDomainStartupRead, err)
 	}
 	classification.recovery = canonicalGeneratedDomainStartupRecoveries(classification.recovery)
 	return generatedDomainStartupObservation{classification: classification, database: database3,

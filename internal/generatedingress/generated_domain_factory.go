@@ -110,7 +110,12 @@ func newGeneratedDomainConstruction(
 		len(observation.classification.recovery) == 0:
 		result, err = constructGeneratedDomainCold(ctx, reservation, input, observation)
 	default:
-		err = errGeneratedDomainConstructionRefused
+		reason := generatedDomainConstructionReasonDisposition
+		if len(observation.classification.recovery) != 0 {
+			reason = generatedDomainConstructionReasonRecovery
+		}
+		err = generatedDomainConstructionFinalDiagnostic(
+			generatedDomainConstructionStageInitialClassification, reason, nil)
 	}
 	if err != nil {
 		return nil, err
@@ -265,7 +270,8 @@ func constructGeneratedDomainStable(
 ) (*generatedDomainConstruction, error) {
 	store, present, _, err := inspectStateStoreReadOnly(input.options.DataRoot)
 	if err != nil || !present || store == nil {
-		return nil, errGeneratedDomainConstructionRefused
+		return nil, generatedDomainConstructionFinalDiagnostic(
+			generatedDomainConstructionStageStableFinal, generatedDomainConstructionReasonStateStore, err)
 	}
 	manager, err := assembleGeneratedDomainManager(input, store)
 	if err != nil {
@@ -279,6 +285,7 @@ func constructGeneratedDomainStable(
 		return nil, err
 	}
 	if err := verifyGeneratedDomainConstructionFinal(ctx, manager, input, input.physical, input.proof,
+		generatedDomainConstructionStageStableFinal,
 		generatedDomainStartupStable); err != nil {
 		return nil, err
 	}
@@ -392,13 +399,16 @@ func constructGeneratedDomainEmpty(
 	}
 	classification, err := inspectGeneratedDomainStartup(ctx, input.stores, input.runner, input.options)
 	if err != nil || classification.disposition != generatedDomainStartupEmpty {
-		return nil, errGeneratedDomainConstructionRefused
+		return nil, generatedDomainConstructionFinalDiagnostic(
+			generatedDomainConstructionStageEmptyReclassification,
+			generatedDomainConstructionReasonClassification, err)
 	}
 	if err := bootstrapGeneratedDomainEmpty(ctx, manager, input, physical); err != nil {
 		return nil, err
 	}
 	// Check the completed physical state while both exclusions are still held.
 	if err := verifyGeneratedDomainConstructionFinal(ctx, manager, input, physical, transition.final,
+		generatedDomainConstructionStageEmptyFinalLocked,
 		generatedDomainStartupStable); err != nil {
 		return nil, err
 	}
@@ -432,6 +442,7 @@ func constructGeneratedDomainEmpty(
 	// been proved released. The registry remains the in-process authority; this
 	// final read does not claim cross-process atomicity.
 	if err := verifyGeneratedDomainConstructionFinal(ctx, manager, input, physical, transition.final,
+		generatedDomainConstructionStageEmptyFinalReleased,
 		generatedDomainStartupStable); err != nil {
 		return nil, err
 	}
@@ -560,7 +571,12 @@ func captureGeneratedDomainConstructionManifest(
 	}
 	startup, err := inspectGeneratedDomainStartupObservation(ctx, input.stores, input.runner, input.options)
 	if err != nil || len(startup.classification.recovery) != 0 {
-		return empty, errors.Join(errGeneratedDomainConstructionRefused, err)
+		reason := generatedDomainConstructionReasonFromError(err, generatedDomainConstructionReasonClassification)
+		if err == nil && len(startup.classification.recovery) != 0 {
+			reason = generatedDomainConstructionReasonRecovery
+		}
+		return empty, newGeneratedDomainConstructionDiagnostic(
+			generatedDomainConstructionStageManifest, reason, errGeneratedDomainConstructionRefused, err)
 	}
 	var cold *generatedDomainColdManifest
 	switch {
@@ -572,7 +588,8 @@ func captureGeneratedDomainConstructionManifest(
 		}
 		cold = cloneGeneratedDomainColdManifest(*result.cold)
 	default:
-		return empty, errGeneratedDomainConstructionRefused
+		return empty, generatedDomainConstructionFinalDiagnostic(
+			generatedDomainConstructionStageManifest, generatedDomainConstructionReasonDisposition, nil)
 	}
 	physical, proof, err := inspectGeneratedDomainPhysicalIdentity(ctx, input.stores, input.runner, input.options)
 	if err != nil {
@@ -620,7 +637,8 @@ func reattestGeneratedDomainConstructionJoin(
 		!sameGeneratedDomainPhysicalIdentity(manifest.physical, observed.physical) ||
 		!sameGeneratedDomainPathObservation(manifest.proof, observed.proof, false) ||
 		manifest.owners != observed.owners || !sameGeneratedDomainColdManifest(manifest.cold, observed.cold) {
-		return nil, errGeneratedDomainConstructionRefused
+		return nil, generatedDomainConstructionFinalDiagnostic(
+			generatedDomainConstructionStageJoin, generatedDomainConstructionReasonManifest, nil)
 	}
 	return joined, nil
 }
@@ -675,25 +693,38 @@ func verifyGeneratedDomainConstructionFinal(
 	input generatedDomainReservationInput,
 	expected generatedDomainPhysicalIdentity,
 	expectedProof generatedDomainPathProof,
+	stage generatedDomainConstructionStage,
 	disposition generatedDomainStartupDisposition,
 ) error {
 	if err := checkGeneratedDomainManagerRebindFence(ctx, manager); err != nil {
-		return err
+		return newGeneratedDomainConstructionDiagnostic(stage,
+			generatedDomainConstructionReasonFence, err)
 	}
 	classification, err := inspectGeneratedDomainStartup(ctx, input.stores, input.runner, input.options)
 	if err != nil || classification.disposition != disposition || len(classification.recovery) != 0 {
-		return errGeneratedDomainConstructionRefused
+		reason := generatedDomainConstructionReasonClassification
+		if err == nil && len(classification.recovery) != 0 {
+			reason = generatedDomainConstructionReasonRecovery
+		} else if err == nil {
+			reason = generatedDomainConstructionReasonDisposition
+		}
+		return generatedDomainConstructionFinalDiagnostic(stage, reason, err)
 	}
 	physical, proof, err := inspectGeneratedDomainPhysicalIdentity(ctx, input.stores, input.runner, input.options)
 	if err != nil || !sameGeneratedDomainPhysicalIdentity(physical, expected) ||
 		!sameGeneratedDomainPathObservation(proof, expectedProof, false) {
-		return errors.New("generated domain physical identity changed")
+		return newGeneratedDomainConstructionDiagnostic(stage,
+			generatedDomainConstructionReasonFromError(err, generatedDomainConstructionReasonPhysicalIdentity),
+			errors.New("generated domain physical identity changed"))
 	}
 	if gatewayRebindProcessFailStop.Load() || gatewayRebindProcessCommitBarrier.Load() {
-		return errors.New("generated domain process latch is closed")
+		return newGeneratedDomainConstructionDiagnostic(stage,
+			generatedDomainConstructionReasonProcessLatch,
+			errors.New("generated domain process latch is closed"))
 	}
 	if err := checkGeneratedDomainManagerRebindFence(ctx, manager); err != nil {
-		return err
+		return newGeneratedDomainConstructionDiagnostic(stage,
+			generatedDomainConstructionReasonFence, err)
 	}
 	return nil
 }
