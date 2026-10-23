@@ -113,6 +113,10 @@ func (r *generatedDomainBootstrapTestRunner) Run(_ context.Context,
 			(args[4] == r.container.ID || args[4] == caddyContainerName) {
 			return jsonResult(*r.container), nil
 		}
+		if args[3] == generatedDomainStartupContainerInspectFormat && r.container != nil &&
+			(args[4] == r.container.ID || args[4] == caddyContainerName) {
+			return jsonResult(*r.container), nil
+		}
 	}
 	if len(args) == 5 && args[0] == "volume" && args[1] == "inspect" && args[2] == "--format" &&
 		(args[3] == generatedDomainVolumeInspectFormat || args[3] == generatedDomainBootstrapVolumeIdentityFormat) &&
@@ -125,6 +129,10 @@ func (r *generatedDomainBootstrapTestRunner) Run(_ context.Context,
 		}
 		if args[3] == "json" && r.network != nil && (args[4] == r.network.ID || args[4] == caddyNetworkName) {
 			return jsonResult([]gatewayNetworkIdentityInspection{*r.network}), nil
+		}
+		if args[3] == generatedDomainStartupNetworkInspectFormat && r.network != nil &&
+			(args[4] == r.network.ID || args[4] == caddyNetworkName) {
+			return jsonResult(*r.network), nil
 		}
 	}
 	if len(args) >= 2 && args[0] == "volume" && args[1] == "create" {

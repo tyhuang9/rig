@@ -104,6 +104,56 @@ type generatedDomainDockerCensusBudget struct {
 	bytes   int
 }
 
+// Startup observations use a private projection instead of decoding Docker's
+// full inspect payload. Docker may add fields to MountPoint, EndpointSettings,
+// and NetworkResource without changing the fields that form Rig's ownership
+// proof. Projecting the exact consumed fields keeps strict JSON decoding useful
+// while preventing unrelated Docker API growth from changing that proof.
+const (
+	generatedDomainStartupMountsProjection = `[{{range $index, $mount := .Mounts}}{{if $index}},{{end}}` +
+		`{"Type":{{json $mount.Type}},"Name":{{json $mount.Name}},"Destination":{{json $mount.Destination}},"RW":{{json $mount.RW}}}{{end}}]`
+	generatedDomainStartupNetworkAttachmentsProjection = `{{if .NetworkSettings}}{ ` +
+		`{{$networkFirst := true}}{{range $name, $network := .NetworkSettings.Networks}}` +
+		`{{if not $networkFirst}},{{end}}{{$networkFirst = false}}{{json $name}}:` +
+		`{"Aliases":{{json $network.Aliases}},"IPAddress":{{json $network.IPAddress}},` +
+		`"GwPriority":{{json $network.GwPriority}},"IPv6Gateway":{{json $network.IPv6Gateway}}}{{end}}` +
+		`}{{else}}null{{end}}`
+	generatedDomainStartupConfiguredNetworksProjection = `{{if .NetworkSettings}}{ ` +
+		`{{$configuredFirst := true}}{{range $name, $network := .NetworkSettings.Networks}}` +
+		`{{if not $configuredFirst}},{{end}}{{$configuredFirst = false}}{{json $name}}:{"IPAMConfig":` +
+		`{{if $network.IPAMConfig}}{"IPv4Address":{{json $network.IPAMConfig.IPv4Address}},` +
+		`"IPv6Address":{{json $network.IPAMConfig.IPv6Address}}}{{else}}null{{end}},` +
+		`"NetworkID":{{json $network.NetworkID}},"EndpointID":{{json $network.EndpointID}},` +
+		`"IPAddress":{{json $network.IPAddress}},"GwPriority":{{json $network.GwPriority}},` +
+		`"IPv6Gateway":{{json $network.IPv6Gateway}}}{{end}}}{{else}}null{{end}}`
+	generatedDomainStartupContainerInspectFormat = `{"id":{{json .ID}},"name":{{json .Name}},` +
+		`"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},` +
+		`"user":{{json .Config.User}},"env":{{json .Config.Env}},"entrypoint":{{json .Config.Entrypoint}},` +
+		`"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},` +
+		`"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},` +
+		`"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},` +
+		`"binds":{{json .HostConfig.Binds}},"mounts":` + generatedDomainStartupMountsProjection + `,` +
+		`"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},` +
+		`"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},` +
+		`"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},` +
+		`"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},` +
+		`"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},` +
+		`"running":{{json .State.Running}},"restarting":{{json .State.Restarting}},` +
+		`"portBindings":{{json .HostConfig.PortBindings}},"networks":` +
+		generatedDomainStartupNetworkAttachmentsProjection + `,"paused":{{json .State.Paused}},` +
+		`"dead":{{json .State.Dead}},"restartCount":{{json .RestartCount}},"effectivePortBindings":` +
+		`{{if .NetworkSettings}}{{json .NetworkSettings.Ports}}{{else}}null{{end}},"configuredNetworks":` +
+		generatedDomainStartupConfiguredNetworksProjection + `}`
+	generatedDomainStartupNetworkInspectFormat = `{"Id":{{json .ID}},"Name":{{json .Name}},` +
+		`"Driver":{{json .Driver}},"Scope":{{json .Scope}},"Internal":{{json .Internal}},` +
+		`"Options":{{json .Options}},"IPAM":{"Config":[{{range $index, $config := .IPAM.Config}}` +
+		`{{if $index}},{{end}}{"Subnet":{{json $config.Subnet}},"Gateway":{{json $config.Gateway}}}{{end}}]},` +
+		`"Labels":{{json .Labels}},"Containers":{ ` +
+		`{{$containerFirst := true}}{{range $id, $container := .Containers}}` +
+		`{{if not $containerFirst}},{{end}}{{$containerFirst = false}}{{json $id}}:` +
+		`{"Name":{{json $container.Name}},"IPv4Address":{{json $container.IPv4Address}}}{{end}}}}`
+)
+
 func (b *generatedDomainDockerCensusBudget) charge(body []byte, entries int) error {
 	if b == nil || entries < 0 || len(body) > generatedDomainStartupMaximumBytes-b.bytes ||
 		entries > generatedDomainStartupMaximumEntries-b.entries {
@@ -755,7 +805,8 @@ func generatedDomainObjectByName(snapshot generatedDomainDockerStartupSnapshot, 
 func (r *generatedDomainStartupReader) readDetailedContainer(ctx context.Context, deadline time.Time,
 	id string,
 ) (caddyInspection, gatewayContainerRuntime, error) {
-	body, err := r.runRead(ctx, deadline, "container", "inspect", "--format", gatewayContainerInspectFormat, id)
+	body, err := r.runRead(ctx, deadline, "container", "inspect", "--format",
+		generatedDomainStartupContainerInspectFormat, id)
 	if err != nil {
 		return caddyInspection{}, gatewayContainerRuntime{}, err
 	}
@@ -781,29 +832,25 @@ func (r *generatedDomainStartupReader) readDetailedVolume(ctx context.Context, d
 		return volumeInspection{}, gatewayV1VolumeIdentity{}, errors.New("generated domain gateway volume inspection is invalid")
 	}
 	return volumeInspection{Name: value.Name, Driver: value.Driver, Scope: value.Scope,
-			Options: value.Options, Labels: value.Labels}, gatewayV1VolumeIdentity{Mountpoint: value.Mountpoint,
-			CreatedAt: value.CreatedAt}, nil
+		Options: value.Options, Labels: value.Labels}, gatewayV1VolumeIdentity{Mountpoint: value.Mountpoint,
+		CreatedAt: value.CreatedAt}, nil
 }
 
 func (r *generatedDomainStartupReader) readDetailedNetwork(ctx context.Context, deadline time.Time,
 	id string,
 ) (caddyNetworkInspection, string, error) {
-	body, err := r.runRead(ctx, deadline, "network", "inspect", "--format", "json", id)
+	body, err := r.runRead(ctx, deadline, "network", "inspect", "--format",
+		generatedDomainStartupNetworkInspectFormat, id)
 	if err != nil {
 		return caddyNetworkInspection{}, "", err
 	}
 	defer clear(body)
-	if rejectGeneratedDomainDuplicateJSONKeys(body) != nil {
+	var value gatewayNetworkIdentityInspection
+	if decodeGeneratedDomainStrictJSON(body, &value) != nil ||
+		!generatedDomainCanonicalDockerID(value.ID, false) || value.ID != id {
 		return caddyNetworkInspection{}, "", errors.New("generated domain gateway network inspection is invalid")
 	}
-	var values []gatewayNetworkIdentityInspection
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&values) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(values) != 1 ||
-		!generatedDomainCanonicalDockerID(values[0].ID, false) || values[0].ID != id {
-		return caddyNetworkInspection{}, "", errors.New("generated domain gateway network inspection is invalid")
-	}
-	return values[0].caddy(), normalizeID(values[0].ID), nil
+	return value.caddy(), normalizeID(value.ID), nil
 }
 
 func (r *generatedDomainStartupReader) attestRecovery(ctx context.Context, deadline time.Time,

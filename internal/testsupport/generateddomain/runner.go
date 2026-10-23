@@ -218,6 +218,10 @@ func (r *Runner) runLocked(args []string) (runtimeprocess.CommandResult, error, 
 			value, err := jsonResult([]map[string]any{r.networkInspection()})
 			return result(value, err)
 		}
+		if generatedDomainStartupNetworkProjection(args[3]) {
+			value, err := jsonResult(r.networkInspection())
+			return result(value, err)
+		}
 		if args[3] == `{"id":{{json .ID}},"name":{{json .Name}},"labels":{{json .Labels}},"driver":{{json .Driver}},"scope":{{json .Scope}},"options":{{json .Options}}}` {
 			value, err := jsonResult(map[string]any{"id": NetworkID, "name": "rig-generated-caddy-ingress-v1", "labels": r.networkLabels(), "driver": "bridge", "scope": "local", "options": map[string]string{}})
 			return result(value, err)
@@ -386,6 +390,22 @@ func (r *Runner) runLocked(args []string) (runtimeprocess.CommandResult, error, 
 		return result(runtimeprocess.CommandResult{}, nil)
 	}
 	return runtimeprocess.CommandResult{}, nil, false
+}
+
+func generatedDomainStartupNetworkProjection(format string) bool {
+	for _, required := range []string{
+		`"Id":{{json .ID}}`,
+		`"Name":{{json .Name}}`,
+		`"IPAM":{"Config":[`,
+		`"Containers":{`,
+		`"Name":{{json $container.Name}}`,
+		`"IPv4Address":{{json $container.IPv4Address}}`,
+	} {
+		if !strings.Contains(format, required) {
+			return false
+		}
+	}
+	return true
 }
 
 func generatedDomainGatewayReadinessProbe(args []string) (string, bool) {
