@@ -83,7 +83,7 @@ func newRuntimeCandidateSessionWithConfigurationAndDomainOptions(
 	run func(runtimeprocess.CommandRequest) runtimeRequestResult,
 ) *runtimeCandidateSession {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)

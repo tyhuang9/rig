@@ -19,7 +19,7 @@ import (
 
 func newNetworkAuthorityEngine(t *testing.T, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, runtimeNetworkAuthority) {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)
@@ -375,7 +375,7 @@ func TestGeneratedNetworkBoundaryClosesSQLBeforeRunnerAndPinsOriginalScope(t *te
 }
 
 func TestGeneratedRuntimeEngineRequiresConfiguredDeploymentAuthority(t *testing.T) {
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)

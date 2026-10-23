@@ -477,7 +477,7 @@ func newRetainedRuntimeEngine(t *testing.T, capacity fixedDomainCapacity, run fu
 
 func newRetainedRuntimeEngineWithDomainOptions(t *testing.T, domainOptions generateddomain.Options, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, context.Context, deploymenteffects.Scope, func() error) {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)
@@ -552,7 +552,7 @@ func (r *synchronizedRetainedRunner) requestCount() int {
 
 func newRetainedRuntimeEngineWithRunner(t *testing.T, runner runtimeprocess.CommandRunner, capacity fixedDomainCapacity) (*Engine, context.Context, func() error) {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)
