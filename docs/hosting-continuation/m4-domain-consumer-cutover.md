@@ -1,13 +1,216 @@
 # M4 generated-domain consumer cutover
 
-Status: consumer implementation and corrections committed through `dacabb0cd080f1c4d0bc3adc4ac0e5f3b9652469`;
-the selected Windows and native Linux matrix and four added regression tests
-passed with explicit environment/live-test skips. Hosted Docker acceptance and
-receipt-owned predecessor retirement remain open. M4 is incomplete.
+Status: draft [PR #222](https://github.com/tyhuang9/rig/pull/222), initially
+published at `c676c5ca669ca3162fcdb3bdfb183e264aa78a8b`. The selected local Windows and
+native Linux matrix and four added regression tests passed with explicit
+environment/live-test skips. The first hosted run subsequently finished with
+68 failed checks, 61 successful checks and two skipped checks. Repairs are in
+progress, with the reviewed follow-up checkpoint recorded below through
+`c1b6c13247347bd619c3e6cb55a81c99ac510b5a`; this is not hosted acceptance. Receipt-owned predecessor retirement
+remains open. M4 is incomplete.
 
 The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
+
+## First hosted run: 23 October 2026
+
+The terminal snapshot at 21:15:54 UTC covers the exact published head above.
+GitHub tested merge `badbe7e60ee6a6351514974bb3de39ab5ad89cb8`, whose parents
+are the PR #220 base `46e0885c5c850d7cfe901b4ec142c151f30eac7a` and that
+PR #222 head. Its tree `bb507663a860897a227674032e60b31bebe8d4e7` equals the
+published head tree. The failures therefore apply to this source revision.
+
+All 68 completed failed-job logs were captured once, with job metadata and
+SHA-256 receipts. The terminal failure census has SHA-256
+`c805ebf01b47ae29be07d6be758f3a4d683b8245be8a7ac56502b633e2703946`;
+the check snapshot has SHA-256
+`04425d0cd0de69c0bbe5ae81f219307bb1b69f16353fb7e7ee04e117e5f0d4a1`.
+They are retained under the local acceptance evidence directory
+`m4-lifecycle-coordinator-verification/ci-followups-20261020/` as
+`pr222-terminal-failure-census-20261023.json` and
+`pr222-checks-20261023T211554Z.json`. Counts describe checks, not distinct defects.
+
+An additive JSON-event census clarification,
+`pr222-terminal-json-census-erratum-20261023.json`, has SHA-256
+`110a785e4f9164e9fe1f90a9100ccc73534dde7ec167fece69a47572fbac8c99`.
+It distinguishes actual test failure events from echoed subprocess output.
+The registry cleanup-after-fatal control passed: its intentional child failure
+was echoed by the successful parent. The two candidate-head tests are the actual
+failing tests in that Windows ingress-remainder job. Original logs and the
+original text census are preserved.
+
+Initial diagnosis identified these separate causes or investigation areas:
+
+- Docker bootstrap compares an expected nil options map with an observed empty
+  map. The repair must normalize that equivalent representation while retaining
+  exact resource identity, labels, mountpoint, creation time and census checks.
+- Three live ingress fixtures pass a not-yet-created child directory into
+  protected controller-directory preparation. The fixture must create its own
+  private state root first; secure temporary-directory validation stays intact.
+- LAN and migration controller journeys still omit the completed generated
+  domain required by normal composition. Initial and restart fixtures must use
+  the sealed opener and supported domain construction, preserving real Docker
+  execution and ownership checks.
+- Several historical-state tests use direct writes now refused by migration
+  042. Their historical or deliberate-corruption setup needs correction while
+  preserving production activation guards and the original assertions.
+- Ordinary package execution exposes construction-authority failures that the
+  selected local matrix did not establish. The cause remains under investigation;
+  a fixed-daemon-ID hypothesis was withdrawn after inspecting the published
+  unique-ID fixture implementation.
+- Additional rebind fixture failures and two timeout signatures remain to be
+  resolved. No captured log contained `WARNING: DATA RACE`; that absence does
+  not establish race acceptance for failed or timed-out checks.
+
+These findings supersede any inference that the selected local matrix proves
+the entire hosted suite. Local repair checkpoints and subsequent hosted results
+will be recorded separately. The E5 retirement worktree is held until this
+baseline is repaired.
+
+### Bootstrap and private live-state repair
+
+Local commit `b40cc5b55a316d1a340d2e67862cadfef3711f5d` changes five files.
+Expected bootstrap volume/network options now use the same `cloneStringMap`
+canonicalization as the observed census. The bootstrap fixture supplies the
+actual nil-volume-options representation. Three live ingress fixtures create
+their own private child state directory before protected preparation.
+
+Verification on Windows used:
+
+```text
+go test ./internal/generatedingress -run ^(TestGeneratedDomainEmptyBootstrapReceipts|TestGeneratedDomainEmptyBootstrapEffectBoundaries)$ -count=1 -v
+go test -tags live_docker ./internal/generatedingress -run '^$' -count=1
+```
+
+Both commands exited zero. The first passed two outer parent tests and 13
+unique child scenarios: 11 outer subtests and two subprocess-owned receipt
+scenarios. Echoed subprocess repetitions are counted once. The second command
+only verifies tagged compilation; it does not run Docker tests.
+
+The bounded security review found no weakened identity, namespace, census,
+authority or effect-ordering check. Evidence is retained in
+`m4-lifecycle-coordinator-verification/pr222-ci-repair-20261023T2125Z/`:
+
+- `bootstrap.raw.log`: SHA-256
+  `a1cdb92adf59715268c8e281de86268acd4276365f9294a75aac24e194ec138b`.
+- `bootstrap-options-source-security-review.md`: SHA-256
+  `772c458ffeaeb26b05f96fa1ef70f27f795be677cd890d0f140f90865d1fa50a`.
+- `bootstrap-root-commit-record-20261023.json`: SHA-256
+  `c962867b7dbdfc7ab88dabe994107ef98c578b5a1b13f9729e1e37f2c54461cb`.
+
+This checkpoint does not establish live Docker or Linux race acceptance.
+
+### Cumulative ingress race timeouts
+
+Both failed remainder jobs reached the unchanged 32-minute package deadline.
+Job `120324870922` had completed 284 parents totaling 1903.41 seconds; its active
+parent had run for 16 seconds. Job `120324872741` had completed 281 parents
+totaling 1844.34 seconds; its active parent had run for 75 seconds. These logs
+support splitting the cumulative workload, not declaring the active parent
+deadlocked. The retained timing record is
+`pr222-ingress-timeout-parent-durations-20261023.json`, SHA-256
+`7fb86178f45dac8077460d681163d6ff4b77de0b90f15d9bec9759829510bcbd`.
+
+Commit `eebffe2959c3a58fbee16870eb0dae78c0c08ee6` separates complete generated-domain construction, stable
+startup classification, other domain startup, capacity, and gateway-operation
+parent families from the remainder. All three workflow matrices use the same
+selectors. Race detection, the 32-minute Go timeout, 34-minute hosted step
+timeout, complete subtest trees and aggregate gates remain required.
+
+The shell contract passed 60 argument checks, 24 representative parent-selection
+controls, three exact workflow matrices and 40 refusal/failure controls. Both
+shell syntax checks and `git diff --check` passed. The receipt is
+`m4-lifecycle-coordinator-verification/pr222-ci-partitions-20261023T213117Z/receipt.json`,
+SHA-256 `31fe0a0c5b4cb883a338b77bc47f88f89ef724922d7a02dc73569ddb7dfbd1af`.
+It uses stubbed Go output with the existing pinned real jq executable; it is not
+Go test execution. The first attempt at `213039Z` failed because jq was absent
+from PATH and remains recorded.
+
+Actual Windows `go test ./internal/generatedingress -list ^Test` discovered
+1,201 unique parent tests. All 31 partitions were nonempty; their union contains
+every discovered parent exactly once, with no missing or duplicated parent.
+Root independently expanded every include/exclude filter from the actual shell
+source and matched those selections against the retained discovery output.
+This proves selection coverage for that discovery, not test execution or Linux
+race timing. The root audit/commit receipt has SHA-256
+`0e5779f6036f9c9434ca90f83f3432707e15dacc0a15751cccb6798c74231e31`.
+Hosted execution of the revised partitions remains pending.
+
+### Constructor refusal attribution
+
+Commit `312308608bfb133490ef8c35ddb97e48a8dde9b8` adds four closed diagnostic
+categories to existing constructor refusals: invalid post-inspection input,
+retained root/database identity conflict, retained daemon namespace conflict,
+and input that changed before admission. `errors.Join` retains the existing
+deployment-execution configuration sentinel. No identity predicate, lock
+boundary, admission rule or effect ordering changes. Diagnostic text contains
+no paths, IDs, database rows, raw causes or credentials.
+
+The focused registry parent passed with six unique subprocess child scenarios.
+Source and security review passed. This direct Windows command recorded CGO
+disabled, `GOTOOLCHAIN=auto` and empty `GOFLAGS`; it must not be described using
+the pinned environment from a different checkpoint. Evidence is in the repair
+directory's `constructor-attribution/` folder:
+
+- Coordinator source/evidence audit: SHA-256
+  `44e1648e007a16b40dc4aa0c1e40cdcaaffce10d8ddf838a0f02e5d1ed202a21`.
+- Root commit record: SHA-256
+  `7d55166f1742ae7cb47ebf7976ce1dfb19b7e68f0d1733b975e15054dbd16c8a`.
+
+The underlying hosted failure remains unresolved. Native Linux package,
+repeat and temporary-directory-churn attempts did not reproduce it. No
+filesystem-identity hypothesis is accepted as the cause, and no retained
+registry entry is discarded by this change. First-failure sequences from the
+hosted logs are retained in
+`pr222-first-authority-failure-sequences-20261023.json`, SHA-256
+`284a69b14bb9631aff4d911c512f6711eee30116e5cd30efbf9ab578f8f75e44`.
+
+### Historical and authority fixture corrections
+
+Commit `c1b6c13247347bd619c3e6cb55a81c99ac510b5a` changes five test files:
+
+- The live assembly source assertion follows the sealed database opener and
+  completed-domain composition helper now used by the fixture.
+- Migration 037 tests use the checked-in migration set through 037, preserving
+  the release-identity boundary they are intended to test.
+- Named disposable malformed-state fixtures account for the new 042 guards
+  when deliberately constructing states that production correctly prohibits.
+  Production guards and the downstream refusal assertions remain intact.
+- Candidate self-head tests provide a canonical receipt for their positive
+  read-only/successor cases and explicitly refuse missing or malformed receipts.
+  They retain predecessor-mutation, generation-drift and overflow checks.
+
+Eight selected hostd/database/deployment parents and both candidate-head parents
+passed on Windows. A third typed-network parent in the shared candidate-head
+log belongs to separate unfinished work and is excluded from this checkpoint's
+acceptance. Bounded independent review found no actionable issue. The root
+five-file commit record has SHA-256
+`a1a68eed95c4f6cf62a762e77478512bf579b8586f5533fd4f5b1b42902b8b62`.
+
+### Follow-up checkpoint static checks and limits
+
+Readonly formatting, vet for `cmd/hostd`, `internal/database`,
+`internal/deployments` and `internal/generatedingress`, and the existing
+canonical generation check passed. Those commands used `GOTOOLCHAIN=local`,
+`GOFLAGS=-mod=readonly` and CGO disabled. The 1,191-file source manifest was
+unchanged across that static run, with SHA-256
+`e4a41f01042de17c71df23dbafaf9bb335e19db7244d8b8b66f5f9eee07e9cdc`.
+The static artifact manifest has SHA-256
+`cbf618c77e3d2a17a0f036674be12b65746e7a1a919700f228286ee487b3840b`.
+
+The static worktree included an unpublished test-only network-fixture change.
+Another related test-only edit followed that run. Both are excluded from this
+publication checkpoint; the static evidence is not an exact clean-checkout
+compile claim. Published production/source changes and selected regression
+evidence have separate file hashes and bounded reviews. Final documentation
+checks and the exact published head are recorded in the publication receipt.
+
+Remaining work includes current hosted constructor attribution, live controller
+composition/restart fixtures, typed/rebind fixture corrections, the bounded
+relay-outage setup failure, actual Docker/race acceptance and receipt-owned
+predecessor retirement. The follow-up is a draft CI checkpoint, not milestone
+completion or deployment approval.
 
 The tested activation and cold-accounting core is recorded in local commit
 `59489c20eda5124b9408e8402e51c7a329cf1dde`. Local merge
