@@ -98,3 +98,52 @@ assert_event_rejected "$(event "${prefix}${message}" | jq -c '.Package = "unrela
 assert_event_rejected "$(event "${prefix}${message}" | jq -c '.Test = "TestUnrelated"')"
 
 printf 'relay outage diagnostic projection contract passed: %d accepted, %d rejected\n' "$accepted" "$rejected"
+
+# The seed diagnostic carries only a closed phase and error class. Exercise the
+# exact second CI projection, with the same package/test/action filtering.
+mapfile -t patterns < <(awk -F "'" '/^[[:space:]]*relay_setup_failure_pattern=/ && NF == 3 { print $2 }' "$workflow")
+mapfile -t filters < <(awk -F "'" 'index($0, "--arg diagnostic_pattern \"$relay_setup_failure_pattern\"") && NF == 3 { print $2 }' "$workflow")
+if (( ${#patterns[@]} != 1 || ${#filters[@]} != 1 )) || [[ -z "${patterns[0]:-}" || -z "${filters[0]:-}" ]]; then
+  printf 'expected exactly one relay seed failure pattern and projection in the workflow\n' >&2
+  exit 1
+fi
+diagnostic_pattern="${patterns[0]}"
+projection_filter="${filters[0]}"
+accepted=0
+rejected=0
+
+for error_class in deadline canceled constraint other; do
+  assert_projects \
+    "${prefix}relay_outage_setup_failure phase=controller_seed error_class=${error_class}"$'\n' \
+    "{\"phase\":\"controller_seed\",\"error_class\":\"${error_class}\"}"
+done
+assert_projects \
+  $'\trelay_outage_integration_test.go:9: relay_outage_setup_failure phase=controller_seed error_class=other' \
+  '{"phase":"controller_seed","error_class":"other"}'
+
+message='relay_outage_setup_failure phase=controller_seed error_class=other'
+assert_rejects "$message"
+assert_rejects "other_test.go:81: $message"
+assert_rejects "relay_outage_integration_test.go:0: $message"
+assert_rejects "relay_outage_integration_test.go:01: $message"
+assert_rejects "${prefix}${message/phase=controller_seed/phase=relay_enrollment}"
+assert_rejects "${prefix}${message/phase=controller_seed/phase=}"
+for error_class in timeout cancelled CONSTRAINT unknown ''; do
+  assert_rejects "${prefix}${message/error_class=other/error_class=$error_class}"
+done
+assert_rejects "${prefix}${message} detail=synthetic_sensitive_text"
+assert_rejects "detail=synthetic_sensitive_text ${prefix}${message}"
+assert_rejects "${prefix}${message}"$'\nextra'
+assert_rejects $'\n'"${prefix}${message}"
+assert_rejects "${prefix}${message}"$'\n\n'
+assert_rejects "${prefix}${message}\\n"
+assert_rejects "${prefix}${message} "
+assert_rejects "${prefix}${message}"$'\r\n'
+assert_rejects "${prefix}relay_outage_setup_failure error_class=other phase=controller_seed"
+assert_rejects 'ordinary test progress'
+assert_event_rejected ''
+assert_event_rejected "$(event "${prefix}${message}" | jq -c '.Action = "fail"')"
+assert_event_rejected "$(event "${prefix}${message}" | jq -c '.Package = "unrelated/package"')"
+assert_event_rejected "$(event "${prefix}${message}" | jq -c '.Test = "TestUnrelated"')"
+
+printf 'relay seed failure projection contract passed: %d accepted, %d rejected\n' "$accepted" "$rejected"
