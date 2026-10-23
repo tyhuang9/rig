@@ -5,15 +5,70 @@ published at `c676c5ca669ca3162fcdb3bdfb183e264aa78a8b`. The selected local Wind
 native Linux matrix and four added regression tests passed with explicit
 environment/live-test skips. The first hosted run subsequently finished with
 68 failed checks, 61 successful checks and two skipped checks. Repairs are in
-progress. The published repair checkpoint is
-`f4a0165f1f3560dbe12c85af94bc8b77f4161a45`. Its hosted run still refuses domain
-construction. Local diagnostic repairs are recorded below; they do not establish
-hosted acceptance. Receipt-owned predecessor retirement
+progress. The published diagnostic checkpoint is
+`cc1cccee1dba3c93803f4085924e1c1e1c890f2c`; its hosted run localizes the startup
+refusal to the locked final check's Docker static-response probe. Local runtime fixture corrections
+are recorded below; they do not establish hosted acceptance. Receipt-owned predecessor retirement
 remains open. M4 is incomplete.
 
 The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
+
+## Runtime fixture lifetime completion
+
+Commit `2fb2f9a66dd3e73a842e57356c9359eb7bc42b2d` changes seven authentic test-root
+allocations in four runtime test files to the existing process-lifetime helper.
+The initial caller map missed three allocations; a complete search of the sealed
+fixture's callers identified and included them before publication. Test assertions,
+the helper, package cleanup and production identity guards are unchanged.
+
+Nine selected parents passed in one native Linux process, with five child passes
+and no failure or skip. This includes the three sequential capacity-source cases
+from the hosted failure, candidate lifecycle, both network fixture paths, log
+limits, image/cleanup behavior and concurrent retained-capacity release. Exact
+discovery matched the roster, all 14 unique RUN names have matching PASS records,
+and temporary roots used private native Linux `/tmp`.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `runtime-lifetime-completion-final-20261023T233557Z/receipt.json`, SHA-256
+  `bbe481934b3623118afe2d384531005372e63b459b919aa263f4ec989262c748`.
+  It retains the runner, binary, original commands, environment and source hashes.
+- `runtime-lifetime-completion-root-audit-20261023.json`, SHA-256
+  `cf22763563647e81705462f093d5825e9837af0fb54934f029418cb1cb421f2e`.
+  The audit adds the five indented child passes omitted by the receipt's summary
+  parser without changing or replaying the raw run.
+- `runtime-lifetime-static-20261023T233628Z/receipt.json`, SHA-256
+  `ce47b39b23b19154904075677625fad4378d68576110775df2eccec65feb2b04`:
+  four-file formatting and runtime vet pass with stable source.
+
+An earlier path/TMPDIR harness attempt failed before discovery or test execution
+and remains retained. Independent source review and root diff review found only
+the seven intended substitutions. These focused non-race results do not establish
+that the full 47-parent hosted failure set passes or identify a specific reused
+physical identity. Hosted race verification remains required.
+
+Canonical generation also passed using bundled PowerShell 7.6.5. Receipt
+`runtime-lifetime-canonical-20261023T233904Z/receipt.json` has SHA-256
+`bda5dc575b04951fda3526696905051a8934d9bae7f6193169a89f97cbd3e970`.
+The four-file source stayed unchanged. Formatting, vet and canonical execution
+used the local Windows toolchain with empty `GOFLAGS` and `CGO_ENABLED=0`.
+
+### Hosted attribution result
+
+The 23:39:09 UTC snapshot for `cc1ccce` contains 18 failed, five successful,
+14 running, 103 queued and one skipped check, SHA-256
+`a4e01933afcf156e26880d0e15ebfd7ae415f0a67945827c256ad5d28b121303`.
+All 18 completed failure logs were retained once against verified merge
+`4ba5565a37cfff4e2be96f3ce19a287874c37412`, whose tree equals the published head.
+The controller TLS, process-kill, final-handover and supported-hostd diagnostic
+jobs report `stage=empty_final_locked reason=docker_static_response`.
+The [TLS log](https://github.com/tyhuang9/rig/actions/runs/40040252281/job/120709392868)
+has raw SHA-256
+`f4033109fa47c18ea65523487434b58f73e69e0fdd2eaaa0e21a4d2ea5214e6f`.
+This identifies the failing probe boundary; its command/response cause still
+requires investigation. The probe and refusal guard remain required.
 
 ## Current startup and relay diagnostics
 
