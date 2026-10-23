@@ -219,6 +219,8 @@ describe("ApplicationDeploymentSetup", () => {
     const response = deferred<Awaited<ReturnType<typeof api.deploymentJobByIdempotency>>>();
     vi.spyOn(api, "deploymentJobByIdempotency").mockReturnValue(response.promise);
     renderSetup();
+    const reviewHeading = await screen.findByRole("heading", { name: "Review and deploy" });
+    await waitFor(() => expect(document.activeElement).toBe(reviewHeading));
     const lookup = await screen.findByRole("button", { name: "Find submitted job" });
     lookup.focus();
     expect(document.activeElement).toBe(lookup);
