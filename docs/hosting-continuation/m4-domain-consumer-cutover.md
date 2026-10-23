@@ -6,12 +6,157 @@ native Linux matrix and four added regression tests passed with explicit
 environment/live-test skips. The first hosted run subsequently finished with
 68 failed checks, 61 successful checks and two skipped checks. Repairs are in
 progress, with the reviewed follow-up checkpoint recorded below through
-`c1b6c13247347bd619c3e6cb55a81c99ac510b5a`; this is not hosted acceptance. Receipt-owned predecessor retirement
+`213f8415c0ee4409de05f5eb9d26c9fadabdc130`; this is not hosted acceptance. Receipt-owned predecessor retirement
 remains open. M4 is incomplete.
 
 The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
+
+## Follow-up hosted run: 23 October 2026
+
+The reviewed repair checkpoint was published to the same draft PR at
+`c5b68a1253d98f3b21a014d7bfc8aa6d04133eae`. GitHub's synthetic merge
+`ba6d2922d42160544461c6a84180133a8f558b45` has the unchanged PR #220 base and
+this head as parents. Its tree `850c39cedf3c5853b05af39ecdbd694968aa7874`
+equals the published head tree.
+
+The first six completed failed jobs were retained separately from the original
+run. The TLS controller, gateway readiness and final-handover journeys now
+reach a bootstrap **container** receipt rejection. Their logs do not identify
+the exact failed container predicate. The final-handover job reports Docker
+28.0.4 and a gateway container in Created state. A source comparison found that
+bootstrap requires a network endpoint immediately after create, whereas the
+existing stopped-container validator distinguishes configured networking from
+an attached endpoint. This is a repair candidate requiring verification, not
+proof of the observed predicate or permission to weaken identity checks.
+
+The two migration jobs still reject omitted completed-domain dependencies, and
+the legacy composition job rejects missing predecessor migration provenance.
+The latter now has a focused local repair below; the live controller fixtures
+remain open. Generic construction failures cannot all be assigned to one cause.
+This run is ongoing; no hosted acceptance or milestone completion is claimed.
+The bounded diagnosis record is
+`ci-followups-20261020/pr222-c5-bootstrap-container-diagnosis-20261023.md`,
+SHA-256 `2c000e2abdbf3a3170a747ef9eb2df7e9afc5f467a03b8a8b15725acc0dc6d45`.
+
+The later Linux executor job `120672535525` identifies the constructor's
+retained-root-or-database-identity conflict branch. It does not establish inode
+reuse or justify removing retained identity checks. The Windows core job
+`120672535046` separately exposes a diagnostic fixture passing a value runner
+where construction requires pointer identity. Both remain repair work.
+
+The 22:27:04 UTC snapshot on `c5b68a1` contains 42 failed, 37 successful,
+15 running, 47 queued and two skipped checks. All 42 completed failure logs
+were retained once. These are check counts, not distinct defect counts. The
+crash-matrix aggregate failed because its prerequisite matrix was skipped; it
+did not execute a runtime test. Snapshot SHA-256:
+`a9dbf3b2398f557b1fc2f7fb889264d6711c97cfd83aba1162b1ba346468b61b`.
+
+### Complete application-network fixture census
+
+Local commit `1b21667b08d7183bf8249060cf375a4c81943379` repairs two test fixtures.
+They now bind every application network from the existing physical observation,
+with equal nonempty name/ID censuses, validated identities and deterministic
+ordering. This replaces the unrelated single-network template binding; the
+production full-census checks and drift assertions remain unchanged.
+
+The initial five-parent Windows command hit Go's default ten-minute package
+timeout after four complete parent passes and eleven child passes. The fifth
+parent had not completed. Its successor ran only that parent with the existing
+CI timeout (`-timeout=32m`) and passed it plus two children in 234.16 seconds.
+The combined evidence is five parent passes and thirteen child passes, with the
+original timeout preserved. Both runs used `GOTOOLCHAIN=local`,
+`GOFLAGS=-mod=readonly`, and `CGO_ENABLED=0` on the same two reviewed file hashes.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- Initial run: `typed-network-20261023T164643/raw.log`, SHA-256
+  `d7857c9f0f473b02b5674c72a0d2ef9e55f377a40d6386503bbc56188a8b8dc4`.
+- Fifth-only successor: `typed-network-20261023T164643-fifth/raw.log`, SHA-256
+  `ea27b8d90254c2dcf21391f6057fc9698068b2492d153d52f9c9e99d31e364eb`.
+- Source review: `typed-network-source-review.json`, SHA-256
+  `cf140b326e167ba10b5fbbd66c282f5c8076412ca99c223ced728673e3ac8b5b`.
+- Independent raw/command/source audit: `typed-network-root-precommit-audit-20261023.json`,
+  SHA-256 `8936023788023a87db88307b13799aa167113abb56a5c06a264926e141163731`.
+
+These focused tests do not establish Docker, race, or full-suite acceptance.
+
+### Canonical legacy fixture and deliberate drift boundary
+
+Commit `c43c29b70f3c1dfbd64dc8aedc5f967cf9eeb471` preserves the original
+canonical predecessor runner and migration family through the current-state
+fixture. The real redeploy receives all five serving-roster fields, including
+release and slot. It does not invent provenance or rewrite history. The
+existing malformed-runtime-head test additionally removes migration 042's
+activation trigger in its deliberate-corruption setup; production guards and
+the refusal, zero-copy and eleven-progress-record assertions remain intact.
+
+The first four-parent run passed the deliberate-drift parent but failed three
+legacy parents because the roster projection omitted serving slot. After that
+projection was corrected, a three-parent successor passed both census/lineage
+parents and the concrete legacy composition parent, including commit and
+rollback children. The successor ran from 22:06:49 to 22:18:16 UTC, exited zero,
+and used `-count=1 -v -timeout=32m`. Its recorded environment overrides are
+unset; it must not be described as using the initial run's explicit overrides.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/` includes the original
+`legacy-drift-20261023T170228` and successor
+`legacy-successor-20261023T220649Z` command, raw and before/after source records.
+The independent audit is `legacy-fixture-root-precommit-audit-20261023.json`,
+SHA-256 `d66ac415dac16f0f0901818662d61434386fe8dda1b4852d8150d50c65872026`.
+Scoped source review SHA-256:
+`64533eb3a19eb65f7d22efee664deaf080cc8364cbe28ed5ea21777d82f5d2d0`.
+
+### Bootstrap networking before and after acknowledged start
+
+Commit `213f8415c0ee4409de05f5eb9d26c9fadabdc130` validates network topology
+against the private receipt's acknowledged start phase. Before start, Docker
+may omit the configured network ID and network membership. Any nonempty ID
+must match the independently observed receipt network; any visible member must
+be the exact receipt container with its expected name and address. The stopped
+container still requires exact configured networking, requested address and
+gateway priority, with no endpoint ID, runtime address or effective host port.
+After acknowledged start, the exact network ID, member, runtime address and
+effective host bindings are mandatory before the live configuration check.
+
+Ownership, census, image, volume, physical identity, protected state, SQL state
+and fence checks remain. Lost acknowledgments and drift still retain uncertain
+resources without retry, adoption or cleanup. The original hosted logs do not
+expose inspected fields, so the exact hosted predicate remains unproved until
+the successor Docker run.
+
+The focused Windows command passed four outer parents and 38 unique children,
+including omitted/exposed stopped topology, strict running topology, crossed
+identities, sticky drift and lost acknowledgments:
+
+```text
+go test ./internal/generatedingress -run '^(TestGeneratedDomainEmptyBootstrapReceipts|TestGeneratedDomainBootstrapPhaseTopologyValidation|TestGeneratedDomainBootstrapPhaseDriftIsSticky|TestGeneratedDomainEmptyBootstrapEffectBoundaries)$' -count=1 -v -timeout=32m
+```
+
+Evidence: `bootstrap-phase-20261023T222156Z/`, actual 22:21:56–22:22:12 UTC,
+exit zero; its environment overrides are unset. Raw SHA-256:
+`7d289be6f300f5186142e927c1fdc53619792c39398c02c7e17e4769d1cea2c6`.
+Independent audit `bootstrap-phase-root-precommit-audit-20261023.json`, SHA-256
+`20e54332af9fcea3c1890220c6d5e706862c53ef4ad64641eedb844c3675e1f3`, checks the
+raw census, unchanged source bytes and static artifacts. Scoped security review
+with its additive stopped-projection clarification has SHA-256
+`f0879cca0012902bcc068a635809702a7d58d4f7e517e2769645ae4371a0786e`.
+
+Readonly formatting, `go vet ./internal/generatedingress`, and
+`go test -tags live_docker ./internal/generatedingress -run '^$' -count=1`
+passed on the frozen source with explicit local toolchain, readonly modules,
+CGO disabled and Windows/amd64. Static receipt SHA-256:
+`44c314d952b71b074b0774390b68548158e4ecb4736ed6bd7487e810feec7aa8`.
+Tagged compilation ran no Docker tests. Additional fixture lifetime,
+constructor, deliberate-drift and cold-process controller repairs remain open;
+the full suite and hosted Docker/race gates are not accepted by this checkpoint.
+
+The existing canonical-generation check also passed on the frozen source via
+PowerShell 7.6.5. Its first attempt failed in the Windows PowerShell 5 harness
+because `Get-FileHash` was unavailable; that failed attempt is retained. The
+successful `bootstrap-canonical-20261023T222859Z/receipt.json` has SHA-256
+`aee4cda1d2e6b803d99fc00bedad034e690535e0231a8a7a64c2ec8424dffbae`.
 
 ## First hosted run: 23 October 2026
 
