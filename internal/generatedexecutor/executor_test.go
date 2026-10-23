@@ -1324,7 +1324,11 @@ func generatedNetworkBoundaryTestError() error {
 
 func TestGeneratedExecutorPassesAcceptedTechnologyToRuntime(t *testing.T) {
 	for _, technology := range []string{"", "node", "nextjs"} {
-		t.Run(technology, func(t *testing.T) {
+		name := technology
+		if name == "" {
+			name = "unversioned"
+		}
+		t.Run(name, func(t *testing.T) {
 			fixture := newSealedExecutorFixtureWithTechnology(t, technology)
 			result, err := fixture.execute()
 			if err != nil || result.CompletionCode != "deployment_completed" {

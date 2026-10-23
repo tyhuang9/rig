@@ -85,7 +85,8 @@ func (a *GeneratedRouteAuthority) readPublishedRouteAttestation(ctx context.Cont
 
 	plan, err := a.stores.Plans().GetRevision(ctx, appID, planID, planNumber)
 	if err != nil || plan.ID != planID || plan.RevisionNumber != planNumber ||
-		plan.State != deploymentplans.RevisionAccepted || plan.Plan.Strategy != deploymentplans.StrategyGeneratedNode ||
+		plan.State != deploymentplans.RevisionAccepted && plan.State != deploymentplans.RevisionSuperseded ||
+		plan.Plan.Strategy != deploymentplans.StrategyGeneratedNode ||
 		len(plan.Plan.Components) != len(canonicalRoster) {
 		return routeRecord{}, publishedRouteAttestationError(err)
 	}
