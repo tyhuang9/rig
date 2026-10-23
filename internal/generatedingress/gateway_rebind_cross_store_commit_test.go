@@ -311,6 +311,14 @@ func newGatewayRebindCoordinatorFixtureWithPredecessor(t *testing.T, f gatewayRe
 	f.manager.gatewayRebindCommitBarrier = &atomic.Bool{}
 	input := completeGatewayRebindCoordinatorFixture(t, f)
 	template := newGatewayCurrentStateFixture(t)
+	if len(template.receipt.Resources.ApplicationNetworks) != 1 || f.runner.network == "" {
+		t.Fatal("coordinator fixture application network is incomplete")
+	}
+	// The terminal-progress template supplies a valid concrete Docker network
+	// identity. Bind that identity to the application network created by the
+	// authentic route candidate above instead of retaining the template app's
+	// unrelated network name.
+	template.receipt.Resources.ApplicationNetworks[0].Name = f.runner.network
 	f.manager.gatewayRebindV2NetworkObserver = func(_ context.Context,
 		claim appaccess.GatewayRebindClaimV2,
 	) (gatewayRebindSuccessorNetworkObservation, error) {

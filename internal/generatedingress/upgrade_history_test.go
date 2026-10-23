@@ -44,7 +44,7 @@ func TestGatewayHistoryRetirementPermitsV1AfterSourceStateChanges(t *testing.T) 
 	if err := manager.fenceLegacyV1Locked(); err != nil {
 		t.Fatalf("retired history did not release v1 fence: %v", err)
 	}
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatalf("retired history did not permit a v1 switch: %v", err)
 	}
 	selection, err := manager.selectGatewayUpgradeGenerationLocked(journal.OperationID)

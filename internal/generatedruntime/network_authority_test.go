@@ -14,6 +14,7 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 func newNetworkAuthorityEngine(t *testing.T, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, runtimeNetworkAuthority) {
@@ -23,16 +24,17 @@ func newNetworkAuthorityEngine(t *testing.T, run func(runtimeprocess.CommandRequ
 	if err != nil {
 		t.Fatal(err)
 	}
-	authority := newRuntimeNetworkAuthority(t, directories.WorkingDirectory, candidateSpec())
 	runner := &runtimeFakeRunner{run: run}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, authority.repository, EngineOptions{
+	environment := &runtimeFakeEnvironment{path: filepath.Join(root, "env")}
+	options := EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
-	return engine, runner, authority
+	fixture := newRuntimeDomainFixture(t, root, runner, environment, options, generateddomain.Options{
+		MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30,
+	})
+	authority := newRuntimeNetworkAuthority(t, fixture, candidateSpec())
+	return fixture.engine, runner, authority
 }
 
 func exactNetworkInspection(appID string) runtimeRequestResult {
@@ -380,9 +382,9 @@ func TestGeneratedRuntimeEngineRequiresConfiguredDeploymentAuthority(t *testing.
 	}
 	options := EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second}
 	runner := &runtimeFakeRunner{run: func(runtimeprocess.CommandRequest) runtimeRequestResult { return runtimeRequestResult{} }}
-	for name, repository := range map[string]*deployments.Repository{"nil": nil, "unconfigured": deployments.New(nil)} {
+	for name := range map[string]struct{}{"nil": {}, "unconfigured": {}} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := NewEngine(runner, &runtimeFakeEnvironment{}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 1, DiskAvailableBytes: 1}}, repository, options); err == nil {
+			if _, err := NewEngine(runner, &runtimeFakeEnvironment{}, nil, options); err == nil {
 				t.Fatal("engine accepted missing generated command authority")
 			}
 		})

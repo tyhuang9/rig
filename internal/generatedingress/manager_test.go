@@ -14,10 +14,8 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
-	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -267,7 +265,7 @@ func (r *ingressRunner) caddyInspection() caddyInspection {
 func TestSwitchPersistsAcceptedRouteAfterValidatedReload(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	request := switchRequest(runner)
-	if err := manager.Switch(context.Background(), request); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	state, err := manager.store.load()
@@ -330,7 +328,7 @@ func TestCopyConfigRejectsWorkingDirectoryPermissionRelaxation(t *testing.T) {
 
 func TestSwitchProbesCandidateFromAttestedCaddyBeforeProposedRoute(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
 	probeIndex, proposedCopyIndex := -1, -1
@@ -382,7 +380,7 @@ func TestGatewayReadinessRequiresExactReachableStatusAndRollsBack(t *testing.T) 
 			runner.gatewayProbeTruncated = test.truncated
 			request := switchRequest(runner)
 			request.FromSlot = generatedidentity.SlotGreen
-			err := manager.Switch(context.Background(), request)
+			err := exerciseManagerSwitch(manager, context.Background(), request)
 			if !IsCode(err, DiagnosticGatewayReadinessFailed) || testRouteCandidateMayBeLive(err) || !testRouteGatewayReadinessFailed(err) {
 				t.Fatalf("error=%v mayBeLive=%t readiness=%t", err, testRouteCandidateMayBeLive(err), testRouteGatewayReadinessFailed(err))
 			}
@@ -426,7 +424,7 @@ func TestGatewayReadinessAllowsTransportStatusAndChecksEveryEndpoint(t *testing.
 func TestGatewayReadinessCancellationCompensatesTemporaryNetworkAttachment(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.gatewayProbeErr = context.Canceled
-	err := manager.Switch(context.Background(), switchRequest(runner))
+	err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 	if !IsCode(err, DiagnosticCancelled) || testRouteCandidateMayBeLive(err) {
 		t.Fatalf("error=%v mayBeLive=%t", err, testRouteCandidateMayBeLive(err))
 	}
@@ -445,7 +443,7 @@ func TestGatewayReadinessCancellationCompensatesTemporaryNetworkAttachment(t *te
 func TestGatewayReadinessTerminationUncertaintyAndRollbackUncertaintyRemainSafe(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.gatewayProbeErr = runtimeprocess.ErrTerminationFailed
-	err := manager.Switch(context.Background(), switchRequest(runner))
+	err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 	if !IsCode(err, DiagnosticIngressUnavailable) || testRouteGatewayReadinessFailed(err) {
 		t.Fatalf("termination error=%v readiness=%t", err, testRouteGatewayReadinessFailed(err))
 	}
@@ -453,7 +451,7 @@ func TestGatewayReadinessTerminationUncertaintyAndRollbackUncertaintyRemainSafe(
 	manager, runner = newManagerFixture(t, false)
 	runner.gatewayProbeOutput = []byte("000")
 	runner.failRollbackReload = true
-	err = manager.Switch(context.Background(), switchRequest(runner))
+	err = exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 	if !IsCode(err, DiagnosticRouteUnresolved) || !testRouteCandidateMayBeLive(err) {
 		t.Fatalf("uncertain compensation error=%v mayBeLive=%t", err, testRouteCandidateMayBeLive(err))
 	}
@@ -478,7 +476,7 @@ func TestGatewayReadinessPostProbeAttestationWithholdsCandidateRoute(t *testing.
 		t.Run(test.name, func(t *testing.T) {
 			manager, runner := newManagerFixture(t, false)
 			runner.gatewayProbeMutate = test.mutate
-			err := manager.Switch(context.Background(), switchRequest(runner))
+			err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 			if err == nil {
 				t.Fatal("post-probe ingress drift was accepted")
 			}
@@ -492,11 +490,11 @@ func TestGatewayReadinessPostProbeAttestationWithholdsCandidateRoute(t *testing.
 func TestGatewayReadinessFailureOnCommittedRouteMarksCandidateMayBeLive(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	request := switchRequest(runner)
-	if err := manager.Switch(context.Background(), request); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	runner.gatewayProbeOutput = []byte("000")
-	err := manager.Switch(context.Background(), request)
+	err := exerciseManagerSwitch(manager, context.Background(), request)
 	if !IsCode(err, DiagnosticGatewayReadinessFailed) || !testRouteCandidateMayBeLive(err) || !testRouteGatewayReadinessFailed(err) {
 		t.Fatalf("error=%v mayBeLive=%t readiness=%t", err, testRouteCandidateMayBeLive(err), testRouteGatewayReadinessFailed(err))
 	}
@@ -504,7 +502,7 @@ func TestGatewayReadinessFailureOnCommittedRouteMarksCandidateMayBeLive(t *testi
 
 func TestObserveAttestsLiveCommittedRouteWithoutMutation(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
 	var live any
@@ -535,7 +533,7 @@ func TestObserveAttestsLiveCommittedRouteWithoutMutation(t *testing.T) {
 
 func TestWithObservationSerializesSwitchThroughCallback(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
 	callbackEntered := make(chan struct{})
@@ -565,7 +563,7 @@ func TestWithObservationSerializesSwitchThroughCallback(t *testing.T) {
 		} else {
 			lockAvailable <- false
 		}
-		switchDone <- manager.Switch(context.Background(), switchRequest(runner))
+		switchDone <- exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 	}()
 	held := !<-lockAvailable
 	completedEarly := false
@@ -592,7 +590,7 @@ func TestWithObservationSerializesSwitchThroughCallback(t *testing.T) {
 
 func TestCancelledObservationReleasesSwitchMutexAfterDockerStall(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
 	stalled := &stalledObservationRunner{delegate: runner, entered: make(chan struct{})}
@@ -613,7 +611,7 @@ func TestCancelledObservationReleasesSwitchMutexAfterDockerStall(t *testing.T) {
 		t.Fatal("stalled observation did not hold the switch mutex")
 	}
 	switchDone := make(chan error, 1)
-	go func() { switchDone <- manager.Switch(context.Background(), switchRequest(runner)) }()
+	go func() { switchDone <- exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)) }()
 	cancel()
 	select {
 	case err := <-observeDone:
@@ -695,7 +693,7 @@ func TestWithObservationRejectsNilCallbackWithoutDockerAccess(t *testing.T) {
 
 func TestWithObservationPassesCallbackErrorThrough(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
 	expected := errors.New("active head changed")
@@ -712,7 +710,7 @@ func TestWithObservationPassesCallbackErrorThrough(t *testing.T) {
 
 func TestWithObservationPassesBoundedContextToCallback(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -741,7 +739,7 @@ func TestWithObservationPassesBoundedContextToCallback(t *testing.T) {
 
 func TestWithObservationRejectsCancellationAfterCallback(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -813,7 +811,7 @@ func TestObserveWithholdsURLOnUncertainOrDriftedIngress(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			manager, runner := newManagerFixture(t, false)
-			if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+			if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 				t.Fatal(err)
 			}
 			test.mutate(t, manager, runner)
@@ -834,7 +832,7 @@ func TestObserveWithholdsURLOnUncertainOrDriftedIngress(t *testing.T) {
 func TestSwitchIdempotentlyRepairsCommittedRoute(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	request := switchRequest(runner)
-	if err := manager.Switch(context.Background(), request); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	committed, err := manager.store.load()
@@ -843,7 +841,7 @@ func TestSwitchIdempotentlyRepairsCommittedRoute(t *testing.T) {
 	}
 	runner.liveConfig = []byte("drifted live configuration")
 	commandCount := len(runner.commands)
-	if err := manager.Switch(context.Background(), request); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	attested, reconciled := false, false
@@ -870,12 +868,12 @@ func TestSwitchIdempotentlyRepairsCommittedRoute(t *testing.T) {
 func TestSwitchIdempotentRepairFailureMarksCandidateLive(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	request := switchRequest(runner)
-	if err := manager.Switch(context.Background(), request); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	runner.failRestartInstall = runner.restartInstalls + 1
 
-	err := manager.Switch(context.Background(), request)
+	err := exerciseManagerSwitch(manager, context.Background(), request)
 	if !testRouteCandidateMayBeLive(err) {
 		t.Fatalf("error = %v, candidate may be live = false", err)
 	}
@@ -888,13 +886,13 @@ func TestSwitchIdempotentRepairFailureMarksCandidateLive(t *testing.T) {
 func TestSwitchIdempotentRepairAttestsCandidateBeforePublishing(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	request := switchRequest(runner)
-	if err := manager.Switch(context.Background(), request); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	commandCount := len(runner.commands)
 	runner.endpointRoleLabel = "static"
 
-	err := manager.Switch(context.Background(), request)
+	err := exerciseManagerSwitch(manager, context.Background(), request)
 	if !IsCode(err, DiagnosticIngressDrift) || !testRouteCandidateMayBeLive(err) {
 		t.Fatalf("error = %v, candidate may be live = %t", err, testRouteCandidateMayBeLive(err))
 	}
@@ -908,14 +906,14 @@ func TestSwitchIdempotentRepairAttestsCandidateBeforePublishing(t *testing.T) {
 func TestSwitchRejectsEndpointRoleLabelDrift(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.endpointRoleLabel = "static"
-	if err := manager.Switch(context.Background(), switchRequest(runner)); !IsCode(err, DiagnosticIngressDrift) {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); !IsCode(err, DiagnosticIngressDrift) {
 		t.Fatalf("error = %v", err)
 	}
 }
 
 func TestSwitchReloadFailureRollsBackFirstDeploymentAndClearsPendingState(t *testing.T) {
 	manager, runner := newManagerFixture(t, true)
-	err := manager.Switch(context.Background(), switchRequest(runner))
+	err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 	if !IsCode(err, DiagnosticRouteReloadFailed) {
 		t.Fatalf("error = %v", err)
 	}
@@ -949,7 +947,7 @@ func TestSwitchRestartInstallFailureCompensatesBeforeCleanupSafeError(t *testing
 	request := switchRequest(runner)
 	request.FromSlot = generatedidentity.SlotGreen
 
-	err := manager.Switch(context.Background(), request)
+	err := exerciseManagerSwitch(manager, context.Background(), request)
 	if !IsCode(err, DiagnosticRouteUnresolved) || testRouteCandidateMayBeLive(err) {
 		t.Fatalf("error = %v, candidate may be live = %t", err, testRouteCandidateMayBeLive(err))
 	}
@@ -985,7 +983,7 @@ func TestSwitchFailedCompensationMarksCandidateLiveAndRemainsRecoverable(t *test
 	request := switchRequest(runner)
 	request.FromSlot = generatedidentity.SlotGreen
 
-	err := manager.Switch(context.Background(), request)
+	err := exerciseManagerSwitch(manager, context.Background(), request)
 	if !IsCode(err, DiagnosticRouteUnresolved) || !testRouteCandidateMayBeLive(err) {
 		t.Fatalf("error = %v, candidate may be live = %t", err, testRouteCandidateMayBeLive(err))
 	}
@@ -997,7 +995,7 @@ func TestSwitchFailedCompensationMarksCandidateLiveAndRemainsRecoverable(t *test
 	if !bytes.Equal(runner.liveConfig, expectedConfig(t, runner, map[string]routeRecord{runner.appID: proposed})) {
 		t.Fatal("candidate was not left live after uncertain compensation")
 	}
-	if err := manager.Recover(context.Background()); err != nil {
+	if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	expected := expectedConfig(t, runner, map[string]routeRecord{runner.appID: proposed})
@@ -1008,7 +1006,7 @@ func TestSwitchFailedCompensationMarksCandidateLiveAndRemainsRecoverable(t *test
 
 func TestProvisionAndCapacitySnapshotUsePinnedDockerDataPlane(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Provision(context.Background()); err != nil {
+	if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := manager.Snapshot(context.Background())
@@ -1045,53 +1043,12 @@ func TestCapacitySnapshotPreservesGenuinelyLowCapacity(t *testing.T) {
 	}
 }
 
-func TestLowIngressCapacityBecomesReplacementCapacityDiagnostic(t *testing.T) {
-	manager, runner := newManagerFixture(t, false)
-	runner.capacityOutput = []byte("1024 2048\n")
-	authority := liveGeneratedDeployments(t, manager.options.WorkingDirectory)
-	engine, err := newLiveRuntimeEngine(runner, &unusedEnvironmentStager{}, manager, authority.repository, liveRuntimeEngineOptions{
-		DockerExecutable:      manager.options.DockerExecutable,
-		DockerConfigDirectory: manager.options.DockerConfigDirectory,
-		WorkingDirectory:      manager.options.WorkingDirectory,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	scope, releaseScope, err := deploymenteffects.AcquireScoped(context.Background(), manager.options.WorkingDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := releaseScope(); err != nil {
-			t.Error(err)
-		}
-	}()
-	ctx := deploymenteffects.WithScope(context.Background(), scope)
-	spec := authority.PrepareCandidate(t, ctx, liveCandidateSpec("blue", uuid.NewString(), uuid.NewString()))
-	spec = authority.BindNetwork(t, ctx, spec)
-	request := GeneratedReplacementRequest{
-		Claim: spec.Network.Claim, DeploymentID: spec.DeploymentID, ReleaseID: spec.ReleaseID,
-		ConfigurationRevisionID: spec.ConfigurationRevisionID, ConfigurationRevisionNumber: spec.ConfigurationRevisionNumber,
-		DeploymentPlanRevisionID: spec.DeploymentPlanRevisionID, DeploymentPlanRevisionNumber: spec.DeploymentPlanRevisionNumber,
-		CandidateSlot: string(generatedidentity.SlotBlue), Findings: spec.Network.Findings,
-	}
-	commandsBefore := len(runner.commands)
-	if _, err := engine.ReserveReplacement(ctx, request); !liveRuntimeIsCode(err, liveRuntimeDiagnosticInsufficientReplacementSpace) {
-		t.Fatalf("error = %v", err)
-	}
-	for _, command := range runner.commands[commandsBefore:] {
-		if len(command) >= 2 && ((command[0] == "container" && (command[1] == "create" || command[1] == "start" || command[1] == "rm")) || (command[0] == "network" && command[1] == "create")) {
-			t.Fatalf("capacity rejection mutated Docker: %#v", command)
-		}
-	}
-}
-
 func TestProvisionRejectsListenerAddressOutsideOwnedSubnet(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	_, _, expected := ingressNetworkCandidate(0)
 	runner.caddyNetworks[caddyNetworkName].IPAddress = expected
 	runner.ingressContainers[strings.Repeat("d", 64)] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: "10.203.0.3/28"}
-	if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticIngressDrift) {
+	if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); !IsCode(err, DiagnosticIngressDrift) {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -1104,9 +1061,9 @@ func TestRestartingCaddyCannotAcceptRoutesOrListenerObservation(t *testing.T) {
 			var err error
 			switch action {
 			case "provision":
-				err = manager.Provision(context.Background())
+				err = exerciseLegacyV1EnsureGatewayCore(manager, context.Background())
 			case "switch":
-				err = manager.Switch(context.Background(), switchRequest(runner))
+				err = exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 			case "listen":
 				_, err = manager.caddyListenAddress(context.Background())
 			}
@@ -1129,7 +1086,7 @@ func TestProvisionRejectsCaddyRestartLoopAfterStart(t *testing.T) {
 			runner.stopped = true
 			runner.caddyMissing = missing
 			runner.restartAfterStart = true
-			if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticIngressUnavailable) {
+			if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); !IsCode(err, DiagnosticIngressUnavailable) {
 				t.Fatalf("post-start restart error = %v", err)
 			}
 			starts := 0
@@ -1308,7 +1265,7 @@ func TestProvisionRepairsStoppedCaddyBeforeReconnectingApplicationNetwork(t *tes
 	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: route}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Provision(context.Background()); err != nil {
+	if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	disconnect, start, connect := commandIndex(runner.commands, "disconnect"), commandIndex(runner.commands, "start"), commandIndex(runner.commands, "connect")
@@ -1328,7 +1285,7 @@ func TestProvisionReconcilesMissingAndStaleApplicationNetworks(t *testing.T) {
 	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{runner.appID: route}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Provision(context.Background()); err != nil {
+	if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, attached := runner.caddyNetworks[runner.network]; !attached {
@@ -1337,7 +1294,7 @@ func TestProvisionReconcilesMissingAndStaleApplicationNetworks(t *testing.T) {
 	if err := manager.store.save(routeState{Version: stateVersion, Active: map[string]routeRecord{}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Provision(context.Background()); err != nil {
+	if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, attached := runner.caddyNetworks[runner.network]; attached {
@@ -1348,7 +1305,7 @@ func TestProvisionReconcilesMissingAndStaleApplicationNetworks(t *testing.T) {
 func TestProvisionRejectsNonLocalVolumeOptions(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	runner.volumeOptions = map[string]string{"type": "nfs"}
-	if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticIngressDrift) {
+	if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); !IsCode(err, DiagnosticIngressDrift) {
 		t.Fatalf("error = %v", err)
 	}
 }
@@ -1481,9 +1438,9 @@ func TestCaddyGatewayDriftBlocksProvisionSwitchAndConfigCopy(t *testing.T) {
 			var err error
 			switch action {
 			case "provision":
-				err = manager.Provision(context.Background())
+				err = exerciseLegacyV1EnsureGatewayCore(manager, context.Background())
 			case "switch":
-				err = manager.Switch(context.Background(), switchRequest(runner))
+				err = exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 			case "apply":
 				err = manager.applyRoutes(context.Background(), map[string]routeRecord{}, "reconcile.json")
 			}
@@ -1603,7 +1560,7 @@ func TestProvisionCreatesPinnedIngressNetworkAndStaticCaddyAddress(t *testing.T)
 	runner.ingressMissing = true
 	runner.caddyMissing = true
 	runner.caddyNetworks = map[string]*networkAttachment{}
-	if err := manager.Provision(context.Background()); err != nil {
+	if err := exerciseLegacyV1EnsureGatewayCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	subnet, gateway, address := ingressNetworkCandidate(0)
@@ -1641,7 +1598,7 @@ func TestProvisionCreatesPinnedIngressNetworkAndStaticCaddyAddress(t *testing.T)
 
 func TestConfigPromotionRunsAsRootWhileCaddyCommandsRemainNonRoot(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
-	if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
 	for _, command := range runner.commands {

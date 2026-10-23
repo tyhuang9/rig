@@ -150,7 +150,7 @@ func (f *candidateOwnerFixture) reserve(t *testing.T) GeneratedReplacementReserv
 	t.Helper()
 	reservation, err := f.authority.ReserveReplacement(f.validation.migration.guarded.context, GeneratedReplacementRequest(f.validation.request))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reserve candidate replacement: %v", err)
 	}
 	return reservation
 }
@@ -159,7 +159,7 @@ func (f *candidateOwnerFixture) pin(t *testing.T, reservation GeneratedReplaceme
 	t.Helper()
 	execution, err := f.authority.PinCandidates(f.validation.migration.guarded.context, f.validation.request, reservation)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("pin candidate execution: %v", err)
 	}
 	return execution
 }
@@ -168,7 +168,7 @@ func (f *candidateOwnerFixture) beginCreate(t *testing.T, execution *GeneratedCa
 	t.Helper()
 	invocation, err := execution.BeginCreate("api")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("begin candidate create: %v", err)
 	}
 	return invocation
 }

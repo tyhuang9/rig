@@ -30,7 +30,7 @@ func gatewayRebindDistinctApprovalFixture(t *testing.T, db *sql.DB) (gatewayRebi
 }
 
 func TestHostingGatewayActiveRebindApprovalsPreserveRevokedOwnership(t *testing.T) {
-	f, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+	f, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 	ctx := context.Background()
 	before, err := f.repository.HostingGatewayStartupSnapshot(ctx)
 	if err != nil || !before.ActiveRebindApprovalsAuthorizeServing() {
@@ -76,11 +76,7 @@ func TestHostingGatewayActiveRebindApprovalsPreserveRevokedOwnership(t *testing.
 
 func TestHostingGatewayActiveRebindApprovalsShareReadTransaction(t *testing.T) {
 	root := t.TempDir()
-	reader, err := database.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = reader.Close() })
+	reader := openHistoricalGatewayDatabase(t, root)
 	addUsers(t, reader)
 	f, claim := gatewayRebindDistinctApprovalFixture(t, reader)
 	writer, err := database.Open(root)
@@ -108,7 +104,7 @@ func TestHostingGatewayActiveRebindApprovalsShareReadTransaction(t *testing.T) {
 }
 
 func TestHostingGatewayActiveRebindApprovalsRejectCrossedProjection(t *testing.T) {
-	f, _ := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+	f, _ := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 	snapshot, err := f.repository.HostingGatewayStartupSnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)

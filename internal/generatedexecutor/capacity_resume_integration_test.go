@@ -3,23 +3,18 @@ package generatedexecutor
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
-	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
-	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
@@ -32,11 +27,10 @@ import (
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
-	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtimeexecutor"
 	"github.com/hostd/hostd/internal/sourceconnections"
 	"github.com/hostd/hostd/internal/sourceinspection"
-	"github.com/hostd/hostd/internal/testsupport/databasefixture"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 func TestCapacityPausedDeploymentResumesWithRecordedPinsAndOneReplacement(t *testing.T) {
@@ -102,7 +96,7 @@ func TestCapacityPausedDeploymentResumesWithRecordedPinsAndOneReplacement(t *tes
 		t.Fatal("configuration drift did not create a new immutable head")
 	}
 
-	fixture.capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 1 << 30, DiskAvailableBytes: 1 << 30})
+	fixture.capacity.SetCapacity(1<<30, 1<<30)
 	resumed, err = fixture.jobs.Resume(job.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -114,8 +108,8 @@ func TestCapacityPausedDeploymentResumesWithRecordedPinsAndOneReplacement(t *tes
 	if completed.Attempt != 3 || completed.PauseDisposition != "" {
 		t.Fatalf("completed job=%+v", completed)
 	}
-	if fixture.capacity.Calls() != 3 {
-		t.Fatalf("capacity admission checks=%d want 3", fixture.capacity.Calls())
+	if fixture.capacity.CapacityCalls() != 3 {
+		t.Fatalf("capacity admission checks=%d want 3", fixture.capacity.CapacityCalls())
 	}
 	if fixture.compiler.calls != 1 || fixture.runner.createCalls != 1 || len(fixture.routes.requests) != 1 || len(fixture.migrations.requests) != 0 {
 		t.Fatalf("replacement side effects compile=%d candidates=%d routes=%d migrations=%d", fixture.compiler.calls, fixture.runner.createCalls, len(fixture.routes.requests), len(fixture.migrations.requests))
@@ -148,7 +142,7 @@ func TestGeneratedNetworkRefusalAfterFirstRealCandidateRetainsWholeAggregate(t *
 	web.RunCommand = projectanalysis.ManagedStaticCommand(web.StaticOutputDirectory, int(web.InternalPort))
 	web.InstallDirectory = web.RootDirectory
 	fixture := newSealedExecutorFixtureWithComponents(t, []deploymentplans.Component{api, web})
-	fixture.capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 256 << 20, DiskAvailableBytes: 256 << 20})
+	fixture.capacity.SetCapacity(256<<20, 256<<20)
 	checkCompetitor := fixture.capacityCompetitor(t)
 	fixture.runner.afterStart = func() {
 		fixture.runner.beforeNetworkInspect = func() {
@@ -191,7 +185,7 @@ func TestResumedGeneratedNetworkRiskRetainsRealCapacityBeforeExplicitRefusal(t *
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newSealedExecutorFixture(t)
-			fixture.capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 128 << 20, DiskAvailableBytes: 128 << 20})
+			fixture.capacity.SetCapacity(128<<20, 128<<20)
 			checkCompetitor := fixture.capacityCompetitor(t)
 			if test.seed != 0 {
 				fixture.seedCandidate(t, test.seed)
@@ -249,7 +243,7 @@ type capacityResumeFixture struct {
 	plan           deploymentplans.DeploymentPlanRevision
 	configuration  appconfig.Configuration
 	release        releasesnapshot.Release
-	capacity       *scriptedCapacitySource
+	capacity       *generateddomain.Runner
 	compiler       *fakeCompiler
 	runtime        *sealedRuntimeEngine
 	runner         *sealedCandidateRunner
@@ -260,11 +254,26 @@ type capacityResumeFixture struct {
 func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	t.Helper()
 	dataRoot := t.TempDir()
-	db, err := databasefixture.Open(dataRoot)
+	prepareExecutorDomainDatabase(t, dataRoot)
+	runner := newSealedCandidateRunner(t)
+	environment := &sealedCandidateEnvironment{root: filepath.Join(dataRoot, "candidate-environments")}
+	if err := os.Mkdir(environment.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	engineOptions := generatedruntime.EngineOptions{
+		DockerExecutable: filepath.Join(dataRoot, "docker.exe"), WorkingDirectory: directories.WorkingDirectory,
+		DockerConfigDirectory: directories.DockerConfigDirectory, CommandTimeout: time.Minute, HealthTimeout: time.Minute,
+		HealthPollInterval: 100 * time.Millisecond, OutputLimit: 16 << 10,
+		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20, LogSize: "1m", LogFiles: 2},
+		ReplacementDiskBytes: 128 << 20,
+	}
+	domainFixture := newExecutorDomainFixture(t, dataRoot, runner, environment, engineOptions)
+	db, bindings, plans, configurations := domainFixture.db, domainFixture.bindings, domainFixture.plans, domainFixture.configuration
+	deploymentRepository := domainFixture.repository
 
 	actorID, machineID := uuid.NewString(), uuid.NewString()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
@@ -302,15 +311,7 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plans, err := deploymentplans.New(db, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
 	plan, err := plans.Replace(context.Background(), app.ID, actorID, deploymentplans.ReplaceInput{Plan: acceptedPlan})
-	if err != nil {
-		t.Fatal(err)
-	}
-	configurations, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,46 +341,9 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 		t.Fatalf("materialize local release: err=%v state=%q code=%q queryErr=%v", err, state, code, queryErr)
 	}
 
-	capacity := &scriptedCapacitySource{}
-	capacity.Set(generatedruntime.CapacitySnapshot{})
-	dockerConfig := filepath.Join(dataRoot, "docker-config")
-	if err := os.Mkdir(dockerConfig, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
-	if err != nil {
-		t.Fatal(err)
-	}
-	bindings, err := deploymentbinding.New(db, validator)
-	if err != nil {
-		t.Fatal(err)
-	}
+	capacity := domainFixture.process
+	capacity.SetCapacity(0, 0)
 	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
-	if err != nil {
-		t.Fatal(err)
-	}
-	positive, err := applifecycle.NewPositiveFenceValidator(applifecycle.New(db))
-	if err != nil {
-		t.Fatal(err)
-	}
-	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	runner := newSealedCandidateRunner(t)
-	environment := &sealedCandidateEnvironment{root: filepath.Join(dataRoot, "candidate-environments")}
-	if err := os.Mkdir(environment.root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	migrationOptions := deployments.GeneratedMigrationProcessOptions{
-		DockerExecutable: filepath.Join(dataRoot, "docker.exe"), DockerConfigDirectory: dockerConfig,
-		WorkingDirectory: directories.WorkingDirectory, Timeout: time.Minute, OutputLimit: 16 << 10,
-	}
-	deploymentRepository, err := deployments.NewWithExecutionGuardAndGeneratedMigration(db, guard, plans, configurations, environment, runner, migrationOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,13 +361,7 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 		t.Fatal(err)
 	}
 	runner.addImage(sealedCandidateImage{appID: app.ID, releaseID: release.ID, planID: plan.ID, artifact: artifact, component: plan.Plan.Components[0]})
-	engine, err := generatedruntime.NewEngine(runner, environment, capacity, deploymentRepository, generatedruntime.EngineOptions{
-		DockerExecutable: filepath.Join(dataRoot, "docker.exe"), WorkingDirectory: directories.WorkingDirectory,
-		DockerConfigDirectory: dockerConfig, CommandTimeout: time.Minute, HealthTimeout: time.Minute,
-		HealthPollInterval: 100 * time.Millisecond, OutputLimit: 16 << 10,
-		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20, LogSize: "1m", LogFiles: 2},
-		ReplacementDiskBytes: 128 << 20,
-	})
+	engine, err := generatedruntime.NewEngine(domainFixture.process, environment, domainFixture.domain.Candidates(), engineOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,9 +375,9 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	}
 	runtimeState := generatedruntimestate.New(db)
 	runtime := &sealedRuntimeEngine{engine: engine}
-	routes := &fakeRoutes{events: &events}
+	routes := &fakeRoutes{events: &events, delegate: generatedRouteController{authority: domainFixture.domain.Routes()}}
 	migrations := &fakeMigrations{events: &events}
-	boundExecutor, err := NewExecutor(applicationStore, materializer, configurations, deploymentRepository, plans, compiler, artifactRepository, runtimeState, runtime, authorization, routes, migrations, Options{})
+	boundExecutor, err := newExecutor(applicationStore, materializer, configurations, deploymentRepository, plans, compiler, artifactRepository, runtimeState, runtime, authorization, routes, migrations, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +446,10 @@ func (f *capacityResumeFixture) waitForJob(t *testing.T, id string, status jobs.
 					componentState, componentDiagnostic = runtimeDeployment.Components[0].State, runtimeDeployment.Components[0].DiagnosticCode
 				}
 			}
-			t.Fatalf("job did not reach %s: status=%q code=%q err=%v deployments=%d deploymentErr=%v runtimePhase=%q runtimeDiagnostic=%q componentState=%q componentDiagnostic=%q stateErr=%v", status, job.Status, job.ErrorCode, getErr, len(deployments), deploymentErr, phase, diagnostic, componentState, componentDiagnostic, stateErr)
+			f.runner.mu.Lock()
+			fallbackCommandCount := len(f.runner.commands)
+			f.runner.mu.Unlock()
+			t.Fatalf("job did not reach %s: status=%q code=%q err=%v deployments=%d deploymentErr=%v runtimePhase=%q runtimeDiagnostic=%q componentState=%q componentDiagnostic=%q stateErr=%v capacityCalls=%d routeInputs=%d routeCause=%q fallbackCommands=%d domainCommands=%d", status, job.Status, job.ErrorCode, getErr, len(deployments), deploymentErr, phase, diagnostic, componentState, componentDiagnostic, stateErr, f.capacity.CapacityCalls(), len(f.routes.inputs), classifyRoutePauseCause(f.routes.lastErr), fallbackCommandCount, len(f.capacity.Commands()))
 		case <-ticker.C:
 		}
 	}
@@ -519,200 +480,6 @@ func (f *capacityResumeFixture) assertOneRelease(t *testing.T) {
 	if err := f.db.QueryRow(`SELECT COUNT(*) FROM releases WHERE app_id=? AND workspace_state='ready'`, f.app.ID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("ready releases=%d err=%v", count, err)
 	}
-}
-
-type scriptedCapacitySource struct {
-	mu       sync.Mutex
-	snapshot generatedruntime.CapacitySnapshot
-	calls    int
-}
-
-type realNetworkRetentionSpec struct {
-	appID, releaseID, deploymentPlanID string
-	deploymentID                       string
-	artifactID, imageID, definition    string
-	component                          deploymentplans.Component
-}
-
-type realNetworkRetentionRunner struct {
-	db                         *sql.DB
-	jobID                      string
-	specs                      map[string]realNetworkRetentionSpec
-	containers                 map[string]realNetworkRetentionSpec
-	networkCreated             bool
-	containerCreates           int
-	containerStarts            int
-	cleanupCalls               int
-	invalidated                bool
-	invalidateOnNetworkInspect bool
-}
-
-func (r *realNetworkRetentionRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
-	if len(request.Args) < 2 {
-		return runtimeprocess.CommandResult{}, errors.New("unexpected generated runtime command")
-	}
-	switch request.Args[0] + " " + request.Args[1] {
-	case "image inspect":
-		spec, ok := r.specs[request.Args[len(request.Args)-1]]
-		if !ok {
-			return runtimeprocess.CommandResult{}, errors.New("unexpected image")
-		}
-		return retentionJSON(map[string]any{
-			"id": spec.imageID, "size": 100,
-			"labels": map[string]string{
-				"io.rig.managed": "generated-image", "io.rig.application": spec.appID,
-				"io.rig.release": spec.releaseID, "io.rig.artifact": spec.artifactID,
-				"io.rig.plan": spec.deploymentPlanID, "io.rig.component": spec.component.Name,
-				"io.rig.role": spec.component.Role, "io.rig.definition": spec.definition,
-			},
-			"user": "node", "workingDir": "/workspace", "entrypoint": []string{"/usr/local/bin/rig-entrypoint"},
-		})
-	case "network inspect":
-		if !r.networkCreated {
-			return runtimeprocess.CommandResult{Stderr: []byte("No such network")}, errors.New("network missing")
-		}
-		var spec realNetworkRetentionSpec
-		for _, value := range r.specs {
-			spec = value
-			break
-		}
-		description, _ := generatedruntime.DescribeAppNetwork(spec.appID)
-		if r.invalidateOnNetworkInspect && !r.invalidated {
-			r.invalidated = true
-			if _, err := r.db.Exec(`UPDATE jobs SET attempt=attempt+1 WHERE id=?`, r.jobID); err != nil {
-				return runtimeprocess.CommandResult{}, err
-			}
-		}
-		return retentionJSON(map[string]any{
-			"name": description.Name, "driver": "bridge", "scope": "local", "internal": false,
-			"labels": map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": spec.appID},
-		})
-	case "network create":
-		r.networkCreated = true
-		return runtimeprocess.CommandResult{Stdout: []byte(strings.Repeat("9", 64))}, nil
-	case "container inspect":
-		identity := request.Args[len(request.Args)-1]
-		spec, ok := r.containers[identity]
-		if !ok {
-			return runtimeprocess.CommandResult{Stderr: []byte("No such container")}, errors.New("container missing")
-		}
-		if !r.invalidated && identity == strings.Repeat("a", 64) {
-			r.invalidated = true
-			if _, err := r.db.Exec(`UPDATE jobs SET attempt=attempt+1 WHERE id=?`, r.jobID); err != nil {
-				return runtimeprocess.CommandResult{}, err
-			}
-		}
-		return retentionJSON(retentionContainerInspection(spec, identity))
-	case "container create":
-		imageID := request.Args[len(request.Args)-4]
-		spec, ok := r.specs[imageID]
-		if !ok {
-			return runtimeprocess.CommandResult{}, errors.New("unexpected candidate image")
-		}
-		if err := r.db.QueryRow(`SELECT id FROM deployments WHERE job_id=?`, r.jobID).Scan(&spec.deploymentID); err != nil {
-			return runtimeprocess.CommandResult{}, err
-		}
-		description, _ := generatedruntime.DescribeInactiveCandidate(spec.appID, spec.component.Name, "")
-		containerID := strings.Repeat(map[string]string{"api": "a", "web": "b"}[spec.component.Name], 64)
-		r.containers[containerID] = spec
-		r.containers[description.ContainerName] = spec
-		r.containerCreates++
-		return runtimeprocess.CommandResult{Stdout: []byte(containerID + "\n")}, nil
-	case "container start":
-		r.containerStarts++
-		return runtimeprocess.CommandResult{}, nil
-	case "container stop", "container rm":
-		r.cleanupCalls++
-		return runtimeprocess.CommandResult{}, nil
-	default:
-		return runtimeprocess.CommandResult{}, errors.New("unexpected generated runtime command")
-	}
-}
-
-func retentionContainerInspection(spec realNetworkRetentionSpec, containerID string) map[string]any {
-	description, _ := generatedruntime.DescribeInactiveCandidate(spec.appID, spec.component.Name, "")
-	limits := generatedruntime.ContainerLimits{MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256, TmpfsBytes: 64 << 20, LogSize: "10m", LogFiles: 3}
-	return map[string]any{
-		"id": containerID, "name": "/" + description.ContainerName, "image": spec.imageID,
-		"labels": map[string]string{
-			"io.rig.managed": "generated-runtime", "io.rig.application": spec.appID,
-			"io.rig.release": spec.releaseID, "io.rig.deployment": spec.deploymentID, "io.rig.artifact": spec.artifactID,
-			"io.rig.plan": spec.deploymentPlanID, "io.rig.component": spec.component.Name,
-			"io.rig.role": spec.component.Role, "io.rig.slot": string(description.Slot),
-		},
-		"user": "node", "workingDir": "/workspace", "cmd": []string{"/bin/sh", "-lc", spec.component.RunCommand},
-		"healthTest":     []string{"CMD-SHELL", `node -e "const h=require('node:http');const q=h.get({host:'127.0.0.1',port:process.env.RIG_RUNTIME_INTERNAL_PORT,path:process.env.RIG_RUNTIME_HEALTH_PATH,timeout:1500},r=>{r.resume();process.exit(r.statusCode>=200&&r.statusCode<400?0:1)});q.on('error',()=>process.exit(1));q.on('timeout',()=>{q.destroy();process.exit(1)})"`},
-		"healthInterval": int64(2 * time.Second), "healthTimeout": int64(2 * time.Second), "healthStartPeriod": int64(5 * time.Second), "healthRetries": 3,
-		"memory": limits.MemoryBytes, "memorySwap": limits.MemoryBytes, "nanoCpus": limits.MilliCPUs * 1_000_000,
-		"pidsLimit": limits.PIDs, "ulimits": []map[string]any{{"Name": "nofile", "Soft": 1024, "Hard": 1024}}, "init": true,
-		"networkMode": description.NetworkName, "readonlyRootfs": true, "privileged": false, "capAdd": []string{}, "capDrop": []string{"ALL"},
-		"securityOpt": []string{"no-new-privileges:true"}, "binds": []string{}, "portBindings": map[string]any{},
-		"tmpfs":   map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=" + strconv.FormatInt(limits.TmpfsBytes, 10)},
-		"logType": "local", "logConfig": map[string]string{"max-size": limits.LogSize, "max-file": strconv.Itoa(limits.LogFiles)}, "restart": "no",
-		"status": "created", "running": false, "paused": false, "restarting": false, "dead": false, "exitCode": 0, "health": "",
-		"networks": map[string]any{description.NetworkName: map[string]any{"Aliases": []string{description.NetworkAlias}}},
-	}
-}
-
-func retentionJSON(value any) (runtimeprocess.CommandResult, error) {
-	body, err := json.Marshal(value)
-	return runtimeprocess.CommandResult{Stdout: body}, err
-}
-
-type realNetworkRetentionEnvironment struct{ path string }
-
-func (e *realNetworkRetentionEnvironment) Stage(_ string, _ int, contents []byte) (generatedruntime.EnvironmentLease, error) {
-	defer func() {
-		for index := range contents {
-			contents[index] = 0
-		}
-	}()
-	if err := os.WriteFile(e.path, contents, 0o600); err != nil {
-		return nil, err
-	}
-	return realNetworkRetentionLease{path: e.path}, nil
-}
-
-type realNetworkRetentionLease struct{ path string }
-
-func (l realNetworkRetentionLease) Path() string { return l.path }
-func (l realNetworkRetentionLease) Cleanup() error {
-	err := os.Remove(l.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
-}
-
-func (s *scriptedCapacitySource) Set(snapshot generatedruntime.CapacitySnapshot) {
-	s.mu.Lock()
-	s.snapshot = snapshot
-	s.mu.Unlock()
-}
-
-func (s *scriptedCapacitySource) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.calls++
-	return s.snapshot, nil
-}
-
-func (s *scriptedCapacitySource) Calls() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.calls
-}
-
-type capacityUnusedRunner struct{}
-
-func (capacityUnusedRunner) Run(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
-	return runtimeprocess.CommandResult{}, errors.New("capacity admission must not execute Docker")
-}
-
-type capacityUnusedEnvironment struct{}
-
-func (capacityUnusedEnvironment) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
-	return nil, errors.New("capacity admission must not stage an environment")
 }
 
 type capacityUnusedSourceReader struct{}

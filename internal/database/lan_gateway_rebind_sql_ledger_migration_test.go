@@ -2,7 +2,6 @@ package database
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"errors"
 	"io/fs"
@@ -11,8 +10,6 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
-
-	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
 const lanGatewayRebindSQLLedgerMigration = "034_lan_gateway_rebind_sql_ledger.sql"
@@ -124,50 +121,54 @@ func TestLANGatewayRebindSQLLedgerMigrationPreservesPopulated033History(t *testi
 		}
 	}
 
-	runtime := generatedruntimestate.New(db)
-	value, _, err := runtime.Begin(context.Background(), generatedruntimestate.BeginInput{
-		DeploymentID: deploymentID, AppID: appID, ReleaseID: releaseID,
-		DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1,
-		ComponentNames: []string{"api"},
-	})
-	if err != nil {
-		t.Fatalf("begin generated runtime: %v", err)
-	}
-	if _, err := db.Exec(`INSERT INTO generated_image_artifacts(
-		id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,
-		compiler_version,build_definition_digest,attempt_number,image_content_id,state,
-		created_at,updated_at,finished_at
-	) VALUES(?,?,?,?,?,'test',?,1,?,'ready',?,?,?)`, artifactID, releaseID, planID, 1, "api",
-		digestOne, "sha256:"+digestTwo, stamp, stamp, stamp); err != nil {
-		t.Fatalf("seed generated image: %v", err)
-	}
-	if _, err := runtime.SetImageReady(context.Background(), appID, deploymentID, "api", artifactID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetContainerStarting(context.Background(), appID, deploymentID, "api", "rig-ledger-api"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetContainerRunning(context.Background(), appID, deploymentID, "api", digestThree); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.AdvanceComponent(context.Background(), appID, deploymentID, "api",
-		generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatal(err)
-	}
-	for _, next := range []generatedruntimestate.Phase{
-		generatedruntimestate.PhaseBuilding,
-		generatedruntimestate.PhaseStartingCandidate,
-		generatedruntimestate.PhaseWaitingHealth,
-		generatedruntimestate.PhaseSwitchingRoute,
+	// Seed the actual 033 schema directly. The current runtime repository reads
+	// columns introduced after this migration and is not a historical writer.
+	const activeSlot = "blue"
+	for index, statement := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO generated_runtime_deployments(
+			deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,
+			candidate_slot,phase,migration_state,created_at,updated_at
+		) VALUES(?,?,?,?,1,?,'preflight','not_required',?,?)`,
+			[]any{deploymentID, appID, releaseID, planID, activeSlot, stamp, stamp}},
+		{`INSERT INTO generated_image_artifacts(
+			id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,
+			compiler_version,build_definition_digest,attempt_number,image_content_id,state,
+			created_at,updated_at,finished_at
+		) VALUES(?,?,?,1,'api','test',?,1,?,'ready',?,?,?)`,
+			[]any{artifactID, releaseID, planID, digestOne, "sha256:" + digestTwo, stamp, stamp, stamp}},
+		{`INSERT INTO generated_runtime_components(
+			deployment_id,component_name,slot,state,created_at,updated_at
+		) VALUES(?,'api',?,'pending',?,?)`, []any{deploymentID, activeSlot, stamp, stamp}},
+		{`UPDATE generated_runtime_components SET state='image_ready',image_artifact_id=?,updated_at=?
+			WHERE deployment_id=? AND component_name='api'`, []any{artifactID, stamp, deploymentID}},
+		{`UPDATE generated_runtime_components SET state='starting',container_name='rig-ledger-api',updated_at=?
+			WHERE deployment_id=? AND component_name='api'`, []any{stamp, deploymentID}},
+		{`UPDATE generated_runtime_components SET state='running',container_id=?,updated_at=?
+			WHERE deployment_id=? AND component_name='api'`, []any{digestThree, stamp, deploymentID}},
+		{`UPDATE generated_runtime_components SET state='healthy',updated_at=?
+			WHERE deployment_id=? AND component_name='api'`, []any{stamp, deploymentID}},
 	} {
-		value, err = runtime.Advance(context.Background(), appID, deploymentID, value.Phase, next, "")
-		if err != nil {
-			t.Fatalf("advance generated runtime to %s: %v", next, err)
+		if _, err := db.Exec(statement.query, statement.args...); err != nil {
+			t.Fatalf("seed historical runtime statement %d: %v", index+1, err)
 		}
 	}
-	active, changed, err := runtime.SwitchActive(context.Background(), appID, deploymentID, 0)
-	if err != nil || !changed {
-		t.Fatalf("switch generated runtime active=%#v changed=%t error=%v", active, changed, err)
+	for _, next := range []string{"building", "starting_candidate", "waiting_health", "switching_route"} {
+		if _, err := db.Exec(`UPDATE generated_runtime_deployments SET phase=?,updated_at=? WHERE deployment_id=?`,
+			next, stamp, deploymentID); err != nil {
+			t.Fatalf("advance historical runtime to %s: %v", next, err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE generated_runtime_active_heads
+		SET deployment_id=?,release_id=?,slot=?,generation=1,updated_at=? WHERE app_id=?`,
+		deploymentID, releaseID, activeSlot, stamp, appID); err != nil {
+		t.Fatalf("seed historical serving head: %v", err)
+	}
+	if _, err := db.Exec(`UPDATE generated_runtime_components SET state='active',updated_at=?
+		WHERE deployment_id=? AND component_name='api'`, stamp, deploymentID); err != nil {
+		t.Fatalf("seed historical active component: %v", err)
 	}
 
 	if _, err := db.Exec(`INSERT INTO lan_gateway_rebind_claims(
@@ -194,7 +195,7 @@ func TestLANGatewayRebindSQLLedgerMigrationPreservesPopulated033History(t *testi
 		serving_deployment_id,serving_release_id,serving_slot,route_generation,entry_digest
 	) VALUES(?,1,?,?,8100,?,'active',?,1,?,?,4,?,?,?,?,1,?)`,
 		rebindOp, appID, allocationID, accessOp, accessID, digestThree, grantID, digestFive,
-		deploymentID, releaseID, active.Slot, digestTwo); err != nil {
+		deploymentID, releaseID, activeSlot, digestTwo); err != nil {
 		t.Fatalf("seed populated 033 roster: %v", err)
 	}
 
@@ -206,6 +207,29 @@ func TestLANGatewayRebindSQLLedgerMigrationPreservesPopulated033History(t *testi
 	only034["migrations/"+lanGatewayRebindSQLLedgerMigration] = &fstest.MapFile{Data: body}
 	if err := migrateFS(db, only034); err != nil {
 		t.Fatalf("upgrade populated 033 database: %v", err)
+	}
+	var migrationCount int
+	var latestMigration string
+	if err := db.QueryRow(`SELECT COUNT(*),MAX(version) FROM schema_migrations`).Scan(&migrationCount, &latestMigration); err != nil {
+		t.Fatal(err)
+	}
+	if migrationCount != 34 || latestMigration != lanGatewayRebindSQLLedgerMigration {
+		t.Fatalf("historical target changed: migrations=%d latest=%q", migrationCount, latestMigration)
+	}
+	var headDeployment, headRelease, headSlot, runtimePhase, componentState string
+	var headGeneration int
+	if err := db.QueryRow(`SELECT h.deployment_id,h.release_id,h.slot,h.generation,d.phase,c.state
+		FROM generated_runtime_active_heads h
+		JOIN generated_runtime_deployments d ON d.deployment_id=h.deployment_id
+		JOIN generated_runtime_components c ON c.deployment_id=d.deployment_id AND c.component_name='api'
+		WHERE h.app_id=?`, appID).Scan(&headDeployment, &headRelease, &headSlot, &headGeneration,
+		&runtimePhase, &componentState); err != nil {
+		t.Fatal(err)
+	}
+	if headDeployment != deploymentID || headRelease != releaseID || headSlot != activeSlot ||
+		headGeneration != 1 || runtimePhase != "switching_route" || componentState != "active" {
+		t.Fatalf("migrated runtime changed: deployment=%q release=%q slot=%q generation=%d phase=%q component=%q",
+			headDeployment, headRelease, headSlot, headGeneration, runtimePhase, componentState)
 	}
 
 	var (
@@ -249,7 +273,7 @@ func TestLANGatewayRebindSQLLedgerMigrationPreservesPopulated033History(t *testi
 		rosterState != "active" || rosterAccessID != accessID || accessNumber != 1 ||
 		rosterAccessDigest != digestThree || rosterGrant != grantID || grantSequence != 4 ||
 		rosterGrantDigest != digestFive || rosterDeployment != deploymentID ||
-		rosterRelease != releaseID || rosterSlot != active.Slot || routeGeneration != 1 ||
+		rosterRelease != releaseID || rosterSlot != activeSlot || routeGeneration != 1 ||
 		rosterEntryDigest != digestTwo {
 		t.Fatalf("migrated roster changed: operation=%q ordinal=%d app=%q allocation=%q port=%d owner=%q state=%q access=%q/%d accessDigest=%q grant=%q/%d grantDigest=%q deployment=%q release=%q slot=%q generation=%d entry=%q",
 			rosterOperation, ordinal, rosterApp, rosterAllocation, allocatedPort, rosterOwner,

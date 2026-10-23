@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
@@ -43,6 +42,7 @@ type runtimeCompositionDependencies struct {
 	plans                   *deploymentplans.Store
 	bindings                *deploymentbinding.Repository
 	effectsWorkingDirectory string
+	generated               *generatedRuntimeDomainDependencies
 }
 
 type runtimeCompositionOptions struct {
@@ -50,10 +50,22 @@ type runtimeCompositionOptions struct {
 	runner                 runtimeprocess.CommandRunner
 	routePauseLogger       *slog.Logger
 	beforeStep             func(string) error
-	recoverIngress         func(context.Context, *generatedingress.Manager) error
-	preinspectedIngress    *generatedingress.Manager
-	capacitySourceFactory  func(generatedruntime.CapacitySource) generatedruntime.CapacitySource
 	migrationRunnerFactory func(generatedruntime.MigrationRunner) generatedruntime.MigrationRunner
+}
+
+// generatedRuntimeDomainDependencies are assembled before the outer startup
+// effects lease is released. The domain is installed only after the private
+// constructor returns and the reacquired-lease completed join returns the
+// same wrapper. Runtime composition consumes this exact owner graph and
+// cannot create a Manager, budget, candidate authority, or route authority.
+type generatedRuntimeDomainDependencies struct {
+	domain      *generatedingress.GeneratedDomain
+	deployments *deployments.Repository
+	environment *generatedruntime.SecureEnvironmentStager
+	directories docker.ControllerDirectories
+	engine      generatedruntime.EngineOptions
+	options     generatedingress.GeneratedDomainOptions
+	stores      *deployments.GeneratedOwnerStores
 }
 
 type runtimeComposition struct {
@@ -105,6 +117,116 @@ func applyRuntimeCapabilities(server *controller.Server, capabilities runtimeCap
 	server.GeneratedRuntime = capabilities.generated
 }
 
+func prepareGeneratedRuntimeDomainDependencies(ctx context.Context, configuration config.Config,
+	dependencies runtimeCompositionDependencies, options runtimeCompositionOptions,
+) (*generatedRuntimeDomainDependencies, error) {
+	if ctx == nil || !configuration.GeneratedRuntime || dependencies.db == nil ||
+		dependencies.configuration == nil || dependencies.plans == nil || dependencies.bindings == nil ||
+		!dependencies.bindings.UsesDatabase(dependencies.db) ||
+		!dependencies.plans.ConfiguredFor(dependencies.db) ||
+		!dependencies.configuration.ConfiguredFor(dependencies.db) ||
+		dependencies.effectsWorkingDirectory == "" ||
+		!filepath.IsAbs(dependencies.effectsWorkingDirectory) ||
+		filepath.Clean(dependencies.effectsWorkingDirectory) != dependencies.effectsWorkingDirectory {
+		return nil, errors.New("generated domain dependencies are required")
+	}
+	if options.dockerExecutable == "" || !filepath.IsAbs(options.dockerExecutable) ||
+		filepath.Clean(options.dockerExecutable) != options.dockerExecutable {
+		return nil, errors.New("generated runtime Docker executable is invalid")
+	}
+	if options.runner == nil {
+		options.runner = &runtimeprocess.ExecRunner{}
+	}
+	step := func(name string) error {
+		if options.beforeStep == nil {
+			return nil
+		}
+		if err := options.beforeStep(name); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+		return nil
+	}
+	positiveFence, err := applifecycle.NewPositiveFenceValidator(applifecycle.New(dependencies.db))
+	if err != nil {
+		return nil, fmt.Errorf("runtime deployment positive fence setup: %w", err)
+	}
+	executionGuard, err := deploymentexecution.NewGuard(dependencies.db, dependencies.bindings,
+		positiveFence, dependencies.effectsWorkingDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("runtime deployment execution guard setup: %w", err)
+	}
+	if err := step("generated_environment_temp_create"); err != nil {
+		return nil, err
+	}
+	environmentTemporary, err := securetemp.NewGeneratedRuntime(configuration.DataRoot)
+	if err != nil {
+		return nil, fmt.Errorf("generated runtime environment storage setup: %w", err)
+	}
+	if err := step("generated_environment_temp_recover"); err != nil {
+		return nil, err
+	}
+	if err := environmentTemporary.Recover(); err != nil {
+		return nil, fmt.Errorf("clean generated runtime environment files: %w", err)
+	}
+	if err := step("controller_directories_create"); err != nil {
+		return nil, err
+	}
+	directories, err := docker.PrepareControllerDirectories(configuration.DataRoot)
+	if err != nil {
+		return nil, fmt.Errorf("generated controller directory setup: %w", err)
+	}
+	if err := step("environment_stager_create"); err != nil {
+		return nil, err
+	}
+	environment, err := generatedruntime.NewSecureEnvironmentStager(environmentTemporary)
+	if err != nil {
+		return nil, fmt.Errorf("generated runtime environment setup: %w", err)
+	}
+	if err := step("migration_authority_create"); err != nil {
+		return nil, err
+	}
+	runtimeDeployments, err := deployments.NewWithExecutionGuardAndGeneratedMigration(
+		dependencies.db, executionGuard, dependencies.plans, dependencies.configuration,
+		environment, options.runner, deployments.GeneratedMigrationProcessOptions{
+			DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
+			DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
+			Timeout: 10 * time.Minute, OutputLimit: 16 << 10,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("generated migration authority setup: %w", err)
+	}
+	stores, err := runtimeDeployments.GeneratedOwnerStores()
+	if err != nil {
+		return nil, fmt.Errorf("generated domain store setup: %w", err)
+	}
+	engineOptions := generatedruntime.EngineOptions{
+		DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
+		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
+		CommandTimeout: 30 * time.Second, HealthTimeout: 2 * time.Minute,
+		HealthPollInterval: time.Second, OutputLimit: 64 << 10,
+		Limits: generatedruntime.ContainerLimits{
+			MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256,
+			TmpfsBytes: 64 << 20, LogSize: "10m", LogFiles: 3,
+		},
+		ReplacementDiskBytes: 256 << 20,
+	}
+	domainOptions := generatedingress.GeneratedDomainOptions{
+		DockerExecutable: engineOptions.DockerExecutable, DockerEndpoint: engineOptions.DockerEndpoint,
+		DockerConfigDirectory: engineOptions.DockerConfigDirectory, WorkingDirectory: engineOptions.WorkingDirectory,
+		DataRoot: configuration.DataRoot, CommandTimeout: engineOptions.CommandTimeout, PullTimeout: 5 * time.Minute,
+		HealthTimeout: engineOptions.HealthTimeout, HealthPollInterval: engineOptions.HealthPollInterval,
+		OutputLimit: engineOptions.OutputLimit, MemoryBytes: engineOptions.Limits.MemoryBytes,
+		MilliCPUs: engineOptions.Limits.MilliCPUs, PIDs: engineOptions.Limits.PIDs,
+		TmpfsBytes: engineOptions.Limits.TmpfsBytes, LogSize: engineOptions.Limits.LogSize,
+		LogFiles: engineOptions.Limits.LogFiles, ReplacementDiskBytes: engineOptions.ReplacementDiskBytes,
+	}
+	return &generatedRuntimeDomainDependencies{
+		deployments: runtimeDeployments, environment: environment, directories: directories,
+		engine: engineOptions, options: domainOptions, stores: stores,
+	}, nil
+}
+
 func prepareRuntimeComposition(ctx context.Context, configuration config.Config, dependencies runtimeCompositionDependencies, options runtimeCompositionOptions) (runtimeComposition, error) {
 	if ctx == nil || dependencies.db == nil || dependencies.applications == nil || dependencies.snapshots == nil || dependencies.configuration == nil || dependencies.deployments == nil || dependencies.plans == nil {
 		return runtimeComposition{}, errors.New("runtime composition dependencies are required")
@@ -120,9 +242,14 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		(!dependencies.plans.ConfiguredFor(dependencies.db) || !dependencies.configuration.ConfiguredFor(dependencies.db)) {
 		return runtimeComposition{}, errors.New("generated runtime stores must use the composition database")
 	}
+	if configuration.GeneratedRuntime && (dependencies.generated == nil || dependencies.generated.domain == nil ||
+		dependencies.generated.deployments == nil || dependencies.generated.environment == nil ||
+		dependencies.generated.stores == nil || dependencies.generated.domain.Gateway() == nil ||
+		dependencies.generated.domain.Candidates() == nil || dependencies.generated.domain.Routes() == nil) {
+		return runtimeComposition{}, errors.New("complete generated domain is required")
+	}
 	var runtimeDeployments = dependencies.deployments
-	var executionGuard *deploymentexecution.Guard
-	if configuration.ComposeRuntime || configuration.GeneratedRuntime {
+	if configuration.ComposeRuntime && !configuration.GeneratedRuntime {
 		if !dependencies.deployments.UsesDatabase(dependencies.db) || dependencies.effectsWorkingDirectory == "" ||
 			!filepath.IsAbs(dependencies.effectsWorkingDirectory) || filepath.Clean(dependencies.effectsWorkingDirectory) != dependencies.effectsWorkingDirectory {
 			return runtimeComposition{}, errors.New("runtime deployment execution dependencies are required")
@@ -131,16 +258,17 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("runtime deployment positive fence setup: %w", err)
 		}
-		executionGuard, err = deploymentexecution.NewGuard(dependencies.db, dependencies.bindings, positiveFence, dependencies.effectsWorkingDirectory)
+		executionGuard, err := deploymentexecution.NewGuard(dependencies.db, dependencies.bindings, positiveFence, dependencies.effectsWorkingDirectory)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("runtime deployment execution guard setup: %w", err)
 		}
-		if !configuration.GeneratedRuntime {
-			runtimeDeployments, err = deployments.NewWithExecutionGuard(dependencies.db, executionGuard)
-			if err != nil {
-				return runtimeComposition{}, fmt.Errorf("runtime deployment repository setup: %w", err)
-			}
+		runtimeDeployments, err = deployments.NewWithExecutionGuard(dependencies.db, executionGuard)
+		if err != nil {
+			return runtimeComposition{}, fmt.Errorf("runtime deployment repository setup: %w", err)
 		}
+	}
+	if configuration.GeneratedRuntime {
+		runtimeDeployments = dependencies.generated.deployments
 	}
 	if configuration.GeneratedRuntime && (options.dockerExecutable == "" || !filepath.IsAbs(options.dockerExecutable) || filepath.Clean(options.dockerExecutable) != options.dockerExecutable) {
 		return runtimeComposition{}, errors.New("generated runtime Docker executable is invalid")
@@ -192,20 +320,6 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 			return runtimeComposition{}, fmt.Errorf("clean generated build temporary files: %w", err)
 		}
 
-		if err := step("generated_environment_temp_create"); err != nil {
-			return runtimeComposition{}, err
-		}
-		environmentTemporary, err := securetemp.NewGeneratedRuntime(configuration.DataRoot)
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("generated runtime environment storage setup: %w", err)
-		}
-		if err := step("generated_environment_temp_recover"); err != nil {
-			return runtimeComposition{}, err
-		}
-		if err := environmentTemporary.Recover(); err != nil {
-			return runtimeComposition{}, fmt.Errorf("clean generated runtime environment files: %w", err)
-		}
-
 		if err := step("artifact_repository_create"); err != nil {
 			return runtimeComposition{}, err
 		}
@@ -217,34 +331,7 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 			return runtimeComposition{}, fmt.Errorf("recover generated image artifacts: %w", err)
 		}
 
-		if err := step("controller_directories_create"); err != nil {
-			return runtimeComposition{}, err
-		}
-		directories, err := docker.PrepareControllerDirectories(configuration.DataRoot)
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("generated controller directory setup: %w", err)
-		}
-		if err := step("environment_stager_create"); err != nil {
-			return runtimeComposition{}, err
-		}
-		environment, err := generatedruntime.NewSecureEnvironmentStager(environmentTemporary)
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("generated runtime environment setup: %w", err)
-		}
-		if err := step("migration_authority_create"); err != nil {
-			return runtimeComposition{}, err
-		}
-		runtimeDeployments, err = deployments.NewWithExecutionGuardAndGeneratedMigration(
-			dependencies.db, executionGuard, dependencies.plans, dependencies.configuration,
-			environment, options.runner, deployments.GeneratedMigrationProcessOptions{
-				DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
-				DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-				Timeout: 10 * time.Minute, OutputLimit: 16 << 10,
-			},
-		)
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("generated migration authority setup: %w", err)
-		}
+		environment := dependencies.generated.environment
 		if err := step("builder_create"); err != nil {
 			return runtimeComposition{}, err
 		}
@@ -254,45 +341,13 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated builder setup: %w", err)
 		}
-		if err := step("ingress_create"); err != nil {
-			return runtimeComposition{}, err
-		}
-		ingress := options.preinspectedIngress
-		if ingress == nil {
-			ingress, err = generatedingress.New(options.runner, generatedingress.Options{
-				DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
-				DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-				DataRoot: configuration.DataRoot, RebindFenceCheck: fenceCheck,
-				RebindCurrentStateRepository: appaccess.New(dependencies.db),
-			})
-			if err != nil {
-				return runtimeComposition{}, fmt.Errorf("generated ingress setup: %w", err)
-			}
-		}
-		result.ingress = ingress
-		if err := step("ingress_recover"); err != nil {
-			return runtimeComposition{}, err
-		}
-		if options.recoverIngress != nil {
-			err = options.recoverIngress(recoveryContext, ingress)
-		} else {
-			err = ingress.Recover(recoveryContext)
-		}
-		if err != nil {
-			return runtimeComposition{}, fmt.Errorf("recover generated ingress: %w", err)
-		}
+		result.ingress = dependencies.generated.domain.Gateway()
 
 		if err := step("runtime_engine_create"); err != nil {
 			return runtimeComposition{}, err
 		}
-		capacitySource := generatedruntime.CapacitySource(ingress)
-		if options.capacitySourceFactory != nil {
-			capacitySource = options.capacitySourceFactory(capacitySource)
-		}
-		engine, err := generatedruntime.NewEngine(options.runner, environment, capacitySource, runtimeDeployments, generatedruntime.EngineOptions{
-			DockerExecutable: options.dockerExecutable, DockerEndpoint: configuration.DockerEndpoint,
-			DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
-		})
+		engine, err := generatedruntime.NewEngine(options.runner, environment,
+			dependencies.generated.domain.Candidates(), dependencies.generated.engine)
 		if err != nil {
 			return runtimeComposition{}, fmt.Errorf("generated runtime engine setup: %w", err)
 		}
@@ -334,7 +389,8 @@ func prepareRuntimeComposition(ctx context.Context, configuration config.Config,
 		}
 		result.generated, err = generatedexecutor.NewExecutor(
 			dependencies.applications, dependencies.snapshots, dependencies.configuration, runtimeDeployments,
-			dependencies.plans, compiler, artifacts, state, engine, authorization, ingress, migrationRunner,
+			dependencies.plans, compiler, artifacts, state, engine, authorization,
+			dependencies.generated.domain.Routes(), migrationRunner,
 			generatedexecutor.Options{RoutePauseLogger: options.routePauseLogger},
 		)
 		if err != nil {

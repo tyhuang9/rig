@@ -65,21 +65,36 @@ type EngineOptions struct {
 }
 
 type Engine struct {
-	runner      runtimeprocess.CommandRunner
-	capacity    *capacityGate
-	deployments *deployments.Repository
-	candidates  *generatedingress.GeneratedCandidateAuthority
-	options     EngineOptions
-	dockerEnv   []string
-	networkMu   sync.Mutex
+	runner     runtimeprocess.CommandRunner
+	candidates *generatedingress.GeneratedCandidateAuthority
+	options    EngineOptions
+	dockerEnv  []string
+	networkMu  sync.Mutex
 
 	afterNetworkCommandPrepared func()
 }
 
-func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStager, capacity CapacitySource, deploymentRepository *deployments.Repository, options EngineOptions) (*Engine, error) {
-	if runner == nil || environment == nil || deploymentRepository == nil || !deploymentRepository.ExecutionConfigured() {
+func NewEngine(runner runtimeprocess.CommandRunner, environment generatedingress.GeneratedCandidateEnvironmentStager,
+	candidates *generatedingress.GeneratedCandidateAuthority, options EngineOptions,
+) (*Engine, error) {
+	if runner == nil || environment == nil || candidates == nil {
 		return nil, errors.New("generated runtime dependencies are required")
 	}
+	options = normalizedEngineOptions(options)
+	if !validEngineOptions(options) {
+		return nil, errors.New("generated runtime options are invalid")
+	}
+	dockerEnv, err := runtimeDockerEnvironment(options.DockerEndpoint, options.DockerConfigDirectory)
+	if err != nil {
+		return nil, err
+	}
+	if err := candidates.ValidateRuntimeOwner(runner, environment, generatedCandidateProcessOptions(options)); err != nil {
+		return nil, err
+	}
+	return &Engine{runner: runner, candidates: candidates, options: options, dockerEnv: dockerEnv}, nil
+}
+
+func normalizedEngineOptions(options EngineOptions) EngineOptions {
 	if options.CommandTimeout == 0 {
 		options.CommandTimeout = defaultCommandTimeout
 	}
@@ -101,26 +116,11 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 	if minimum := minimumReplacementDiskBytes(options.Limits); options.ReplacementDiskBytes < minimum {
 		options.ReplacementDiskBytes = minimum
 	}
-	if !validEngineOptions(options) {
-		return nil, errors.New("generated runtime options are invalid")
-	}
-	dockerEnv, err := runtimeDockerEnvironment(options.DockerEndpoint, options.DockerConfigDirectory)
-	if err != nil {
-		return nil, err
-	}
-	gate, err := newCapacityGate(capacity)
-	if err != nil {
-		return nil, err
-	}
-	candidateEnvironment, ok := environment.(generatedingress.GeneratedCandidateEnvironmentStager)
-	if !ok {
-		return nil, errors.New("generated candidate environment owner is required")
-	}
-	stores, err := deploymentRepository.GeneratedOwnerStores()
-	if err != nil {
-		return nil, err
-	}
-	candidates, err := generatedingress.NewGeneratedCandidateAuthority(stores, runner, candidateEnvironment, gate.budget, generatedingress.GeneratedCandidateProcessOptions{
+	return options
+}
+
+func generatedCandidateProcessOptions(options EngineOptions) generatedingress.GeneratedCandidateProcessOptions {
+	return generatedingress.GeneratedCandidateProcessOptions{
 		DockerExecutable: options.DockerExecutable, DockerEndpoint: options.DockerEndpoint,
 		DockerConfigDirectory: options.DockerConfigDirectory, WorkingDirectory: options.WorkingDirectory,
 		CommandTimeout: options.CommandTimeout, HealthTimeout: options.HealthTimeout,
@@ -128,11 +128,7 @@ func NewEngine(runner runtimeprocess.CommandRunner, environment EnvironmentStage
 		MemoryBytes: options.Limits.MemoryBytes, MilliCPUs: options.Limits.MilliCPUs, PIDs: options.Limits.PIDs,
 		TmpfsBytes: options.Limits.TmpfsBytes, LogSize: options.Limits.LogSize, LogFiles: options.Limits.LogFiles,
 		ReplacementDiskBytes: options.ReplacementDiskBytes,
-	})
-	if err != nil {
-		return nil, err
 	}
-	return &Engine{runner: runner, capacity: gate, deployments: deploymentRepository, candidates: candidates, options: options, dockerEnv: dockerEnv}, nil
 }
 
 // ReserveReplacement derives the complete protected roster through the
@@ -210,10 +206,10 @@ func (e *Engine) StopAndRemove(ctx context.Context, candidate Candidate, grace t
 }
 
 func (e *Engine) checkLegacyRemoval(ctx context.Context, candidate Candidate) error {
-	if e == nil || e.deployments == nil {
+	if e == nil || e.candidates == nil {
 		return &Error{Code: DiagnosticValidationFailed}
 	}
-	return e.deployments.CheckLegacyGeneratedCandidateRemoval(ctx, candidate.AppID, candidate.DeploymentID,
+	return e.candidates.CheckLegacyGeneratedCandidateRemoval(ctx, candidate.AppID, candidate.DeploymentID,
 		candidate.Component, candidate.ContainerName, candidate.ContainerID)
 }
 
@@ -247,14 +243,14 @@ func DescribeAppNetwork(appID string) (AppNetworkDescription, error) {
 // EnsureAppNetwork is the explicit mutating counterpart to DescribeAppNetwork.
 // Coordinators call it only after their final policy/approval gate.
 func (e *Engine) EnsureAppNetwork(ctx context.Context, request deployments.GeneratedNetworkRequest) error {
-	if e == nil || ctx == nil || e.deployments == nil || request.Claim.ApplicationID() == "" {
+	if e == nil || ctx == nil || e.candidates == nil || request.Claim.ApplicationID() == "" {
 		return networkBoundaryFailure(DiagnosticValidationFailed, deployments.ErrInvalidDeployment)
 	}
 	return e.ensureNetwork(ctx, request, networkName(request.Claim.ApplicationID()))
 }
 
 func (e *Engine) ensureNetwork(ctx context.Context, request deployments.GeneratedNetworkRequest, name string) error {
-	execution, err := e.deployments.PinGeneratedNetwork(ctx, request)
+	execution, err := e.candidates.PinGeneratedNetwork(ctx, request)
 	if err != nil {
 		return networkBoundaryFailure(networkDiagnostic(ctx, err, DiagnosticRuntimeUnavailable), err)
 	}

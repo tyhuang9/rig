@@ -343,11 +343,9 @@ func newGatewayRebindEffectBoundaryTwoAppFixture(t *testing.T) gatewayRebindEffe
 		t.Fatal(err)
 	}
 	profile := preclaim.CurrentProfile
-	appID := uuid.NewString()
-	if _, err := fixture.db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
-		VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`, appID, "rebind-"+appID, "Second rebind app"); err != nil {
-		t.Fatal(err)
-	}
+	migration, _ := newGeneratedRouteCanonicalMigrationOnDatabase(t, fixture.db, fixture.manager.options.DataRoot,
+		fixture.manager.options.WorkingDirectory)
+	appID := migration.guarded.appID
 	allocation, _, err := fixture.repository.ReserveAppAccess(ctx, appaccess.ReserveAppAccessInput{
 		AppID: appID, OperationID: uuid.NewString(), GatewayProfileRevisionID: profile.ID,
 		GatewayProfileRevisionNumber: profile.RevisionNumber,
@@ -391,7 +389,7 @@ func newGatewayRebindEffectBoundaryTwoAppFixture(t *testing.T) gatewayRebindEffe
 	if err != nil {
 		t.Fatal(err)
 	}
-	active := seedGatewayRebindPredecessorRuntime(t, fixture.db, appID)
+	active, activeEndpoint := seedGatewayRebindPredecessorRuntime(t, fixture.manager, fixture.runner, migration)
 	binding, err := gatewayV2LANBindingForRequest(gatewayV2LANGrantRequest{
 		AttemptID: grant.AttemptID, ClaimRequestDigest: grant.RequestDigest, AppID: appID,
 		AllocationID: revision.Allocation.ID, OwnerOperationID: revision.OperationID, Port: revision.Allocation.Port,
@@ -405,9 +403,7 @@ func newGatewayRebindEffectBoundaryTwoAppFixture(t *testing.T) gatewayRebindEffe
 	}
 	state := cloneGatewayV2RouteState(fixture.state)
 	secondRoute := cloneGatewayV2AppRoute(state.Apps[fixture.proposal.Roster[0].AppID])
-	secondRoute.Route.Endpoints = []generatedroute.RouteEndpoint{
-		endpoint("api", "server", "rebind-second-network", "rebind-second-blue", 3000, '4'),
-	}
+	secondRoute.Route.Endpoints = []generatedroute.RouteEndpoint{activeEndpoint}
 	secondRoute.LAN = &binding
 	state.Apps[appID] = secondRoute
 	if err := fixture.store.writeExact(fixture.store.v2Path, fixture.store.v2Purpose,

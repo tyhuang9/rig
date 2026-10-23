@@ -3,7 +3,6 @@ package generatedruntime
 import (
 	"encoding/json"
 	"errors"
-	"github.com/hostd/hostd/internal/generatedingress"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,8 +11,10 @@ import (
 
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/generatedcontainer"
+	"github.com/hostd/hostd/internal/generatedingress"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 func TestGeneratedRuntimeCandidateExitOneHelper(t *testing.T) {
@@ -55,7 +56,7 @@ func newRuntimeCandidateSession(
 	t *testing.T,
 	spec CandidateSpec,
 	limits ContainerLimits,
-	capacity CapacitySource,
+	capacity fixedDomainCapacity,
 	run func(runtimeprocess.CommandRequest) runtimeRequestResult,
 ) *runtimeCandidateSession {
 	return newRuntimeCandidateSessionWithConfiguration(t, spec, limits, capacity, nil, run)
@@ -65,8 +66,20 @@ func newRuntimeCandidateSessionWithConfiguration(
 	t *testing.T,
 	spec CandidateSpec,
 	limits ContainerLimits,
-	capacity CapacitySource,
+	capacity fixedDomainCapacity,
 	configurationEntries []appconfig.ScopedValueInput,
+	run func(runtimeprocess.CommandRequest) runtimeRequestResult,
+) *runtimeCandidateSession {
+	return newRuntimeCandidateSessionWithConfigurationAndDomainOptions(t, spec, limits,
+		configurationEntries, runtimeDomainOptionsForFixedCapacity(capacity), run)
+}
+
+func newRuntimeCandidateSessionWithConfigurationAndDomainOptions(
+	t *testing.T,
+	spec CandidateSpec,
+	limits ContainerLimits,
+	configurationEntries []appconfig.ScopedValueInput,
+	domainOptions generateddomain.Options,
 	run func(runtimeprocess.CommandRequest) runtimeRequestResult,
 ) *runtimeCandidateSession {
 	t.Helper()
@@ -77,19 +90,14 @@ func newRuntimeCandidateSessionWithConfiguration(
 	}
 	runner := &runtimeFakeRunner{run: run}
 	environment := &runtimeFakeEnvironment{path: filepath.Join(root, "candidate.env")}
-	authority := newRuntimeNetworkAuthorityWithConfiguration(t, directories.WorkingDirectory, spec, configurationEntries)
-	if capacity == nil {
-		capacity = fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}
-	}
 	options := EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
 		HealthPollInterval: 100 * time.Millisecond, Limits: limits,
 	}
-	engine, err := NewEngine(runner, environment, capacity, authority.repository, options)
-	if err != nil {
-		t.Fatalf("compose candidate engine: %v", err)
-	}
+	fixture := newRuntimeDomainFixture(t, root, runner, environment, options, domainOptions)
+	authority := newRuntimeNetworkAuthorityWithConfiguration(t, fixture, spec, configurationEntries)
+	engine := fixture.engine
 	candidateSlot, err := InactiveSlot(authority.spec.ActiveSlot)
 	if err != nil {
 		t.Fatal(err)
@@ -109,14 +117,14 @@ func newDefaultRuntimeCandidateSession(
 	run func(runtimeprocess.CommandRequest) runtimeRequestResult,
 ) *runtimeCandidateSession {
 	t.Helper()
-	return newRuntimeCandidateSession(t, spec, defaultLimits(), nil, run)
+	return newRuntimeCandidateSession(t, spec, defaultLimits(), fixedDomainCapacity{}, run)
 }
 
 func newPreparedRuntimeCandidate(
 	t *testing.T,
 	spec CandidateSpec,
 	limits ContainerLimits,
-	capacity CapacitySource,
+	capacity fixedDomainCapacity,
 ) (*runtimeCandidateSession, *runtimeCandidateProgram, generatedingress.GeneratedCandidateInvocation) {
 	return newPreparedRuntimeCandidateWithConfiguration(t, spec, limits, capacity, nil)
 }
@@ -125,7 +133,7 @@ func newPreparedRuntimeCandidateWithConfiguration(
 	t *testing.T,
 	spec CandidateSpec,
 	limits ContainerLimits,
-	capacity CapacitySource,
+	capacity fixedDomainCapacity,
 	configurationEntries []appconfig.ScopedValueInput,
 ) (*runtimeCandidateSession, *runtimeCandidateProgram, generatedingress.GeneratedCandidateInvocation) {
 	t.Helper()

@@ -28,8 +28,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
@@ -38,6 +38,7 @@ import (
 	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/sourceinspection"
@@ -76,12 +77,20 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("hosting fixture API dependencies are missing; run its frozen pnpm install before the live gate")
 	}
 	root := t.TempDir()
-	for _, name := range []string{"runtime-docker", "build-docker", "working"} {
+	dataRoot := filepath.Join(root, "data")
+	if err := os.Mkdir(dataRoot, 0o700); err != nil {
+		t.Fatal("create hosted controller data root")
+	}
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal("prepare hosted controller directories")
+	}
+	for _, name := range []string{"build-docker"} {
 		if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
 			t.Fatal("create hosted test directory")
 		}
 	}
-	runtimeDockerConfig := filepath.Join(root, "runtime-docker")
+	runtimeDockerConfig := directories.DockerConfigDirectory
 	buildDockerConfig := filepath.Join(root, "build-docker")
 	if plugin := os.Getenv("RIG_LIVE_BUILDX_PLUGIN"); plugin != "" {
 		if !filepath.IsAbs(plugin) {
@@ -122,25 +131,24 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 		t.Fatal("disposable Docker daemon already contains the fixture Compose project")
 	}
 
-	appID := uuid.NewString()
-	dataRoot := filepath.Join(root, "data")
-	db, err := database.Open(dataRoot)
+	controllerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire hosted controller owner")
+	}
+	defer controllerLease.Close()
+	db, err := database.OpenForGeneratedDomain(ctx, dataRoot, controllerLease)
 	if err != nil {
 		t.Fatal("open isolated controller database")
 	}
 	defer db.Close()
-	if _, err := db.ExecContext(ctx, `INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES('hosting-live','hosting-live','test',datetime('now'),datetime('now'))`); err != nil {
-		t.Fatal("seed test owner")
-	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,'hosting-live','Hosting Live','draft',datetime('now'),datetime('now'))`, appID); err != nil {
-		t.Fatal("seed test application")
-	}
-	plan := hostingLivePlan(t, ctx, workspace, db, dataRoot, appID)
 	config, err := appconfig.New(db, dataRoot)
 	if err != nil {
 		t.Fatal("open scoped configuration store")
 	}
-	bootstrapConfiguration := hostingLiveBootstrapConfiguration(t, ctx, config, appID, plan)
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal("open protected fixture plan store")
+	}
 	stagerRoot, err := securetemp.NewGeneratedRuntime(dataRoot)
 	if err != nil {
 		t.Fatal("prepare protected runtime environment storage")
@@ -149,21 +157,48 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatal("prepare runtime environment stager")
 	}
-	plans, err := deploymentplans.New(db, dataRoot)
+	authority := liveauthority.NewWithStores(t, db, directories.WorkingDirectory, plans, config)
+	stores, err := authority.Repository().GeneratedOwnerStores()
 	if err != nil {
-		t.Fatal("open protected fixture plan store")
+		t.Fatal("capture generated domain stores")
 	}
-	authority := liveauthority.NewWithStores(t, db, filepath.Join(root, "working"), plans, config)
-	engine, err := generatedruntime.NewEngine(&runtimeprocess.ExecRunner{}, stager, hostingLiveCapacity{}, authority.Repository(), generatedruntime.EngineOptions{
+	runner := &runtimeprocess.ExecRunner{}
+	runtimeOptions := generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: runtimeDockerConfig,
-		WorkingDirectory: filepath.Join(root, "working"), CommandTimeout: 45 * time.Second,
+		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: 45 * time.Second,
 		HealthTimeout: 35 * time.Second, HealthPollInterval: 250 * time.Millisecond,
+		OutputLimit:          64 << 10,
 		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 256 << 20, MilliCPUs: 500, PIDs: 128, TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2},
 		ReplacementDiskBytes: 256 << 20,
+	}
+	port := uint16(hostingLiveFreePort(t, "127.0.0.1"))
+	domain, err := generatedingress.NewGeneratedDomain(ctx, stores, runner, stager, generatedingress.GeneratedDomainOptions{
+		DockerExecutable: runtimeOptions.DockerExecutable, DockerConfigDirectory: runtimeOptions.DockerConfigDirectory,
+		WorkingDirectory: runtimeOptions.WorkingDirectory, DataRoot: dataRoot, HostPort: port,
+		CommandTimeout: runtimeOptions.CommandTimeout, PullTimeout: 5 * time.Minute,
+		HealthTimeout: runtimeOptions.HealthTimeout, HealthPollInterval: runtimeOptions.HealthPollInterval,
+		OutputLimit: runtimeOptions.OutputLimit, MemoryBytes: runtimeOptions.Limits.MemoryBytes,
+		MilliCPUs: runtimeOptions.Limits.MilliCPUs, PIDs: runtimeOptions.Limits.PIDs,
+		TmpfsBytes: runtimeOptions.Limits.TmpfsBytes, LogSize: runtimeOptions.Limits.LogSize,
+		LogFiles: runtimeOptions.Limits.LogFiles, ReplacementDiskBytes: runtimeOptions.ReplacementDiskBytes,
 	})
+	if err != nil {
+		t.Fatal("construct hosted generated domain")
+	}
+	engine, err := generatedruntime.NewEngine(runner, stager, domain.Candidates(), runtimeOptions)
 	if err != nil {
 		t.Fatal("prepare generated runtime engine")
 	}
+
+	appID := uuid.NewString()
+	if _, err := db.ExecContext(ctx, `INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES('hosting-live','hosting-live','test',datetime('now'),datetime('now'))`); err != nil {
+		t.Fatal("seed test owner")
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,'hosting-live','Hosting Live','draft',datetime('now'),datetime('now'))`, appID); err != nil {
+		t.Fatal("seed test application")
+	}
+	plan := hostingLivePlan(t, ctx, workspace, db, dataRoot, appID)
+	bootstrapConfiguration := hostingLiveBootstrapConfiguration(t, ctx, config, appID, plan)
 	appNetwork, err := generatedruntime.DescribeAppNetwork(appID)
 	if err != nil {
 		t.Fatal("describe app-private network")
@@ -210,7 +245,7 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 			t.Error("F7 Compose containers remain after cleanup")
 		}
 	})
-	networkScope, releaseNetwork, err := deploymenteffects.AcquireScoped(ctx, filepath.Join(root, "working"))
+	networkScope, releaseNetwork, err := deploymenteffects.AcquireScoped(ctx, directories.WorkingDirectory)
 	if err != nil {
 		t.Fatal("acquire fixture network scope")
 	}
@@ -264,26 +299,13 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	releaseID, artifactID := uuid.NewString(), uuid.NewString()
 	imageID, definitionDigest := hostingLiveBuildAPI(t, ctx, docker, buildDockerConfig, workspace, root, imageTag, plan, appID, releaseID, artifactID, dbURL, token, sentinel)
 	hostingLiveImageHasNoSecrets(t, ctx, docker, runtimeDockerConfig, imageID, dbURL, token, sentinel)
-	port := uint16(hostingLiveFreePort(t, "127.0.0.1"))
-	accessRepository := appaccess.New(db)
-	ingress, err := generatedingress.New(runtimeprocess.ExecRunner{}, generatedingress.Options{
-		DockerExecutable: docker, DockerConfigDirectory: runtimeDockerConfig,
-		WorkingDirectory: filepath.Join(root, "working"), DataRoot: dataRoot,
-		HostPort: port, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
-		RebindFenceCheck:             accessRepository.CheckGatewayRebindFence,
-		RebindCurrentStateRepository: accessRepository,
-	})
-	if err != nil {
-		t.Fatal("prepare generated ingress")
-	}
 	blueSpec := hostingLiveCandidateSpec(appID, plan, imageID, definitionDigest, releaseID, artifactID)
 	blueSession := hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, authority, config, revisionA, settings, blueSpec, &blue)
 	defer blueSession.Close()
 	hostingLiveOnlyAppNetwork(t, ctx, docker, runtimeDockerConfig, blue.ContainerID, appNetwork.Name)
-	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(blue)}}); err != nil {
+	if err := blueSession.ActivateRoute(domain.Routes(), generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(blue)}}); err != nil {
 		t.Fatal("route initial API candidate")
 	}
-	hostingLiveRecordPublished(t, ctx, ingress, appID, blueSession)
 	blueSession.Close()
 	hostingLiveAwaitMarker(t, ctx, port, appID, "runtime-A")
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", true)
@@ -323,10 +345,9 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	greenSession := hostingLiveStart(t, ctx, docker, runtimeDockerConfig, engine, authority, config, revisionB, settings, greenSpec, &green)
 	defer greenSession.Close()
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-A", false)
-	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(green)}}); err != nil {
+	if err := greenSession.ActivateRoute(domain.Routes(), generatedruntime.RouteSwitchRequest{AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot, Endpoints: []generatedruntime.RouteEndpoint{hostingLiveEndpoint(green)}}); err != nil {
 		t.Fatal("switch to configuration-only replacement")
 	}
-	hostingLiveRecordPublished(t, ctx, ingress, appID, greenSession)
 	greenSession.Close()
 	hostingLiveAwaitMarker(t, ctx, port, appID, "runtime-B")
 	hostingLiveAssertAPI(t, ctx, port, appID, "runtime-B", false)
@@ -336,12 +357,6 @@ func TestLiveHostingNotesDatabaseRoundtrip(t *testing.T) {
 	hostingLiveAssertRequest(t, ctx, port, appID, http.MethodGet, "/api/notes", "", http.StatusOK, "TLS bridge roundtrip")
 	t.Logf("M1 acceptance identities: app=%s strategy=generated plan=%s/%d config-initial=%s/%d config-final=%s/%d release=%s artifact=%s image=%s ingress-port=%d deployment=direct-runtime-gate", appID, plan.ID, plan.RevisionNumber, revisionA.RevisionID, revisionA.RevisionNumber, revisionB.RevisionID, revisionB.RevisionNumber, releaseID, artifactID, imageID, port)
 	t.Log("M1 hosted Docker gate: app-private bridge, verified TLS PostgreSQL roundtrip, HTTPS probe, bad-CA rollback, same-image scoped revision replacement, and persistent note read passed; predecessor retirement is pending")
-}
-
-type hostingLiveCapacity struct{}
-
-func (hostingLiveCapacity) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
-	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
 }
 
 type hostingLiveSettings struct{ dbURL, httpsURL, ca, token, sentinel string }
@@ -1050,17 +1065,6 @@ func hostingLiveStart(t *testing.T, ctx context.Context, docker, dockerConfig st
 		t.Fatalf("API candidate did not pass database readiness: %s", hostingLiveRuntimeCode(err))
 	}
 	return session
-}
-
-func hostingLiveRecordPublished(t *testing.T, ctx context.Context, ingress *generatedingress.Manager, appID string, session *liveauthority.CandidateSession) {
-	t.Helper()
-	observation, err := ingress.Observe(ctx, appID)
-	if err != nil {
-		t.Fatal("observe exact API route")
-	}
-	if err := session.RoutePublished(observation.Slot, observation.Endpoints); err != nil {
-		t.Fatal("record observed API route:", err)
-	}
 }
 
 // Exact disposable-fixture teardown is not controller retirement evidence.

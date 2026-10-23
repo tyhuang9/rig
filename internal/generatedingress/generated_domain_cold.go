@@ -831,7 +831,8 @@ func generatedDomainColdActivationMatches(pins candidateValidationPins, snapshot
 			value.PredecessorDeploymentID != snapshot.headPins.previousDeploymentID ||
 			value.PredecessorReleaseID != snapshot.headPins.previousReleaseID ||
 			value.PredecessorSlot != snapshot.headPins.previousSlot ||
-			value.CreatorJobID != snapshot.pins.jobID || value.CreatorWorkerAttempt != pins.attempt() ||
+			value.CreatorJobID != snapshot.pins.jobID || value.CreatorWorkerAttempt < 1 ||
+			value.CreatorWorkerAttempt > pins.attempt() ||
 			value.CandidateRosterDigest != generatedRouteActivationRosterDigest(candidateRoster) ||
 			!lowerHex(value.RouteIntentDigest, 64) || !lowerHex(value.CommittedRouteProofDigest, 64) {
 			return false

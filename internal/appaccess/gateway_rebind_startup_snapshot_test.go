@@ -88,7 +88,7 @@ func TestGatewayRebindStartupSnapshotRejectsIncompleteStaleAndCorruptLineage(t *
 
 	t.Run("stale route generation", func(t *testing.T) {
 		fixture := newGatewayRebindFixture(t, true)
-		for _, trigger := range []string{"lan_gateway_rebind_fence_runtime_head_update", "generated_runtime_active_head_valid_update"} {
+		for _, trigger := range []string{"lan_gateway_rebind_fence_runtime_head_update", "generated_runtime_active_head_valid_update", "generated_runtime_active_head_activation_guard"} {
 			if _, err := fixture.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
 				t.Fatal(err)
 			}
@@ -216,11 +216,7 @@ func TestGatewayRebindStartupSnapshotRejectsIncompleteStaleAndCorruptLineage(t *
 
 func TestGatewayRebindStartupSnapshotUsesOneReadSnapshotAcrossHandles(t *testing.T) {
 	dataRoot := t.TempDir()
-	readerDB, err := database.Open(dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = readerDB.Close() })
+	readerDB := openHistoricalGatewayDatabase(t, dataRoot)
 	addUsers(t, readerDB)
 	fixture := newGatewayRebindFixtureOnDB(t, readerDB, true)
 	writerDB, err := database.Open(dataRoot)
@@ -283,7 +279,7 @@ type gatewayRebindFixture struct {
 
 func newGatewayRebindFixture(t *testing.T, insertRoster bool) gatewayRebindFixture {
 	t.Helper()
-	db := appAccessDB(t)
+	db := historicalAppAccessDB(t)
 	return newGatewayRebindFixtureOnDB(t, db, insertRoster)
 }
 
@@ -297,6 +293,22 @@ func newGatewayRebindFixtureOnDBWithClaim(t *testing.T, db *sql.DB, insertRoster
 }
 
 func newGatewayRebindFixtureOnDBWithClaimAndReleaseID(t *testing.T, db *sql.DB,
+	insertRoster, insertClaim bool, releaseID string,
+) gatewayRebindFixture {
+	t.Helper()
+	fixture := newHistoricalGatewayRebindFixtureOnDBWithClaimAndReleaseID(t, db, insertRoster, insertClaim, releaseID)
+	upgradeHistoricalGatewayDatabase(t, db)
+	return fixture
+}
+
+// Use this only when the historical sequence includes later runtime mutations.
+// The caller must upgrade before exercising current read or admission behavior.
+func newHistoricalGatewayRebindFixtureOnDBWithClaim(t *testing.T, db *sql.DB, insertRoster, insertClaim bool) gatewayRebindFixture {
+	t.Helper()
+	return newHistoricalGatewayRebindFixtureOnDBWithClaimAndReleaseID(t, db, insertRoster, insertClaim, uuid.NewString())
+}
+
+func newHistoricalGatewayRebindFixtureOnDBWithClaimAndReleaseID(t *testing.T, db *sql.DB,
 	insertRoster, insertClaim bool, releaseID string,
 ) gatewayRebindFixture {
 	t.Helper()
@@ -343,7 +355,7 @@ func newGatewayRebindFixtureOnDBWithClaimAndReleaseID(t *testing.T, db *sql.DB,
 	if err != nil {
 		t.Fatal(err)
 	}
-	active := seedGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, releaseID)
+	active := seedHistoricalGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, releaseID)
 
 	upgrade, _, err := repository.ClaimGatewayProfileUpgrade(ctx, upgradeInput)
 	if err != nil {
@@ -432,15 +444,16 @@ func newGatewayRebindFixtureOnDBWithClaimAndReleaseID(t *testing.T, db *sql.DB,
 	}
 }
 
-func seedGatewayRebindActiveRuntime(t *testing.T, db *sql.DB, appID string) generatedruntimestate.ActiveHead {
+func seedHistoricalGatewayRebindActiveRuntime(t *testing.T, db *sql.DB, appID string) generatedruntimestate.ActiveHead {
 	t.Helper()
-	return seedGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, uuid.NewString())
+	return seedHistoricalGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, uuid.NewString())
 }
 
-func seedGatewayRebindActiveRuntimeWithReleaseID(t *testing.T, db *sql.DB,
+func seedHistoricalGatewayRebindActiveRuntimeWithReleaseID(t *testing.T, db *sql.DB,
 	appID, releaseID string,
 ) generatedruntimestate.ActiveHead {
 	t.Helper()
+	assertHistoricalGatewaySchema(t, db)
 	planID, deploymentID, jobID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	stamp := formatTime(testNow)
 	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(
@@ -470,12 +483,10 @@ func seedGatewayRebindActiveRuntimeWithReleaseID(t *testing.T, db *sql.DB,
 	) VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,1)`, deploymentID, appID, releaseID, jobID, planID); err != nil {
 		t.Fatal(err)
 	}
-	runtime := generatedruntimestate.New(db)
-	value, _, err := runtime.Begin(context.Background(), generatedruntimestate.BeginInput{
-		DeploymentID: deploymentID, AppID: appID, ReleaseID: releaseID,
-		DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, ComponentNames: []string{"api"},
-	})
-	if err != nil {
+	if _, err := db.Exec(`INSERT INTO generated_runtime_deployments(
+		deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,
+		candidate_slot,phase,migration_state,created_at,updated_at
+	) VALUES(?,?,?,?,1,'blue','preflight','not_required',?,?)`, deploymentID, appID, releaseID, planID, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
 	artifactID := uuid.NewString()
@@ -487,33 +498,9 @@ func seedGatewayRebindActiveRuntimeWithReleaseID(t *testing.T, db *sql.DB,
 		strings.Repeat("1", 64), "sha256:"+strings.Repeat("2", 64), stamp, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.SetImageReady(context.Background(), appID, deploymentID, "api", artifactID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetContainerStarting(context.Background(), appID, deploymentID, "api", "rig-rebind-api"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetContainerRunning(context.Background(), appID, deploymentID, "api", strings.Repeat("3", 64)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.AdvanceComponent(context.Background(), appID, deploymentID, "api",
-		generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatal(err)
-	}
-	for _, next := range []generatedruntimestate.Phase{
-		generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate,
-		generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute,
-	} {
-		value, err = runtime.Advance(context.Background(), appID, deploymentID, value.Phase, next, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	head, changed, err := runtime.SwitchActive(context.Background(), appID, deploymentID, 0)
-	if err != nil || !changed {
-		t.Fatalf("switch active head=%#v changed=%t error=%v", head, changed, err)
-	}
-	return head
+	return activateHistoricalGatewayComponent(t, db, generatedruntimestate.ActiveHead{
+		AppID: appID, DeploymentID: deploymentID, ReleaseID: releaseID, Slot: "blue", Generation: 1,
+	}, artifactID, "rig-rebind-api", strings.Repeat("3", 64))
 }
 
 func insertGatewayRebindClaim(t *testing.T, db *sql.DB, claim GatewayRebindClaim) {

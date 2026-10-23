@@ -333,12 +333,59 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 		return 1
 	}
 	deploymentRepository := deployments.New(db)
+	var generatedDependencies *generatedRuntimeDomainDependencies
+	if cfg.GeneratedRuntime {
+		generatedDependencies, err = prepareGeneratedRuntimeDomainDependencies(context.Background(), cfg,
+			runtimeCompositionDependencies{
+				db: db, configuration: applicationConfiguration, deployments: deploymentRepository,
+				plans: planStore, bindings: deploymentBindings,
+				effectsWorkingDirectory: ownerDirectories.WorkingDirectory,
+			}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, runner: assembly.runner})
+		if err != nil {
+			logger.Error("generated domain dependency setup failed", "error", err)
+			return 1
+		}
+		if startupAdmission == nil || workerAdmission == nil {
+			logger.Error("generated domain startup admission is unavailable")
+			return 1
+		}
+		if err := startupAdmission.Release(); err != nil {
+			logger.Error("deployment effects startup admission release failed before generated domain construction", "error", err)
+			return 1
+		}
+		startupAdmission = nil
+		domain, domainErr := generatedingress.NewGeneratedDomain(context.Background(), generatedDependencies.stores,
+			assembly.runner, generatedDependencies.environment, generatedDependencies.options)
+		if domainErr != nil {
+			logger.Error("generated domain construction failed", "error", domainErr)
+			return 1
+		}
+		reacquireContext, cancelReacquire := context.WithTimeout(context.Background(), 30*time.Second)
+		releaseReacquired, reacquireErr := workerAdmission(reacquireContext)
+		cancelReacquire()
+		if reacquireErr != nil {
+			logger.Error("deployment effects startup admission reacquisition failed", "error", reacquireErr)
+			return 1
+		}
+		if releaseReacquired == nil {
+			logger.Error("deployment effects startup admission reacquisition returned no release")
+			return 1
+		}
+		startupAdmission = &deploymentEffectsStartupLease{release: releaseReacquired}
+		joined, joinErr := generatedingress.NewGeneratedDomain(context.Background(), generatedDependencies.stores,
+			assembly.runner, generatedDependencies.environment, generatedDependencies.options)
+		if joinErr != nil || joined != domain {
+			logger.Error("generated domain completed join failed", "error", joinErr)
+			return 1
+		}
+		generatedDependencies.domain = joined
+	}
 	runtime, err := prepareRuntimeComposition(context.Background(), cfg, runtimeCompositionDependencies{
 		db: db, applications: applications, snapshots: snapshots, configuration: applicationConfiguration,
 		deployments: deploymentRepository, plans: planStore, bindings: deploymentBindings,
-		effectsWorkingDirectory: ownerDirectories.WorkingDirectory,
+		effectsWorkingDirectory: ownerDirectories.WorkingDirectory, generated: generatedDependencies,
 	}, runtimeCompositionOptions{dockerExecutable: dockerExecutable, runner: assembly.runner,
-		routePauseLogger: logger, preinspectedIngress: gate.ingress})
+		routePauseLogger: logger})
 	if err != nil {
 		logger.Error("runtime composition failed", "error", err)
 		return 1

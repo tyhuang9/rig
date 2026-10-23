@@ -92,6 +92,12 @@ func TestGeneratedRouteAuthorityCommitsReceiptHeadAndRosterWithOriginalClaim(t *
 	if err := manager.Switch(context.Background(), generatedRouteRequest(runner.appID, identity)); !IsCode(err, DiagnosticValidationFailed) {
 		t.Fatalf("ordinary Manager.Switch error = %v", err)
 	}
+	if err := manager.Provision(context.Background()); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("ordinary Manager.Provision error = %v", err)
+	}
+	if err := manager.Recover(context.Background()); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("ordinary Manager.Recover error = %v", err)
+	}
 }
 
 func TestGeneratedRouteAuthorityRejectsChangedOriginalClaimWithoutPartialSQLCommit(t *testing.T) {

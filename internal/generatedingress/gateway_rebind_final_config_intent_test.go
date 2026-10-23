@@ -552,7 +552,9 @@ func installGatewayRebindFinalConfigLoopbackServingProgress(t *testing.T) (gatew
 ) {
 	t.Helper()
 	fixture := newGatewayRebindEffectBoundaryFixture(t)
-	loopbackID := "ffffffff-ffff-4fff-8fff-ffffffffffff"
+	migration, _ := newGeneratedRouteCanonicalMigrationOnDatabase(t, fixture.predecessor.db,
+		fixture.predecessor.manager.options.DataRoot, fixture.predecessor.manager.options.WorkingDirectory)
+	loopbackID := migration.guarded.appID
 	for _, trigger := range []string{
 		"lan_gateway_rebind_fence_runtime_head_insert", "lan_gateway_rebind_fence_runtime_head_update",
 		"lan_gateway_rebind_fence_runtime_head_delete", "lan_gateway_rebind_fence_access_head_insert",
@@ -561,12 +563,8 @@ func installGatewayRebindFinalConfigLoopbackServingProgress(t *testing.T) (gatew
 			t.Fatal(err)
 		}
 	}
-	if _, err := fixture.predecessor.db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
-		VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`,
-		loopbackID, "rebind-loopback-"+loopbackID, "Loopback-only rebind app"); err != nil {
-		t.Fatal(err)
-	}
-	head := seedGatewayRebindPredecessorRuntime(t, fixture.predecessor.db, loopbackID)
+	head, loopbackEndpoint := seedGatewayRebindPredecessorRuntime(t, fixture.predecessor.manager,
+		fixture.predecessor.runner, migration)
 	for _, statement := range []string{
 		`CREATE TRIGGER lan_gateway_rebind_fence_runtime_head_update
 			BEFORE UPDATE ON generated_runtime_active_heads
@@ -597,9 +595,7 @@ func installGatewayRebindFinalConfigLoopbackServingProgress(t *testing.T) (gatew
 	}
 	source.LAN = nil
 	source.Route.Slot = generatedidentity.Slot(head.Slot)
-	source.Route.Endpoints = []generatedroute.RouteEndpoint{
-		endpoint("api", "server", "rebind-loopback-network", "rebind-loopback-"+head.Slot, 3000, '7'),
-	}
+	source.Route.Endpoints = []generatedroute.RouteEndpoint{loopbackEndpoint}
 	state.Apps[loopbackID] = source
 	predecessor := gatewayUpgradeGenerationSelection{
 		Store: fixture.predecessor.store, Generation: fixture.predecessor.store.generation,

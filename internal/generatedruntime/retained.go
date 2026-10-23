@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 )
 
@@ -63,9 +64,9 @@ type RetainedGuard func(context.Context) error
 type RetainedReservation interface{ retainedReservation() }
 
 type retainedReservation struct {
-	owner     *Engine
-	operation string
-	lease     *capacityLease
+	owner      *Engine
+	operation  string
+	accounting generatedingress.GeneratedRetainedCapacityReservation
 
 	mu       sync.Mutex
 	all      map[string]RetainedTarget
@@ -145,22 +146,19 @@ func (e *Engine) ObserveAndReserveRetained(ctx context.Context, operationID stri
 	if ctx.Err() != nil {
 		return nil, nil, &Error{Code: DiagnosticCancelled}
 	}
-	var lease *capacityLease
+	var accounting generatedingress.GeneratedRetainedCapacityReservation
 	if len(reserved) != 0 {
-		lease, err = e.capacity.acquireCount(ctx, capacityRequest{
-			memory: uint64(e.options.Limits.MemoryBytes),
-			disk:   e.options.ReplacementDiskBytes,
-		}, len(reserved))
+		accounting, err = e.candidates.ReserveRetainedCapacity(ctx, operationID, len(reserved))
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, capacityDiagnostic(ctx, err)
 		}
 		if ctx.Err() != nil {
-			lease.Release()
+			_ = e.candidates.ReleaseRetainedCapacity(operationID, accounting)
 			return nil, nil, &Error{Code: DiagnosticCancelled}
 		}
 	}
 	return observations, &retainedReservation{
-		owner: e, operation: operationID, lease: lease, all: all, reserved: reserved,
+		owner: e, operation: operationID, accounting: accounting, all: all, reserved: reserved,
 	}, nil
 }
 
@@ -350,9 +348,13 @@ func (e *Engine) ReleaseRetainedReservation(ctx context.Context, reservation Ret
 	if ctx.Err() != nil {
 		return &Error{Code: DiagnosticCancelled}
 	}
+	if value.accounting != nil {
+		if err := e.candidates.ReleaseRetainedCapacity(value.operation, value.accounting); err != nil {
+			return &Error{Code: DiagnosticValidationFailed}
+		}
+	}
 	value.released = true
-	lease := value.lease
-	lease.Release()
+	value.accounting = nil
 	return nil
 }
 
@@ -380,8 +382,13 @@ func (e *Engine) ReleaseUnattemptedRetainedReservation(ctx context.Context, rese
 			return &Error{Code: DiagnosticValidationFailed}
 		}
 	}
+	if value.accounting != nil {
+		if err := e.candidates.ReleaseRetainedCapacity(value.operation, value.accounting); err != nil {
+			return &Error{Code: DiagnosticValidationFailed}
+		}
+	}
 	value.released = true
-	value.lease.Release()
+	value.accounting = nil
 	return nil
 }
 

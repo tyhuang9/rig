@@ -7,34 +7,25 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
 func TestHostingGatewayStartupRuntimeCensusUsesOneTransaction(t *testing.T) {
-	root := t.TempDir()
-	db, err := database.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	fixture := newGeneratedDomainRuntimeFixture(t)
+	t.Cleanup(fixture.Close)
+	db := fixture.Database()
 	addUsers(t, db)
 	appID := addApps(t, db, 1)[0]
-	head := seedGatewayRebindActiveRuntime(t, db, appID)
-	repository := New(db)
+	head, _ := fixture.Activate(t, GeneratedDomainRuntimeSeed{AppID: appID})
+	repository := New(fixture.OpenSealedReader(t))
 	before, err := repository.HostingGatewayStartupSnapshot(context.Background())
 	if err != nil || len(before.RuntimeHeads) != 1 || len(before.RuntimeComponents) != 1 {
 		t.Fatalf("complete initial runtime census: %+v %v", before.RuntimeHeads, err)
 	}
-	writer, err := database.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = writer.Close() })
 	var replacement generatedruntimestate.ActiveHead
 	repository.afterGrantStartupClaimsRead = func() {
 		repository.afterGrantStartupClaimsRead = nil
-		replacement = redeployRuntimeHeadForRebindTest(t, writer, head)
+		replacement, _ = fixture.Activate(t, GeneratedDomainRuntimeSeed{AppID: head.AppID, ReleaseID: head.ReleaseID})
 	}
 	during, err := repository.HostingGatewayStartupSnapshot(context.Background())
 	if err != nil || replacement.DeploymentID == "" || !reflect.DeepEqual(during, before) {
@@ -51,14 +42,15 @@ func TestHostingGatewayStartupRuntimeCensusUsesOneTransaction(t *testing.T) {
 }
 
 func TestHostingGatewayStartupRuntimeCensusIncludesLANAndLoopback(t *testing.T) {
-	f := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	f := newHistoricalGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	apps := addApps(t, f.db, 3)
 	sort.Strings(apps)
-	loopback := seedGatewayRebindActiveRuntime(t, f.db, apps[0])
-	seedGatewayRebindActiveRuntime(t, f.db, apps[1])
+	loopback := seedHistoricalGatewayRebindActiveRuntime(t, f.db, apps[0])
+	seedHistoricalGatewayRebindActiveRuntime(t, f.db, apps[1])
 	if _, err := f.db.Exec(`UPDATE applications SET archived_at=? WHERE id=?`, formatTime(testNow), apps[1]); err != nil {
 		t.Fatal(err)
 	}
+	upgradeHistoricalGatewayDatabase(t, f.db)
 	before := runtimeHeadReadChanges(t, f.db)
 	snapshot, err := f.repository.HostingGatewayStartupSnapshot(context.Background())
 	if err != nil || len(snapshot.RuntimeHeads) != 2 || len(snapshot.RuntimeComponents) != 2 {
@@ -75,7 +67,8 @@ func TestHostingGatewayStartupRuntimeCensusIncludesLANAndLoopback(t *testing.T) 
 	if after := runtimeHeadReadChanges(t, f.db); after != before {
 		t.Fatal("startup census wrote database rows")
 	}
-	// Non-serving component state must remain visible to restart authorization.
+	// A legacy (receipt-free) component failure after upgrade must remain
+	// visible to restart authorization. Receipt-owned failure is tested by its owner.
 	runtime := generatedruntimestate.New(f.db)
 	if _, err := runtime.FailComponent(context.Background(), loopback.AppID, loopback.DeploymentID, "api",
 		generatedruntimestate.ComponentActive, generatedruntimestate.DiagnosticDaemonRestarted); err != nil {
@@ -107,11 +100,12 @@ func TestHostingGatewayStartupRuntimeCensusRefusesCorruptionWithoutPartialResult
 		{"unexpected terminal timestamp", `UPDATE generated_runtime_components SET finished_at=updated_at WHERE deployment_id=?`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			db := appAccessDB(t)
+			db := historicalAppAccessDB(t)
 			apps := addApps(t, db, 2)
 			sort.Strings(apps)
-			seedGatewayRebindActiveRuntime(t, db, apps[0])
-			broken := seedGatewayRebindActiveRuntime(t, db, apps[1])
+			seedHistoricalGatewayRebindActiveRuntime(t, db, apps[0])
+			broken := seedHistoricalGatewayRebindActiveRuntime(t, db, apps[1])
+			upgradeHistoricalGatewayDatabase(t, db)
 			// These guards are disabled only in this disposable corruption fixture.
 			for _, query := range []string{
 				`DROP TRIGGER generated_runtime_component_no_delete`,

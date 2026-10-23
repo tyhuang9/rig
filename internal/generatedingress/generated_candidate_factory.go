@@ -4,7 +4,6 @@ import (
 	"os"
 	"reflect"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/hostd/hostd/internal/deploymentexecution"
@@ -14,9 +13,10 @@ import (
 )
 
 // GeneratedCandidateAuthority is the one candidate owner associated with a
-// concrete repository registry. Command and invocation methods are defined by
-// the candidate execution owner; composition remains fixed here.
+// complete private generated domain. Command and invocation methods are
+// defined by the candidate execution owner; composition remains fixed here.
 type GeneratedCandidateAuthority struct {
+	self        *GeneratedCandidateAuthority
 	stores      *deployments.GeneratedOwnerStores
 	process     runtimeprocess.CommandRunner
 	environment GeneratedCandidateEnvironmentStager
@@ -27,76 +27,10 @@ type GeneratedCandidateAuthority struct {
 	dockerEnv   []string
 }
 
-type generatedCandidateAuthorityRegistry struct {
-	mu        sync.Mutex
-	authority *GeneratedCandidateAuthority
-}
-
-var generatedCandidateAuthorityRegistries = struct {
-	sync.Mutex
-	values map[*deployments.Repository]*generatedCandidateAuthorityRegistry
-}{values: make(map[*deployments.Repository]*generatedCandidateAuthorityRegistry)}
-
-// NewGeneratedCandidateAuthority returns the one candidate owner associated
-// with the sealed store bundle. This is the relocation surface for the E4
-// owner; the generated-domain factory will replace its external construction
-// before route authority is enabled.
-func NewGeneratedCandidateAuthority(
-	stores *deployments.GeneratedOwnerStores,
-	process runtimeprocess.CommandRunner,
-	environment GeneratedCandidateEnvironmentStager,
-	budget *generatedcapacity.Budget,
-	options GeneratedCandidateProcessOptions,
-) (*GeneratedCandidateAuthority, error) {
-	if stores == nil {
-		return nil, deploymentexecution.ErrInvalidConfiguration
-	}
-	// Capture the sealed bundle by value before validation and retention. A
-	// caller may pass the address of its own value copy and later overwrite
-	// that variable; the authority must keep the exact dependencies validated
-	// for this construction attempt.
-	fixedStores := *stores
-	stores = &fixedStores
-	if !generatedCandidateRepositoryConfigured(stores) ||
-		!generatedCandidatePointerIdentity(process) ||
-		!generatedCandidatePointerIdentity(environment) ||
-		budget == nil || !budget.Configured() ||
-		!validGeneratedCandidateProcessOptions(options) {
-		return nil, deploymentexecution.ErrInvalidConfiguration
-	}
-
-	authority, err := newGeneratedCandidateAuthorityConcrete(stores, process, environment, budget, options)
-	if err != nil {
-		return nil, err
-	}
-
-	generatedCandidateAuthorityRegistries.Lock()
-	repositoryIdentity := stores.Repository()
-	registry := generatedCandidateAuthorityRegistries.values[repositoryIdentity]
-	if registry == nil {
-		registry = &generatedCandidateAuthorityRegistry{}
-		generatedCandidateAuthorityRegistries.values[repositoryIdentity] = registry
-	}
-	generatedCandidateAuthorityRegistries.Unlock()
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	if registry.authority != nil {
-		existing := registry.authority
-		if existing.process != process || existing.environment != environment ||
-			existing.budget != budget || existing.options != options {
-			return nil, deploymentexecution.ErrInvalidConfiguration
-		}
-		return existing, nil
-	}
-	registry.authority = authority
-	return authority, nil
-}
-
 // newGeneratedCandidateAuthorityConcrete builds one complete candidate owner
-// without consulting or publishing through the temporary public repository
-// registry. The private generated-domain constructor uses this once after it
-// has created the raw budget; NewGeneratedCandidateAuthority preserves the
-// public join behavior around the same concrete assembly.
+// without a public registry or alternate construction surface. The private
+// generated-domain constructor calls it exactly once after creating the one
+// raw budget.
 func newGeneratedCandidateAuthorityConcrete(
 	stores *deployments.GeneratedOwnerStores,
 	process runtimeprocess.CommandRunner,
@@ -119,10 +53,17 @@ func newGeneratedCandidateAuthorityConcrete(
 	if err != nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
-	return &GeneratedCandidateAuthority{
+	authority := &GeneratedCandidateAuthority{
 		stores: stores, process: process, environment: environment, budget: budget,
 		options: options, ledger: ledger, heads: newCandidateHeadRegistry(), dockerEnv: dockerEnv,
-	}, nil
+	}
+	authority.self = authority
+	return authority, nil
+}
+
+func validGeneratedCandidateAuthority(a *GeneratedCandidateAuthority) bool {
+	return a != nil && a.self == a && generatedCandidateRepositoryConfigured(a.stores) &&
+		a.budget != nil && a.budget.Configured() && a.ledger != nil && a.heads != nil
 }
 
 func generatedCandidateRepositoryConfigured(stores *deployments.GeneratedOwnerStores) bool {

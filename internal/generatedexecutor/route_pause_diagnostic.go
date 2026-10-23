@@ -57,6 +57,14 @@ func (e *Executor) observeRoutePauseError(ctx context.Context, stage routePauseS
 }
 
 func classifyRoutePauseCause(err error) routePauseCause {
+	var sealed interface{ routePauseCause() routePauseCause }
+	if errors.As(err, &sealed) {
+		cause := sealed.routePauseCause()
+		if cause == routePauseCauseGatewayReadinessFailed || knownRoutePauseStateCause(cause) {
+			return cause
+		}
+		return routePauseCauseUnknown
+	}
 	switch {
 	case errors.Is(err, deployments.ErrGeneratedCandidateRetirementUnavailable):
 		return routePauseCauseRetirementUnavailable

@@ -21,11 +21,7 @@ func finishGatewayRebindFixtureWork(t *testing.T, db *sql.DB) {
 
 func TestGatewayRebindImmediatePreclaimRollsBackCompleteObservation(t *testing.T) {
 	root := t.TempDir()
-	first, err := database.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = first.Close() })
+	first := openHistoricalGatewayDatabase(t, root)
 	addUsers(t, first)
 	fixture := newGatewayRebindFixtureOnDBWithClaim(t, first, false, false)
 	proposal := gatewayRebindPreclaimProposalFor(fixture)
@@ -69,7 +65,7 @@ func TestGatewayRebindImmediatePreclaimRollsBackCompleteObservation(t *testing.T
 
 func TestGatewayRebindImmediatePreclaimRejectsNonterminalAndClaimedState(t *testing.T) {
 	t.Run("nonterminal job", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		if _, err := fixture.db.Exec(`UPDATE deployments SET status='succeeded' WHERE status='preparing'`); err != nil {
 			t.Fatal(err)
 		}
@@ -79,14 +75,14 @@ func TestGatewayRebindImmediatePreclaimRejectsNonterminalAndClaimedState(t *test
 		}
 	})
 	t.Run("claim already exists", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, true)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, true)
 		result, err := fixture.repository.GatewayRebindImmediatePreclaim(context.Background(), gatewayRebindPreclaimProposalFor(fixture))
 		if !errors.Is(err, ErrInvalidStoredState) || !reflect.DeepEqual(result, GatewayRebindImmediatePreclaimResult{}) {
 			t.Fatalf("claimed preclaim result=%#v error=%v", result, err)
 		}
 	})
 	t.Run("cancelled", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		result, err := fixture.repository.GatewayRebindImmediatePreclaim(ctx, gatewayRebindPreclaimProposalFor(fixture))
@@ -98,11 +94,7 @@ func TestGatewayRebindImmediatePreclaimRejectsNonterminalAndClaimedState(t *test
 
 func TestGatewayRebindImmediatePreclaimSerializesSecondHandleWriter(t *testing.T) {
 	root := t.TempDir()
-	first, err := database.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = first.Close() })
+	first := openHistoricalGatewayDatabase(t, root)
 	addUsers(t, first)
 	fixture := newGatewayRebindFixtureOnDBWithClaim(t, first, false, false)
 	second, err := database.Open(root)

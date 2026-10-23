@@ -251,9 +251,10 @@ func TestHostingGatewayStartupSnapshotReportsDiagnosticStageAndCause(t *testing.
 	})
 
 	t.Run("invalid runtime component", func(t *testing.T) {
-		db := appAccessDB(t)
+		db := historicalAppAccessDB(t)
 		appID := addApps(t, db, 1)[0]
-		head := seedGatewayRebindActiveRuntime(t, db, appID)
+		head := seedHistoricalGatewayRebindActiveRuntime(t, db, appID)
+		upgradeHistoricalGatewayDatabase(t, db)
 		if _, err := db.Exec(`DROP TRIGGER generated_runtime_component_no_delete`); err != nil {
 			t.Fatal(err)
 		}

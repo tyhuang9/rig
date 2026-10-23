@@ -36,6 +36,7 @@ type generatedImageTestAuthority struct {
 	request          deployments.GeneratedImageRequest
 	release          releasesnapshot.Release
 	revision         deploymentplans.DeploymentPlanRevision
+	dataRoot         string
 	workingDirectory string
 }
 
@@ -159,12 +160,14 @@ func newGeneratedImageTestAuthorityWithDependencies(t *testing.T, db *sql.DB, re
 		release.ID, release.AppID, stamp, release.SourceProvider, release.RepositoryID, release.ResolvedSHA, nullableTestText(release.ArchiveSHA256), release.WorkspaceTreeSHA256, release.ConfigurationRevisionID, release.ConfigurationRevisionNumber, revision.ID, revision.RevisionNumber); err != nil {
 		t.Fatal(err)
 	}
+	dataRoot := ""
 	if repository == nil {
 		positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
 		if err != nil {
 			t.Fatal(err)
 		}
-		directories, err := runtimedocker.PrepareControllerDirectories(t.TempDir())
+		dataRoot = t.TempDir()
+		directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -173,12 +176,11 @@ func newGeneratedImageTestAuthorityWithDependencies(t *testing.T, db *sql.DB, re
 		if err != nil {
 			t.Fatal(err)
 		}
-		protectedRoot := t.TempDir()
-		plans, err := deploymentplans.New(db, protectedRoot)
+		plans, err := deploymentplans.New(db, dataRoot)
 		if err != nil {
 			t.Fatal(err)
 		}
-		configuration, err := appconfig.New(db, protectedRoot)
+		configuration, err := appconfig.New(db, dataRoot)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +246,7 @@ func newGeneratedImageTestAuthorityWithDependencies(t *testing.T, db *sql.DB, re
 		SourceProvider: release.SourceProvider, SourceRepositoryID: release.RepositoryID, SourceResolvedDigest: release.ResolvedSHA,
 		PlanSourceProvider: revision.Plan.Source.Provider, PlanSourceRepositoryID: revision.Plan.Source.RepositoryID, PlanSourceResolvedDigest: revision.Plan.Source.ResolvedDigest,
 		ArchiveSHA256: release.ArchiveSHA256, WorkspaceTreeSHA256: release.WorkspaceTreeSHA256}
-	return &generatedImageTestAuthority{db: db, repository: repository, bindings: bindings, context: ctx, scope: scope, releaseScope: releaseScope, claim: claim, request: request, release: release, revision: revision, workingDirectory: workingDirectory}
+	return &generatedImageTestAuthority{db: db, repository: repository, bindings: bindings, context: ctx, scope: scope, releaseScope: releaseScope, claim: claim, request: request, release: release, revision: revision, dataRoot: dataRoot, workingDirectory: workingDirectory}
 }
 
 func (f *generatedImageTestAuthority) selectBuild(t *testing.T) (*deployments.GeneratedImageExecution, deployments.GeneratedImageBuildSelection) {

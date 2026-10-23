@@ -140,7 +140,7 @@ func TestCommittedV2FinalContainerRequiresJournalBoundIdentity(t *testing.T) {
 	}
 }
 
-func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
+func TestCommittedV2PrivateSwitchObserveRecoveryCoreAndSnapshot(t *testing.T) {
 	manager, _ := newManagerFixture(t, false)
 	installCommittedV2Pair(t, manager)
 	runner := newCommittedV2Runner()
@@ -168,7 +168,7 @@ func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
 			endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
 		},
 	}
-	if err := manager.Switch(context.Background(), request); err != nil {
+	if err := exerciseManagerSwitch(manager, context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	after, afterJournal, err := store.loadBoundUpgrade(journal.OperationID)
@@ -189,7 +189,7 @@ func TestCommittedV2ManagerSwitchObserveRecoverAndSnapshot(t *testing.T) {
 	if observation.Slot != generatedidentity.SlotGreen || observation.URL != "http://"+upgradeTestAppA+".rig.localhost:8080" {
 		t.Fatalf("observation = %#v", observation)
 	}
-	if err := manager.Recover(context.Background()); err != nil {
+	if err := exerciseCommittedV2RecoveryCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := manager.Snapshot(context.Background())
@@ -225,7 +225,7 @@ func TestCommittedV2UnknownTopologyStopsBeforeDockerMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous := state.Apps[upgradeTestAppA]
-	err = manager.Switch(context.Background(), generatedroute.RouteSwitchRequest{
+	err = exerciseManagerSwitch(manager, context.Background(), generatedroute.RouteSwitchRequest{
 		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedidentity.SlotGreen,
 		Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
@@ -288,7 +288,7 @@ func TestCommittedV2RecoveryRollsBackDurableProposedRoute(t *testing.T) {
 		}
 		return gatewayTopologyUnknownOrDrift
 	}
-	if err := manager.Recover(context.Background()); err != nil {
+	if err := exerciseCommittedV2RecoveryCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	recovered, _, err := store.loadBoundUpgrade(journal.OperationID)
@@ -342,7 +342,7 @@ func TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow(t *testing.T) {
 		}
 		return gatewayTopologyUnknownOrDrift
 	}
-	if err := manager.Recover(context.Background()); err != nil {
+	if err := exerciseCommittedV2RecoveryCore(manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if mixedCalls != 1 {
@@ -385,7 +385,7 @@ func TestCommittedV2RejectsRogueCandidateBeforePendingOrReload(t *testing.T) {
 		t.Fatal(err)
 	}
 	previous := before.Apps[upgradeTestAppA]
-	routeErr := manager.Switch(context.Background(), generatedroute.RouteSwitchRequest{
+	routeErr := exerciseManagerSwitch(manager, context.Background(), generatedroute.RouteSwitchRequest{
 		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedidentity.SlotGreen,
 		Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'f'),
@@ -428,7 +428,7 @@ func TestCommittedV2RejectsUnattachedApplicationNetworkBeforePendingOrReload(t *
 		t.Fatal(err)
 	}
 	previous := before.Apps[upgradeTestAppA]
-	routeErr := manager.Switch(context.Background(), generatedroute.RouteSwitchRequest{
+	routeErr := exerciseManagerSwitch(manager, context.Background(), generatedroute.RouteSwitchRequest{
 		AppID: upgradeTestAppA, FromSlot: previous.Route.Slot, ToSlot: generatedidentity.SlotGreen,
 		Endpoints: []generatedroute.RouteEndpoint{
 			endpoint("frontend", "static", "new-net-a", "frontend-green", 4173, 'd'),
@@ -479,7 +479,7 @@ func TestObservationBudgetsSeparateLockAcquisitionFromCommittedV2Probes(t *testi
 
 	t.Run("v1 retains the total observation bound", func(t *testing.T) {
 		manager, runner := newManagerFixture(t, false)
-		if err := manager.Switch(context.Background(), switchRequest(runner)); err != nil {
+		if err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner)); err != nil {
 			t.Fatal(err)
 		}
 		var callbackRemaining time.Duration

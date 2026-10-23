@@ -39,14 +39,18 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedcapacity"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
@@ -60,6 +64,10 @@ const (
 // runtime, and ingress. The source comes through a controlled GitHub connection
 // and HTTP archive fixture into an immutable release snapshot.
 func TestLiveControllerGeneratedDeploymentJourney(t *testing.T) {
+	if manifest := os.Getenv("RIG_CONTROLLER_JOURNEY_RESTART_MANIFEST"); manifest != "" {
+		controllerJourneyRunRestartChild(t, manifest)
+		return
+	}
 	controllerJourneyRun(t, false)
 }
 
@@ -186,7 +194,16 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	db, err := database.Open(dataRoot)
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal("prepare controller owner directories:", err)
+	}
+	ownerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire controller owner:", err)
+	}
+	defer func() { _ = ownerLease.Close() }()
+	db, err := database.OpenForGeneratedDomain(ctx, dataRoot, ownerLease)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +249,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	healthObserver := &controllerJourneyHealthObserver{
 		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
 	}
-	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
+	composition, err := prepareRuntimeCompositionForTest(t, ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
@@ -253,6 +270,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	}).Handler()
 	api := httptest.NewServer(handler)
 	defer api.Close()
+	controllerURL := func() string { return api.URL }
 	apiListenAddress, err := controllerJourneyFixtureControllerListenAddress(api.URL)
 	if err != nil {
 		t.Fatal("validate first fixture controller listener")
@@ -272,7 +290,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 			}
 			body = bytes.NewReader(encoded)
 		}
-		req, err := http.NewRequestWithContext(ctx, method, api.URL+path, body)
+		req, err := http.NewRequestWithContext(ctx, method, controllerURL()+path, body)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -560,7 +578,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	}
 	assertControllerAppIsolation := func(probeSources []controllerJourneyAppProbeSource) {
 		t.Helper()
-		target, err := controllerJourneyControllerProbeTarget(api.URL, gateway, application.ID)
+		target, err := controllerJourneyControllerProbeTarget(controllerURL(), gateway, application.ID)
 		if err != nil {
 			t.Fatal("derive the attested controller isolation probe target")
 		}
@@ -799,6 +817,9 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		case <-time.After(10 * time.Second):
 			t.Fatal("initial deployment worker did not stop before process-kill matrix")
 		}
+		if err := ownerLease.Close(); err != nil {
+			t.Fatal("release initial controller owner before process-kill matrix")
+		}
 		controllerProcessKillMatrix(t, ctx, docker, source, dataRoot, application.ID, user.ID, plan, saved, entries, &api, handler, composition.ingress, jobStore, db, request)
 		return
 	}
@@ -813,103 +834,34 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		t.Fatal("close controller database for restart")
 	}
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
-	capacityPressure := &controllerJourneyCapacitySource{}
-	restartedObserver := &controllerJourneyHealthObserver{
-		delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string),
+	if err := ownerLease.Close(); err != nil {
+		t.Fatal("release initial controller owner for cold restart")
 	}
+	// Query-only handles in the parent cannot join or construct the child domain.
+	// Each restarted worker opens its own sealed database in a fresh OS process.
 	type restartedController struct {
-		db              *sql.DB
-		apps            *apps.Store
-		jobs            *jobs.Service
-		deployments     *deployments.Repository
-		configuration   *appconfig.Store
-		plans           *deploymentplans.Store
-		sources         *sourceconnections.Service
-		composition     runtimeComposition
-		scopedAdmission jobs.ScopedAdmission
+		jobs        *jobs.Service
+		composition runtimeComposition
 	}
 	openRestartedController := func(controllerDB *sql.DB) (restartedController, error) {
-		configuration, err := appconfig.New(controllerDB, dataRoot)
-		if err != nil {
-			return restartedController{}, err
-		}
-		plans, err := deploymentplans.New(controllerDB, dataRoot)
-		if err != nil {
-			return restartedController{}, err
-		}
-		sources := sourceconnections.NewService(sourceconnections.NewRepository(controllerDB), provider, sourceconnections.NewFileCredentialStore(dataRoot), "fixture-app", time.Now)
-		snapshots, err := releasesnapshot.New(controllerDB, sources, dataRoot)
-		if err != nil {
-			return restartedController{}, err
-		}
-		jobStore, bindingStore, err := newDeploymentJobService(controllerDB)
-		if err != nil {
-			return restartedController{}, err
-		}
-		value := restartedController{
-			db: controllerDB, apps: apps.New(controllerDB), jobs: jobStore, deployments: deployments.New(controllerDB),
-			configuration: configuration, plans: plans, sources: sources,
-		}
-		restartedEffectsWorkingDirectory, restartedScopedAdmission := liveDeploymentExecutionFixture(t, controllerDB, dataRoot)
-		value.scopedAdmission = restartedScopedAdmission
-		value.composition, err = prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
-			db: controllerDB, applications: value.apps, snapshots: snapshots, configuration: value.configuration,
-			deployments: value.deployments, plans: value.plans, bindings: bindingStore,
-			effectsWorkingDirectory: restartedEffectsWorkingDirectory,
-		}, runtimeCompositionOptions{
-			dockerExecutable: docker,
-			runner:           restartedObserver,
-			routePauseLogger: newStructuredLogger(os.Stderr, "info"),
-			capacitySourceFactory: func(source generatedruntime.CapacitySource) generatedruntime.CapacitySource {
-				capacityPressure.SetDelegate(source)
-				return capacityPressure
-			},
-		})
-		return value, err
+		queries, _, err := newDeploymentJobService(controllerDB)
+		return restartedController{jobs: queries, composition: runtimeComposition{
+			state: generatedruntimestate.New(controllerDB),
+		}}, err
 	}
-	startRestartedController := func(value restartedController) (*httptest.Server, context.CancelFunc, <-chan struct{}, error) {
-		workerContext, stop := context.WithCancel(ctx)
-		done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{
-			recoverState: value.jobs.RecoverRuntimeContext,
-		}, value.composition.executor, func(workerContext context.Context, executor jobs.Executor) error {
-			return value.jobs.RunWorkerWithScopedAdmission(workerContext, executor, value.scopedAdmission)
-		}, func(error) {})
-		if err != nil {
-			stop()
-			return nil, nil, nil, err
-		}
-		server := controllerJourneyRestartControllerServer(t, (&controller.Server{
-			Auth: auth.New(value.db), Apps: value.apps, Jobs: value.jobs, Machines: machines.New(value.db), Sources: value.sources,
-			Configuration: value.configuration, Deployments: value.deployments, DeploymentPlans: value.plans,
-			GeneratedIngress: value.composition.ingress, GeneratedRuntimeState: value.composition.state,
-			GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		}).Handler(), dbPort, httpsPort)
-		return server, stop, done, nil
-	}
+	restartedObserver := controllerJourneyStartRestartChild(t, ctx, controllerJourneyRestartManifest{
+		DataRoot: dataRoot, Source: source, Docker: docker, ExcludedPorts: []int{dbPort, httpsPort},
+	})
+	controllerURL = func() string { return restartedObserver.url }
 	reopenedDB, err := database.Open(dataRoot)
 	if err != nil {
-		t.Fatal("reopen durable controller database:", err)
+		t.Fatal("reopen durable controller query database:", err)
 	}
 	defer reopenedDB.Close()
 	restarted, err := openRestartedController(reopenedDB)
 	if err != nil {
-		t.Fatal("recover generated runtime after controller restart:", err)
+		t.Fatal("open restarted controller queries:", err)
 	}
-	var stopRestartedWorker context.CancelFunc
-	var restartedDone <-chan struct{}
-	api, stopRestartedWorker, restartedDone, err = startRestartedController(restarted)
-	if err != nil {
-		t.Fatal("restart durable deployment worker:", err)
-	}
-	defer func() {
-		stopRestartedWorker()
-		select {
-		case <-restartedDone:
-		case <-time.After(10 * time.Second):
-			t.Error("restarted deployment worker did not stop")
-		}
-	}()
-	defer api.Close()
 	var retainedJob jobs.Job
 	request(http.MethodGet, "/api/v1/jobs/"+completed.ID, nil, http.StatusOK, &retainedJob)
 	if retainedJob.ID != completed.ID || retainedJob.Status != string(jobs.Succeeded) {
@@ -933,7 +885,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	builderContainerIDs := controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=rig.controller=generated-builder")
 	builderNetworkIDs := controllerJourneyDockerIDSet(t, ctx, docker, "network", "ls", "-q", "--filter", "label=rig.controller=generated-builder")
 	buildCallsBeforeCapacity := restartedObserver.BuildCalls()
-	archiveReadsBeforeCapacity := provider.archiveReads.Load()
+	archiveReadsBeforeCapacity := restartedObserver.ArchiveReads()
 	publicEntries := make([]apicontract.ScopedConfigurationValueInput, 0, len(entries))
 	for _, entry := range entries {
 		if entry.Sensitive {
@@ -953,7 +905,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		bytes.Contains(replacementResponse, []byte(dbURL)) || bytes.Contains(replacementResponse, []byte(sentinel)) {
 		t.Fatal("configuration-only replacement did not create a protected revision")
 	}
-	capacityPressure.SetArmed(true)
+	restartedObserver.control("capacity-on", "")
 	var replacementMutation apicontract.JobMutationResponse
 	request(http.MethodPost, deploymentPath, apicontract.DeployApplicationRequest{
 		ExpectedPlanRevisionID: plan.RevisionID, ExpectedPlanRevisionNumber: plan.RevisionNumber,
@@ -997,7 +949,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		pausedDeployment.ActualConfigurationRevisionID != replacementConfiguration.RevisionID || pausedDeployment.ActualConfigurationRevisionNumber != replacementConfiguration.RevisionNumber {
 		t.Fatal("capacity pause did not retain accepted immutable deployment pins")
 	}
-	if provider.archiveReads.Load() != archiveReadsBeforeCapacity+1 {
+	if restartedObserver.ArchiveReads() != archiveReadsBeforeCapacity+1 {
 		t.Fatal("capacity pause did not materialize exactly one accepted replacement release")
 	}
 	pausedRuntime, err := restarted.composition.state.Get(ctx, application.ID, pausedDeployment.ID)
@@ -1006,9 +958,17 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		t.Fatal("capacity pause durable runtime state is not pinned before candidate work")
 	}
 	for _, component := range pausedRuntime.Components {
-		if component.State != generatedruntimestate.ComponentPending || component.ContainerID != "" {
+		if component.State != generatedruntimestate.ComponentPending || component.ContainerID != "" || component.ContainerName != "" || component.ImageArtifactID != "" {
 			t.Fatal("capacity pause created a candidate component")
 		}
+	}
+	var candidateIntents, lifecycleOperations int
+	if err := reopenedDB.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM generated_candidate_intents WHERE deployment_id=?),
+		(SELECT COUNT(*) FROM application_lifecycle_operations WHERE deployment_id=?)`,
+		pausedDeployment.ID, pausedDeployment.ID).Scan(&candidateIntents, &lifecycleOperations); err != nil ||
+		candidateIntents != 0 || lifecycleOperations != 0 {
+		t.Fatal("capacity pause retained candidate or lifecycle effects before cold restart")
 	}
 	if restartedObserver.BuildCalls() != buildCallsBeforeCapacity ||
 		controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID) != servingContainerIDs ||
@@ -1028,38 +988,29 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
 	pausedInput := append([]byte(nil), pausedReplacement.Input...)
-	stopRestartedWorker()
-	select {
-	case <-restartedDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("capacity-paused deployment worker did not stop for controller restart")
-	}
-	api.Close()
+	previousCounters := restartedObserver.stop()
 	if err := reopenedDB.Close(); err != nil {
-		t.Fatal("close capacity-paused controller database for restart")
+		t.Fatal("close capacity-paused controller query database for restart")
 	}
+	previousPID := restartedObserver.child.command.Process.Pid
+	restartedObserver = controllerJourneyStartRestartChild(t, ctx, controllerJourneyRestartManifest{
+		DataRoot: dataRoot, Source: source, Docker: docker, ExcludedPorts: []int{dbPort, httpsPort},
+		CapacityPressure: true,
+	})
+	if restartedObserver.child.command.Process.Pid == previousPID {
+		t.Fatal("capacity restart reused the previous controller process")
+	}
+	restartedObserver.buildBase = previousCounters.Builds
+	restartedObserver.archiveBase = previousCounters.ArchiveReads
 	capacityRestartDB, err := database.Open(dataRoot)
 	if err != nil {
-		t.Fatal("reopen capacity-paused controller database:", err)
+		t.Fatal("reopen capacity-paused controller query database:", err)
 	}
 	defer capacityRestartDB.Close()
 	capacityRestart, err := openRestartedController(capacityRestartDB)
 	if err != nil {
-		t.Fatal("recover capacity-paused generated runtime after controller restart:", err)
+		t.Fatal("open capacity-restarted controller queries:", err)
 	}
-	api, stopCapacityRestartWorker, capacityRestartDone, err := startRestartedController(capacityRestart)
-	if err != nil {
-		t.Fatal("restart capacity-paused durable deployment worker:", err)
-	}
-	defer func() {
-		stopCapacityRestartWorker()
-		select {
-		case <-capacityRestartDone:
-		case <-time.After(10 * time.Second):
-			t.Error("capacity-restarted deployment worker did not stop")
-		}
-	}()
-	defer api.Close()
 	recoveredPaused, err := capacityRestart.jobs.Get(pausedReplacement.ID)
 	if err != nil || recoveredPaused.Status != string(jobs.WaitingUser) || recoveredPaused.Phase != jobs.PauseInsufficientReplacementCapacity ||
 		recoveredPaused.PauseDisposition != jobs.PauseInsufficientReplacementCapacity || recoveredPaused.ErrorCode != "" ||
@@ -1120,7 +1071,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		capacityRestartHead.Slot != activeBeforeCapacity.Slot || capacityRestartHead.Generation != activeBeforeCapacity.Generation {
 		t.Fatal("controller restart changed the active serving head during capacity pause")
 	}
-	if restartedObserver.BuildCalls() != buildCallsBeforeCapacity || provider.archiveReads.Load() != archiveReadsBeforeCapacity+1 ||
+	if restartedObserver.BuildCalls() != buildCallsBeforeCapacity || restartedObserver.ArchiveReads() != archiveReadsBeforeCapacity+1 ||
 		controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=io.rig.application="+application.ID) != servingContainerIDs ||
 		controllerJourneyDockerIDSet(t, ctx, docker, "ps", "-aq", "--filter", "label=rig.controller=generated-builder") != builderContainerIDs ||
 		controllerJourneyDockerIDSet(t, ctx, docker, "network", "ls", "-q", "--filter", "label=rig.controller=generated-builder") != builderNetworkIDs {
@@ -1134,7 +1085,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	assertControllerAppIsolation(capacityRestartProbeSources)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedRouteURL, "read", browserNote)
-	capacityPressure.SetArmed(false)
+	restartedObserver.control("capacity-off", "")
 	var resumedResponse apicontract.JobResponse
 	request(http.MethodPost, "/api/v1/jobs/"+pausedReplacement.ID+"/resume", nil, http.StatusOK, &resumedResponse)
 	resumedInProgress := resumedResponse.Job.Status == string(jobs.Queued) || resumedResponse.Job.Status == string(jobs.Assigned) ||
@@ -1161,7 +1112,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	if replacementJob.ID != pausedReplacement.ID || replacementJob.Attempt != pausedReplacement.Attempt+1 {
 		t.Fatal("capacity resume did not complete the original job on its next attempt")
 	}
-	if restartedObserver.BuildCalls() != buildCallsBeforeCapacity+len(plan.Components) || provider.archiveReads.Load() != archiveReadsBeforeCapacity+1 {
+	if restartedObserver.BuildCalls() != buildCallsBeforeCapacity+len(plan.Components) || restartedObserver.ArchiveReads() != archiveReadsBeforeCapacity+1 {
 		t.Fatal("capacity resume duplicated accepted replacement build or source materialization")
 	}
 	var replacementHistory apicontract.DeploymentList
@@ -1260,7 +1211,7 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedReplacementRouteURL, "read", browserNote)
-	t.Logf("M2 controller journey identities: app=%s connection=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d capacity-pause-job=%s capacity-pause-disposition=%s capacity-pause-deployment=%s capacity-pause-release=%s capacity-pause-no-build=%t capacity-pause-serving-unchanged=%t capacity-resume-attempt=%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=github-fixture sha=%s archive-reads=%d ingress=127.0.0.1:8080", application.ID, connection.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, pausedReplacement.ID, pausedReplacement.PauseDisposition, pausedDeployment.ID, pausedDeployment.ReleaseID, true, true, replacementJob.Attempt, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID, controllerJourneyGitHubSHA, provider.archiveReads.Load())
+	t.Logf("M2 controller journey identities: app=%s connection=%s plan=%s/%d config=%s/%d job=%s deployment=%s release=%s replacement-config=%s/%d capacity-pause-job=%s capacity-pause-disposition=%s capacity-pause-deployment=%s capacity-pause-release=%s capacity-pause-no-build=%t capacity-pause-serving-unchanged=%t capacity-resume-attempt=%d replacement-job=%s replacement-deployment=%s replacement-release=%s bad-config=%s/%d failed-job=%s failed-deployment=%s source=github-fixture sha=%s archive-reads=%d ingress=127.0.0.1:8080", application.ID, connection.ID, plan.RevisionID, plan.RevisionNumber, saved.RevisionID, saved.RevisionNumber, completed.ID, history.Items[0].ID, releases.Items[0].ID, replacementConfiguration.RevisionID, replacementConfiguration.RevisionNumber, pausedReplacement.ID, pausedReplacement.PauseDisposition, pausedDeployment.ID, pausedDeployment.ReleaseID, true, true, replacementJob.Attempt, replacementJob.ID, replacementDeployment.ID, replacementRelease.ID, badConfiguration.RevisionID, badConfiguration.RevisionNumber, failedJob.ID, failedDeployment.ID, controllerJourneyGitHubSHA, restartedObserver.ArchiveReads())
 
 	gatewayEntries := append([]apicontract.ScopedConfigurationValueInput(nil), publicEntries...)
 	for index := range gatewayEntries {
@@ -1350,6 +1301,412 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedGatewayRouteURL, "read", browserNote)
 	t.Logf("M2 gateway readiness identities: gateway-config=%s/%d gateway-job=%s gateway-deployment=%s gateway-release=%s serving-deployment=%s", gatewayConfiguration.RevisionID, gatewayConfiguration.RevisionNumber, gatewayJob.ID, gatewayDeployment.ID, gatewayRelease.ID, replacementDeployment.ID)
+	restartedObserver.stop()
+}
+
+// Restart control files are private fixture coordination, never production
+// inputs. They carry only closed commands, counters and non-secret identities.
+// A fresh child owns the sealed database, concrete domain and durable worker.
+type controllerJourneyRestartManifest struct {
+	DataRoot         string
+	Source           string
+	Docker           string
+	ControlDirectory string
+	ExcludedPorts    []int
+	CapacityPressure bool
+}
+
+type controllerJourneyRestartCommand struct {
+	Sequence uint64
+	Action   string
+	Target   string
+}
+
+type controllerJourneyRestartResponse struct {
+	Sequence           uint64
+	PID                int
+	URL                string
+	Builds             int
+	ArchiveReads       int32
+	Candidate          controllerJourneyCandidate
+	GatewayProbeFailed bool
+}
+
+type controllerJourneyRestartProcess struct {
+	t           *testing.T
+	ctx         context.Context
+	child       *controllerProcessKillProcess
+	directory   string
+	sequence    uint64
+	url         string
+	buildBase   int
+	archiveBase int32
+}
+
+func controllerJourneyWriteRestartFile(path string, value any) error {
+	data, err := json.Marshal(value)
+	if err != nil || len(data) > 16<<10 {
+		return errors.New("restart fixture message invalid")
+	}
+	staged := path + ".next"
+	file, err := os.OpenFile(staged, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(staged)
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	// Linking the complete file makes publication atomic and refuses overwrite.
+	return os.Link(staged, path)
+}
+
+func controllerJourneyReadRestartFile(path string, output any) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, (16<<10)+1))
+	if err != nil || len(data) > 16<<10 {
+		return errors.New("restart fixture message exceeds bound")
+	}
+	return json.Unmarshal(data, output)
+}
+
+func TestControllerJourneyRestartFileProtocol(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "request.json")
+	want := controllerJourneyRestartCommand{Sequence: 1, Action: "stats"}
+	var got controllerJourneyRestartCommand
+	if err := controllerJourneyReadRestartFile(path, &got); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("missing restart message was not distinguished")
+	}
+	if err := controllerJourneyWriteRestartFile(path, want); err != nil {
+		t.Fatal(err)
+	}
+	if err := controllerJourneyReadRestartFile(path, &got); err != nil || got != want {
+		t.Fatal("complete restart message did not round trip")
+	}
+	if err := controllerJourneyWriteRestartFile(path, controllerJourneyRestartCommand{Sequence: 2, Action: "stop"}); err == nil {
+		t.Fatal("restart protocol overwrote an already published command")
+	}
+	if err := controllerJourneyReadRestartFile(path, &got); err != nil || got != want {
+		t.Fatal("refused overwrite changed the original command")
+	}
+	for _, value := range []string{"{", strings.Repeat(" ", (16<<10)+1)} {
+		invalid := filepath.Join(t.TempDir(), "response.json")
+		if err := os.WriteFile(invalid, []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := controllerJourneyReadRestartFile(invalid, &got); err == nil {
+			t.Fatal("restart protocol accepted an invalid or oversized response")
+		}
+	}
+	oversized := filepath.Join(t.TempDir(), "request.json")
+	if err := controllerJourneyWriteRestartFile(oversized, controllerJourneyRestartCommand{Target: strings.Repeat("x", 16<<10)}); err == nil {
+		t.Fatal("restart protocol published an oversized request")
+	}
+	if _, err := os.Stat(oversized); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("rejected oversized request was published")
+	}
+}
+
+func controllerJourneyStartRestartChild(t *testing.T, ctx context.Context, manifest controllerJourneyRestartManifest) *controllerJourneyRestartProcess {
+	t.Helper()
+	manifest.ControlDirectory = t.TempDir()
+	manifestPath := filepath.Join(manifest.ControlDirectory, "manifest.json")
+	if err := controllerJourneyWriteRestartFile(manifestPath, manifest); err != nil {
+		t.Fatal("write private controller restart manifest")
+	}
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestLiveControllerGeneratedDeploymentJourney$", "-test.timeout=26m")
+	command.Env = append(append([]string(nil), os.Environ()...), "RIG_CONTROLLER_JOURNEY_RESTART_MANIFEST="+manifestPath)
+	child := controllerProcessKillCapture(command)
+	if err := command.Start(); err != nil {
+		t.Fatal("start fresh controller process")
+	}
+	go func() {
+		child.err = command.Wait()
+		close(child.done)
+	}()
+	t.Cleanup(func() { controllerProcessKillCleanupChild(child) })
+	result := &controllerJourneyRestartProcess{t: t, ctx: ctx, child: child, directory: manifest.ControlDirectory}
+	ready := result.wait(0, 7*time.Minute)
+	if ready.PID != child.command.Process.Pid || ready.PID == os.Getpid() {
+		t.Fatal("restart readiness did not identify the fresh controller process")
+	}
+	address, err := controllerJourneyFixtureControllerListenAddress(ready.URL)
+	if err != nil || !strings.HasPrefix(address, "127.0.0.1:") {
+		t.Fatal("restarted controller did not bind loopback")
+	}
+	result.url = ready.URL
+	return result
+}
+
+func (child *controllerJourneyRestartProcess) wait(sequence uint64, timeout time.Duration) controllerJourneyRestartResponse {
+	child.t.Helper()
+	ctx, cancel := context.WithTimeout(child.ctx, timeout)
+	defer cancel()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	path := filepath.Join(child.directory, fmt.Sprintf("%06d.response.json", sequence))
+	for {
+		var response controllerJourneyRestartResponse
+		if err := controllerJourneyReadRestartFile(path, &response); err == nil {
+			if response.Sequence != sequence || response.PID != child.child.command.Process.Pid {
+				child.t.Fatal("restart response identity mismatch")
+			}
+			response.Builds += child.buildBase
+			response.ArchiveReads += child.archiveBase
+			return response
+		} else if !errors.Is(err, os.ErrNotExist) {
+			child.t.Fatal("restart response invalid")
+		}
+		select {
+		case <-child.child.done:
+			// A clean stop can publish its complete response and exit between
+			// the first read and this select. Accept only the exact response.
+			var response controllerJourneyRestartResponse
+			if controllerJourneyReadRestartFile(path, &response) == nil &&
+				response.Sequence == sequence && response.PID == child.child.command.Process.Pid {
+				response.Builds += child.buildBase
+				response.ArchiveReads += child.archiveBase
+				return response
+			}
+			controllerProcessKillReportClosedDiagnostic(child.t, child.child)
+			child.t.Fatalf("restarted controller exited before response, exit code %d", child.child.command.ProcessState.ExitCode())
+		case <-ctx.Done():
+			child.t.Fatal("restarted controller response exceeded bound")
+		case <-tick.C:
+		}
+	}
+}
+
+func (child *controllerJourneyRestartProcess) control(action, target string) controllerJourneyRestartResponse {
+	child.t.Helper()
+	child.sequence++
+	path := filepath.Join(child.directory, fmt.Sprintf("%06d.request.json", child.sequence))
+	if err := controllerJourneyWriteRestartFile(path, controllerJourneyRestartCommand{Sequence: child.sequence, Action: action, Target: target}); err != nil {
+		child.t.Fatal("write controller restart command")
+	}
+	return child.wait(child.sequence, 3*time.Minute)
+}
+
+func (child *controllerJourneyRestartProcess) BuildCalls() int {
+	return child.control("stats", "").Builds
+}
+
+func (child *controllerJourneyRestartProcess) ArchiveReads() int32 {
+	return child.control("stats", "").ArchiveReads
+}
+
+func (child *controllerJourneyRestartProcess) beginGatewayReadinessCapture(target string) {
+	child.control("capture-begin", target)
+}
+
+func (child *controllerJourneyRestartProcess) gatewayReadinessCapture() (controllerJourneyCandidate, bool) {
+	response := child.control("capture-end", "")
+	return response.Candidate, response.GatewayProbeFailed
+}
+
+func (child *controllerJourneyRestartProcess) stop() controllerJourneyRestartResponse {
+	child.t.Helper()
+	response := child.control("stop", "")
+	select {
+	case <-child.child.done:
+		if child.child.err != nil {
+			child.t.Fatal("controller restart child did not stop cleanly")
+		}
+	case <-time.After(10 * time.Second):
+		child.t.Fatal("controller restart child did not exit after stopping")
+	}
+	return response
+}
+
+func controllerJourneyRunRestartChild(t *testing.T, manifestPath string) {
+	var manifest controllerJourneyRestartManifest
+	if controllerJourneyReadRestartFile(manifestPath, &manifest) != nil ||
+		!filepath.IsAbs(manifest.DataRoot) || !filepath.IsAbs(manifest.Source) || !filepath.IsAbs(manifest.Docker) ||
+		filepath.Dir(manifestPath) != manifest.ControlDirectory || filepath.Base(manifestPath) != "manifest.json" ||
+		runtime.GOOS != "linux" || os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
+		t.Fatal("controller restart child requires an exact local Linux fixture manifest")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+	directories, err := runtimedocker.PrepareControllerDirectories(manifest.DataRoot)
+	if err != nil {
+		t.Fatal("prepare restarted controller directories")
+	}
+	ownerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire restarted controller owner")
+	}
+	defer func() { _ = ownerLease.Close() }()
+	db, err := database.OpenForGeneratedDomain(ctx, manifest.DataRoot, ownerLease)
+	if err != nil {
+		t.Fatal("open sealed restarted controller database")
+	}
+	defer db.Close()
+	provider := controllerJourneyNewGitHubProvider(t, manifest.Source)
+	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), provider, sourceconnections.NewFileCredentialStore(manifest.DataRoot), "fixture-app", time.Now)
+	snapshots, err := releasesnapshot.New(db, sources, manifest.DataRoot)
+	if err != nil {
+		t.Fatal("open restarted source materializer")
+	}
+	if err := snapshots.Recover(); err != nil {
+		t.Fatal("recover restarted source materializer")
+	}
+	configuration, err := appconfig.New(db, manifest.DataRoot)
+	if err != nil {
+		t.Fatal("open restarted scoped configuration")
+	}
+	if err := configuration.Recover(ctx); err != nil {
+		t.Fatal("recover restarted scoped configuration")
+	}
+	plans, err := deploymentplans.New(db, manifest.DataRoot)
+	if err != nil {
+		t.Fatal("open restarted deployment plans")
+	}
+	if err := plans.Recover(ctx); err != nil {
+		t.Fatal("recover restarted deployment plans")
+	}
+	jobStore, bindings, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal("open restarted deployment jobs")
+	}
+	effectsDirectory, admission := liveDeploymentExecutionFixture(t, db, manifest.DataRoot)
+	settings := config.Defaults()
+	settings.DataRoot, settings.GeneratedRuntime = manifest.DataRoot, true
+	observer := &controllerJourneyHealthObserver{delegate: runtimeprocess.ExecRunner{}, test: t, last: make(map[string]string)}
+	dependencies := runtimeCompositionDependencies{
+		db: db, applications: apps.New(db), snapshots: snapshots, configuration: configuration,
+		deployments: deployments.New(db), plans: plans, bindings: bindings, effectsWorkingDirectory: effectsDirectory,
+	}
+	options := runtimeCompositionOptions{dockerExecutable: manifest.Docker, runner: observer, routePauseLogger: newStructuredLogger(os.Stderr, "info")}
+	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, settings, dependencies, options)
+	if err != nil {
+		t.Fatal("construct cold restarted generated domain")
+	}
+	dependencies.generated = generated
+	composition, err := prepareRuntimeComposition(ctx, settings, dependencies, options)
+	if err != nil {
+		t.Fatal("compose cold restarted generated runtime")
+	}
+	// Exercise the exact owner's raw budget through opaque, unattempted
+	// reservations. No capacity observation, factory or authority is overridden.
+	type charge struct {
+		id          string
+		reservation generatedingress.GeneratedRetainedCapacityReservation
+	}
+	var charges []charge
+	releasePressure := func() {
+		for _, charge := range charges {
+			if err := generated.domain.Candidates().ReleaseRetainedCapacity(charge.id, charge.reservation); err != nil {
+				t.Fatal("release exact unattempted fixture capacity reservation")
+			}
+		}
+		charges = nil
+	}
+	defer releasePressure()
+	armPressure := func() {
+		if len(charges) != 0 {
+			t.Fatal("fixture capacity pressure already armed")
+		}
+		pressureContext, stop := context.WithTimeout(ctx, 2*time.Minute)
+		defer stop()
+		for index := 0; index < 1024; index++ {
+			id := fmt.Sprintf("controller-journey-pressure-%d-%d", os.Getpid(), index)
+			reservation, err := generated.domain.Candidates().ReserveRetainedCapacity(pressureContext, id, 1)
+			if errors.Is(err, generatedcapacity.ErrInsufficientCapacity) {
+				if len(charges) == 0 {
+					t.Fatal("fixture host has no positive capacity before pressure")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal("reserve fixture pressure from concrete domain")
+			}
+			charges = append(charges, charge{id: id, reservation: reservation})
+		}
+		t.Fatal("fixture pressure exceeded bounded share count")
+	}
+	if manifest.CapacityPressure {
+		armPressure()
+	}
+	workerContext, stopWorker := context.WithCancel(ctx)
+	defer stopWorker()
+	done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{recoverState: jobStore.RecoverRuntimeContext}, composition.executor,
+		func(workerContext context.Context, executor jobs.Executor) error {
+			return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, admission)
+		}, func(error) {})
+	if err != nil {
+		t.Fatal("recover restarted durable worker")
+	}
+	server := controllerJourneyRestartControllerServer(t, (&controller.Server{
+		Auth: auth.New(db), Apps: dependencies.applications, Jobs: jobStore, Machines: machines.New(db), Sources: sources,
+		Configuration: configuration, Deployments: dependencies.deployments, DeploymentPlans: plans,
+		GeneratedIngress: composition.ingress, GeneratedRuntimeState: composition.state,
+		GeneratedRuntime: true, Caddy: true, DataRoot: manifest.DataRoot, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).Handler(), manifest.ExcludedPorts...)
+	defer server.Close()
+	respond := func(sequence uint64, candidate controllerJourneyCandidate, failed bool) {
+		response := controllerJourneyRestartResponse{Sequence: sequence, PID: os.Getpid(), URL: server.URL,
+			Builds: observer.BuildCalls(), ArchiveReads: provider.archiveReads.Load(), Candidate: candidate, GatewayProbeFailed: failed}
+		path := filepath.Join(manifest.ControlDirectory, fmt.Sprintf("%06d.response.json", sequence))
+		if err := controllerJourneyWriteRestartFile(path, response); err != nil {
+			t.Fatal("publish controller restart response")
+		}
+	}
+	respond(0, controllerJourneyCandidate{}, false)
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	sequence := uint64(1)
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("controller restart child exceeded bound")
+		case <-done:
+			t.Fatal("restarted durable worker stopped unexpectedly")
+		case <-tick.C:
+		}
+		var command controllerJourneyRestartCommand
+		path := filepath.Join(manifest.ControlDirectory, fmt.Sprintf("%06d.request.json", sequence))
+		if err := controllerJourneyReadRestartFile(path, &command); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil || command.Sequence != sequence {
+			t.Fatal("controller restart command invalid")
+		}
+		var candidate controllerJourneyCandidate
+		failed := false
+		switch command.Action {
+		case "stats":
+		case "capacity-on":
+			armPressure()
+		case "capacity-off":
+			releasePressure()
+		case "capture-begin":
+			observer.beginGatewayReadinessCapture(command.Target)
+		case "capture-end":
+			candidate, failed = observer.gatewayReadinessCapture()
+		case "stop":
+			stopWorker()
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatal("restarted durable worker did not stop")
+			}
+			server.Close()
+			respond(sequence, candidate, failed)
+			return
+		default:
+			t.Fatal("unknown controller restart command")
+		}
+		respond(sequence, candidate, failed)
+		sequence++
+	}
 }
 
 func controllerJourneyExecutable(t *testing.T, name string) string {
@@ -1640,37 +1997,6 @@ func (observer *controllerJourneyHealthObserver) BuildCalls() int {
 	observer.mu.Lock()
 	defer observer.mu.Unlock()
 	return observer.builds
-}
-
-type controllerJourneyCapacitySource struct {
-	mu       sync.RWMutex
-	delegate generatedruntime.CapacitySource
-	armed    bool
-}
-
-func (source *controllerJourneyCapacitySource) SetDelegate(delegate generatedruntime.CapacitySource) {
-	source.mu.Lock()
-	defer source.mu.Unlock()
-	source.delegate = delegate
-}
-
-func (source *controllerJourneyCapacitySource) SetArmed(armed bool) {
-	source.mu.Lock()
-	defer source.mu.Unlock()
-	source.armed = armed
-}
-
-func (source *controllerJourneyCapacitySource) Snapshot(ctx context.Context) (generatedruntime.CapacitySnapshot, error) {
-	source.mu.RLock()
-	armed, delegate := source.armed, source.delegate
-	source.mu.RUnlock()
-	if armed {
-		return generatedruntime.CapacitySnapshot{}, nil
-	}
-	if delegate == nil {
-		return generatedruntime.CapacitySnapshot{}, errors.New("capacity source delegate is required")
-	}
-	return delegate.Snapshot(ctx)
 }
 
 func (observer *controllerJourneyHealthObserver) beginGatewayReadinessCapture(expectedTarget string) {

@@ -131,7 +131,7 @@ func TestGatewayRebindFenceAllowsValidatedNoHistoryStates(t *testing.T) {
 	})
 
 	t.Run("committed native upgrade", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		assertGatewayRebindFenceOpen(t, fixture.repository)
 	})
 }
@@ -139,7 +139,7 @@ func TestGatewayRebindFenceAllowsValidatedNoHistoryStates(t *testing.T) {
 func claimGatewayRebindV2ForFence(t *testing.T,
 ) (gatewayRebindFixture, GatewayRebindPreclaimProposalV2, GatewayRebindClaimV2) {
 	t.Helper()
-	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	finishGatewayRebindFixtureWork(t, fixture.db)
 	proposal := gatewayRebindV2ProposalForFixture(t, fixture)
 	claim, created, err := fixture.repository.ClaimGatewayRebindV2(context.Background(), proposal)

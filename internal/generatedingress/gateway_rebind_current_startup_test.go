@@ -244,7 +244,7 @@ func TestGatewayRebindCurrentStartupRouteRecoveryBeforeAdmission(t *testing.T) {
 				t.Fatal("read-only startup inspection changed pending route")
 			}
 			// Composition calls this public method before starting deployment workers.
-			if err := f.manager.Recover(context.Background()); err != nil {
+			if err := exerciseGatewayCurrentRecoveryCore(f.manager, context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			recovered := routeOperationLoad(t, f.store)

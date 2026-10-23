@@ -14,8 +14,6 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appconfig"
-	"github.com/hostd/hostd/internal/applifecycle"
-	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
@@ -29,7 +27,6 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
-	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 type executorMigrationAuthority struct {
@@ -423,11 +420,23 @@ func TestGeneratedExecutorRetainsCandidateRiskOnSucceededHandoffUncertainty(t *t
 func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Component) *executorMigrationAuthority {
 	t.Helper()
 	dataRoot := filepath.Join(t.TempDir(), "state")
-	db, err := databasefixture.Open(dataRoot)
+	prepareExecutorDomainDatabase(t, dataRoot)
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	stager := &executorMigrationStager{path: filepath.Join(t.TempDir(), "migration.env")}
+	process := &executorMigrationProcess{id: strings.Repeat("1", 64)}
+	engineOptions := generatedruntime.EngineOptions{
+		DockerExecutable: filepath.Join(dataRoot, "docker"), DockerConfigDirectory: directories.DockerConfigDirectory,
+		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Minute, HealthTimeout: time.Minute,
+		HealthPollInterval: 100 * time.Millisecond, OutputLimit: 16 << 10,
+		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20, LogSize: "1m", LogFiles: 2},
+		ReplacementDiskBytes: 128 << 20,
+	}
+	domainFixture := newExecutorDomainFixture(t, dataRoot, process, stager, engineOptions)
+	db, bindings, plans, configuration := domainFixture.db, domainFixture.bindings, domainFixture.plans, domainFixture.configuration
+	repository := domainFixture.repository
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
 	machineID := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, testActorID, testActorID, "hash", stamp, stamp); err != nil {
@@ -443,15 +452,6 @@ func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Compo
 		t.Fatal(err)
 	}
 
-	lifecycle := applifecycle.New(db)
-	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bindings, err := deploymentbinding.New(db, validator)
-	if err != nil {
-		t.Fatal(err)
-	}
 	tx, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -471,18 +471,6 @@ func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Compo
 	if err != nil {
 		t.Fatal(err)
 	}
-	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
-	if err != nil {
-		t.Fatal(err)
-	}
-	directories, err := runtimedocker.PrepareControllerDirectories(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
 	scope, releaseScope, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
 	if err != nil {
 		t.Fatal(err)
@@ -493,14 +481,6 @@ func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Compo
 		}
 	})
 
-	plans, err := deploymentplans.New(db, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	configuration, err := appconfig.New(db, t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
 	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "buildCommand", "runCommand", "internalPort", "healthProbe"}
 	provenance := make([]deploymentplans.FieldProvenance, 0, len(fields))
 	for _, field := range fields {
@@ -538,20 +518,12 @@ func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Compo
 		t.Fatal(err)
 	}
 
-	dockerConfig := t.TempDir()
-	stager := &executorMigrationStager{path: filepath.Join(t.TempDir(), "migration.env")}
-	process := &executorMigrationProcess{id: strings.Repeat("1", 64)}
 	network, err := generatedidentity.DescribeAppNetwork(testAppID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	process.expectedNetwork = network.Name
 	process.networkLabels = map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": testAppID}
-	options := deployments.GeneratedMigrationProcessOptions{DockerExecutable: filepath.Join(t.TempDir(), "docker"), DockerConfigDirectory: dockerConfig, WorkingDirectory: t.TempDir(), Timeout: time.Minute, OutputLimit: 16 << 10}
-	repository, err := deployments.NewWithExecutionGuardAndGeneratedMigration(db, guard, plans, configuration, stager, process, options)
-	if err != nil {
-		t.Fatal(err)
-	}
 	deployment, _, err := repository.GetOrCreateByJob(context.Background(), testAppID, testJobID, "current")
 	if err != nil {
 		t.Fatal(err)
@@ -595,15 +567,7 @@ func newExecutorMigrationAuthority(t *testing.T, component deploymentplans.Compo
 	if _, err := state.Advance(context.Background(), testAppID, deployment.ID, runtimeDeployment.Phase, generatedruntimestate.PhaseMigrating, ""); err != nil {
 		t.Fatal(err)
 	}
-	capacity := &scriptedCapacitySource{}
-	capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 512 << 20, DiskAvailableBytes: 512 << 20})
-	engine, err := generatedruntime.NewEngine(process, stager, capacity, repository, generatedruntime.EngineOptions{
-		DockerExecutable: options.DockerExecutable, DockerConfigDirectory: options.DockerConfigDirectory,
-		WorkingDirectory: options.WorkingDirectory, CommandTimeout: time.Minute, HealthTimeout: time.Minute,
-		HealthPollInterval: 100 * time.Millisecond, OutputLimit: options.OutputLimit,
-		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20, LogSize: "1m", LogFiles: 2},
-		ReplacementDiskBytes: 128 << 20,
-	})
+	engine, err := generatedruntime.NewEngine(domainFixture.process, stager, domainFixture.domain.Candidates(), engineOptions)
 	if err != nil {
 		t.Fatal(err)
 	}

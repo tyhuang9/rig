@@ -502,12 +502,6 @@ func TestGeneratedDomainConstructionAssemblesCompletePrivateManager(t *testing.T
 		t.Fatalf("completed owned Manager typed admission = %v", err)
 	}
 	leave()
-	generatedCandidateAuthorityRegistries.Lock()
-	_, publiclyRegistered := generatedCandidateAuthorityRegistries.values[fixture.identity.stores.Repository()]
-	generatedCandidateAuthorityRegistries.Unlock()
-	if publiclyRegistered {
-		t.Fatal("private candidate owner was published through the temporary public registry")
-	}
 	for _, command := range fixture.runner.snapshot() {
 		effectCopy := len(command) >= 4 && command[0] == "container" && command[1] == "cp" &&
 			command[len(command)-1] != "-"

@@ -39,11 +39,40 @@ type Executor struct {
 	state         runtimeState
 	runtime       runtimeEngine
 	authorization AuthorizationGate
-	routes        generatedruntime.RouteSwitcher
+	routes        routeController
 	migrations    generatedruntime.MigrationRunner
 	pinMigration  func(context.Context, deployments.GeneratedMigrationRequest) (generatedMigrationExecution, error)
 	options       Options
 	waitDrain     func(context.Context, time.Duration) error
+}
+
+// routeController is the package-private lifecycle boundary used after the
+// original candidate execution has proved the complete route roster. The
+// exported constructor always installs generatedRouteController; callers
+// cannot supply an alternate route writer or a proof callback.
+type routeController interface {
+	activate(context.Context, *generatedingress.GeneratedCandidateExecution,
+		generatedruntime.RouteSwitchRequest, generatedruntimestate.Deployment,
+	) (generatedruntimestate.Deployment, error)
+}
+
+type generatedRouteController struct {
+	authority *generatedingress.GeneratedRouteAuthority
+}
+
+func (c generatedRouteController) activate(ctx context.Context,
+	execution *generatedingress.GeneratedCandidateExecution,
+	request generatedruntime.RouteSwitchRequest,
+	_ generatedruntimestate.Deployment,
+) (generatedruntimestate.Deployment, error) {
+	if c.authority == nil {
+		return generatedruntimestate.Deployment{}, errors.New("generated route authority is unavailable")
+	}
+	pinned, err := c.authority.Pin(ctx, execution, request)
+	if err != nil {
+		return generatedruntimestate.Deployment{}, err
+	}
+	return pinned.Activate(ctx)
 }
 
 func NewExecutor(
@@ -57,7 +86,29 @@ func NewExecutor(
 	state runtimeState,
 	runtime runtimeEngine,
 	authorization AuthorizationGate,
-	routes generatedruntime.RouteSwitcher,
+	routes *generatedingress.GeneratedRouteAuthority,
+	migrations generatedruntime.MigrationRunner,
+	options Options,
+) (*Executor, error) {
+	if routes == nil {
+		return nil, errors.New("generated executor route authority is required")
+	}
+	return newExecutor(applications, releases, configuration, deploymentRepository, plans, compiler,
+		artifacts, state, runtime, authorization, generatedRouteController{authority: routes}, migrations, options)
+}
+
+func newExecutor(
+	applications applicationReader,
+	releases releaseResolver,
+	configuration configurationExporter,
+	deploymentRepository deploymentStore,
+	plans planReader,
+	compiler imageCompiler,
+	artifacts artifactStore,
+	state runtimeState,
+	runtime runtimeEngine,
+	authorization AuthorizationGate,
+	routes routeController,
 	migrations generatedruntime.MigrationRunner,
 	options Options,
 ) (*Executor, error) {
@@ -336,7 +387,7 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			if observeErr != nil {
 				return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, observeErr)
 			}
-			advanced, _, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
+			advanced, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidateExecution, candidates)
 			if switchErr != nil {
 				// FinishHealth irreversibly closed inactive cleanup before route
 				// publication. Route failures always preserve these candidates.

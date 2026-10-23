@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -35,8 +36,10 @@ import (
 // sealed GeneratedOwnerStores bundle.
 type candidateTestRepository struct {
 	*deployments.Repository
-	db     *sql.DB
-	stores *deployments.GeneratedOwnerStores
+	db        *sql.DB
+	stores    *deployments.GeneratedOwnerStores
+	mu        sync.Mutex
+	authority *GeneratedCandidateAuthority
 }
 
 func (r *candidateTestRepository) GeneratedCandidateAuthority(
@@ -48,22 +51,30 @@ func (r *candidateTestRepository) GeneratedCandidateAuthority(
 	if r == nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
-	return NewGeneratedCandidateAuthority(r.stores, process, environment, budget, options)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.authority != nil {
+		if r.authority.process != process || r.authority.environment != environment ||
+			r.authority.budget != budget || r.authority.options != options {
+			return nil, deploymentexecution.ErrInvalidConfiguration
+		}
+		return r.authority, nil
+	}
+	authority, err := newGeneratedCandidateAuthorityConcrete(r.stores, process, environment, budget, options)
+	if err != nil {
+		return nil, err
+	}
+	r.authority = authority
+	return authority, nil
 }
 
 func (r *candidateTestRepository) candidateAuthority() *GeneratedCandidateAuthority {
-	if r == nil || r.stores == nil || r.stores.Repository() == nil {
+	if r == nil {
 		return nil
 	}
-	generatedCandidateAuthorityRegistries.Lock()
-	registry := generatedCandidateAuthorityRegistries.values[r.stores.Repository()]
-	generatedCandidateAuthorityRegistries.Unlock()
-	if registry == nil {
-		return nil
-	}
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	return registry.authority
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.authority
 }
 
 type candidateTestGuarded struct {
@@ -85,6 +96,8 @@ type candidateMigrationRequestFixture struct {
 
 type generatedMigrationFixture struct {
 	repository     *candidateTestRepository
+	bindings       *deploymentbinding.Repository
+	jobService     *jobs.Service
 	configuration  *appconfig.Store
 	guarded        *candidateTestGuarded
 	releaseEffects func() error
@@ -156,7 +169,7 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if err != nil {
 		t.Fatal(err)
 	}
-	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, repository, stores, plans,
+	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, bindings, repository, stores, plans,
 		configuration, directories.WorkingDirectory, planComponentNames, runtimeComponentNames)
 }
 
@@ -209,18 +222,19 @@ func newGeneratedMigrationFixtureOnDomainWithComponents(t *testing.T, identity g
 	if !stores.ConfiguredForDomain(identity.dataRoot, identity.options.WorkingDirectory) {
 		t.Fatal("generated migration fixture did not retain exact domain provenance")
 	}
-	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, repository,
+	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, bindings, repository,
 		stores, plans, configuration,
 		identity.options.WorkingDirectory, planComponentNames, runtimeComponentNames)
 }
 
 func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobService *jobs.Service,
+	bindings *deploymentbinding.Repository,
 	repository *deployments.Repository, stores *deployments.GeneratedOwnerStores,
 	plans *deploymentplans.Store, configuration *appconfig.Store, workingDirectory string,
 	planComponentNames, runtimeComponentNames []string,
 ) *generatedMigrationFixture {
 	t.Helper()
-	if db == nil || jobService == nil || repository == nil || stores == nil || plans == nil ||
+	if db == nil || jobService == nil || bindings == nil || repository == nil || stores == nil || plans == nil ||
 		configuration == nil || workingDirectory == "" {
 		t.Fatal("generated migration fixture dependencies are incomplete")
 	}
@@ -354,7 +368,8 @@ func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobS
 		t.Fatal(err)
 	}
 	return &generatedMigrationFixture{
-		repository: testRepository, configuration: configuration, guarded: guarded,
+		repository: testRepository, bindings: bindings, jobService: jobService,
+		configuration: configuration, guarded: guarded,
 		releaseEffects: releaseEffects, plan: plan, claim: claim, binding: created.Binding,
 		request: candidateMigrationRequestFixture{
 			DeploymentID: deployment.ID, ReleaseID: releaseID,

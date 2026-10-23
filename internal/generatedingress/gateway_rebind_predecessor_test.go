@@ -27,6 +27,7 @@ type gatewayRebindPredecessorFixture struct {
 	store      *gatewayUpgradeStateStore
 	repository *appaccess.Repository
 	db         *sql.DB
+	migration  *generatedMigrationFixture
 	runner     *ingressRunner
 	state      gatewayV2RouteState
 	journal    gatewayMigrationJournal
@@ -313,11 +314,9 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	appID := uuid.NewString()
-	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
-		VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`, appID, "rebind-"+appID, "Rebind app"); err != nil {
-		t.Fatal(err)
-	}
+	migration, _ := newGeneratedRouteCanonicalMigrationOnDatabase(t, db, manager.options.DataRoot,
+		manager.options.WorkingDirectory)
+	appID := migration.guarded.appID
 	allocation, _, err := repository.ReserveAppAccess(ctx, appaccess.ReserveAppAccessInput{
 		AppID: appID, OperationID: uuid.NewString(), GatewayProfileRevisionID: profile.ID,
 		GatewayProfileRevisionNumber: profile.RevisionNumber,
@@ -362,7 +361,8 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	active := seedGatewayRebindPredecessorRuntime(t, db, appID)
+	active, activeEndpoint := seedGatewayRebindPredecessorRuntimeWithContainerID(t, manager, runner, migration,
+		strings.Repeat(string(endpointID), 64))
 
 	upgradeSpec := appaccess.GatewayProfileUpgradeSpec{
 		ProfileRevisionID: profile.ID, ProfileRevisionNumber: profile.RevisionNumber, ProfileSpecDigest: profile.SpecDigest,
@@ -396,10 +396,8 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 
 	source := routeState{Version: stateVersion, Active: map[string]routeRecord{
 		appID: {
-			Slot: generatedidentity.Slot(active.Slot),
-			Endpoints: []generatedroute.RouteEndpoint{
-				endpoint("api", "server", "rebind-app-network", "rebind-app-blue", 3000, endpointID),
-			},
+			Slot:      generatedidentity.Slot(active.Slot),
+			Endpoints: []generatedroute.RouteEndpoint{activeEndpoint},
 		},
 	}}
 	if err := manager.store.save(source); err != nil {
@@ -558,7 +556,7 @@ func newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t *testing.T, 
 		t.Fatal(err)
 	}
 	return gatewayRebindPredecessorFixture{
-		manager: manager, store: store, repository: repository, db: db, runner: runner,
+		manager: manager, store: store, repository: repository, db: db, migration: migration, runner: runner,
 		state: loadedState, journal: loadedJournal,
 		proposal: appaccess.GatewayRebindPreclaimProposal{
 			Spec: rebindSpec, RebindApproval: rebindApproval,
@@ -577,89 +575,63 @@ func gatewayRebindTestDigest(t *testing.T, value any) string {
 	return hex.EncodeToString(digest[:])
 }
 
-func seedGatewayRebindPredecessorRuntime(t *testing.T, db *sql.DB, appID string) generatedruntimestate.ActiveHead {
-	return seedGatewayRebindPredecessorRuntimeWithContainerID(t, db, appID, strings.Repeat("3", 64))
+func seedGatewayRebindPredecessorRuntime(t *testing.T, manager *Manager, runner *ingressRunner,
+	migration *generatedMigrationFixture,
+) (generatedruntimestate.ActiveHead, generatedroute.RouteEndpoint) {
+	return seedGatewayRebindPredecessorRuntimeWithContainerID(t, manager, runner, migration,
+		strings.Repeat("3", 64))
 }
 
-// seedGatewayRebindPredecessorRuntimeWithContainerID builds the same active
-// predecessor runtime as the default helper while allowing a composition
-// fixture to model a second app with its own concrete endpoint identity.
-func seedGatewayRebindPredecessorRuntimeWithContainerID(t *testing.T, db *sql.DB, appID, containerID string) generatedruntimestate.ActiveHead {
+func seedGatewayRebindPredecessorRuntimeWithContainerID(t *testing.T, manager *Manager, runner *ingressRunner,
+	migration *generatedMigrationFixture, containerID string,
+) (generatedruntimestate.ActiveHead, generatedroute.RouteEndpoint) {
 	t.Helper()
-	planID, releaseID, deploymentID, jobID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
-	stamp := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(
-		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
-		analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,
-		field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at
-	) VALUES(?,?,1,?,'generated_node','test','1',?,'local',0,?,?,1,8,'',?,?,'accepted',?,?)`,
-		planID, appID, "apps/"+appID+"/deployment-plans/"+planID+".secret",
-		strings.Repeat("c", 64), strings.Repeat("d", 64), strings.Repeat("e", 64),
-		gatewayRebindTestAdministrator, stamp, gatewayRebindTestAdministrator, stamp); err != nil {
-		t.Fatal(err)
+	if manager == nil || runner == nil || migration == nil {
+		t.Fatal("gateway rebind predecessor runtime dependencies are incomplete")
 	}
-	if _, err := db.Exec(`INSERT INTO releases(
-		id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,
-		workspace_state,workspace_tree_sha256,deployment_plan_revision_id,deployment_plan_revision_number
-	) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,1)`, releaseID, appID, stamp,
-		strings.Repeat("d", 64), strings.Repeat("f", 64), planID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,created_at,updated_at)
-		VALUES(?,'deploy','application',?,'running','running',?,?,?)`, jobID, appID,
-		gatewayRebindTestAdministrator, stamp, stamp); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO deployments(
-		id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,
-		deployment_plan_revision_id,deployment_plan_revision_number
-	) VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,1)`, deploymentID, appID, releaseID, jobID, planID); err != nil {
-		t.Fatal(err)
-	}
-	runtime := generatedruntimestate.New(db)
-	value, _, err := runtime.Begin(context.Background(), generatedruntimestate.BeginInput{
-		DeploymentID: deploymentID, AppID: appID, ReleaseID: releaseID,
-		DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, ComponentNames: []string{"api"},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	artifactID := uuid.NewString()
-	if _, err := db.Exec(`INSERT INTO generated_image_artifacts(
-		id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,
-		compiler_version,build_definition_digest,attempt_number,image_content_id,state,
-		created_at,updated_at,finished_at
-	) VALUES(?,?,?,?,?,'test',?,1,?,'ready',?,?,?)`, artifactID, releaseID, planID, 1, "api",
-		strings.Repeat("1", 64), "sha256:"+strings.Repeat("2", 64), stamp, stamp, stamp); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetImageReady(context.Background(), appID, deploymentID, "api", artifactID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetContainerStarting(context.Background(), appID, deploymentID, "api", "rig-rebind-api"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetContainerRunning(context.Background(), appID, deploymentID, "api", containerID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.AdvanceComponent(context.Background(), appID, deploymentID, "api",
-		generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatal(err)
-	}
-	for _, next := range []generatedruntimestate.Phase{
-		generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate,
-		generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute,
-	} {
-		value, err = runtime.Advance(context.Background(), appID, deploymentID, value.Phase, next, "")
-		if err != nil {
-			t.Fatal(err)
+	owner, _ := newGeneratedRouteSequentialCandidateOwnerForMigrationWithContainerID(t, migration, containerID)
+	execution, identity := prepareGeneratedRouteSequentialCandidate(t, owner)
+	endpoint := generatedRouteEndpoint(identity)
+	endpoints := make(map[string]generatedRouteEndpointSnapshot)
+	if installed, ok := manager.runner.(*generatedRoutePredecessorRunner); ok {
+		for id, snapshot := range installed.endpoints {
+			endpoints[id] = snapshot
 		}
+	} else {
+		runner.appID = migration.guarded.appID
+		runner.network = endpoint.NetworkName
+		runner.endpoint = endpoint
 	}
-	head, changed, err := runtime.SwitchActive(context.Background(), appID, deploymentID, 0)
-	if err != nil || !changed {
-		t.Fatalf("switch runtime head=%#v changed=%t error=%v", head, changed, err)
+	endpoints[identity.ContainerID] = generatedRouteEndpointSnapshot{appID: migration.guarded.appID,
+		endpoint: endpoint, slot: generatedidentity.Slot(identity.Slot)}
+	manager.runner = &generatedRoutePredecessorRunner{ingressRunner: runner,
+		slot: generatedidentity.Slot(identity.Slot), endpoints: endpoints}
+	authority, err := newGeneratedRouteAuthority(manager, owner.authority, owner.authority.stores)
+	if err != nil {
+		t.Fatalf("construct predecessor route authority: %v", err)
 	}
-	return head
+	activation, err := authority.Pin(migration.guarded.context, execution,
+		generatedRouteRequest(migration.guarded.appID, identity))
+	if err != nil {
+		t.Fatalf("pin predecessor route: %v", err)
+	}
+	if _, err := activation.Activate(migration.guarded.context); err != nil {
+		t.Fatalf("activate predecessor route: %v", err)
+	}
+	head, err := generatedruntimestate.New(migration.repository.db).Active(context.Background(),
+		migration.guarded.appID)
+	if err != nil {
+		t.Fatalf("read predecessor active head: %v", err)
+	}
+	// Gateway rebind fixtures model completed deploy SQL/runtime authority but
+	// deliberately retain no application lifecycle operation. Current-V2
+	// promotion tests assert that this lifecycle head remains uninitialized.
+	completeGeneratedRouteSequentialCandidateState(t, owner, head)
+	execution.Leave()
+	if err := migration.releaseEffects(); err != nil {
+		t.Fatalf("release predecessor deployment effects: %v", err)
+	}
+	return head, endpoint
 }
 
 func insertGatewayRebindPredecessorClaim(t *testing.T, db *sql.DB, claim appaccess.GatewayRebindClaim) {

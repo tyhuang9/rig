@@ -136,13 +136,11 @@ func newGatewayRebindCurrentAttestationTwoAppCompositionFixture(t *testing.T) (g
 ) {
 	t.Helper()
 	f := newGatewayRebindPredecessorFixtureWithEndpointAndLANApprover(t, false, '3', uuid.NewString())
-	loopbackID := "f1111111-1111-4111-8111-111111111111"
-	if _, err := f.db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
-		VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`,
-		loopbackID, "rebind-loopback-"+loopbackID, "Loopback-only rebind app"); err != nil {
-		t.Fatal(err)
-	}
-	head := seedGatewayRebindPredecessorRuntimeWithContainerID(t, f.db, loopbackID, strings.Repeat("7", 64))
+	migration, _ := newGeneratedRouteCanonicalMigrationOnDatabase(t, f.db, f.manager.options.DataRoot,
+		f.manager.options.WorkingDirectory)
+	loopbackID := migration.guarded.appID
+	head, loopbackEndpoint := seedGatewayRebindPredecessorRuntimeWithContainerID(t, f.manager, f.runner,
+		migration, strings.Repeat("7", 64))
 	var loopbackJobID string
 	if err := f.db.QueryRow(`SELECT job_id FROM deployments
 		WHERE id=? AND app_id=? AND status='preparing'`, head.DeploymentID, loopbackID).Scan(&loopbackJobID); err != nil {
@@ -168,10 +166,6 @@ func newGatewayRebindCurrentAttestationTwoAppCompositionFixture(t *testing.T) (g
 	if err != nil || deploymentRows != 1 {
 		t.Fatal("two-app composition fixture did not settle exactly one loopback deployment")
 	}
-	network, err := generatedidentity.DescribeAppNetwork(loopbackID)
-	if err != nil {
-		t.Fatal(err)
-	}
 	state := cloneGatewayV2RouteState(f.state)
 	lanAppID := f.stateAppID()
 	lanRoute, found := state.Apps[lanAppID]
@@ -181,9 +175,7 @@ func newGatewayRebindCurrentAttestationTwoAppCompositionFixture(t *testing.T) (g
 	loopbackRoute := cloneGatewayV2AppRoute(lanRoute)
 	loopbackRoute.LAN = nil
 	loopbackRoute.Route.Slot = generatedidentity.Slot(head.Slot)
-	loopbackRoute.Route.Endpoints = []generatedroute.RouteEndpoint{
-		endpoint("api", "server", network.Name, "rebind-loopback-"+head.Slot, 3000, '7'),
-	}
+	loopbackRoute.Route.Endpoints = []generatedroute.RouteEndpoint{loopbackEndpoint}
 	state.Apps[loopbackID] = loopbackRoute
 	if err := f.store.writeExact(f.store.v2Path, f.store.v2Purpose, state, false, maxV2RouteStateBytes); err != nil {
 		t.Fatal(err)

@@ -21,23 +21,20 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
 
 const nextLiveBaseImage = "node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e"
-
-type nextLiveCapacity struct{}
-
-func (nextLiveCapacity) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
-	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 8 << 30, DiskAvailableBytes: 16 << 30}, nil
-}
 
 // This gate deliberately exercises the production runtime and ingress with a
 // separately built fixture image. Compiler and durable-controller journeys have
@@ -56,12 +53,15 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 		t.Fatal("Docker daemon unavailable")
 	}
 	root := t.TempDir()
-	dockerConfig, working, dataRoot := filepath.Join(root, "docker-config"), filepath.Join(root, "working"), filepath.Join(root, "data")
-	for _, directory := range []string{dockerConfig, working, dataRoot} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
+	dataRoot := filepath.Join(root, "data")
+	if err := os.Mkdir(dataRoot, 0o700); err != nil {
+		t.Fatal(err)
 	}
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerConfig, working := directories.DockerConfigDirectory, directories.WorkingDirectory
 	appID, releaseID, artifactID, planID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	network, err := generatedruntime.DescribeAppNetwork(appID)
 	if err != nil {
@@ -83,7 +83,12 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &runtimeprocess.ExecRunner{}
-	db, err := database.Open(dataRoot)
+	controllerLease, err := controllerowner.Acquire(ctx, working)
+	if err != nil {
+		t.Fatal("acquire Next cache controller owner")
+	}
+	t.Cleanup(func() { _ = controllerLease.Close() })
+	db, err := database.OpenForGeneratedDomain(ctx, dataRoot, controllerLease)
 	if err != nil {
 		t.Fatal("open Next cache controller database")
 	}
@@ -92,27 +97,45 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 			t.Error("close Next cache controller database")
 		}
 	})
-	authority := liveauthority.New(t, db, working)
-	engine, err := generatedruntime.NewEngine(runner, environment, nextLiveCapacity{}, authority.Repository(), generatedruntime.EngineOptions{
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := appconfig.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := liveauthority.NewWithStores(t, db, working, plans, configuration)
+	stores, err := authority.Repository().GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := generatedruntime.EngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
+		OutputLimit:          64 << 10,
 		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256, TmpfsBytes: 64 << 20, LogSize: "1m", LogFiles: 2},
 		ReplacementDiskBytes: 512 << 20,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 	port := uint16(controllerJourneyPort(t, "127.0.0.1"))
-	accessRepository := appaccess.New(db)
-	ingress, err := generatedingress.New(runner, generatedingress.Options{
-		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
-		DataRoot: dataRoot, HostPort: port, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
-		RebindFenceCheck:             accessRepository.CheckGatewayRebindFence,
-		RebindCurrentStateRepository: accessRepository,
+	domain, err := generatedingress.NewGeneratedDomain(ctx, stores, runner, environment, generatedingress.GeneratedDomainOptions{
+		DockerExecutable: options.DockerExecutable, DockerConfigDirectory: options.DockerConfigDirectory,
+		WorkingDirectory: options.WorkingDirectory, DataRoot: dataRoot, HostPort: port,
+		CommandTimeout: options.CommandTimeout, PullTimeout: 5 * time.Minute,
+		HealthTimeout: options.HealthTimeout, HealthPollInterval: options.HealthPollInterval,
+		OutputLimit: options.OutputLimit, MemoryBytes: options.Limits.MemoryBytes,
+		MilliCPUs: options.Limits.MilliCPUs, PIDs: options.Limits.PIDs,
+		TmpfsBytes: options.Limits.TmpfsBytes, LogSize: options.Limits.LogSize,
+		LogFiles: options.Limits.LogFiles, ReplacementDiskBytes: options.ReplacementDiskBytes,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	engine, err := generatedruntime.NewEngine(runner, environment, domain.Candidates(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingress := domain.Gateway()
 	definition := sha256.Sum256([]byte("reviewed-nextjs-cache-fixture-v1"))
 	spec := generatedruntime.CandidateSpec{
 		AppID: appID, ReleaseID: releaseID, DeploymentID: uuid.NewString(), ArtifactID: artifactID,
@@ -138,11 +161,10 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 		t.Fatal("Next candidate unhealthy:", err)
 	}
 	assertNextLiveContainer(t, ctx, docker, blue, firstSecret)
-	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{nextLiveEndpoint(blue)}}); err != nil {
+	if err := blueSession.ActivateRoute(domain.Routes(), generatedruntime.RouteSwitchRequest{AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedruntime.RouteEndpoint{nextLiveEndpoint(blue)}}); err != nil {
 		t.Fatal("route initial Next server:", err)
 	}
 	nextLiveAttestedEndpoint(t, ctx, ingress, appID, blue)
-	nextLiveRecordPublished(t, ctx, ingress, appID, blueSession)
 	blueSession.Close()
 	base := "http://127.0.0.1:" + strconv.Itoa(int(port))
 	nextLiveRequest(t, ctx, base, appID, "/", http.StatusOK, "next-public-A", firstSecret)
@@ -174,14 +196,13 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	}
 	assertNextLiveContainer(t, ctx, docker, green, secondSecret)
 	nextLiveRequest(t, ctx, base, appID, "/api/runtime", http.StatusOK, `"runtimeMarker":"blue"`, firstSecret)
-	if err := ingress.Switch(ctx, generatedruntime.RouteSwitchRequest{
+	if err := greenSession.ActivateRoute(domain.Routes(), generatedruntime.RouteSwitchRequest{
 		AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot,
 		Endpoints: []generatedruntime.RouteEndpoint{nextLiveEndpoint(green)}, DrainPeriod: time.Second,
 	}); err != nil {
 		t.Fatal("replace Next route:", err)
 	}
 	nextLiveAttestedEndpoint(t, ctx, ingress, appID, green)
-	nextLiveRecordPublished(t, ctx, ingress, appID, greenSession)
 	greenSession.Close()
 	nextLiveRequest(t, ctx, base, appID, "/", http.StatusOK, "next-public-A", secondSecret)
 	nextLiveRequest(t, ctx, base, appID, "/api/runtime", http.StatusOK, `"runtimeMarker":"green"`, secondSecret)
@@ -192,14 +213,6 @@ func TestLiveNextCacheRuntimeRoute(t *testing.T) {
 	}
 	nextLiveRequest(t, ctx, base, appID, "/api/health", http.StatusOK, `"status":"ok"`, secondSecret)
 	t.Logf("Next cache runtime route passed: app=%s release=%s blue=%s green=%s port=%d; predecessor retirement remains pending", appID, releaseID, blue.Slot, green.Slot, port)
-}
-
-func nextLiveRecordPublished(t *testing.T, ctx context.Context, ingress *generatedingress.Manager, appID string, session *liveauthority.CandidateSession) {
-	t.Helper()
-	observation, err := ingress.Observe(ctx, appID)
-	if err != nil || session.RoutePublished(observation.Slot, observation.Endpoints) != nil {
-		t.Fatal("record exact observed Next route")
-	}
 }
 
 // Restart is a fixture action. This read-only observation proves Docker health;

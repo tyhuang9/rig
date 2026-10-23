@@ -93,11 +93,15 @@ func TestGeneratedExecutorRoutePauseAttribution(t *testing.T) {
 	t.Run("post active route state persistence", func(t *testing.T) {
 		fixture := newSealedExecutorFixture(t)
 		logs := attachRoutePauseTestLogger(fixture.executor)
-		fixture.state.failAdvanceToDraining = true
+		fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
 
 		result, err := fixture.execute()
 		requireRoutePauseResult(t, result, err)
 		requireRoutePauseRecord(t, logs, routePauseStageRouteSwitch, routePauseCauseUnknown)
+		if runtime := fixture.runtimeDeployment(t); runtime.Phase != generatedruntimestate.PhaseDraining ||
+			fixture.routes.delegateCalls != 1 {
+			t.Fatalf("durable activation runtime=%+v delegate calls=%d", runtime, fixture.routes.delegateCalls)
+		}
 	})
 
 	t.Run("receipt owned predecessor retirement", func(t *testing.T) {
@@ -154,7 +158,7 @@ func TestGeneratedExecutorRoutePauseCauseClassification(t *testing.T) {
 	}{
 		{name: "retirement unavailable", err: errors.Join(errors.New("private detail"), deployments.ErrGeneratedCandidateRetirementUnavailable), want: routePauseCauseRetirementUnavailable},
 		{name: "candidate cleanup", err: &generatedruntime.Error{Code: generatedruntime.DiagnosticCandidateCleanupFailed}, want: routePauseCauseCandidateCleanupFailed},
-		{name: "gateway readiness", err: routeSwitchError{gatewayReadinessFailed: true}, want: routePauseCauseGatewayReadinessFailed},
+		{name: "gateway readiness", err: routeSwitchError{cause: routePauseCauseGatewayReadinessFailed}, want: routePauseCauseGatewayReadinessFailed},
 		{name: "canceled", err: context.Canceled, want: routePauseCauseCanceled},
 		{name: "deadline", err: context.DeadlineExceeded, want: routePauseCauseDeadlineExceeded},
 		{name: "state not found", err: generatedruntimestate.ErrNotFound, want: routePauseCauseStateNotFound},
@@ -172,6 +176,33 @@ func TestGeneratedExecutorRoutePauseCauseClassification(t *testing.T) {
 }
 
 func TestGeneratedExecutorRoutePauseDiagnosticControls(t *testing.T) {
+	t.Run("route adapter retains only closed causes", func(t *testing.T) {
+		const secret = "token=do-not-disclose /private/path"
+		for _, test := range []struct {
+			name string
+			err  error
+			want routePauseCause
+		}{
+			{name: "canceled", err: errors.Join(errors.New(secret), context.Canceled), want: routePauseCauseCanceled},
+			{name: "deadline", err: errors.Join(errors.New(secret), context.DeadlineExceeded), want: routePauseCauseDeadlineExceeded},
+			{name: "not found", err: errors.Join(errors.New(secret), generatedruntimestate.ErrNotFound), want: routePauseCauseStateNotFound},
+			{name: "invalid state", err: errors.Join(errors.New(secret), generatedruntimestate.ErrInvalidState), want: routePauseCauseInvalidState},
+			{name: "invalid transition", err: errors.Join(errors.New(secret), generatedruntimestate.ErrInvalidTransition), want: routePauseCauseInvalidTransition},
+			{name: "conflict", err: errors.Join(errors.New(secret), generatedruntimestate.ErrConflict), want: routePauseCauseStateConflict},
+			{name: "unknown", err: errors.New(secret), want: routePauseCauseUnknown},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				adapted := newRouteSwitchError(test.err, "route activation failed")
+				if got := classifyRoutePauseCause(adapted); got != test.want {
+					t.Fatalf("cause=%q want=%q", got, test.want)
+				}
+				if strings.Contains(adapted.Error(), secret) || errors.Is(adapted, test.err) {
+					t.Fatalf("adapter retained raw route error: %v", adapted)
+				}
+			})
+		}
+	})
+
 	t.Run("logger write failure cannot change pause", func(t *testing.T) {
 		fixture := newExecutorFixture(t, false)
 		fixture.executor.options.RoutePauseLogger = slog.New(slog.NewJSONHandler(routePauseFailingWriter{}, nil))

@@ -5,16 +5,17 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/database"
-	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
-	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 type operationFixture struct {
@@ -1089,11 +1090,9 @@ func assertResolutionFailsClosed(t *testing.T, fixture *operationFixture) {
 func newOperationFixture(t *testing.T, componentCount int) *operationFixture {
 	t.Helper()
 	dataRoot := filepath.Join(t.TempDir(), "state")
-	db, err := databasefixture.Open(dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	// The retained baseline predates receipt-bound route activation. Build it
+	// under schema041, then upgrade before any lifecycle operation under test.
+	db := openHistoricalOperationDatabase(t, dataRoot)
 	f := &operationFixture{db: db, repo: New(db), jobs: jobs.New(db), dataRoot: dataRoot, appID: uuid.NewString(), actorID: uuid.NewString()}
 	planID, releaseID, deploymentID, deployJobID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
 	stamp := operationStamp()
@@ -1127,10 +1126,11 @@ func newOperationFixture(t *testing.T, componentCount int) *operationFixture {
 	if componentCount == 2 {
 		names = append(names, "web")
 	}
-	runtime := generatedruntimestate.New(db)
-	value, created, err := runtime.Begin(context.Background(), generatedruntimestate.BeginInput{DeploymentID: deploymentID, AppID: f.appID, ReleaseID: releaseID, DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, ComponentNames: names})
-	if err != nil || !created {
-		t.Fatalf("runtime begin=%#v created=%t error=%v", value, created, err)
+	if _, err := db.Exec(`INSERT INTO generated_runtime_deployments(
+		deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,
+		candidate_slot,phase,migration_state,created_at,updated_at
+	) VALUES(?,?,?,?,1,'blue','preflight','not_required',?,?)`, deploymentID, f.appID, releaseID, planID, stamp, stamp); err != nil {
+		t.Fatal(err)
 	}
 	components := make([]RetainedComponent, 0, len(names))
 	for _, name := range names {
@@ -1140,39 +1140,46 @@ func newOperationFixture(t *testing.T, componentCount int) *operationFixture {
 			VALUES(?,?,?,?,?,'test',?,1,?,'ready',?,?,?)`, artifactID, releaseID, planID, 1, name, definition, image, stamp, stamp, stamp); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := runtime.SetImageReady(context.Background(), f.appID, deploymentID, name, artifactID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := runtime.SetContainerStarting(context.Background(), f.appID, deploymentID, name, containerName); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := runtime.SetContainerRunning(context.Background(), f.appID, deploymentID, name, containerID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := runtime.AdvanceComponent(context.Background(), f.appID, deploymentID, name, generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-			t.Fatal(err)
+		for index, statement := range []struct {
+			query string
+			args  []any
+		}{
+			{`INSERT INTO generated_runtime_components(deployment_id,component_name,slot,state,created_at,updated_at)
+				VALUES(?,?,'blue','pending',?,?)`, []any{deploymentID, name, stamp, stamp}},
+			{`UPDATE generated_runtime_components SET state='image_ready',image_artifact_id=? WHERE deployment_id=? AND component_name=?`, []any{artifactID, deploymentID, name}},
+			{`UPDATE generated_runtime_components SET state='starting',container_name=? WHERE deployment_id=? AND component_name=?`, []any{containerName, deploymentID, name}},
+			{`UPDATE generated_runtime_components SET state='running',container_id=? WHERE deployment_id=? AND component_name=?`, []any{containerID, deploymentID, name}},
+			{`UPDATE generated_runtime_components SET state='healthy' WHERE deployment_id=? AND component_name=?`, []any{deploymentID, name}},
+		} {
+			if _, err := db.Exec(statement.query, statement.args...); err != nil {
+				t.Fatalf("historical %s phase %d: %v", name, index+1, err)
+			}
 		}
 		components = append(components, RetainedComponent{Name: name, Role: "service", Technology: "node", ContainerID: containerID,
 			ContainerName: containerName, ArtifactID: artifactID, ImageContentID: image, BuildDefinitionDigest: definition,
 			NetworkName: "rig", NetworkAlias: name, InternalPort: 8080, WorkingDirectory: "/app", RunCommandDigest: digestFor(name + "-command"),
 			Limits: RetainedLimits{MemoryBytes: 128 << 20, MemorySwapBytes: 256 << 20, CPUQuota: 50000, CPUPeriod: 100000, PIDsLimit: 128, TmpfsBytes: 16 << 20, LogDriver: "local", LogMaxSize: "10m", LogMaxFiles: 3, HardeningPolicyVersion: "v1"}})
 	}
-	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate, generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute} {
-		value, err = runtime.Advance(context.Background(), f.appID, deploymentID, value.Phase, next, "")
-		if err != nil {
+	for _, next := range []string{"building", "starting_candidate", "waiting_health", "switching_route"} {
+		if _, err := db.Exec(`UPDATE generated_runtime_deployments SET phase=?,updated_at=? WHERE deployment_id=?`, next, stamp, deploymentID); err != nil {
 			t.Fatal(err)
 		}
 	}
-	head, changed, err := runtime.SwitchActive(context.Background(), f.appID, deploymentID, 0)
-	if err != nil || !changed {
-		t.Fatalf("active head=%#v changed=%t error=%v", head, changed, err)
-	}
-	value, err = runtime.Advance(context.Background(), f.appID, deploymentID, value.Phase, generatedruntimestate.PhaseDraining, "")
+	result, err := db.Exec(`UPDATE generated_runtime_active_heads
+		SET deployment_id=?,release_id=?,slot='blue',generation=1,updated_at=? WHERE app_id=? AND generation=0`, deploymentID, releaseID, stamp, f.appID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	value, err = runtime.Advance(context.Background(), f.appID, deploymentID, value.Phase, generatedruntimestate.PhaseSucceeded, "")
-	if err != nil {
+	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		t.Fatalf("historical head change=%d error=%v", changed, err)
+	}
+	if _, err := db.Exec(`UPDATE generated_runtime_components SET state='active',updated_at=? WHERE deployment_id=?`, stamp, deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE generated_runtime_deployments SET phase='draining',updated_at=? WHERE deployment_id=?`, stamp, deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE generated_runtime_deployments SET phase='succeeded',updated_at=?,finished_at=? WHERE deployment_id=?`, stamp, stamp, deploymentID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`UPDATE deployments SET status='succeeded',started_at=?,finished_at=? WHERE id=?`, stamp, stamp, deploymentID); err != nil {
@@ -1181,7 +1188,27 @@ func newOperationFixture(t *testing.T, componentCount int) *operationFixture {
 	if _, err := db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded' WHERE id=?`, deployJobID); err != nil {
 		t.Fatal(err)
 	}
-	f.pins = GeneratedLifecyclePinsV1{Version: 1, DeploymentID: deploymentID, ReleaseID: releaseID, Slot: head.Slot, ActiveGeneration: head.Generation,
+	if err := database.Migrate(db); err != nil {
+		t.Fatalf("upgrade lifecycle serving history: %v", err)
+	}
+	var activationReceipts, receiptHeads, retained int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM generated_route_activations`).Scan(&activationReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM generated_runtime_active_heads WHERE activation_receipt_id IS NOT NULL`).Scan(&receiptHeads); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM generated_runtime_active_heads h
+		JOIN generated_runtime_deployments d ON d.deployment_id=h.deployment_id AND d.app_id=h.app_id
+		JOIN generated_runtime_components c ON c.deployment_id=d.deployment_id AND c.slot=h.slot
+		WHERE h.app_id=? AND h.deployment_id=? AND h.release_id=? AND h.slot='blue' AND h.generation=1
+		AND h.activation_receipt_id IS NULL AND d.phase='succeeded' AND c.state='active'`, f.appID, deploymentID, releaseID).Scan(&retained); err != nil {
+		t.Fatal(err)
+	}
+	if activationReceipts != 0 || receiptHeads != 0 || retained != len(names) {
+		t.Fatalf("historical upgrade changed retained serving state: receipts=%d heads=%d components=%d want=%d", activationReceipts, receiptHeads, retained, len(names))
+	}
+	f.pins = GeneratedLifecyclePinsV1{Version: 1, DeploymentID: deploymentID, ReleaseID: releaseID, Slot: "blue", ActiveGeneration: 1,
 		PlanRevision: RevisionRef{ID: planID, Number: 1}, Configuration: ConfigurationRef{FormatVersion: 0, PlanRevision: RevisionRef{ID: planID, Number: 1}, RuntimeComponents: names},
 		BaselineDisposition: BaselineRunning, Components: components, Route: AppRouteAnchorV1{SelectedLineageKind: "gateway_rebind", SelectedLineageGeneration: 1,
 			SelectedLineageOperationID: uuid.NewString(), SelectedLineageTerminalDigest: strings.Repeat("f", 64), ProtectedFormatVersion: 2, TargetRecordDigest: strings.Repeat("a", 64)}}
@@ -1262,4 +1289,134 @@ func bytesReplace(value []byte, old, replacement string) []byte {
 }
 func fmtName(name string, components int) string {
 	return name + "-" + string(rune('0'+components)) + "-components"
+}
+
+// These SQL/history fixtures describe serving state written before migration
+// 042 introduced receipt-bound activation. Build the real 001–041 schema once,
+// copy only that empty schema per test, and migrate each populated history before
+// exercising current behavior. Never downgrade a current database or remove its
+// activation guards to construct a positive fixture.
+var historicalOperationTemplate = sync.OnceValues(func() ([]byte, error) {
+	root, err := os.MkdirTemp("", "rig-lifecycle-schema-041-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(root)
+	db, err := openHistoricalOperationConnection(root)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		return nil, err
+	}
+	migrationDir := filepath.Join("..", "database", "migrations")
+	entries, err := os.ReadDir(migrationDir)
+	if err != nil {
+		return nil, err
+	}
+	applied := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= "042_" {
+			continue
+		}
+		applied++
+		if !strings.HasPrefix(entry.Name(), fmt.Sprintf("%03d_", applied)) {
+			return nil, fmt.Errorf("historical migration gap at %s", entry.Name())
+		}
+		body, err := os.ReadFile(filepath.Join(migrationDir, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(string(body)); err == nil {
+			_, err = tx.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(?,datetime('now'))`, entry.Name())
+		}
+		if err != nil {
+			_ = tx.Rollback()
+			return nil, fmt.Errorf("historical migration %s: %w", entry.Name(), err)
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+	}
+	if applied != 41 {
+		return nil, fmt.Errorf("historical migration discovery=%d want=41", applied)
+	}
+	var busy, frames, checkpointed int
+	if err := db.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE)`).Scan(&busy, &frames, &checkpointed); err != nil {
+		return nil, err
+	}
+	if busy != 0 {
+		return nil, fmt.Errorf("historical template checkpoint busy=%d", busy)
+	}
+	if err := db.Close(); err != nil {
+		return nil, err
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(filepath.Join(root, "control.db"+suffix)); !os.IsNotExist(err) {
+			return nil, fmt.Errorf("historical template sidecar %s remains: %v", suffix, err)
+		}
+	}
+	return os.ReadFile(filepath.Join(root, "control.db"))
+})
+
+func openHistoricalOperationConnection(root string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", filepath.Join(root, "control.db"))
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	for _, pragma := range []string{"PRAGMA foreign_keys=ON", "PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=5000"} {
+		if _, err := db.Exec(pragma); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	}
+	return db, nil
+}
+
+func openHistoricalOperationDatabase(t *testing.T, root string) *sql.DB {
+	t.Helper()
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	template, err := historicalOperationTemplate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("historical fixture requires an empty private root: entries=%d error=%v", len(entries), err)
+	}
+	file, err := os.OpenFile(filepath.Join(root, "control.db"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written, writeErr := file.Write(template)
+	closeErr := file.Close()
+	if writeErr != nil || closeErr != nil || written != len(template) || written == 0 {
+		t.Fatalf("copy historical schema: written=%d want=%d write=%v close=%v", written, len(template), writeErr, closeErr)
+	}
+	db, err := openHistoricalOperationConnection(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	var migrations, activationTables int
+	var latest string
+	if err := db.QueryRow(`SELECT COUNT(*),MAX(version) FROM schema_migrations`).Scan(&migrations, &latest); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='generated_route_activations'`).Scan(&activationTables); err != nil {
+		t.Fatal(err)
+	}
+	if migrations != 41 || latest != "041_generated_candidate_intents.sql" || activationTables != 0 {
+		t.Fatalf("historical operation schema is not041: count=%d latest=%q activationTables=%d", migrations, latest, activationTables)
+	}
+	return db
 }

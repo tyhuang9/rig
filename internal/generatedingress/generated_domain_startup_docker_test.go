@@ -898,12 +898,8 @@ func newGeneratedDomainUpgradeFixtureAtPhase(t *testing.T, target gatewayMigrati
 	source := routeState{Version: stateVersion, Active: map[string]routeRecord{}}
 	var installRetainedLAN func(*gatewayUpgradeStateStore, gatewayMigrationJournal, gatewayV2RouteState) gatewayV2RouteState
 	if retainedApp {
-		appID := uuid.NewString()
-		if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
-			VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`, appID,
-			"startup-retained-"+appID, "Startup retained app"); err != nil {
-			t.Fatal(err)
-		}
+		migration := newGeneratedMigrationFixtureOnDomainWithComponents(t, identity, []string{"api"}, []string{"api"})
+		appID := migration.guarded.appID
 		allocation, _, err := repository.ReserveAppAccess(ctx, appaccess.ReserveAppAccessInput{
 			AppID: appID, OperationID: uuid.NewString(), GatewayProfileRevisionID: profile.ID,
 			GatewayProfileRevisionNumber: profile.RevisionNumber,
@@ -945,11 +941,9 @@ func newGeneratedDomainUpgradeFixtureAtPhase(t *testing.T, target gatewayMigrati
 			}); err != nil {
 			t.Fatal(err)
 		}
-		active := seedGatewayRebindPredecessorRuntime(t, db, appID)
+		active, activeEndpoint := seedGatewayRebindPredecessorRuntime(t, manager, runner, migration)
 		source.Active[appID] = routeRecord{Slot: generatedidentity.Slot(active.Slot),
-			Endpoints: []generatedroute.RouteEndpoint{
-				endpoint("api", "server", "startup-retained-network", "startup-retained-blue", 3000, '4'),
-			}}
+			Endpoints: []generatedroute.RouteEndpoint{activeEndpoint}}
 		installRetainedLAN = func(store *gatewayUpgradeStateStore, journal gatewayMigrationJournal,
 			state gatewayV2RouteState,
 		) gatewayV2RouteState {

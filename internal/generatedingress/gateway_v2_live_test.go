@@ -24,10 +24,10 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/hostnetwork"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -201,14 +201,12 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	}
 
 	root := t.TempDir()
-	dockerConfig := filepath.Join(root, "docker-config")
-	working := filepath.Join(root, "working")
 	stateRoot := filepath.Join(root, "ingress-state")
-	for _, directory := range []string{dockerConfig, working, stateRoot} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal("create live gateway-v2 directory")
-		}
+	directories, err := runtimedocker.PrepareControllerDirectories(stateRoot)
+	if err != nil {
+		t.Fatal("prepare live gateway-v2 controller directories:", err)
 	}
+	dockerConfig, working := directories.DockerConfigDirectory, directories.WorkingDirectory
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)
 	t.Cleanup(cancel)
 	runner := &runtimeprocess.ExecRunner{}
@@ -227,30 +225,16 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
-	db, err := database.Open(stateRoot)
-	if err != nil {
-		t.Fatal("open real live gateway-v2 control database")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
-	authority := liveGeneratedDeploymentsWithDatabase(t, db, working)
-	engine, err := newLiveRuntimeEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
+	hostPort := freeLoopbackPort(t)
+	engineOptions := liveRuntimeEngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
-	})
-	if err != nil {
-		t.Fatal("create live gateway-v2 runtime")
 	}
-	ingress, err := New(runner, Options{
-		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
-		DataRoot: stateRoot, HostPort: freeLoopbackPort(t), CommandTimeout: 45 * time.Second,
-		PullTimeout: 5 * time.Minute, OutputLimit: liveDockerOutputLimit,
-		RebindFenceCheck: repository.CheckGatewayRebindFence, RebindCurrentStateRepository: repository,
-	})
-	if err != nil {
-		t.Fatal("create live gateway-v2 ingress")
-	}
+	authority, engine := liveGeneratedDeployments(t, ctx, stateRoot, runner, hostPort, engineOptions)
+	db := authority.db
+	repository := appaccess.New(db)
+	ingress := authority.domain.Gateway()
 	fixture := &liveGatewayV2Fixture{
 		ctx: ctx, runner: runner, docker: docker, root: root, dockerConfig: dockerConfig,
 		stateRoot: stateRoot, db: db, repository: repository, authority: authority, engine: engine,
@@ -277,12 +261,11 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	route := generatedroute.RouteSwitchRequest{
 		AppID: spec.appID, ToSlot: candidate.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(candidate)},
 	}
-	if err := ingress.Switch(ctx, route); err != nil {
+	if err := authority.activate(t, candidate, route); err != nil {
 		failLiveIngress(t, "install gateway-v2 source route", err)
 	}
 	assertLiveOneShot(t, ctx, ingress.options.HostPort, spec.appID, "/", spec.applicationReply,
 		"gateway-v2 source route did not serve through v1")
-	authority.published(t, ctx, ingress, candidate)
 	fixture.source, err = ingress.store.load()
 	if err != nil || fixture.source.Pending != nil {
 		t.Fatal("load gateway-v2 source state")

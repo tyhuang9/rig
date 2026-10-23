@@ -11,7 +11,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/hostd/hostd/internal/generatedingress"
 	"reflect"
 	"sort"
 	"strings"
@@ -27,6 +26,8 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimagestate"
+	"github.com/hostd/hostd/internal/generatedingress"
+	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
@@ -611,10 +612,14 @@ func (s *CandidateSession) RejectObservedFailure() error {
 	return nil
 }
 
-// RoutePublished accepts only the exact observed slot and complete endpoint
-// roster derived afresh through the candidate owner.
-func (s *CandidateSession) RoutePublished(slot generatedruntime.Slot, endpoints []generatedruntime.RouteEndpoint) error {
-	if s == nil || s.execution == nil {
+// ActivateRoute accepts only the exact observed complete endpoint roster and
+// delegates route mutation to the original candidate execution and the
+// caller's complete generated-domain route authority. It exposes neither the
+// execution nor a route proof to the caller.
+func (s *CandidateSession) ActivateRoute(routes *generatedingress.GeneratedRouteAuthority,
+	request generatedroute.RouteSwitchRequest,
+) error {
+	if s == nil || s.execution == nil || routes == nil || s.ctx == nil {
 		return errors.New("live candidate has no route authority")
 	}
 	identity, err := s.execution.ObserveRouteCandidate(s.spec.ComponentName)
@@ -622,7 +627,8 @@ func (s *CandidateSession) RoutePublished(slot generatedruntime.Slot, endpoints 
 		return err
 	}
 	expected := []generatedruntime.RouteEndpoint{endpointFromIdentity(identity)}
-	if slot != generatedruntime.Slot(identity.Slot) || !reflect.DeepEqual(canonicalEndpoints(endpoints), canonicalEndpoints(expected)) {
+	if request.AppID != s.spec.AppID || request.ToSlot != generatedruntime.Slot(identity.Slot) ||
+		!reflect.DeepEqual(canonicalEndpoints(request.Endpoints), canonicalEndpoints(expected)) {
 		return errors.New("published route does not match the exact candidate roster")
 	}
 	current, err := s.authority.runtime.Get(s.ctx, s.spec.AppID, s.spec.DeploymentID)
@@ -630,21 +636,37 @@ func (s *CandidateSession) RoutePublished(slot generatedruntime.Slot, endpoints 
 		return err
 	}
 	hadPredecessor := current.PreviousActiveDeploymentID != ""
-	active, err := s.authority.runtime.Active(s.ctx, s.spec.AppID)
+	before, err := s.authority.runtime.Active(s.ctx, s.spec.AppID)
 	if err != nil {
 		return err
 	}
-	published, switched, err := s.authority.runtime.SwitchActive(s.ctx, s.spec.AppID, s.spec.DeploymentID, active.Generation)
-	if err != nil || (!switched && published.DeploymentID != s.spec.DeploymentID) {
-		return errors.Join(err, errors.New("live route did not switch exact active head"))
+	if (hadPredecessor && (before.DeploymentID != current.PreviousActiveDeploymentID || before.Slot != current.PreviousActiveSlot)) ||
+		(!hadPredecessor && (before.DeploymentID != "" || before.Slot != "")) {
+		return errors.New("live route predecessor changed")
 	}
-	if _, err := s.authority.runtime.Advance(s.ctx, s.spec.AppID, s.spec.DeploymentID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, ""); err != nil {
+	activation, err := routes.Pin(s.ctx, s.execution, request)
+	if err != nil {
 		return err
 	}
+	activated, err := activation.Activate(s.ctx)
+	if err != nil {
+		return err
+	}
+	published, err := s.authority.runtime.Active(s.ctx, s.spec.AppID)
+	if err != nil || activated.AppID != s.spec.AppID || activated.DeploymentID != s.spec.DeploymentID ||
+		activated.ReleaseID != s.spec.ReleaseID || activated.CandidateSlot != identity.Slot ||
+		activated.Phase != generatedruntimestate.PhaseDraining ||
+		published.AppID != s.spec.AppID || published.DeploymentID != s.spec.DeploymentID ||
+		published.ReleaseID != s.spec.ReleaseID || published.Slot != identity.Slot ||
+		published.ActivationReceiptID == "" || published.Generation != before.Generation+1 {
+		return errors.Join(err, errors.New("live route did not commit exact active head"))
+	}
+	s.published = published
 	if hadPredecessor {
 		return nil
 	}
-	if _, err := s.authority.runtime.Advance(s.ctx, s.spec.AppID, s.spec.DeploymentID, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, ""); err != nil {
+	if _, err := s.authority.runtime.Advance(s.ctx, s.spec.AppID, s.spec.DeploymentID,
+		generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, ""); err != nil {
 		return err
 	}
 	if _, err := s.authority.repository.Transition(s.ctx, s.spec.AppID, s.spec.DeploymentID, deployments.Succeeded, ""); err != nil {
@@ -653,7 +675,6 @@ func (s *CandidateSession) RoutePublished(slot generatedruntime.Slot, endpoints 
 	if err := s.finishJob("succeeded", ""); err != nil {
 		return err
 	}
-	s.published = published
 	return nil
 }
 

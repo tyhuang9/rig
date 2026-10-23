@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -16,6 +17,7 @@ import (
 	"github.com/hostd/hostd/internal/apps"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -25,10 +27,10 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	"github.com/hostd/hostd/internal/runtime/docker"
-	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/runtimeexecutor"
 	"github.com/hostd/hostd/internal/sourceconnections"
+	generateddomaintest "github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 func TestResolveRuntimeDockerExecutableOnlyForGeneratedRuntime(t *testing.T) {
@@ -75,16 +77,8 @@ func TestRuntimeCompositionEnablementAndRouterSelection(t *testing.T) {
 			fixture := newRuntimeCompositionFixture(t)
 			configuration := fixture.configuration
 			configuration.FakeRuntime, configuration.ComposeRuntime, configuration.GeneratedRuntime = test.fake, test.compose, test.generated
-			var ingressRecovered int
-			result, err := prepareRuntimeComposition(context.Background(), configuration, fixture.dependencies, runtimeCompositionOptions{
+			result, err := prepareRuntimeCompositionForTest(t, context.Background(), configuration, fixture.dependencies, runtimeCompositionOptions{
 				dockerExecutable: fixture.dockerExecutable,
-				recoverIngress: func(ctx context.Context, _ *generatedingress.Manager) error {
-					if ctx.Err() != nil {
-						t.Fatalf("ingress recovery context = %v", ctx.Err())
-					}
-					ingressRecovered++
-					return nil
-				},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -97,18 +91,55 @@ func TestRuntimeCompositionEnablementAndRouterSelection(t *testing.T) {
 			if !test.fake && !test.wantRouter && result.executor != nil {
 				t.Fatalf("disabled executor = %T", result.executor)
 			}
-			if ingressRecovered != boolInt(test.generated) {
-				t.Fatalf("ingress recovery count = %d", ingressRecovered)
-			}
 		})
 	}
 }
 
-type runtimeCompositionCommandRunner struct{ calls int }
+func prepareCompleteGeneratedRuntimeDomainForTest(t *testing.T, ctx context.Context, configuration config.Config, dependencies runtimeCompositionDependencies, options runtimeCompositionOptions) (*generatedRuntimeDomainDependencies, error) {
+	t.Helper()
+	if !configuration.GeneratedRuntime {
+		return nil, errors.New("generated runtime fixture requires generated runtime")
+	}
+	if options.runner == nil {
+		options.runner = generateddomaintest.NewRunner(generateddomaintest.Options{})
+	}
+	options.beforeStep = nil
+	generated, err := prepareGeneratedRuntimeDomainDependencies(ctx, configuration, dependencies, options)
+	if err != nil {
+		return nil, fmt.Errorf("prepare generated domain dependencies: %w", err)
+	}
+	domain, err := generatedingress.NewGeneratedDomain(ctx, generated.stores, options.runner, generated.environment, generated.options)
+	if err != nil {
+		calls := -1
+		if runner, ok := options.runner.(*generateddomaintest.Runner); ok {
+			calls = runner.Calls()
+		}
+		return nil, fmt.Errorf("construct generated domain after %d Docker calls: %w", calls, err)
+	}
+	joined, err := generatedingress.NewGeneratedDomain(ctx, generated.stores, options.runner, generated.environment, generated.options)
+	if err != nil {
+		return nil, fmt.Errorf("join generated domain: %w", err)
+	}
+	if joined != domain {
+		return nil, errors.New("complete generated domain join returned a different owner")
+	}
+	generated.domain = domain
+	return generated, nil
+}
 
-func (runner *runtimeCompositionCommandRunner) Run(context.Context, runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
-	runner.calls++
-	return runtimeprocess.CommandResult{}, nil
+func prepareRuntimeCompositionForTest(t *testing.T, ctx context.Context, configuration config.Config, dependencies runtimeCompositionDependencies, options runtimeCompositionOptions) (runtimeComposition, error) {
+	t.Helper()
+	if configuration.GeneratedRuntime {
+		if options.runner == nil {
+			options.runner = generateddomaintest.NewRunner(generateddomaintest.Options{})
+		}
+		generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, configuration, dependencies, options)
+		if err != nil {
+			return runtimeComposition{}, err
+		}
+		dependencies.generated = generated
+	}
+	return prepareRuntimeComposition(ctx, configuration, dependencies, options)
 }
 
 func TestHostdDaemonAssemblyRunnerComposesGeneratedRuntime(t *testing.T) {
@@ -117,10 +148,9 @@ func TestHostdDaemonAssemblyRunnerComposesGeneratedRuntime(t *testing.T) {
 		fixture := newRuntimeCompositionFixture(t)
 		fixture.configuration.GeneratedRuntime = true
 		assembly = normalizeHostdDaemonAssembly(assembly)
-		composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+		composition, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 			dockerExecutable: fixture.dockerExecutable,
 			runner:           assembly.runner,
-			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
 		})
 		if err != nil {
 			t.Fatalf("compose generated runtime: %v", err)
@@ -132,18 +162,20 @@ func TestHostdDaemonAssemblyRunnerComposesGeneratedRuntime(t *testing.T) {
 	}
 
 	t.Run("default runner", func(t *testing.T) {
-		compose(t, hostdDaemonAssemblyOptions{})
+		if normalizeHostdDaemonAssembly(hostdDaemonAssemblyOptions{}).runner == nil {
+			t.Fatal("default daemon runner was not installed")
+		}
 	})
 
 	t.Run("injected runner", func(t *testing.T) {
-		injected := &runtimeCompositionCommandRunner{}
+		injected := generateddomaintest.NewRunner(generateddomaintest.Options{})
 		assembly := normalizeHostdDaemonAssembly(hostdDaemonAssemblyOptions{runner: injected})
 		if assembly.runner != injected {
 			t.Fatalf("injected daemon runner identity changed: got %p want %p", assembly.runner, injected)
 		}
 		compose(t, assembly)
-		if injected.calls != 0 {
-			t.Fatalf("composition executed %d injected commands", injected.calls)
+		if injected.Calls() == 0 {
+			t.Fatal("complete generated domain did not use the injected daemon runner")
 		}
 	})
 }
@@ -175,22 +207,18 @@ func TestRuntimeCompositionRequiresSameDatabaseMigrationStoresBeforeSetup(t *tes
 			if err != nil {
 				t.Fatal(err)
 			}
-			steps, recovered := 0, false
-			runner := &runtimeCompositionCommandRunner{}
-			result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
+			steps := 0
+			runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+			result, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
 				dockerExecutable: fixture.dockerExecutable,
 				runner:           runner,
 				beforeStep: func(string) error {
 					steps++
 					return nil
 				},
-				recoverIngress: func(context.Context, *generatedingress.Manager) error {
-					recovered = true
-					return nil
-				},
 			})
-			if err == nil || result.executor != nil || result.generated != nil || steps != 0 || recovered || runner.calls != 0 {
-				t.Fatalf("foreign %s accepted or crossed setup: err=%v steps=%d recovered=%t calls=%d", dependency, err, steps, recovered, runner.calls)
+			if err == nil || result.executor != nil || result.generated != nil || steps != 0 || runner.Calls() != 0 {
+				t.Fatalf("foreign %s accepted or crossed setup: err=%v steps=%d calls=%d", dependency, err, steps, runner.Calls())
 			}
 		})
 	}
@@ -231,22 +259,18 @@ func TestRuntimeCompositionRequiresSameDatabaseDeploymentBindingsBeforeSetup(t *
 						t.Fatal(err)
 					}
 				}
-				steps, recovered := 0, false
-				runner := &runtimeCompositionCommandRunner{}
-				result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
+				steps := 0
+				runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+				result, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
 					dockerExecutable: fixture.dockerExecutable,
 					runner:           runner,
 					beforeStep: func(string) error {
 						steps++
 						return nil
 					},
-					recoverIngress: func(context.Context, *generatedingress.Manager) error {
-						recovered = true
-						return nil
-					},
 				})
-				if err == nil || result.executor != nil || steps != 0 || runner.calls != 0 || recovered {
-					t.Fatalf("composition=%#v error=%v steps=%d runner=%d recovered=%t", result, err, steps, runner.calls, recovered)
+				if err == nil || result.executor != nil || steps != 0 || runner.Calls() != 0 {
+					t.Fatalf("composition=%#v error=%v steps=%d runner=%d", result, err, steps, runner.Calls())
 				}
 			})
 		}
@@ -254,47 +278,94 @@ func TestRuntimeCompositionRequiresSameDatabaseDeploymentBindingsBeforeSetup(t *
 }
 
 func TestRuntimeCompositionRequiresSameDatabaseDeploymentsAndEffectsDirectoryBeforeSetup(t *testing.T) {
-	for _, mode := range []string{"compose", "generated"} {
-		for _, dependency := range []string{"missing deployments", "unconfigured deployments", "foreign deployments", "missing effects directory"} {
-			t.Run(mode+"/"+dependency, func(t *testing.T) {
-				fixture := newRuntimeCompositionFixture(t)
-				fixture.configuration.ComposeRuntime = mode == "compose"
-				fixture.configuration.GeneratedRuntime = mode == "generated"
-				dependencies := fixture.dependencies
-				switch dependency {
-				case "missing deployments":
-					dependencies.deployments = nil
-				case "unconfigured deployments":
-					dependencies.deployments = deployments.New(nil)
-				case "foreign deployments":
-					foreignDB, err := database.Open(filepath.Join(t.TempDir(), "foreign"))
-					if err != nil {
-						t.Fatal(err)
-					}
-					t.Cleanup(func() { _ = foreignDB.Close() })
-					dependencies.deployments = deployments.New(foreignDB)
-				case "missing effects directory":
-					dependencies.effectsWorkingDirectory = ""
+	for _, dependency := range []string{"missing deployments", "unconfigured deployments", "foreign deployments", "missing effects directory"} {
+		t.Run("compose/"+dependency, func(t *testing.T) {
+			fixture := newRuntimeCompositionFixture(t)
+			fixture.configuration.ComposeRuntime = true
+			dependencies := fixture.dependencies
+			switch dependency {
+			case "missing deployments":
+				dependencies.deployments = nil
+			case "unconfigured deployments":
+				dependencies.deployments = deployments.New(nil)
+			case "foreign deployments":
+				foreignDB, err := database.Open(filepath.Join(t.TempDir(), "foreign"))
+				if err != nil {
+					t.Fatal(err)
 				}
-				steps, recovered := 0, false
-				runner := &runtimeCompositionCommandRunner{}
-				result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
-					dockerExecutable: fixture.dockerExecutable,
-					runner:           runner,
-					beforeStep: func(string) error {
-						steps++
-						return nil
-					},
-					recoverIngress: func(context.Context, *generatedingress.Manager) error {
-						recovered = true
-						return nil
-					},
-				})
-				if err == nil || result.executor != nil || steps != 0 || runner.calls != 0 || recovered {
-					t.Fatalf("composition=%#v error=%v steps=%d runner=%d recovered=%t", result, err, steps, runner.calls, recovered)
-				}
+				t.Cleanup(func() { _ = foreignDB.Close() })
+				dependencies.deployments = deployments.New(foreignDB)
+			case "missing effects directory":
+				dependencies.effectsWorkingDirectory = ""
+			}
+			steps := 0
+			runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+			result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, dependencies, runtimeCompositionOptions{
+				runner: runner,
+				beforeStep: func(string) error {
+					steps++
+					return nil
+				},
 			})
+			if err == nil || result.executor != nil || steps != 0 || runner.Calls() != 0 {
+				t.Fatalf("composition=%#v error=%v steps=%d runner=%d", result, err, steps, runner.Calls())
+			}
+		})
+	}
+
+	t.Run("generated/missing deployments rejects before complete-domain requirement", func(t *testing.T) {
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.GeneratedRuntime = true
+		fixture.dependencies.deployments = nil
+		steps := 0
+		result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			beforeStep: func(string) error {
+				steps++
+				return nil
+			},
+		})
+		if err == nil || result.executor != nil || steps != 0 {
+			t.Fatalf("composition=%#v error=%v steps=%d", result, err, steps)
 		}
+	})
+
+	t.Run("generated/missing effects directory rejects during domain preparation", func(t *testing.T) {
+		fixture := newRuntimeCompositionFixture(t)
+		fixture.configuration.GeneratedRuntime = true
+		fixture.dependencies.effectsWorkingDirectory = ""
+		runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+		result, err := prepareGeneratedRuntimeDomainDependencies(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			dockerExecutable: fixture.dockerExecutable,
+			runner:           runner,
+		})
+		if err == nil || result != nil || runner.Calls() != 0 {
+			t.Fatalf("preparation=%#v error=%v runner=%d", result, err, runner.Calls())
+		}
+	})
+
+	for _, dependency := range []string{"unconfigured deployments", "foreign deployments"} {
+		t.Run("generated/domain owns deployments/"+dependency, func(t *testing.T) {
+			fixture := newRuntimeCompositionFixture(t)
+			fixture.configuration.GeneratedRuntime = true
+			if dependency == "unconfigured deployments" {
+				fixture.dependencies.deployments = deployments.New(nil)
+			} else {
+				foreignDB, err := database.Open(filepath.Join(t.TempDir(), "foreign"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = foreignDB.Close() })
+				fixture.dependencies.deployments = deployments.New(foreignDB)
+			}
+			runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+			result, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+				dockerExecutable: fixture.dockerExecutable,
+				runner:           runner,
+			})
+			if err != nil || result.generated == nil || runner.Calls() == 0 {
+				t.Fatalf("composition=%#v error=%v runner=%d", result, err, runner.Calls())
+			}
+		})
 	}
 }
 
@@ -319,7 +390,7 @@ func TestRuntimeCompositionFakeAndDisabledDoNotRequireDeploymentBindings(t *test
 func TestRuntimeCompositionRouterUsesSameDatabasePersistedBindings(t *testing.T) {
 	fixture := newRuntimeCompositionFixture(t)
 	fixture.configuration.ComposeRuntime = true
-	runner := &runtimeCompositionCommandRunner{}
+	runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
 	composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{runner: runner})
 	if err != nil {
 		t.Fatal(err)
@@ -340,8 +411,8 @@ func TestRuntimeCompositionRouterUsesSameDatabasePersistedBindings(t *testing.T)
 		if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM deployments WHERE job_id=?`, jobID).Scan(&deploymentsCount); err != nil {
 			t.Fatal(err)
 		}
-		if deploymentsCount != 0 || len(reporter.updates) != 0 || runner.calls != 0 {
-			t.Fatalf("deployments=%d updates=%d runner=%d", deploymentsCount, len(reporter.updates), runner.calls)
+		if deploymentsCount != 0 || len(reporter.updates) != 0 || runner.Calls() != 0 {
+			t.Fatalf("deployments=%d updates=%d runner=%d", deploymentsCount, len(reporter.updates), runner.Calls())
 		}
 	})
 
@@ -372,8 +443,8 @@ func TestRuntimeCompositionRouterUsesSameDatabasePersistedBindings(t *testing.T)
 		if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM deployments WHERE job_id=?`, job.ID).Scan(&deploymentsCount); err != nil {
 			t.Fatal(err)
 		}
-		if deploymentsCount != 1 || runner.calls != 0 {
-			t.Fatalf("deployments=%d runner=%d", deploymentsCount, runner.calls)
+		if deploymentsCount != 1 || runner.Calls() != 0 {
+			t.Fatalf("deployments=%d runner=%d", deploymentsCount, runner.Calls())
 		}
 	})
 }
@@ -381,6 +452,15 @@ func TestRuntimeCompositionRouterUsesSameDatabasePersistedBindings(t *testing.T)
 func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) {
 	fixture := newRuntimeCompositionFixture(t)
 	fixture.configuration.GeneratedRuntime = true
+	runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+		dockerExecutable: fixture.dockerExecutable,
+		runner:           runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.dependencies.generated = generated
 	directories, err := docker.PrepareControllerDirectories(fixture.configuration.DataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -412,15 +492,10 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 	var calls []string
 	composition, err := prepareRuntimeComposition(ctx, fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 		dockerExecutable: fixture.dockerExecutable,
+		runner:           runner,
 		beforeStep: func(name string) error {
+			assertStartupAdmissionHeld("composition " + name)
 			calls = append(calls, name)
-			return nil
-		},
-		recoverIngress: func(recoveryContext context.Context, _ *generatedingress.Manager) error {
-			if recoveryContext.Err() != nil {
-				t.Fatalf("ingress recovery inherited cancellation: %v", recoveryContext.Err())
-			}
-			assertStartupAdmissionHeld("ingress recovery")
 			return nil
 		},
 	})
@@ -464,8 +539,8 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 		t.Fatal("worker did not finish")
 	}
 	wantRecoveryOrder := []string{
-		"compose_temp_recover", "generated_build_temp_recover", "generated_environment_temp_recover",
-		"artifact_repository_recover", "ingress_recover", "runtime_recover", "worker",
+		"compose_temp_recover", "generated_build_temp_recover", "artifact_repository_recover",
+		"runtime_recover", "worker",
 	}
 	var recoveryOrder []string
 	for _, call := range calls {
@@ -480,50 +555,31 @@ func TestGeneratedCompositionRecoversBeforeDeploymentJobAndWorker(t *testing.T) 
 	}
 }
 
-func TestGeneratedCompositionCapacitySourceFactory(t *testing.T) {
-	t.Run("default ingress", func(t *testing.T) {
-		fixture := newRuntimeCompositionFixture(t)
-		fixture.configuration.GeneratedRuntime = true
-		composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
-			dockerExecutable: fixture.dockerExecutable,
-			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
-		})
-		if err != nil || composition.ingress == nil {
-			t.Fatalf("default ingress capacity source: ingress=%p err=%v", composition.ingress, err)
-		}
+func TestGeneratedCompositionUsesExactCompleteDomainOwner(t *testing.T) {
+	fixture := newRuntimeCompositionFixture(t)
+	fixture.configuration.GeneratedRuntime = true
+	runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+		dockerExecutable: fixture.dockerExecutable,
+		runner:           runner,
 	})
-
-	t.Run("wrapped ingress", func(t *testing.T) {
-		fixture := newRuntimeCompositionFixture(t)
-		fixture.configuration.GeneratedRuntime = true
-		var received generatedruntime.CapacitySource
-		composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
-			dockerExecutable: fixture.dockerExecutable,
-			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
-			capacitySourceFactory: func(source generatedruntime.CapacitySource) generatedruntime.CapacitySource {
-				received = source
-				return runtimeCompositionCapacitySource{delegate: source}
-			},
-		})
-		if err != nil || composition.ingress == nil || received != composition.ingress {
-			t.Fatalf("wrapped ingress capacity source: ingress=%p received=%T err=%v", composition.ingress, received, err)
-		}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.domain == nil || generated.domain.Gateway() == nil || generated.domain.Candidates() == nil || generated.domain.Routes() == nil {
+		t.Fatal("complete generated domain did not expose all sealed owners")
+	}
+	fixture.dependencies.generated = generated
+	composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+		dockerExecutable: fixture.dockerExecutable,
+		runner:           runner,
 	})
-
-	t.Run("nil wrapped source rejected", func(t *testing.T) {
-		fixture := newRuntimeCompositionFixture(t)
-		fixture.configuration.GeneratedRuntime = true
-		_, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
-			dockerExecutable: fixture.dockerExecutable,
-			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
-			capacitySourceFactory: func(generatedruntime.CapacitySource) generatedruntime.CapacitySource {
-				return nil
-			},
-		})
-		if err == nil {
-			t.Fatal("generated composition accepted a nil wrapped capacity source")
-		}
-	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if composition.generated == nil || composition.ingress != generated.domain.Gateway() {
+		t.Fatalf("composition did not retain exact generated domain gateway: ingress=%p owner=%p executor=%T", composition.ingress, generated.domain.Gateway(), composition.generated)
+	}
 }
 
 func TestGeneratedCompositionMigrationRunnerFactory(t *testing.T) {
@@ -531,9 +587,8 @@ func TestGeneratedCompositionMigrationRunnerFactory(t *testing.T) {
 		fixture := newRuntimeCompositionFixture(t)
 		fixture.configuration.GeneratedRuntime = true
 		var received generatedruntime.MigrationRunner
-		_, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+		_, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 			dockerExecutable: fixture.dockerExecutable,
-			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
 			migrationRunnerFactory: func(runner generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
 				received = runner
 				return runtimeCompositionMigrationRunner{delegate: runner}
@@ -547,9 +602,8 @@ func TestGeneratedCompositionMigrationRunnerFactory(t *testing.T) {
 	t.Run("nil runner rejected", func(t *testing.T) {
 		fixture := newRuntimeCompositionFixture(t)
 		fixture.configuration.GeneratedRuntime = true
-		_, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+		_, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 			dockerExecutable: fixture.dockerExecutable,
-			recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
 			migrationRunnerFactory: func(generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
 				return nil
 			},
@@ -566,14 +620,6 @@ type runtimeCompositionMigrationRunner struct {
 
 func (runner runtimeCompositionMigrationRunner) Run(ctx context.Context, invocation deployments.GeneratedMigrationInvocation) error {
 	return runner.delegate.Run(ctx, invocation)
-}
-
-type runtimeCompositionCapacitySource struct {
-	delegate generatedruntime.CapacitySource
-}
-
-func (source runtimeCompositionCapacitySource) Snapshot(ctx context.Context) (generatedruntime.CapacitySnapshot, error) {
-	return source.delegate.Snapshot(ctx)
 }
 
 func TestGeneratedCompositionRecoversEachTemporaryNamespace(t *testing.T) {
@@ -600,9 +646,8 @@ func TestGeneratedCompositionRecoversEachTemporaryNamespace(t *testing.T) {
 		operations = append(operations, files.Directory)
 	}
 
-	if _, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+	if _, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 		dockerExecutable: fixture.dockerExecutable,
-		recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -624,7 +669,7 @@ func TestGeneratedCompositionRejectsInvalidDockerPathBeforeRecovery(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{}); err == nil {
+	if _, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{}); err == nil {
 		t.Fatal("generated composition accepted an unresolved Docker executable")
 	}
 	if _, err := os.Stat(files.Directory); err != nil {
@@ -638,24 +683,60 @@ func TestRuntimeCompositionRebindFenceFailsBeforeRecovery(t *testing.T) {
 			fixture := newRuntimeCompositionFixture(t)
 			fixture.configuration.ComposeRuntime = mode == "compose"
 			fixture.configuration.GeneratedRuntime = mode == "generated"
+			runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+			if fixture.configuration.GeneratedRuntime {
+				generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+					dockerExecutable: fixture.dockerExecutable,
+					runner:           runner,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				fixture.dependencies.generated = generated
+			}
 			if _, err := fixture.db.Exec(`DROP TABLE lan_gateway_rebind_claims`); err != nil {
 				t.Fatal(err)
 			}
 			steps := 0
-			recovered := false
 			_, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 				dockerExecutable: fixture.dockerExecutable,
+				runner:           runner,
 				beforeStep: func(string) error {
 					steps++
 					return nil
 				},
-				recoverIngress: func(context.Context, *generatedingress.Manager) error {
-					recovered = true
+			})
+			if err == nil || steps != 0 {
+				t.Fatalf("composition error=%v steps=%d", err, steps)
+			}
+		})
+	}
+}
+
+func TestGeneratedDomainPreparationFailureStopsAtExactStep(t *testing.T) {
+	steps := []string{
+		"generated_environment_temp_create", "generated_environment_temp_recover",
+		"controller_directories_create", "environment_stager_create", "migration_authority_create",
+	}
+	for index, failAt := range steps {
+		t.Run(failAt, func(t *testing.T) {
+			fixture := newRuntimeCompositionFixture(t)
+			fixture.configuration.GeneratedRuntime = true
+			failure := errors.New("injected startup failure")
+			var calls []string
+			result, err := prepareGeneratedRuntimeDomainDependencies(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+				dockerExecutable: fixture.dockerExecutable,
+				runner:           generateddomaintest.NewRunner(generateddomaintest.Options{}),
+				beforeStep: func(name string) error {
+					calls = append(calls, name)
+					if name == failAt {
+						return failure
+					}
 					return nil
 				},
 			})
-			if err == nil || steps != 0 || recovered {
-				t.Fatalf("composition error=%v steps=%d recovered=%t", err, steps, recovered)
+			if !errors.Is(err, failure) || result != nil || !reflect.DeepEqual(calls, steps[:index+1]) {
+				t.Fatalf("result=%#v err=%v calls=%v", result, err, calls)
 			}
 		})
 	}
@@ -664,22 +745,29 @@ func TestRuntimeCompositionRebindFenceFailsBeforeRecovery(t *testing.T) {
 func TestGeneratedCompositionFailureStopsAtExactStep(t *testing.T) {
 	steps := []string{
 		"compose_temp_create", "compose_temp_recover", "generated_build_temp_create", "generated_build_temp_recover",
-		"generated_environment_temp_create", "generated_environment_temp_recover",
-		"artifact_repository_create", "artifact_repository_recover", "controller_directories_create",
-		"environment_stager_create", "migration_authority_create", "builder_create",
-		"ingress_create", "ingress_recover", "runtime_engine_create", "compiler_create",
-		"migration_runner_create", "runtime_state_create", "authorization_gate_create", "generated_executor_create",
-		"compose_executor_create", "runtime_router_create",
+		"artifact_repository_create", "artifact_repository_recover", "builder_create", "runtime_engine_create",
+		"compiler_create", "migration_runner_create", "runtime_state_create", "authorization_gate_create",
+		"generated_executor_create", "compose_executor_create", "runtime_router_create",
 	}
 	for index, failAt := range steps {
 		t.Run(failAt, func(t *testing.T) {
 			fixture := newRuntimeCompositionFixture(t)
 			fixture.configuration.ComposeRuntime = true
 			fixture.configuration.GeneratedRuntime = true
+			runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+			generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+				dockerExecutable: fixture.dockerExecutable,
+				runner:           runner,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.dependencies.generated = generated
 			failure := errors.New("injected startup failure")
 			var calls []string
 			result, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 				dockerExecutable: fixture.dockerExecutable,
+				runner:           runner,
 				beforeStep: func(name string) error {
 					calls = append(calls, name)
 					if name == failAt {
@@ -687,7 +775,6 @@ func TestGeneratedCompositionFailureStopsAtExactStep(t *testing.T) {
 					}
 					return nil
 				},
-				recoverIngress: func(context.Context, *generatedingress.Manager) error { return nil },
 			})
 			if !errors.Is(err, failure) || result.executor != nil || !reflect.DeepEqual(calls, steps[:index+1]) {
 				t.Fatalf("result=%#v err=%v calls=%v", result, err, calls)
@@ -729,8 +816,20 @@ type runtimeCompositionFixture struct {
 
 func newRuntimeCompositionFixture(t *testing.T) runtimeCompositionFixture {
 	t.Helper()
-	root := t.TempDir()
-	db, err := database.Open(root)
+	root := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directories, err := docker.PrepareControllerDirectories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := controllerowner.Acquire(context.Background(), directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	db, err := database.OpenForGeneratedDomain(context.Background(), root, lease)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -758,10 +857,6 @@ func newRuntimeCompositionFixture(t *testing.T) runtimeCompositionFixture {
 	}
 	configuration := config.Defaults()
 	configuration.DataRoot = root
-	directories, err := docker.PrepareControllerDirectories(root)
-	if err != nil {
-		t.Fatal(err)
-	}
 	return runtimeCompositionFixture{
 		db: db, deploymentJobs: deploymentJobs, configuration: configuration, dockerExecutable: dockerExecutable,
 		dependencies: runtimeCompositionDependencies{
@@ -770,11 +865,4 @@ func newRuntimeCompositionFixture(t *testing.T) runtimeCompositionFixture {
 			effectsWorkingDirectory: directories.WorkingDirectory,
 		},
 	}
-}
-
-func boolInt(value bool) int {
-	if value {
-		return 1
-	}
-	return 0
 }

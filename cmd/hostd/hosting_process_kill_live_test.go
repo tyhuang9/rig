@@ -36,6 +36,7 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
@@ -45,6 +46,7 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
@@ -363,7 +365,18 @@ func controllerProcessKillRunChild(t *testing.T) {
 	if runtime.GOOS != "linux" || os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
 		t.Fatal("process-kill child requires local Linux Docker")
 	}
-	db, err := database.Open(manifest.DataRoot)
+	childContext, cancel := context.WithTimeout(context.Background(), 46*time.Minute)
+	defer cancel()
+	directories, err := runtimedocker.PrepareControllerDirectories(manifest.DataRoot)
+	if err != nil {
+		t.Fatal("prepare process-kill controller owner directories")
+	}
+	ownerLease, err := controllerowner.Acquire(childContext, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire process-kill controller owner")
+	}
+	defer func() { _ = ownerLease.Close() }()
+	db, err := database.OpenForGeneratedDomain(childContext, manifest.DataRoot, ownerLease)
 	if err != nil {
 		t.Fatal("open retained controller database")
 	}
@@ -381,14 +394,14 @@ func controllerProcessKillRunChild(t *testing.T) {
 	if err != nil {
 		t.Fatal("reopen scoped configuration")
 	}
-	if err := configuration.Recover(context.Background()); err != nil {
+	if err := configuration.Recover(childContext); err != nil {
 		t.Fatal("recover scoped configuration")
 	}
 	plans, err := deploymentplans.New(db, manifest.DataRoot)
 	if err != nil {
 		t.Fatal("reopen deployment plans")
 	}
-	if err := plans.Recover(context.Background()); err != nil {
+	if err := plans.Recover(childContext); err != nil {
 		t.Fatal("recover accepted deployment plans")
 	}
 	deploymentStore := deployments.New(db)
@@ -404,8 +417,6 @@ func controllerProcessKillRunChild(t *testing.T) {
 	settings.DataRoot = manifest.DataRoot
 	settings.GeneratedRuntime = true
 	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, manifest.DataRoot)
-	childContext, cancel := context.WithTimeout(context.Background(), 46*time.Minute)
-	defer cancel()
 	var barrier *controllerProcessKillBarrier
 	if manifest.Boundary != "" {
 		barrier = &controllerProcessKillBarrier{
@@ -413,7 +424,7 @@ func controllerProcessKillRunChild(t *testing.T) {
 			db: db, appID: manifest.AppID, jobID: manifest.JobID,
 		}
 	}
-	composition, err := prepareRuntimeComposition(childContext, settings, runtimeCompositionDependencies{
+	composition, err := prepareRuntimeCompositionForTest(t, childContext, settings, runtimeCompositionDependencies{
 		db: db, applications: apps.New(db), snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,

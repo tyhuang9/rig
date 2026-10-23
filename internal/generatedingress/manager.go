@@ -433,72 +433,18 @@ func (m *Manager) switchGeneratedDomainRoute(ctx context.Context, request genera
 	return nil
 }
 
-// Recover rolls back an uncertain pending switch to the last committed route,
-// then reapplies the committed aggregate config and restart file.
-func (m *Manager) Recover(ctx context.Context) error {
-	if m == nil || ctx == nil {
-		return &Error{Code: DiagnosticValidationFailed}
-	}
-	release, err := m.lockGateway(ctx)
-	if err != nil {
-		return err
-	}
-	handled, recoveryErr := m.recoverGatewayCurrentStateMachineLocked(ctx)
-	releaseErr := release()
-	if recoveryErr != nil {
-		return recoveryErr
-	}
-	if releaseErr != nil {
-		return gatewayCurrentRouteOperationError(ctx)
-	}
-	if handled {
-		return nil
-	}
-	return m.Provision(ctx)
+// Recover is closed for every ordinary Manager shape. Startup inspection and
+// typed recovery run before the private generated-domain factory; a published
+// domain never grants generic recovery authority through its gateway view.
+func (m *Manager) Recover(context.Context) error {
+	return &Error{Code: DiagnosticValidationFailed}
 }
 
-// Provision creates or verifies the pinned Caddy boundary and reapplies its
-// committed routes. Startup calls it before generated deployment workers so
-// capacity checks can query the Docker VM through this exact container.
-func (m *Manager) Provision(ctx context.Context) (resultErr error) {
-	if m == nil || ctx == nil {
-		return &Error{Code: DiagnosticValidationFailed}
-	}
-	release, err := m.lockGateway(ctx)
-	if err != nil {
-		return err
-	}
-	defer releaseGatewayLock(release, &resultErr)
-	if store, state, journal, committed, err := m.committedV2Locked(ctx); err != nil {
-		return err
-	} else if committed {
-		return m.recoverCommittedV2Locked(ctx, store, state, journal)
-	}
-	if err := m.fenceLegacyV1Locked(); err != nil {
-		return err
-	}
-	state, err := m.store.load()
-	if err != nil {
-		return &Error{Code: DiagnosticRouteStateFailed}
-	}
-	if state.Pending != nil {
-		if err := m.rollbackPending(ctx, &state); err != nil {
-			return err
-		}
-	}
-	if err := m.ensureCaddy(ctx, state.Active); err != nil {
-		return err
-	}
-	if err := m.reconcileCaddyNetworks(ctx, state.Active); err != nil {
-		return err
-	}
-	if err := m.applyRoutes(ctx, state.Active, "recovery.json"); err != nil {
-		return err
-	}
-	if err := m.installRestartConfig(context.WithoutCancel(ctx)); err != nil {
-		return &Error{Code: DiagnosticRouteUnresolved}
-	}
-	return nil
+// Provision is closed for every ordinary Manager shape. Empty bootstrap and
+// retained cold reconstruction are private construction operations with their
+// own exact effect, receipt and release checks.
+func (m *Manager) Provision(context.Context) error {
+	return &Error{Code: DiagnosticValidationFailed}
 }
 
 func (m *Manager) rollbackPending(ctx context.Context, state *routeState) error {
@@ -1600,6 +1546,30 @@ func (m *Manager) WithObservation(ctx context.Context, appID string, fn func(con
 		return err
 	}
 	defer releaseGatewayLock(release, &resultErr)
+	if current, handled, err := m.selectGatewayCurrentObservationLocked(lockContext, appID); err != nil || handled {
+		if err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return &Error{Code: DiagnosticCancelled}
+		}
+		observationContext, cancelObservation := context.WithTimeout(ctx, v2ObservationTimeout)
+		defer cancelObservation()
+		observation, err := m.attestGatewayCurrentObservationLocked(observationContext, current, appID)
+		if err != nil {
+			return err
+		}
+		if observationContext.Err() != nil {
+			return &Error{Code: DiagnosticCancelled}
+		}
+		if err := fn(observationContext, observation); err != nil {
+			return err
+		}
+		if observationContext.Err() != nil {
+			return &Error{Code: DiagnosticCancelled}
+		}
+		return nil
+	}
 
 	_, state, journal, committed, err := m.committedV2Locked(lockContext)
 	if err != nil {

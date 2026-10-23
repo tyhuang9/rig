@@ -86,10 +86,10 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 	secondSpec.ImageContentID = buildLiveGatewayImage(t, fixture.ctx, fixture.runner, fixture.docker, fixture.root, fixture.dockerConfig, image.tag, secondSpec, loopbackReply, "0.0.0.0")
 	second := startLiveCandidate(t, fixture.ctx, engine, authority, secondSpec)
 	secondCandidates = append(secondCandidates, second)
-	if err := fixture.ingress.Switch(fixture.ctx, generatedroute.RouteSwitchRequest{AppID: loopbackID, ToSlot: second.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(second)}}); err != nil {
+	secondRoute := generatedroute.RouteSwitchRequest{AppID: loopbackID, ToSlot: second.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(second)}}
+	if err := authority.activate(t, second, secondRoute); err != nil {
 		failLiveIngress(t, "install loopback-only source route", err)
 	}
-	authority.published(t, fixture.ctx, fixture.ingress, second)
 	fixture.source, err = fixture.ingress.store.load()
 	if err != nil || len(fixture.source.Active) != 2 {
 		t.Fatal("load complete two-application source")

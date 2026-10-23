@@ -13,6 +13,7 @@ import (
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	"github.com/hostd/hostd/internal/runtime/docker"
+	generateddomaintest "github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 type gatewayStartupRecoveryFixture struct {
@@ -371,7 +372,7 @@ func TestGatewayRebindStartupRetirementRequiresExactCurrentKind(t *testing.T) {
 	}
 }
 
-func TestGatewayRebindStartupFreshDatabaseAndManagerReuse(t *testing.T) {
+func TestGatewayRebindStartupFreshDatabaseTransitionsToExactDomainOwner(t *testing.T) {
 	f := newRuntimeCompositionFixture(t)
 	f.configuration.GeneratedRuntime = true
 	directories, err := docker.PrepareControllerDirectories(f.configuration.DataRoot)
@@ -390,39 +391,44 @@ func TestGatewayRebindStartupFreshDatabaseAndManagerReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	// A normal empty startup must not create an ordinary Manager before the
+	// private domain factory owns the missing-to-present transition.
+	runner := generateddomaintest.NewRunner(generateddomaintest.Options{})
+	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, context.Background(), f.configuration,
+		f.dependencies, runtimeCompositionOptions{dockerExecutable: f.dockerExecutable, runner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err = admit(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer func() {
 		if err := release(); err != nil {
 			t.Error(err)
 		}
 	}()
-	gate, err := inspectGatewayStartupAfterPreparation(context.Background(), f.configuration, f.db, f.dockerExecutable, directories, prepared)
-	if err != nil || gate.ingress == nil {
-		t.Fatalf("gate=%+v error=%v", gate, err)
+	joined, err := generatedingress.NewGeneratedDomain(context.Background(), generated.stores, runner,
+		generated.environment, generated.options)
+	if err != nil || joined != generated.domain {
+		t.Fatalf("reacquired exact domain join=%p want=%p error=%v", joined, generated.domain, err)
 	}
-	reused, err := inspectGatewayStartupUsingIngress(context.Background(), f.configuration, f.db,
-		f.dockerExecutable, directories, rebindFenceCheck(f.db), gate.ingress)
-	if err != nil || reused.ingress != gate.ingress {
-		t.Fatalf("ordinary inspection replaced the supplied manager: %v", err)
-	}
-	calls := 0
+	f.dependencies.generated = generated
 	runtime, err := prepareRuntimeComposition(context.Background(), f.configuration, f.dependencies, runtimeCompositionOptions{
-		dockerExecutable: f.dockerExecutable, preinspectedIngress: gate.ingress,
-		recoverIngress: func(_ context.Context, ingress *generatedingress.Manager) error {
-			calls++
-			if ingress != gate.ingress {
-				t.Fatal("ordinary recovery replaced the inspected manager")
-			}
-			return nil
-		},
+		dockerExecutable: f.dockerExecutable, runner: runner,
 	})
-	if err != nil || calls != 1 || runtime.ingress != gate.ingress {
-		t.Fatalf("manager reuse: calls=%d error=%v", calls, err)
+	if err != nil || runtime.ingress != generated.domain.Gateway() {
+		t.Fatalf("domain transition: domain=%p runtime=%p error=%v",
+			generated.domain.Gateway(), runtime.ingress, err)
 	}
-	// A fabricated checkpoint cannot cause the same manager to skip a fresh
-	// protected/SQL selection after admission.
+	// A fabricated checkpoint cannot cause an ordinary startup path to adopt
+	// the constructor-owned Manager after publication.
 	_, err = inspectGatewayStartupAfterPreparation(context.Background(), f.configuration, f.db, f.dockerExecutable, directories,
 		gatewayRebindStartupDecision{disposition: gatewayRebindStartupNormal,
-			preparation: gatewayRebindStartupPreparation{ingress: gate.ingress,
+			preparation: gatewayRebindStartupPreparation{ingress: generated.domain.Gateway(),
 				current: newGatewayStartupRecoveryFixture(false).before}})
 	if err == nil {
 		t.Fatal("accepted a stale preparation checkpoint")

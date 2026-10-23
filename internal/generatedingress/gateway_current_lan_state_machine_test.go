@@ -323,7 +323,7 @@ func TestGatewayCurrentStateMachineGrantReconcilesCanceledAndLostMarkerWrites(t 
 			t.Fatalf("canceled grant did not restore before with exact R+1 marker: %#v calls=%d/%d/%d",
 				retained, driver.applyCalls, driver.restoreCalls, driver.stopCalls)
 		}
-		if err := fixture.manager.Recover(context.Background()); !IsCode(err, DiagnosticRouteUnresolved) {
+		if err := exerciseGatewayCurrentRecoveryCore(fixture.manager, context.Background()); !IsCode(err, DiagnosticRouteUnresolved) {
 			t.Fatalf("generic recovery cleared request-bound LAN pending state: %v", err)
 		}
 		if after := routeOperationLoad(t, fixture.store); !reflect.DeepEqual(after, retained) {

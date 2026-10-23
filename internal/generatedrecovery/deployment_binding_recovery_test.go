@@ -61,6 +61,7 @@ func TestRecoverRuntimeRetainsStaleDeploymentEvidenceAndRetiresJobOnce(t *testin
 func TestRecoverRuntimeStaleCensusIncludesQueuedWaitingAndTerminalRuntime(t *testing.T) {
 	tests := []struct {
 		name          string
+		activation    bool
 		prepare       func(*testing.T, *recoveryFixture)
 		wantRetired   int
 		wantJobStatus string
@@ -75,13 +76,10 @@ func TestRecoverRuntimeStaleCensusIncludesQueuedWaitingAndTerminalRuntime(t *tes
 			wantRetired: 1, wantJobStatus: "needs_attention",
 		},
 		{
-			name: "waiting user with succeeded runtime",
+			name: "waiting user with succeeded runtime", activation: true,
 			prepare: func(t *testing.T, fixture *recoveryFixture) {
 				fixture.toSwitching(t)
-				if _, switched, err := fixture.state.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0); err != nil || !switched {
-					t.Fatalf("switch active: switched=%t err=%v", switched, err)
-				}
-				fixture.advance(t, "draining")
+				fixture.activate(t)
 				fixture.advance(t, "succeeded")
 				if _, err := fixture.db.Exec(`UPDATE jobs SET status='waiting_user',phase='route_reconciliation_required',pause_disposition='route_reconciliation_required' WHERE id=?`, fixture.jobID); err != nil {
 					t.Fatal(err)
@@ -101,7 +99,12 @@ func TestRecoverRuntimeStaleCensusIncludesQueuedWaitingAndTerminalRuntime(t *tes
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newRecoveryFixture(t, false)
+			var fixture *recoveryFixture
+			if test.activation {
+				fixture = newRecoveryActivationFixture(t, false)
+			} else {
+				fixture = newRecoveryFixture(t, false)
+			}
 			test.prepare(t, fixture)
 			before := recoveryEvidenceSnapshot(t, fixture.db)
 			mutableBefore := recoveryMutableSnapshot(t, fixture.db)
@@ -462,7 +465,7 @@ func TestRecoverRuntimeRejectsMissingOrForeignDependenciesAndCancellation(t *tes
 }
 
 func TestRecoverRuntimeUsesOneWriterTransactionForCanonicalValidation(t *testing.T) {
-	fixture := newRecoveryFixture(t, false)
+	fixture := newRecoveryActivationFixture(t, false)
 	repository, recorder, jobID := seedCanonicalRunningRecoveryJob(t, fixture)
 	recorder.transactions = nil
 	result, err := generatedrecovery.RecoverRuntime(context.Background(), fixture.db, fixture.now.Add(time.Minute), repository)
@@ -519,7 +522,7 @@ func TestRecoverRuntimeUsesOneWriterTransactionForCanonicalValidation(t *testing
 }
 
 func TestRecoverRuntimeRejectsCorruptHistoricalAuthorityAfterHeadAdvanced(t *testing.T) {
-	fixture := newRecoveryFixture(t, false)
+	fixture := newRecoveryActivationFixture(t, false)
 	repository, _, boundJobID := seedCanonicalRunningRecoveryJob(t, fixture)
 	if _, err := fixture.db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',finished_at=? WHERE id=?`, timestamp(fixture.now), boundJobID); err != nil {
 		t.Fatal(err)
@@ -561,7 +564,7 @@ func TestRecoverRuntimeRejectsCorruptHistoricalAuthorityAfterHeadAdvanced(t *tes
 }
 
 func TestRecoverRuntimeWriterReservationBlocksConcurrentDesiredAuthoring(t *testing.T) {
-	fixture := newRecoveryFixture(t, false)
+	fixture := newRecoveryActivationFixture(t, false)
 	repository, recorder, boundJobID := seedCanonicalRunningRecoveryJob(t, fixture)
 	if _, err := fixture.db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',finished_at=? WHERE id=?`, timestamp(fixture.now), boundJobID); err != nil {
 		t.Fatal(err)
@@ -722,11 +725,7 @@ func (v *recordingCanonicalValidator) UnresolvedHistoryTx(ctx context.Context, t
 func seedCanonicalRunningRecoveryJob(t *testing.T, fixture *recoveryFixture) (*deploymentbinding.Repository, *recordingCanonicalValidator, string) {
 	t.Helper()
 	fixture.toSwitching(t)
-	head, switched, err := fixture.state.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0)
-	if err != nil || !switched {
-		t.Fatalf("switch active: %#v switched=%t error=%v", head, switched, err)
-	}
-	fixture.advance(t, generatedruntimestate.PhaseDraining)
+	head := fixture.activate(t)
 	fixture.advance(t, generatedruntimestate.PhaseSucceeded)
 	if _, err := fixture.db.Exec(`UPDATE deployments SET status='succeeded',finished_at=? WHERE id=?`, timestamp(fixture.now), fixture.deploymentID); err != nil {
 		t.Fatal(err)
@@ -744,7 +743,7 @@ func seedCanonicalRunningRecoveryJob(t *testing.T, fixture *recoveryFixture) (*d
 	pins := applifecycle.GeneratedLifecyclePinsV1{
 		Version: 1, DeploymentID: fixture.deploymentID, ReleaseID: fixture.releaseID, Slot: head.Slot,
 		ActiveGeneration: head.Generation, PlanRevision: applifecycle.RevisionRef{ID: fixture.planID, Number: 1},
-		Configuration:       applifecycle.ConfigurationRef{FormatVersion: 0, PlanRevision: applifecycle.RevisionRef{ID: fixture.planID, Number: 1}, RuntimeComponents: []string{fixture.component}},
+		Configuration:       applifecycle.ConfigurationRef{RevisionID: fixture.configID, RevisionNumber: 1, FormatVersion: 2, PlanRevision: applifecycle.RevisionRef{ID: fixture.planID, Number: 1}, RuntimeComponents: []string{fixture.component}},
 		BaselineDisposition: applifecycle.BaselineRunning,
 		Components: []applifecycle.RetainedComponent{{
 			Name: fixture.component, Role: "service", Technology: "node", ContainerID: containerID,

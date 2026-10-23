@@ -14,7 +14,7 @@ import (
 )
 
 func TestResolveNativeGatewayBindingFromCommittedUpgradeAuthority(t *testing.T) {
-	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	resolution, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
 		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
 		AccessRevisionID: fixture.entry.AccessRevisionID, GrantAttemptID: fixture.entry.GrantAttemptID,
@@ -174,7 +174,7 @@ func gatewayStartupAuthorityFixture(t *testing.T, rebound bool,
 		fixture = newGatewayRebindFixture(t, true)
 		commitGatewayRebindFixture(t, fixture, strings.Repeat("7", 64))
 	} else {
-		fixture = newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture = newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	}
 	snapshot, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
 	if err != nil || snapshot.CurrentProfile == nil || snapshot.CurrentSource == nil {
@@ -407,7 +407,7 @@ func TestResolveGatewayBindingSeparatesRawAndEffectiveProfiles(t *testing.T) {
 }
 
 func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing.T) {
-	fixture := newGatewayRebindFixture(t, true)
+	fixture := newHistoricalGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), true, true)
 	firstReceipt := strings.Repeat("7", 64)
 	commitGatewayRebindFixture(t, fixture, firstReceipt)
 	first, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
@@ -466,7 +466,7 @@ func TestResolveGatewayBindingWalksRepeatedRebindAcrossRuntimeAdvance(t *testing
 }
 
 func TestDisableAuthorizationAndStartupUseCompleteRepeatedRebindChain(t *testing.T) {
-	fixture := newGatewayRebindFixture(t, true)
+	fixture := newHistoricalGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), true, true)
 	commitGatewayRebindFixture(t, fixture, strings.Repeat("7", 64))
 	first, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
 		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
@@ -507,11 +507,8 @@ func commitNextGatewayRebindForTest(t *testing.T, fixture gatewayRebindFixture,
 	first GatewayBindingResolution,
 ) (GatewayRebindClaimV2, GatewayBindingResolution) {
 	t.Helper()
-	previousHead, err := generatedruntimestate.New(fixture.db).Active(context.Background(), fixture.entry.AppID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	advancedHead := redeployRuntimeHeadForRebindTest(t, fixture.db, previousHead)
+	previousHead := historicalRuntimeHeadForRebindTest(t, fixture.db, fixture.entry.AppID)
+	advancedHead := redeployHistoricalRuntimeHeadForRebindTest(t, fixture.db, previousHead)
 	finishGatewayRebindFixtureWork(t, fixture.db)
 	proposal := gatewayRebindV2ProposalForCommittedFixture(t, fixture, first, advancedHead)
 	claim, created, err := fixture.repository.ClaimGatewayRebindV2(context.Background(), proposal)
@@ -588,6 +585,14 @@ func commitNextGatewayRebindForTest(t *testing.T, fixture gatewayRebindFixture,
 	if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(), committed); err != nil {
 		t.Fatal(err)
 	}
+	upgradeHistoricalGatewayDatabase(t, fixture.db)
+	upgraded, err := fixture.repository.ResolveGatewayBinding(context.Background(), GatewayBindingRef{
+		AppID: fixture.entry.AppID, AllocationID: fixture.entry.AllocationID,
+		AccessRevisionID: fixture.entry.AccessRevisionID, GrantAttemptID: fixture.entry.GrantAttemptID,
+	})
+	if err != nil || !reflect.DeepEqual(upgraded, current) {
+		t.Fatalf("upgraded repeated binding changed: %v", err)
+	}
 	snapshot, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -603,7 +608,7 @@ func commitNextGatewayRebindForTest(t *testing.T, fixture gatewayRebindFixture,
 }
 
 func TestRetiredGatewayBindingRemainsHistoricalAfterLaterRebind(t *testing.T) {
-	fixture := newGatewayRebindFixture(t, true)
+	fixture := newHistoricalGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), true, true)
 	firstReceipt := strings.Repeat("7", 64)
 	commitGatewayRebindFixture(t, fixture, firstReceipt)
 	ref := GatewayBindingRef{
@@ -633,11 +638,8 @@ func TestRetiredGatewayBindingRemainsHistoricalAfterLaterRebind(t *testing.T) {
 		t.Fatalf("commit disable=%#v changed=%t error=%v", disable, changed, err)
 	}
 
-	previousHead, err := generatedruntimestate.New(fixture.db).Active(context.Background(), fixture.entry.AppID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	advancedHead := redeployRuntimeHeadForRebindTest(t, fixture.db, previousHead)
+	previousHead := historicalRuntimeHeadForRebindTest(t, fixture.db, fixture.entry.AppID)
+	advancedHead := redeployHistoricalRuntimeHeadForRebindTest(t, fixture.db, previousHead)
 	finishGatewayRebindFixtureWork(t, fixture.db)
 	proposal := gatewayRebindV2ProposalForCommittedFixture(t, fixture, first, advancedHead)
 	proposal.Roster = nil
@@ -672,6 +674,7 @@ func TestRetiredGatewayBindingRemainsHistoricalAfterLaterRebind(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	upgradeHistoricalGatewayDatabase(t, fixture.db)
 	if _, err := fixture.repository.ResolveGatewayBinding(context.Background(), ref); !errors.Is(err, ErrInvalidStoredState) {
 		t.Fatalf("released binding unexpectedly resolved to selected successor: %v", err)
 	}

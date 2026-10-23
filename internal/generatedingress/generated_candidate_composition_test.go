@@ -12,20 +12,19 @@ import (
 
 func TestCandidateStoreCompositionPreservesSharedOwnerAndRejectsForeignStores(t *testing.T) {
 	fixture := newCandidateFactoryFixture(t)
-	copyBefore := *fixture.repository.stores
-	owner, err := NewGeneratedCandidateAuthority(fixture.repository.stores, fixture.process, fixture.environment, fixture.budget, fixture.options)
+	owner, err := fixture.repository.GeneratedCandidateAuthority(fixture.process, fixture.environment, fixture.budget, fixture.options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	alias, err := NewGeneratedCandidateAuthority(&copyBefore, fixture.process, fixture.environment, fixture.budget, fixture.options)
+	alias, err := fixture.repository.GeneratedCandidateAuthority(fixture.process, fixture.environment, fixture.budget, fixture.options)
 	if err != nil || alias != owner {
 		t.Fatalf("candidate store alias forked owner: same=%t err=%v", alias == owner, err)
 	}
-	if result, err := NewGeneratedCandidateAuthority(&deployments.GeneratedOwnerStores{}, fixture.process, fixture.environment, fixture.budget, fixture.options); result != nil || !errors.Is(err, deploymentexecution.ErrInvalidConfiguration) {
+	if result, err := newGeneratedCandidateAuthorityConcrete(&deployments.GeneratedOwnerStores{}, fixture.process, fixture.environment, fixture.budget, fixture.options); result != nil || !errors.Is(err, deploymentexecution.ErrInvalidConfiguration) {
 		t.Fatalf("unconfigured store bundle accepted: result=%v error=%v", result != nil, err)
 	}
 	foreign := newCandidateFactoryFixture(t)
-	foreignOwner, err := NewGeneratedCandidateAuthority(foreign.repository.stores, foreign.process, foreign.environment, foreign.budget, foreign.options)
+	foreignOwner, err := foreign.repository.GeneratedCandidateAuthority(foreign.process, foreign.environment, foreign.budget, foreign.options)
 	if err != nil {
 		t.Fatal(err)
 	}

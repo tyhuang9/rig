@@ -142,41 +142,22 @@ func newCandidateFactoryFixture(t *testing.T) *candidateFactoryFixture {
 
 func TestGeneratedCandidateFactorySharesPreAndPostCreationRepositoryCopies(t *testing.T) {
 	fixture := newCandidateFactoryFixture(t)
-	copyBeforeOne := *fixture.repository.stores
-	copyBeforeTwo := *fixture.repository.stores
-	first, err := NewGeneratedCandidateAuthority(&copyBeforeOne, fixture.process, fixture.environment, fixture.budget, fixture.options)
+	first, err := fixture.repository.GeneratedCandidateAuthority(fixture.process, fixture.environment, fixture.budget, fixture.options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	foreign := newCandidateFactoryFixture(t)
-	copyBeforeOne = *foreign.repository.stores
-	if !first.stores.Configured() || first.stores.Repository() != fixture.repository.Repository {
-		t.Fatal("authority followed a caller-owned bundle to foreign stores")
-	}
-	copyBeforeOne = deployments.GeneratedOwnerStores{}
-	if !first.stores.Configured() || first.stores.Repository() != fixture.repository.Repository {
-		t.Fatal("authority retained caller-owned store-bundle storage")
-	}
-	copyBeforeOne = *fixture.repository.stores
 	const callers = 24
 	start := make(chan struct{})
 	results := make(chan *GeneratedCandidateAuthority, callers)
 	errorsSeen := make(chan error, callers)
 	var wait sync.WaitGroup
-	stores := []*deployments.GeneratedOwnerStores{fixture.repository.stores, &copyBeforeOne, &copyBeforeTwo}
-	for index := range callers {
-		ownerStores := stores[index%len(stores)]
+	for range callers {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
 			<-start
-			authority, callErr := NewGeneratedCandidateAuthority(
-				ownerStores,
-				fixture.process,
-				fixture.environment,
-				fixture.budget,
-				fixture.options,
-			)
+			authority, callErr := fixture.repository.GeneratedCandidateAuthority(
+				fixture.process, fixture.environment, fixture.budget, fixture.options)
 			results <- authority
 			errorsSeen <- callErr
 		}()
@@ -198,14 +179,8 @@ func TestGeneratedCandidateFactorySharesPreAndPostCreationRepositoryCopies(t *te
 			t.Fatal("concurrent factory call returned a different authority")
 		}
 	}
-	copyAfter := *fixture.repository.stores
-	repeated, err := NewGeneratedCandidateAuthority(
-		&copyAfter,
-		fixture.process,
-		fixture.environment,
-		fixture.budget,
-		fixture.options,
-	)
+	repeated, err := fixture.repository.GeneratedCandidateAuthority(
+		fixture.process, fixture.environment, fixture.budget, fixture.options)
 	if err != nil || repeated != first {
 		t.Fatalf("post-factory repository copy authority=%p error=%v", repeated, err)
 	}
@@ -228,26 +203,17 @@ func TestGeneratedCandidateFactorySharesPreAndPostCreationRepositoryCopies(t *te
 
 	t.Run("concurrent first construction", func(t *testing.T) {
 		concurrent := newCandidateFactoryFixture(t)
-		copyOne := *concurrent.repository.stores
-		copyTwo := *concurrent.repository.stores
-		stores := []*deployments.GeneratedOwnerStores{concurrent.repository.stores, &copyOne, &copyTwo}
 		start := make(chan struct{})
 		results := make(chan *GeneratedCandidateAuthority, callers)
 		errorsSeen := make(chan error, callers)
 		var wait sync.WaitGroup
-		for index := range callers {
-			ownerStores := stores[index%len(stores)]
+		for range callers {
 			wait.Add(1)
 			go func() {
 				defer wait.Done()
 				<-start
-				authority, callErr := NewGeneratedCandidateAuthority(
-					ownerStores,
-					concurrent.process,
-					concurrent.environment,
-					concurrent.budget,
-					concurrent.options,
-				)
+				authority, callErr := concurrent.repository.GeneratedCandidateAuthority(
+					concurrent.process, concurrent.environment, concurrent.budget, concurrent.options)
 				results <- authority
 				errorsSeen <- callErr
 			}()
@@ -278,14 +244,8 @@ func TestGeneratedCandidateFactorySharesPreAndPostCreationRepositoryCopies(t *te
 
 func TestGeneratedCandidateFactoryRejectsCompositionDriftWithoutMutation(t *testing.T) {
 	fixture := newCandidateFactoryFixture(t)
-	initialStores := *fixture.repository.stores
-	first, err := NewGeneratedCandidateAuthority(
-		&initialStores,
-		fixture.process,
-		fixture.environment,
-		fixture.budget,
-		fixture.options,
-	)
+	first, err := fixture.repository.GeneratedCandidateAuthority(
+		fixture.process, fixture.environment, fixture.budget, fixture.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,13 +269,8 @@ func TestGeneratedCandidateFactoryRejectsCompositionDriftWithoutMutation(t *test
 		{name: "options", process: fixture.process, environment: fixture.environment, budget: fixture.budget, options: changedOptions},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			storesCopy := *fixture.repository.stores
-			if authority, callErr := NewGeneratedCandidateAuthority(
-				&storesCopy,
-				test.process,
-				test.environment,
-				test.budget,
-				test.options,
+			if authority, callErr := fixture.repository.GeneratedCandidateAuthority(
+				test.process, test.environment, test.budget, test.options,
 			); authority != nil || !errors.Is(callErr, deploymentexecution.ErrInvalidConfiguration) {
 				t.Fatalf("composition drift authority=%p error=%v", authority, callErr)
 			}
@@ -329,14 +284,8 @@ func TestGeneratedCandidateFactoryRejectsCompositionDriftWithoutMutation(t *test
 		})
 	}
 
-	storesCopy := *fixture.repository.stores
-	repeated, err := NewGeneratedCandidateAuthority(
-		&storesCopy,
-		fixture.process,
-		fixture.environment,
-		fixture.budget,
-		fixture.options,
-	)
+	repeated, err := fixture.repository.GeneratedCandidateAuthority(
+		fixture.process, fixture.environment, fixture.budget, fixture.options)
 	if err != nil || repeated != first {
 		t.Fatalf("exact repeat after refusals authority=%p error=%v", repeated, err)
 	}
@@ -353,7 +302,7 @@ func TestGeneratedCandidateFactoryRejectsInvalidDependenciesAndDatabaseScope(t *
 		options GeneratedCandidateProcessOptions,
 	) {
 		t.Helper()
-		authority, err := NewGeneratedCandidateAuthority(stores, process, environment, budget, options)
+		authority, err := newGeneratedCandidateAuthorityConcrete(stores, process, environment, budget, options)
 		if authority != nil || !errors.Is(err, deploymentexecution.ErrInvalidConfiguration) {
 			t.Fatalf("invalid factory authority=%p error=%v", authority, err)
 		}
