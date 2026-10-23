@@ -11,7 +11,7 @@ import (
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/runtime/docker"
-	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	generateddomaintest "github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 // gatewayStartupDiagnosticExpectedCheckpoints is intentionally independent of
@@ -311,7 +311,7 @@ func TestGatewayStartupDiagnosticUsesDirectTaggedIngressResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	ingress, err := newGatewayStartupIngressWithRunner(fixture.configuration, fixture.dockerExecutable, directories,
-		rebindFenceCheck(fixture.db), nil, runtimeprocess.ExecRunner{})
+		rebindFenceCheck(fixture.db), nil, generateddomaintest.NewRunner(generateddomaintest.Options{}))
 	if err != nil {
 		t.Fatal(err)
 	}
