@@ -16,6 +16,40 @@ import (
 )
 
 func TestGeneratedDomainStartupRequiresExactTypedRecovery(t *testing.T) {
+	t.Run("bootstrap_nonce_native_v1_recovery_descriptor", func(t *testing.T) {
+		source, state, journal := generatedDomainGatewayOnlyUpgradeTestState(t)
+		selection := gatewayUpgradeGenerationSelection{Store: &gatewayUpgradeStateStore{},
+			State: state, Journal: journal, Existing: true, operationID: state.OperationID}
+		request := gatewayV2UpgradeRequestFromStateForTest(state)
+		database := generatedDomainUpgradeDatabaseSnapshot(request, appaccess.GatewayProfileUpgradePrepared, 1)
+		protected := generatedDomainProtectedStartupSnapshot{effectEmpty: false, nativeV1: &source,
+			upgrade: gatewayUpgradeHistory{generations: []gatewayUpgradeGenerationSelection{selection}}}
+		expected := resolveGeneratedDomainRecoveryDockerExpectation(database, protected)
+		if expected.kind != generatedDomainRecoveryDockerUpgrade || len(expected.alternatives) != 1 {
+			t.Fatalf("upgrade recovery expectation = %#v", expected)
+		}
+		objects := generatedDomainDockerObjectsForDescriptors(expected.alternatives[0])
+		volume := -1
+		for index := range objects {
+			if objects[index].kind == "volume" && objects[index].name == caddyVolumeName {
+				volume = index
+				break
+			}
+		}
+		if volume < 0 {
+			t.Fatal("prepared recovery omitted native-v1 volume")
+		}
+		objects[volume].labels = cloneStringMap(objects[volume].labels)
+		objects[volume].labels[generatedDomainBootstrapVolumeNonceLabel] = strings.Repeat("a", 64)
+		if !generatedDomainRecoveryDockerObjectsAccounted(objects, expected) {
+			t.Fatal("exact native-v1 recovery with bootstrap nonce was rejected")
+		}
+		objects[volume].labels[generatedDomainBootstrapVolumeNonceLabel] = strings.Repeat("A", 64)
+		if generatedDomainRecoveryDockerObjectsAccounted(objects, expected) {
+			t.Fatal("malformed native-v1 recovery bootstrap nonce was accounted")
+		}
+	})
+
 	t.Run("recovery_observation_never_probes_applications", func(t *testing.T) {
 		source, state, journal := generatedDomainGatewayOnlyUpgradeTestState(t)
 		selection := gatewayUpgradeGenerationSelection{Store: &gatewayUpgradeStateStore{},

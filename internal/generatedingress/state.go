@@ -174,6 +174,37 @@ func (s *stateStore) save(state routeState) error {
 	return s.sameDirectory(before)
 }
 
+// createInitialEmpty installs the one native-v1 empty route bundle. Unlike
+// save it is create-only: an existing destination and an installed-but-not-
+// durably-synced result are terminal and are never removed or replaced.
+func (s *stateStore) createInitialEmpty() error {
+	state := routeState{Version: stateVersion, Active: map[string]routeRecord{}}
+	body, err := json.Marshal(state)
+	if err != nil || len(body) > maxStateBytes {
+		clear(body)
+		if err == nil {
+			err = errors.New("generated ingress state is too large")
+		}
+		return err
+	}
+	defer clear(body)
+	before, err := s.directoryIdentity()
+	if err != nil {
+		return err
+	}
+	if err := secretfile.WriteNew(s.path, statePurpose, body); err != nil {
+		return err
+	}
+	if err := s.sameDirectory(before); err != nil {
+		return err
+	}
+	loaded, err := s.load()
+	if err != nil || !validRouteState(loaded) || loaded.Pending != nil || len(loaded.Active) != 0 {
+		return errors.New("generated ingress initial state readback failed")
+	}
+	return nil
+}
+
 func (s *stateStore) directoryIdentity() (os.FileInfo, error) {
 	if s == nil || s.root == "" || filepath.Dir(s.path) != s.root {
 		return nil, errors.New("generated ingress state directory is unsafe")

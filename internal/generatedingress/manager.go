@@ -74,6 +74,11 @@ type Options struct {
 	// It is optional for legacy-only callers; any path that observes a scoped
 	// rebind current-state bundle fails closed when this provider is absent.
 	RebindCurrentStateRepository GatewayRebindCurrentStateRepository
+	// generatedDomainRebindRepository is the concrete sealed SQL authority
+	// installed only by the private generated-domain constructor. It is an
+	// unexported copy-family anchor: ordinary callers cannot synthesize or
+	// replace it when they copy a Manager value.
+	generatedDomainRebindRepository *appaccess.Repository
 }
 
 // GatewayRebindCurrentStateRepository is intentionally read-only. Ordinary
@@ -222,14 +227,6 @@ func New(runner runtimeprocess.CommandRunner, options Options) (*Manager, error)
 		return nil, err
 	}
 	manager.domainView = view
-	// A supported Manager always owns one coherent pair of physical adapters.
-	// Both adapters retain this exact manager, runner, protected store, lock and
-	// fail-stop identity. Interactive commit/reconcile still wrap the rebind
-	// adapter per invocation to add request-local authorization; they do not
-	// replace the startup/current capability installed here.
-	rebind, current := newGatewayRebindRuntimeDrivers(manager)
-	manager.gatewayRebindCrossStoreDriver = rebind
-	manager.gatewayCurrentPhysicalDriver = current
 	if err := ticket.publish(manager); err != nil {
 		return nil, err
 	}
@@ -268,18 +265,62 @@ func newManager(runner runtimeprocess.CommandRunner, options Options) (*Manager,
 	if err != nil {
 		return nil, err
 	}
+	return assembleManager(runner, options, store)
+}
+
+// assembleManager composes one complete Manager around a caller-proved state
+// store. It performs no state-directory creation or permission repair. Public
+// New retains its existing behavior by calling newStateStore first; the
+// private generated-domain constructor supplies a separately validated
+// read-only store after its stable observation or owned create transition.
+func assembleManager(runner runtimeprocess.CommandRunner, options Options, store *stateStore) (*Manager, error) {
+	manager := &Manager{mu: newContextMutex()}
+	if err := assembleManagerInto(manager, runner, options, store); err != nil {
+		return nil, err
+	}
+	return manager, nil
+}
+
+// assembleManagerInto completes a prospective Manager whose local exclusion
+// may already be held by the private empty bootstrap. It never replaces that
+// mutex and does not publish the Manager.
+func assembleManagerInto(manager *Manager, runner runtimeprocess.CommandRunner, options Options, store *stateStore) error {
+	if runner == nil || store == nil {
+		return errors.New("generated ingress manager composition is invalid")
+	}
+	options = normalizeManagerOptions(options)
+	if !validOptions(options) || store.root != filepath.Join(options.DataRoot, "runtime", "generated-ingress") ||
+		store.path != filepath.Join(store.root, stateFilename) {
+		return errors.New("generated ingress manager composition is invalid")
+	}
+	observedStore, present, _, err := inspectStateStoreReadOnly(options.DataRoot)
+	if err != nil || !present || observedStore == nil || observedStore.root != store.root ||
+		observedStore.path != store.path {
+		return errors.New("generated ingress manager composition is invalid")
+	}
 	dockerEnv, err := dockerEnvironment(options.DockerEndpoint, options.DockerConfigDirectory)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	workingDirectoryIdentity, err := os.Lstat(options.WorkingDirectory)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return &Manager{runner: runner, store: store, options: options, dockerEnv: dockerEnv,
-		workingDirectoryIdentity: workingDirectoryIdentity, mu: newContextMutex(),
-		gatewayRebindFailStop:      &gatewayRebindProcessFailStop,
-		gatewayRebindCommitBarrier: &gatewayRebindProcessCommitBarrier}, nil
+	if manager == nil || manager.mu.token == nil || manager.runner != nil || manager.store != nil {
+		return errors.New("generated ingress manager composition target is invalid")
+	}
+	manager.runner, manager.store, manager.options = runner, store, options
+	manager.dockerEnv, manager.workingDirectoryIdentity = dockerEnv, workingDirectoryIdentity
+	manager.gatewayRebindFailStop = &gatewayRebindProcessFailStop
+	manager.gatewayRebindCommitBarrier = &gatewayRebindProcessCommitBarrier
+	// Every supported Manager owns one coherent pair of physical adapters.
+	// Both retain this exact Manager, runner, protected store, lock and process
+	// latch identity. Request-scoped facades may wrap the rebind adapter but do
+	// not replace either installed capability.
+	rebind, current := newGatewayRebindRuntimeDrivers(manager)
+	manager.gatewayRebindCrossStoreDriver = rebind
+	manager.gatewayCurrentPhysicalDriver = current
+	return nil
 }
 
 // Switch atomically reloads the aggregate Caddy route set, durably records the
@@ -640,19 +681,10 @@ func (m *Manager) ensureIngressNetwork(ctx context.Context) (string, error) {
 }
 
 func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) error {
-	if net.ParseIP(ingressIP) == nil {
+	args, err := caddyCreateArgs(imageID, ingressIP, m.options.HostPort)
+	if err != nil {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
-	args := []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", "name=" + caddyNetworkName + ",gw-priority=1",
-		"--ip", ingressIP,
-		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--entrypoint", caddyExecutable, "--read-only",
-		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--cap-add", caddyCapability, "--security-opt", "no-new-privileges",
-		"--memory", "268435456", "--memory-swap", "268435456", "--cpus", "1.000", "--pids-limit", "128", "--ulimit", "nofile=1024:1024",
-		"--publish", "127.0.0.1:" + strconv.FormatUint(uint64(m.options.HostPort), 10) + ":8080/tcp", "--restart", "unless-stopped",
-		"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
-		"--env", "XDG_CONFIG_HOME=/config", "--env", "XDG_DATA_HOME=/data",
-		"--label", "io.rig.managed=generated-ingress", "--label", "io.rig.identity-version=v1", "--label", "io.rig.listener-isolation=v1",
-		imageID, "run", "--config", "/config/active.json"}
 	createErr := m.runDiscard(ctx, m.options.CommandTimeout, args...)
 	reconcileCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), m.options.CommandTimeout)
 	defer cancel()
@@ -679,6 +711,22 @@ func (m *Manager) createCaddy(ctx context.Context, imageID, ingressIP string) er
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
 	return nil
+}
+
+func caddyCreateArgs(imageID, ingressIP string, hostPort uint16) ([]string, error) {
+	if !validContainerID(imageID) || net.ParseIP(ingressIP) == nil || hostPort == 0 {
+		return nil, errors.New("generated ingress container create input is invalid")
+	}
+	return []string{"container", "create", "--name", caddyContainerName, "--hostname", caddyContainerName, "--network", "name=" + caddyNetworkName + ",gw-priority=1",
+		"--ip", ingressIP,
+		"--mount", "type=volume,src=" + caddyVolumeName + ",dst=/config", "--user", "1000:1000", "--entrypoint", caddyExecutable, "--read-only",
+		"--tmpfs", "/data:rw,noexec,nosuid,nodev,size=67108864", "--cap-drop", "ALL", "--cap-add", caddyCapability, "--security-opt", "no-new-privileges",
+		"--memory", "268435456", "--memory-swap", "268435456", "--cpus", "1.000", "--pids-limit", "128", "--ulimit", "nofile=1024:1024",
+		"--publish", "127.0.0.1:" + strconv.FormatUint(uint64(hostPort), 10) + ":8080/tcp", "--restart", "unless-stopped",
+		"--log-driver", "local", "--log-opt", "max-size=10m", "--log-opt", "max-file=3",
+		"--env", "XDG_CONFIG_HOME=/config", "--env", "XDG_DATA_HOME=/data",
+		"--label", "io.rig.managed=generated-ingress", "--label", "io.rig.identity-version=v1", "--label", "io.rig.listener-isolation=v1",
+		imageID, "run", "--config", "/config/active.json"}, nil
 }
 
 func (m *Manager) applyRoutes(ctx context.Context, routes map[string]routeRecord, filename string) error {
@@ -714,8 +762,13 @@ func (m *Manager) installRestartConfig(ctx context.Context) error {
 }
 
 func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename string) error {
+	return m.copyConfigToContainer(ctx, contents, filename, caddyContainerName)
+}
+
+func (m *Manager) copyConfigToContainer(ctx context.Context, contents []byte, filename, container string) error {
 	defer clear(contents)
-	if len(contents) == 0 || !validConfigFilename(filename) {
+	if len(contents) == 0 || !validConfigFilename(filename) ||
+		(container != caddyContainerName && !validContainerID(container)) {
 		return &Error{Code: DiagnosticRouteInvalid}
 	}
 	workingDirectoryGuard, ok := m.acquireWorkingDirectoryGuard()
@@ -746,7 +799,7 @@ func (m *Manager) copyConfig(ctx context.Context, contents []byte, filename stri
 	if err != nil || !fileInfo.Mode().IsRegular() || fileInfo.Mode()&os.ModeSymlink != 0 || generatedIngressPathIsReparsePoint(path) || !os.SameFile(createdInfo, fileInfo) || !m.validWorkingDirectory() {
 		return &Error{Code: DiagnosticIngressDrift}
 	}
-	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "cp", path, caddyContainerName+":/config/"+filename); err != nil {
+	if err := m.runDiscard(ctx, m.options.CommandTimeout, "container", "cp", path, container+":/config/"+filename); err != nil {
 		return &Error{Code: DiagnosticIngressUnavailable}
 	}
 	return nil

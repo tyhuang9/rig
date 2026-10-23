@@ -57,6 +57,11 @@ type generatedDomainPathProof struct {
 	ancestors    map[string]os.FileInfo
 }
 
+type generatedDomainOwnedPathTransition struct {
+	final   generatedDomainPathProof
+	created map[string]os.FileInfo
+}
+
 func fixedGeneratedGatewayNamespace() generatedGatewayNamespace {
 	return generatedGatewayNamespace{
 		container: caddyContainerName,
@@ -266,6 +271,69 @@ func (proof generatedDomainPathProof) recheck(requireIngress bool) (os.FileInfo,
 		return nil, errors.New("generated domain ingress identity changed")
 	}
 	return current.ingressRoot, nil
+}
+
+// createIngressRoot performs the constructor's sole absent-to-present path
+// transition. Every missing path is created with create-only Mkdir and then
+// bound to its concrete identity; an independently appearing path is never
+// adopted. The original proof remains immutable.
+func (proof generatedDomainPathProof) createIngressRoot() (generatedDomainOwnedPathTransition, error) {
+	if proof.ingressRoot != nil {
+		return generatedDomainOwnedPathTransition{}, errors.New("generated domain ingress directory already exists")
+	}
+	if _, err := proof.recheck(false); err != nil {
+		return generatedDomainOwnedPathTransition{}, err
+	}
+	runtimeRoot := filepath.Dir(proof.ingressPath)
+	paths := []string{runtimeRoot, proof.ingressPath}
+	created := make(map[string]os.FileInfo, len(paths))
+	for _, path := range paths {
+		if retained := proof.ancestors[path]; retained != nil {
+			current, err := os.Lstat(path)
+			if err != nil || !current.IsDir() || !sameGeneratedDomainFileIdentity(retained, current) ||
+				current.Mode() != retained.Mode() || generatedIngressPathIsReparsePoint(path) {
+				return generatedDomainOwnedPathTransition{}, errors.New("generated domain path identity changed")
+			}
+			continue
+		}
+		if err := os.Mkdir(path, 0o700); err != nil {
+			return generatedDomainOwnedPathTransition{}, errors.New("generated domain ingress directory creation failed")
+		}
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 ||
+			generatedIngressPathIsReparsePoint(path) || !os.SameFile(info, info) {
+			return generatedDomainOwnedPathTransition{}, errors.New("generated domain created path identity is invalid")
+		}
+		created[path] = info
+	}
+	final, err := inspectGeneratedDomainPaths(proof.dataRootPath)
+	if err != nil || final.ingressRoot == nil || !sameGeneratedDomainFileIdentity(proof.dataRoot, final.dataRoot) ||
+		!sameGeneratedDomainFileIdentity(proof.databaseFile, final.databaseFile) ||
+		!sameGeneratedDomainPathIdentityMap(proof.ancestors, final.ancestors, true) {
+		return generatedDomainOwnedPathTransition{}, errors.New("generated domain created path identity changed")
+	}
+	for path, expected := range created {
+		if !sameGeneratedDomainFileIdentity(expected, final.ancestors[path]) {
+			return generatedDomainOwnedPathTransition{}, errors.New("generated domain created path identity changed")
+		}
+	}
+	return generatedDomainOwnedPathTransition{final: final, created: created}, nil
+}
+
+func (transition generatedDomainOwnedPathTransition) current() bool {
+	if transition.final.ingressRoot == nil || len(transition.created) == 0 {
+		return false
+	}
+	current, err := inspectGeneratedDomainPaths(transition.final.dataRootPath)
+	if err != nil || !sameGeneratedDomainPathObservation(transition.final, current, false) {
+		return false
+	}
+	for path, expected := range transition.created {
+		if !sameGeneratedDomainFileIdentity(expected, current.ancestors[path]) {
+			return false
+		}
+	}
+	return true
 }
 
 func sameGeneratedDomainPathObservation(left, right generatedDomainPathProof, allowNewAncestors bool) bool {
