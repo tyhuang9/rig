@@ -7,13 +7,70 @@ environment/live-test skips. The first hosted run subsequently finished with
 68 failed checks, 61 successful checks and two skipped checks. Repairs are in
 progress. The published diagnostic checkpoint is
 `cc1cccee1dba3c93803f4085924e1c1e1c890f2c`; its hosted run localizes the startup
-refusal to the locked final check's Docker static-response probe. Local runtime fixture corrections
-are recorded below; they do not establish hosted acceptance. Receipt-owned predecessor retirement
-remains open. M4 is incomplete.
+refusal to the locked final check's Docker static-response probe. Runtime fixture
+corrections were published at `44ca01022b6bfd6a45a1e6adf44ab8383cc4a57a`.
+The source correction for the missing V1 fallback is recorded below; hosted Docker
+acceptance remains required. Receipt-owned predecessor retirement remains open.
+M4 is incomplete.
 
 The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
+
+## Native V1 unmatched-host response correction
+
+Commit `b13ddf5b72bbba90a566362ca78f5877a2fc3c66` adds one empty 404 fallback after
+the native V1 gateway's application proxy routes, including an empty bootstrap.
+Previously, V1 generated only host-matched proxies, while the existing startup
+probe required an unmatched host to return an empty 404. The pinned
+[Caddy v2.11.4 source](https://github.com/caddyserver/caddy/blob/v2.11.4/modules/caddyhttp/server.go)
+leaves an unhandled request at the default 200 response. This
+source mismatch explains a concrete path to the observed static-response refusal;
+the hosted log does not expose the actual response status.
+
+V2 already had the fallback. It now receives that fallback from the shared V1
+builder, retaining the same order: state-bound probes, application proxies, one
+404 fallback. LAN listeners, host restrictions and per-port routes are unchanged.
+The probe, exact canonical configuration comparison and refusal guards remain.
+Previously retained V1 configurations without the fallback differ from the new
+canonical config and remain refused. This change does not adopt or rewrite them;
+they need an explicit later migration or recovery decision.
+
+Six exactly discovered parents pass under native Linux, with two direct fallback
+subcases and three distinct bootstrap subprocess cases. The controls cover empty
+and populated V1 routes, intended-host proxy precedence, V2 probe order and local
+route equivalence, LAN isolation, stopped-gateway repair and native bootstrap
+receipts. Echoed subprocess results are counted once. There are no failures or
+skips. This is controlled non-race execution, without real Caddy or Docker.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `static-response-404-20261023T234433Z/receipt.json`, SHA-256
+  `d7f0f77249c9796f91f973e6247be411dae587c4a8b821492d6c19f7b4acaf7e`.
+  The pre-run script, exact selector, discovery, binary, source manifests and raw
+  execution output are retained. Native temporary roots are under private `/tmp`.
+- Its additive `census-erratum.json`, SHA-256
+  `b571a19adbd6a7b07e9e184d2528854c456e7decfbc726fdfcc6d23cfb71bd87`,
+  includes indented child passes without changing the original receipt or replaying.
+- `static-response-404-static-20261023T234541Z/receipt.json`, SHA-256
+  `9d4ae04a5fbdc5b708fc9ca3c4105bebf062fcac6e35346c9233219a8ceb596d`:
+  five-file formatting, ingress vet, live-tagged compilation and canonical
+  generation pass with unchanged source.
+- `static-response-404-source-security-review.md`, SHA-256
+  `a6ea5153a64369b883d9a775e91f3e0ba37dad619a01690cd02769341f91f349`,
+  finds no blocker in the exact five-file change.
+- `static-response-404-root-audit-20261023.json`, SHA-256
+  `7b67a72c970bb9ec917313fc26253b9c05ad0473a3041ca77fa406bee10b2c63`,
+  verifies the current source, binaries, runners, raw census, static logs and
+  review bindings independently.
+
+The preceding `44ca010` head's 23:47:50 UTC snapshot had 14 failed checks, five
+successful, 14 running, 107 queued and one skipped. Snapshot SHA-256:
+`5b5371fcf357fdd3c36a7bd83c8360dbd616bd48b8b242dc92408c71a4609b37`.
+Its synthetic merge `8e54614e1f03a7f0e695a470f715dfc90252f66b` has the verified
+PR #220 base and `44ca010` as parents, and the same tree as that head. These
+results precede the fallback correction. Full Docker/race acceptance, genuine
+cold LAN/migration fixture composition and predecessor retirement remain open.
 
 ## Runtime fixture lifetime completion
 
