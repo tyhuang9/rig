@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -233,6 +234,13 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 		runner := &generatedDomainRegistryRunner{daemonID: "registry-exact-daemon-" + filepath.Base(filepath.Dir(fixture.dataRoot))}
 		environment := &candidateFactoryEnvironment{}
 		input := generatedDomainRegistryInput(t, fixture, runner, environment)
+		if _, err := newGeneratedDomainReservationInput(
+			fixture.stores, runner, nil, fixture.options, input.physical,
+		); !errors.Is(err, deploymentexecution.ErrInvalidConfiguration) ||
+			!errors.Is(err, generatedDomainReservationPostInspectionInput) ||
+			strings.Contains(err.Error(), fixture.dataRoot) || strings.Contains(err.Error(), runner.daemonID) {
+			t.Fatalf("post-inspection input attribution exposed mutable identity: %v", err)
+		}
 		state, err := reserveGeneratedDomain(context.Background(), input)
 		if err != nil || state == nil || !state.fenceReady || state.failed {
 			t.Fatalf("first reservation: state=%+v error=%v", state, err)
@@ -306,6 +314,11 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 			generatedDomainDaemonNamespaceConflict(input.physical, rootOnly.physical) {
 			t.Fatal("root collision depended on the daemon+namespace predicate")
 		}
+		if state, err := reserveGeneratedDomain(context.Background(), rootOnly); state != nil ||
+			!errors.Is(err, deploymentexecution.ErrInvalidConfiguration) ||
+			!errors.Is(err, generatedDomainReservationRetainedRootOrDatabase) {
+			t.Fatalf("root collision attribution: state=%v error=%v", state, err)
+		}
 		databaseOnly := separateInput
 		databaseOnly.physical.databaseFile = input.physical.databaseFile
 		databaseOnly.physical.manager.daemonID += "-other"
@@ -314,8 +327,17 @@ func TestGeneratedDomainRegistryFencesLegacyConstructionAndTypedActivity(t *test
 			t.Fatal("database collision depended on the daemon+namespace predicate")
 		}
 		if state, err := reserveGeneratedDomain(context.Background(), separateInput); state != nil ||
-			!errors.Is(err, deploymentexecution.ErrInvalidConfiguration) {
+			!errors.Is(err, deploymentexecution.ErrInvalidConfiguration) ||
+			!errors.Is(err, generatedDomainReservationRetainedDaemonNamespace) {
 			t.Fatalf("daemon+namespace-only collision: state=%v error=%v", state, err)
+		}
+		changedCurrent := separateInput
+		changedCurrent.physical.manager.daemonID += "-current-check"
+		changedCurrent.proof.dataRoot = input.proof.dataRoot
+		if state, err := reserveGeneratedDomain(context.Background(), changedCurrent); state != nil ||
+			!errors.Is(err, deploymentexecution.ErrInvalidConfiguration) ||
+			!errors.Is(err, generatedDomainReservationInputNoLongerCurrent) {
+			t.Fatalf("changed input attribution: state=%v error=%v", state, err)
 		}
 		otherNamespace := separateInput.physical
 		otherNamespace.manager.namespace.network += "-other"

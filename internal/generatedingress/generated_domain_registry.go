@@ -116,6 +116,37 @@ var generatedDomains = generatedDomainProcessRegistry{
 	tickets: make(map[*generatedLegacyConstructionTicket]struct{}), pairingIdle: generatedClosedSignal(),
 }
 
+// generatedDomainReservationRefusal is a closed constructor-stage diagnostic.
+// It carries no path, daemon, database, or retained identity data and never
+// replaces the public deployment-execution configuration sentinel.
+type generatedDomainReservationRefusal uint8
+
+const (
+	generatedDomainReservationPostInspectionInput generatedDomainReservationRefusal = iota + 1
+	generatedDomainReservationRetainedRootOrDatabase
+	generatedDomainReservationRetainedDaemonNamespace
+	generatedDomainReservationInputNoLongerCurrent
+)
+
+func (r generatedDomainReservationRefusal) Error() string {
+	switch r {
+	case generatedDomainReservationPostInspectionInput:
+		return "generated domain reservation input was invalid after physical inspection"
+	case generatedDomainReservationRetainedRootOrDatabase:
+		return "generated domain reservation conflicts with a retained root or database identity"
+	case generatedDomainReservationRetainedDaemonNamespace:
+		return "generated domain reservation conflicts with a retained daemon namespace"
+	case generatedDomainReservationInputNoLongerCurrent:
+		return "generated domain reservation input changed before admission"
+	default:
+		return "generated domain reservation was refused"
+	}
+}
+
+func generatedDomainReservationError(reason generatedDomainReservationRefusal) error {
+	return errors.Join(deploymentexecution.ErrInvalidConfiguration, reason)
+}
+
 func newGeneratedDomainReservationInput(
 	stores *deployments.GeneratedOwnerStores,
 	runner runtimeprocess.CommandRunner,
@@ -126,17 +157,23 @@ func newGeneratedDomainReservationInput(
 	options, valid := normalizeGeneratedDomainOptions(options)
 	if stores == nil || !valid || !generatedCandidatePointerIdentity(runner) ||
 		!generatedCandidatePointerIdentity(environment) {
-		return generatedDomainReservationInput{}, deploymentexecution.ErrInvalidConfiguration
+		return generatedDomainReservationInput{}, generatedDomainReservationError(
+			generatedDomainReservationPostInspectionInput,
+		)
 	}
 	snapshot := *stores
 	repository := snapshot.Repository()
 	if repository == nil {
-		return generatedDomainReservationInput{}, deploymentexecution.ErrInvalidConfiguration
+		return generatedDomainReservationInput{}, generatedDomainReservationError(
+			generatedDomainReservationPostInspectionInput,
+		)
 	}
 	canonical, err := repository.GeneratedOwnerStores()
 	if err != nil || canonical == nil || !snapshot.ConfiguredForDomain(options.DataRoot, options.WorkingDirectory) ||
 		!canonical.ConfiguredForDomain(options.DataRoot, options.WorkingDirectory) {
-		return generatedDomainReservationInput{}, deploymentexecution.ErrInvalidConfiguration
+		return generatedDomainReservationInput{}, generatedDomainReservationError(
+			generatedDomainReservationPostInspectionInput,
+		)
 	}
 	input := generatedDomainReservationInput{
 		stores: canonical, repository: repository, database: canonical.Database(),
@@ -147,11 +184,20 @@ func newGeneratedDomainReservationInput(
 	if err != nil || !sameGeneratedDomainFileIdentity(proof.dataRoot, physical.manager.dataRoot) ||
 		!sameGeneratedDomainFileIdentity(proof.databaseFile, physical.databaseFile) ||
 		!sameGeneratedDomainOptionalFileIdentity(proof.ingressRoot, physical.manager.ingressRoot) {
-		return generatedDomainReservationInput{}, deploymentexecution.ErrInvalidConfiguration
+		return generatedDomainReservationInput{}, generatedDomainReservationError(
+			generatedDomainReservationPostInspectionInput,
+		)
 	}
 	input.proof = proof
-	if !input.configured() || !input.current() {
-		return generatedDomainReservationInput{}, deploymentexecution.ErrInvalidConfiguration
+	if !input.configured() {
+		return generatedDomainReservationInput{}, generatedDomainReservationError(
+			generatedDomainReservationPostInspectionInput,
+		)
+	}
+	if !input.current() {
+		return generatedDomainReservationInput{}, generatedDomainReservationError(
+			generatedDomainReservationInputNoLongerCurrent,
+		)
 	}
 	return input, nil
 }
@@ -371,7 +417,7 @@ func (t *generatedLegacyConstructionTicket) completeLocked() {
 
 func reserveGeneratedDomain(ctx context.Context, input generatedDomainReservationInput) (*generatedDomainState, error) {
 	if ctx == nil || !input.configured() {
-		return nil, deploymentexecution.ErrInvalidConfiguration
+		return nil, generatedDomainReservationError(generatedDomainReservationPostInspectionInput)
 	}
 	return reserveGeneratedDomainAfterPairing(ctx, input, false, false)
 }
@@ -391,10 +437,13 @@ func reserveGeneratedDomainAfterPairing(
 			generatedDomains.mu.Unlock()
 			return waitGeneratedDomainReservation(ctx, state)
 		}
-		if generatedDomainRootOrDatabaseConflict(existing.input.physical, input.physical) ||
-			generatedDomainDaemonNamespaceConflict(existing.input.physical, input.physical) {
+		if generatedDomainRootOrDatabaseConflict(existing.input.physical, input.physical) {
 			generatedDomains.mu.Unlock()
-			return nil, deploymentexecution.ErrInvalidConfiguration
+			return nil, generatedDomainReservationError(generatedDomainReservationRetainedRootOrDatabase)
+		}
+		if generatedDomainDaemonNamespaceConflict(existing.input.physical, input.physical) {
+			generatedDomains.mu.Unlock()
+			return nil, generatedDomainReservationError(generatedDomainReservationRetainedDaemonNamespace)
 		}
 	}
 	if generatedDomains.pairingEpoch != 0 {
@@ -408,7 +457,7 @@ func reserveGeneratedDomainAfterPairing(
 	if !current {
 		generatedDomains.mu.Unlock()
 		if !input.current() {
-			return nil, deploymentexecution.ErrInvalidConfiguration
+			return nil, generatedDomainReservationError(generatedDomainReservationInputNoLongerCurrent)
 		}
 		return reserveGeneratedDomainAfterPairing(ctx, input, true, allowConstructionTransition)
 	}
