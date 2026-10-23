@@ -54,6 +54,7 @@ type routeController interface {
 	activate(context.Context, *generatedingress.GeneratedCandidateExecution,
 		generatedruntime.RouteSwitchRequest, generatedruntimestate.Deployment,
 	) (generatedruntimestate.Deployment, error)
+	attestPublished(context.Context, deploymentexecution.Claim, string) error
 }
 
 type generatedRouteController struct {
@@ -73,6 +74,13 @@ func (c generatedRouteController) activate(ctx context.Context,
 		return generatedruntimestate.Deployment{}, err
 	}
 	return pinned.Activate(ctx)
+}
+
+func (c generatedRouteController) attestPublished(ctx context.Context, claim deploymentexecution.Claim, deploymentID string) error {
+	if c.authority == nil {
+		return errors.New("generated route authority is unavailable")
+	}
+	return c.authority.AttestPublished(ctx, claim, deploymentID)
 }
 
 func NewExecutor(
@@ -397,6 +405,12 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			runtimeDeployment = advanced
 
 		case generatedruntimestate.PhaseDraining:
+			if err = e.routes.attestPublished(ctx, claim, deployment.ID); err != nil {
+				// A durable receipt resolves the activation write, but retry still
+				// needs a fresh physical route proof before cleanup or success.
+				e.observeRoutePauseError(ctx, routePauseStageRouteSwitch, err)
+				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
+			}
 			if err = e.drainPrevious(ctx, resolved, runtimeDeployment); err != nil {
 				// The new slot is already active. Keep the deployment and job
 				// nonterminal so retry or restart recovery can finish old-slot cleanup.
