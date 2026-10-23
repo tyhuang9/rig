@@ -350,7 +350,7 @@ func (r *generatedDomainBootstrapReceipt) guard(
 		if networkErr != nil || !found || normalizeID(id) != r.networkID ||
 			!validGeneratedDomainBootstrapNetwork(network, r.networkID,
 				r.network.IPAM.Config[0].Subnet, r.network.IPAM.Config[0].Gateway,
-				r.ingressIP, r.containerID != "", r.containerID) {
+				r.ingressIP, r.started, r.containerID) {
 			return nil, errors.New("generated domain bootstrap network receipt changed")
 		}
 	}
@@ -442,7 +442,7 @@ func validGeneratedDomainBootstrapVolume(value volumeInspection, identity gatewa
 }
 
 func validGeneratedDomainBootstrapNetwork(value caddyNetworkInspection, id, subnet, gateway, ingressIP string,
-	withContainer bool, containerID string,
+	started bool, containerID string,
 ) bool {
 	if !generatedDomainCanonicalDockerID(id, false) || value.Name != caddyNetworkName || value.Driver != "bridge" ||
 		value.Scope != "local" || value.Internal || len(value.Options) != 0 ||
@@ -453,8 +453,14 @@ func validGeneratedDomainBootstrapNetwork(value caddyNetworkInspection, id, subn
 		}) {
 		return false
 	}
-	if !withContainer {
-		return len(value.Containers) == 0
+	if containerID == "" {
+		return !started && len(value.Containers) == 0
+	}
+	// A stopped container has a requested network attachment, but Docker may
+	// expose its network membership only after Start. If membership is already
+	// visible, it must still be the one exact receipt-owned container.
+	if !started && len(value.Containers) == 0 {
+		return true
 	}
 	if len(value.Containers) != 1 {
 		return false
@@ -482,16 +488,18 @@ func validGeneratedDomainBootstrapContainer(value caddyInspection, runtime gatew
 		return false
 	}
 	network := runtime.ConfiguredNetworks[caddyNetworkName]
-	if normalizeID(network.NetworkID) != networkID || network.GwPriority != caddyGatewayPriority ||
+	if network.GwPriority != caddyGatewayPriority ||
 		network.IPv6Gateway != "" || network.IPAMConfig == nil || network.IPAMConfig.IPv4Address != ingressIP ||
 		network.IPAMConfig.IPv6Address != "" {
 		return false
 	}
 	if running {
-		return network.IPAddress == ingressIP &&
+		return normalizeID(network.NetworkID) == networkID && network.IPAddress == ingressIP &&
 			gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, value.PortBindings)
 	}
-	return network.IPAddress == "" && !gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)
+	return (network.NetworkID == "" || normalizeID(network.NetworkID) == networkID) &&
+		network.EndpointID == "" && network.IPAddress == "" &&
+		!gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)
 }
 
 func generatedDomainBootstrapNetworkCandidate(ctx context.Context, manager *Manager,
