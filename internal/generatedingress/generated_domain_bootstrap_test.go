@@ -207,7 +207,7 @@ func (r *generatedDomainBootstrapTestRunner) createVolumeLocked(args []string) (
 	}
 	r.effects++
 	r.volume = &gatewayVolumeIdentityInspection{Name: caddyVolumeName, Driver: "local", Scope: "local",
-		Options: map[string]string{}, Labels: map[string]string{
+		Options: nil, Labels: map[string]string{
 			gatewayV2ManagedLabelKey:                 gatewayV2ManagedContainerLabel,
 			gatewayV2IdentityLabelKey:                gatewayV1IdentityVersion,
 			generatedDomainBootstrapVolumeNonceLabel: nonce,

@@ -200,6 +200,9 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	}
 	root := t.TempDir()
 	state := filepath.Join(root, "ingress-state")
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal("create live lifecycle controller state root:", err)
+	}
 	directories, err := runtimedocker.PrepareControllerDirectories(state)
 	if err != nil {
 		t.Fatal("prepare live lifecycle controller directories:", err)

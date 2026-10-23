@@ -202,6 +202,9 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 
 	root := t.TempDir()
 	stateRoot := filepath.Join(root, "ingress-state")
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal("create live gateway-v2 controller state root:", err)
+	}
 	directories, err := runtimedocker.PrepareControllerDirectories(stateRoot)
 	if err != nil {
 		t.Fatal("prepare live gateway-v2 controller directories:", err)

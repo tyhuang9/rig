@@ -45,6 +45,9 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 
 	root := t.TempDir()
 	state := filepath.Join(root, "ingress-state")
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal("create live gateway controller state root:", err)
+	}
 	directories, err := runtimedocker.PrepareControllerDirectories(state)
 	if err != nil {
 		t.Fatal("prepare live gateway controller directories:", err)

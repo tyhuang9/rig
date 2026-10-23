@@ -401,13 +401,13 @@ func (r *generatedDomainBootstrapReceipt) matchesSelectedObjects(objects []gener
 	if r.volume.Name != "" {
 		expected["volume\x00"+caddyVolumeName] = generatedDomainDockerObject{kind: "volume", name: caddyVolumeName,
 			labels: r.volume.Labels, data: generatedDomainDockerObjectData{driver: r.volume.Driver,
-				scope: r.volume.Scope, options: r.volume.Options, mountpoint: r.volumeIdentity.Mountpoint,
+				scope: r.volume.Scope, options: cloneStringMap(r.volume.Options), mountpoint: r.volumeIdentity.Mountpoint,
 				createdAt: r.volumeIdentity.CreatedAt}}
 	}
 	if r.networkID != "" {
 		expected["network\x00"+caddyNetworkName] = generatedDomainDockerObject{kind: "network", id: r.networkID,
 			name: caddyNetworkName, labels: r.network.Labels, data: generatedDomainDockerObjectData{
-				driver: r.network.Driver, scope: r.network.Scope, options: r.network.Options}}
+				driver: r.network.Driver, scope: r.network.Scope, options: cloneStringMap(r.network.Options)}}
 	}
 	if r.containerID != "" {
 		expected["container\x00"+caddyContainerName] = generatedDomainDockerObject{kind: "container",
