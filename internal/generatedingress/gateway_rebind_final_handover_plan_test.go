@@ -128,6 +128,13 @@ func TestGatewayRebindFinalHandoverPlanRejectsUnprovenAndAmbiguousAdmission(t *t
 }
 
 func newGatewayRebindFinalHandoverPlanTestContext(t *testing.T) (gatewayRebindFinalHandoverContext, gatewayRebindFinalHandoverObservation) {
+	value, observed, _ := newGatewayRebindFinalHandoverPlanTestContextWithPredecessor(t)
+	return value, observed
+}
+
+func newGatewayRebindFinalHandoverPlanTestContextWithPredecessor(t *testing.T) (
+	gatewayRebindFinalHandoverContext, gatewayRebindFinalHandoverObservation, gatewayRebindPredecessorFixture,
+) {
 	t.Helper()
 	fixture, fake, reads, _ := installGatewayRebindFinalConfigCopyIntent(t)
 	if err := fixture.predecessor.manager.copyGatewayRebindSuccessorFinalConfigWithDriver(context.Background(),
@@ -174,5 +181,5 @@ func newGatewayRebindFinalHandoverPlanTestContext(t *testing.T) (gatewayRebindFi
 	if err != nil {
 		t.Fatal(err)
 	}
-	return value, observed
+	return value, observed, fixture.predecessor
 }

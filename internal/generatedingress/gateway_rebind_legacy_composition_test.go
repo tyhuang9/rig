@@ -26,6 +26,11 @@ func gatewayRebindLegacyCommittedSeed(t *testing.T) (gatewayRebindPredecessorFix
 ) {
 	t.Helper()
 	legacy := newGatewayCurrentStateFixture(t)
+	canonical := legacy.canonicalPredecessor
+	routeRunner, ok := canonical.manager.runner.(*generatedRoutePredecessorRunner)
+	if canonical.migration == nil || canonical.runner == nil || !ok {
+		t.Fatal("legacy fixture lacks its original canonical predecessor family")
+	}
 	db, err := database.Open(legacy.dataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -36,7 +41,7 @@ func gatewayRebindLegacyCommittedSeed(t *testing.T) (gatewayRebindPredecessorFix
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := New(&gatewayCurrentNoCommandRunner{}, Options{DataRoot: legacy.dataRoot,
+	manager, err := New(routeRunner, Options{DataRoot: legacy.dataRoot,
 		DockerExecutable:      filepath.Join(legacy.dataRoot, "docker-test"),
 		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
 		HostPort:         legacy.history.Predecessor.Journal.Source.LocalHostPort,
@@ -45,6 +50,7 @@ func gatewayRebindLegacyCommittedSeed(t *testing.T) (gatewayRebindPredecessorFix
 		t.Fatal(err)
 	}
 	f := gatewayRebindPredecessorFixture{manager: manager, repository: repository, db: db,
+		migration: canonical.migration, runner: canonical.runner,
 		state: legacy.predecessor, journal: legacy.history.Predecessor.Journal, store: legacy.history.Predecessor.Store}
 	ctx := context.Background()
 	stamp := time.Now().UTC().Format(time.RFC3339Nano)
@@ -117,7 +123,9 @@ func gatewayRebindLegacyCommittedSeed(t *testing.T) (gatewayRebindPredecessorFix
 	// An ordinary redeploy advances mutable current state through real SQL and
 	// protected transitions using the existing bounded physical seed driver.
 	selected = gatewayCurrentServingRestoreRedeployFixture(t, f, selected, appaccess.GatewayRebindRosterEntryV2{
-		AppID: entry.AppID, ServingDeploymentID: entry.ServingDeploymentID, RouteGeneration: entry.RouteGeneration})
+		AppID: entry.AppID, ServingDeploymentID: entry.ServingDeploymentID,
+		ServingReleaseID: entry.ServingReleaseID, ServingSlot: entry.ServingSlot,
+		RouteGeneration: entry.RouteGeneration})
 	after, err := repository.GatewayRebindRecoverySnapshot(ctx)
 	if err != nil || !reflect.DeepEqual(snapshot.History, after.History) || !reflect.DeepEqual(snapshot.CurrentTransfers, after.CurrentTransfers) ||
 		selected.State.Revision <= legacy.baseline.Revision || selected.Terminal.Digest != receipt.Digest {

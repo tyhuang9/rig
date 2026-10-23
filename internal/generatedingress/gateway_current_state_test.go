@@ -29,20 +29,21 @@ func (r *gatewayCurrentNoCommandRunner) Run(context.Context, runtimeprocess.Comm
 }
 
 type gatewayCurrentStateFixture struct {
-	manager     *Manager
-	dataRoot    string
-	history     gatewayRebindProtectedIntentHistory
-	intent      gatewayRebindProtectedIntent
-	receipt     gatewayRebindFinalHandoverTerminalReceipt
-	predecessor gatewayV2RouteState
-	transfers   []appaccess.GatewayRebindAllocationTransfer
-	baseline    gatewayCurrentRouteState
-	store       *gatewayCurrentRouteStateStore
+	manager              *Manager
+	dataRoot             string
+	history              gatewayRebindProtectedIntentHistory
+	intent               gatewayRebindProtectedIntent
+	receipt              gatewayRebindFinalHandoverTerminalReceipt
+	predecessor          gatewayV2RouteState
+	canonicalPredecessor gatewayRebindPredecessorFixture
+	transfers            []appaccess.GatewayRebindAllocationTransfer
+	baseline             gatewayCurrentRouteState
+	store                *gatewayCurrentRouteStateStore
 }
 
 func newGatewayCurrentStateFixture(t *testing.T) gatewayCurrentStateFixture {
 	t.Helper()
-	value, initial := newGatewayRebindFinalHandoverPlanTestContext(t)
+	value, initial, canonicalPredecessor := newGatewayRebindFinalHandoverPlanTestContextWithPredecessor(t)
 	manager, dataRoot := handoverTestManager(t, value)
 	for _, record := range handoverTestSuccessRecords(t, value, initial) {
 		store, err := newGatewayRebindProgressStore(dataRoot, record.Generation, record.OperationID, record.Sequence)
@@ -78,7 +79,8 @@ func newGatewayCurrentStateFixture(t *testing.T) gatewayCurrentStateFixture {
 	}
 	return gatewayCurrentStateFixture{manager: manager, dataRoot: dataRoot, history: history,
 		intent: intent, receipt: receipt, predecessor: value.Predecessor.State,
-		transfers: transfers, baseline: baseline, store: store}
+		canonicalPredecessor: canonicalPredecessor,
+		transfers:            transfers, baseline: baseline, store: store}
 }
 
 func gatewayCurrentFixtureTransfers(t *testing.T, receipt gatewayRebindFinalHandoverTerminalReceipt,
