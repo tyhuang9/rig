@@ -40,6 +40,8 @@ const (
 	// emitted by the parent test process.
 	liveHostdRebindStartupDiagnosticMaxBytes   = 64 << 10
 	liveHostdRebindStartupDiagnosticMaxRecords = 64
+	liveHostdRebindRoutePauseMaxBytes          = 64 << 10
+	liveHostdRebindRoutePauseMaxRecords        = 64
 
 	// The fixture owns a four-minute cleanup, the registered two-app fixture
 	// owns another four minutes, and test-owned network cleanup has one minute.
@@ -951,9 +953,154 @@ func liveHostdRebindClosedDiagnostic(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	diagnostic := "sha256:" + hex.EncodeToString(sum[:])
 	if code := liveHostdRebindStartupDiagnosticCode(value); code != "" {
-		return diagnostic + " startup=" + code
+		diagnostic += " startup=" + code
+	}
+	if code := liveHostdRebindRoutePauseDiagnosticCode(value); code != "" {
+		diagnostic += " route_pause=" + code
 	}
 	return diagnostic
+}
+
+// liveHostdRebindRoutePauseDiagnosticCode accepts only the fixed executor
+// message and a closed stage/cause pair. It examines a bounded stderr suffix
+// because route reconciliation follows successful daemon startup, and it
+// returns only the newest valid pair. Every other field is ignored.
+func liveHostdRebindRoutePauseDiagnosticCode(stderr string) string {
+	limited := []byte(stderr)
+	if len(limited) > liveHostdRebindRoutePauseMaxBytes {
+		limited = limited[len(limited)-liveHostdRebindRoutePauseMaxBytes:]
+		newline := bytes.IndexByte(limited, '\n')
+		if newline < 0 {
+			return ""
+		}
+		limited = limited[newline+1:]
+	}
+	limited = bytes.TrimSpace(limited)
+	for records := 0; len(limited) > 0 && records < liveHostdRebindRoutePauseMaxRecords; records++ {
+		line := limited
+		if newline := bytes.LastIndexByte(limited, '\n'); newline >= 0 {
+			line, limited = limited[newline+1:], limited[:newline]
+		} else {
+			limited = nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if stage, cause, ok := liveHostdRebindRoutePauseRecord(line); ok {
+			return stage + "/" + cause
+		}
+	}
+	return ""
+}
+
+func liveHostdRebindRoutePauseRecord(line []byte) (string, string, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	opening, err := decoder.Token()
+	openingDelimiter, isDelimiter := opening.(json.Delim)
+	if err != nil || !isDelimiter || openingDelimiter != '{' {
+		return "", "", false
+	}
+	var message, stage, cause string
+	var seenMessage, seenStage, seenCause bool
+	for decoder.More() {
+		keyToken, keyErr := decoder.Token()
+		key, isString := keyToken.(string)
+		if keyErr != nil || !isString {
+			return "", "", false
+		}
+		var raw json.RawMessage
+		if decoder.Decode(&raw) != nil {
+			return "", "", false
+		}
+		switch key {
+		case "msg":
+			if seenMessage {
+				return "", "", false
+			}
+			seenMessage = true
+			var valid bool
+			message, valid = liveHostdRebindRoutePauseString(raw)
+			if !valid {
+				return "", "", false
+			}
+		case "route_pause_stage":
+			if seenStage {
+				return "", "", false
+			}
+			seenStage = true
+			var valid bool
+			stage, valid = liveHostdRebindRoutePauseString(raw)
+			if !valid {
+				return "", "", false
+			}
+		case "route_pause_cause":
+			if seenCause {
+				return "", "", false
+			}
+			seenCause = true
+			var valid bool
+			cause, valid = liveHostdRebindRoutePauseString(raw)
+			if !valid {
+				return "", "", false
+			}
+		default:
+			if strings.EqualFold(key, "msg") || strings.EqualFold(key, "route_pause_stage") ||
+				strings.EqualFold(key, "route_pause_cause") {
+				return "", "", false
+			}
+		}
+	}
+	closing, closeErr := decoder.Token()
+	closingDelimiter, isDelimiter := closing.(json.Delim)
+	if closeErr != nil || !isDelimiter || closingDelimiter != '}' {
+		return "", "", false
+	}
+	var trailing json.RawMessage
+	if decoder.Decode(&trailing) != io.EOF || !seenMessage || !seenStage || !seenCause ||
+		message != "generated route reconciliation paused" || !liveHostdRebindKnownRoutePausePair(stage, cause) {
+		return "", "", false
+	}
+	return stage, cause, true
+}
+
+func liveHostdRebindRoutePauseString(raw json.RawMessage) (string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", false
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func liveHostdRebindKnownRoutePausePair(stage, cause string) bool {
+	if cause == "unknown" {
+		switch stage {
+		case "runtime_begin", "runtime_success_head", "route_switch", "previous_retirement", "runtime_success_advance":
+			return true
+		default:
+			return false
+		}
+	}
+	stateCause := cause == "canceled" || cause == "deadline_exceeded" || cause == "state_not_found" ||
+		cause == "invalid_state" || cause == "invalid_transition" || cause == "state_conflict"
+	switch stage {
+	case "runtime_begin":
+		return cause == "deployment_in_progress"
+	case "runtime_success_head":
+		return cause == "active_head_mismatch" || stateCause
+	case "route_switch":
+		return cause == "gateway_readiness_failed" || stateCause
+	case "previous_retirement":
+		return cause == "retirement_unavailable" || cause == "candidate_cleanup_failed" || stateCause
+	case "runtime_success_advance":
+		return stateCause
+	default:
+		return false
+	}
 }
 
 // liveHostdRebindStartupDiagnosticCode accepts only the fixed slog message

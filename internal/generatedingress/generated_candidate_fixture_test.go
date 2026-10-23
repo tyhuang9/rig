@@ -17,7 +17,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -28,6 +27,7 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 // candidateTestRepository exposes only the concrete test database alongside
@@ -101,7 +101,7 @@ func newGeneratedMigrationFixture(t *testing.T) *generatedMigrationFixture {
 func newGeneratedMigrationFixtureWithComponents(t *testing.T, planComponentNames, runtimeComponentNames []string) *generatedMigrationFixture {
 	t.Helper()
 	dataRoot := filepath.Join(t.TempDir(), "state")
-	db, err := database.Open(dataRoot)
+	db, err := databasefixture.Open(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}

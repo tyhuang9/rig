@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -86,6 +87,104 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 			}
 		})
 	}
+
+	routeRecord := func(stage, cause string) string {
+		return `{"msg":"generated route reconciliation paused","route_pause_stage":"` + stage +
+			`","route_pause_cause":"` + cause + `","error":"/private/path ` + secret + `"}`
+	}
+	t.Run("route pause closed classifier", func(t *testing.T) {
+		for _, test := range []struct {
+			name        string
+			stderr      string
+			want        string
+			wantStartup string
+		}{
+			{name: "known retirement refusal", stderr: routeRecord("previous_retirement", "retirement_unavailable"), want: "previous_retirement/retirement_unavailable"},
+			{name: "unknown ancillary object is discarded", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"previous_retirement","route_pause_cause":"retirement_unavailable","ancillary":{"error":"` + secret + `"}}`, want: "previous_retirement/retirement_unavailable"},
+			{name: "newest valid pause wins", stderr: routeRecord("route_switch", "unknown") + "\n" + routeRecord("runtime_success_advance", "state_conflict"), want: "runtime_success_advance/state_conflict"},
+			{name: "startup and route pause coexist", stderr: knownRuntime + "\n" + routeRecord("previous_retirement", "retirement_unavailable"), want: "previous_retirement/retirement_unavailable", wantStartup: "runtime_composition"},
+			{name: "unknown stage", stderr: routeRecord("forged-stage", "unknown")},
+			{name: "invalid stage cause pair", stderr: routeRecord("runtime_begin", "retirement_unavailable")},
+			{name: "unknown message", stderr: `{"msg":"forged route pause","route_pause_stage":"previous_retirement","route_pause_cause":"retirement_unavailable","error":"` + secret + `"}`},
+			{name: "malformed JSON", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"previous_retirement","route_pause_cause":"retirement_unavailable"`},
+			{name: "non-string stage", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":42,"route_pause_cause":"unknown","error":"` + secret + `"}`},
+			{name: "non-string cause", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"route_switch","route_pause_cause":{"value":"unknown"},"error":"` + secret + `"}`},
+			{name: "null stage", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":null,"route_pause_cause":"unknown","error":"` + secret + `"}`},
+			{name: "array stage", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":["route_switch"],"route_pause_cause":"unknown","error":"` + secret + `"}`},
+			{name: "boolean stage", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":true,"route_pause_cause":"unknown","error":"` + secret + `"}`},
+			{name: "null cause", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"route_switch","route_pause_cause":null,"error":"` + secret + `"}`},
+			{name: "array cause", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"route_switch","route_pause_cause":["unknown"],"error":"` + secret + `"}`},
+			{name: "boolean cause", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"route_switch","route_pause_cause":true,"error":"` + secret + `"}`},
+			{name: "case folded message key", stderr: `{"Msg":"generated route reconciliation paused","route_pause_stage":"route_switch","route_pause_cause":"unknown","error":"` + secret + `"}`},
+			{name: "case folded stage key", stderr: `{"msg":"generated route reconciliation paused","Route_Pause_Stage":"route_switch","route_pause_cause":"unknown","error":"` + secret + `"}`},
+			{name: "case folded cause key", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"route_switch","Route_Pause_Cause":"unknown","error":"` + secret + `"}`},
+			{name: "duplicate message key", stderr: `{"msg":"generated route reconciliation paused","msg":"forged route pause","route_pause_stage":"route_switch","route_pause_cause":"unknown","error":"` + secret + `"}`},
+			{name: "duplicate stage key", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"route_switch","route_pause_stage":"previous_retirement","route_pause_cause":"unknown","error":"` + secret + `"}`},
+			{name: "duplicate cause key", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"route_switch","route_pause_cause":"unknown","route_pause_cause":"gateway_readiness_failed","error":"` + secret + `"}`},
+			{name: "error cannot manufacture pair", stderr: `{"msg":"generated route reconciliation paused","error":"previous_retirement retirement_unavailable ` + secret + `"}`},
+			{name: "known pause in bounded suffix", stderr: strings.Repeat("x", liveHostdRebindRoutePauseMaxBytes) + "\n" + routeRecord("route_switch", "gateway_readiness_failed"), want: "route_switch/gateway_readiness_failed"},
+			{name: "known pause before byte bound", stderr: routeRecord("previous_retirement", "retirement_unavailable") + "\n" + strings.Repeat("x", liveHostdRebindRoutePauseMaxBytes)},
+			{name: "known pause before record bound", stderr: routeRecord("previous_retirement", "retirement_unavailable") + "\n" + strings.Repeat(`{"msg":"untrusted `+secret+`"}`+"\n", liveHostdRebindRoutePauseMaxRecords)},
+			{name: "known pause after older record bound", stderr: strings.Repeat(`{"msg":"untrusted `+secret+`"}`+"\n", liveHostdRebindRoutePauseMaxRecords) + routeRecord("runtime_success_head", "active_head_mismatch"), want: "runtime_success_head/active_head_mismatch"},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				got := liveHostdRebindClosedDiagnostic(test.stderr)
+				if !strings.HasPrefix(got, "sha256:") || strings.Contains(got, secret) || strings.Contains(got, "/private/path") {
+					t.Fatalf("closed diagnostic exposed untrusted stderr: %q", got)
+				}
+				if test.want == "" {
+					if strings.Contains(got, " route_pause=") {
+						t.Fatalf("closed diagnostic classified an untrusted route pause: %q", got)
+					}
+				} else if !strings.HasSuffix(got, " route_pause="+test.want) {
+					t.Fatalf("closed diagnostic=%q want route pause %q", got, test.want)
+				}
+				if test.wantStartup != "" && !strings.Contains(got, " startup="+test.wantStartup+" ") {
+					t.Fatalf("closed diagnostic=%q want startup %q", got, test.wantStartup)
+				}
+			})
+		}
+	})
+
+	t.Run("route pause pair roster", func(t *testing.T) {
+		pairs := map[string][]string{
+			"runtime_begin":           {"unknown", "deployment_in_progress"},
+			"runtime_success_head":    {"unknown", "active_head_mismatch", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"},
+			"route_switch":            {"unknown", "gateway_readiness_failed", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"},
+			"previous_retirement":     {"unknown", "retirement_unavailable", "candidate_cleanup_failed", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"},
+			"runtime_success_advance": {"unknown", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"},
+		}
+		for stage, causes := range pairs {
+			for _, cause := range causes {
+				if got := liveHostdRebindRoutePauseDiagnosticCode(routeRecord(stage, cause)); got != stage+"/"+cause {
+					t.Fatalf("route pause classifier=%q want %s/%s", got, stage, cause)
+				}
+			}
+		}
+	})
+
+	t.Run("process kill capture waits for reap", func(t *testing.T) {
+		command := &exec.Cmd{}
+		child := controllerProcessKillCapture(command)
+		if command.Stderr != &child.stderr {
+			t.Fatal("process-kill child stderr is not privately captured")
+		}
+		if _, err := command.Stderr.Write([]byte(routeRecord("previous_retirement", "retirement_unavailable"))); err != nil {
+			t.Fatal("write simulated process-kill child stderr")
+		}
+		if got, ok := controllerProcessKillClosedDiagnostic(child); ok || got != "" {
+			t.Fatalf("process-kill diagnostic read before reap: %q", got)
+		}
+		close(child.done)
+		got, ok := controllerProcessKillClosedDiagnostic(child)
+		if !ok || !strings.HasPrefix(got, "sha256:") ||
+			!strings.HasSuffix(got, " route_pause=previous_retirement/retirement_unavailable") {
+			t.Fatalf("closed process-kill diagnostic=%q", got)
+		}
+		if strings.Contains(got, secret) || strings.Contains(got, "/private/path") {
+			t.Fatalf("closed process-kill diagnostic exposed untrusted stderr: %q", got)
+		}
+	})
 
 }
 
