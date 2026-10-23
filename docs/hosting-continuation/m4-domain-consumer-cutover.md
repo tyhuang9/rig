@@ -5,13 +5,144 @@ published at `c676c5ca669ca3162fcdb3bdfb183e264aa78a8b`. The selected local Wind
 native Linux matrix and four added regression tests passed with explicit
 environment/live-test skips. The first hosted run subsequently finished with
 68 failed checks, 61 successful checks and two skipped checks. Repairs are in
-progress, with the reviewed follow-up checkpoint recorded below through
-`213f8415c0ee4409de05f5eb9d26c9fadabdc130`; this is not hosted acceptance. Receipt-owned predecessor retirement
+progress. The reviewed successor source is `8ee108102a984a4916883d85640f74ff41eeb042`,
+following the published `9117de63327afd02d6043b8a465253b30c955344` checkpoint;
+this is not hosted acceptance. Receipt-owned predecessor retirement
 remains open. M4 is incomplete.
 
 The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
+
+## Current Docker reader and fixture-lifetime checkpoint
+
+The 22:48:15 UTC snapshot for published `9117de6` contains 24 failed,
+12 successful, 14 running, 91 queued and two skipped checks. Its SHA-256 is
+`a8b369a5a6b98f4f128a69689b06170fa03a3581b4c2bf2b304d6e36067e7dbd`.
+All 24 completed failure logs were captured once. GitHub tested merge
+`b6a459e870daa1db40efec83ea6dc6d04bf2130b`, whose parents are the unchanged
+PR #220 base and this published head; tree
+`5c6eb61564a4728cc6f5b7a228c54156e8322a3c` equals the head tree.
+
+The Docker jobs now reach a generic construction refusal after bootstrap.
+The final-handover job reports the gateway running, whereas the earlier
+checkpoint reported Created. This establishes progress through bootstrap,
+not successful construction or a completed deployment. The
+[controller TLS job](https://github.com/tyhuang9/rig/actions/runs/40034221139/job/120689618493)
+also refuses construction; raw SHA-256 is
+`18d5cdb0efd5823892f79bffcc9fc52b5f040e0bcccee9db3c968cf7932fa973`.
+The LAN and migration fixtures still omit completed-domain dependencies.
+
+Source inspection found a separate concrete incompatibility: the strict startup
+reader decodes full Docker mount, endpoint, configured-network and network-inspect
+objects into partial Rig structs. Docker 28 supplies additional nested fields,
+which the strict decoder rejects. Controlled runners emit only the smaller Rig
+shape, so they do not reproduce this difference. The exact first predicate in
+the hosted refusal has not been observed. The bounded reader projection and
+representative Docker-shape controls below have passed focused local checks;
+the successor hosted run must establish actual Docker acceptance.
+
+The source diagnosis and its additive nested-shape correction are retained as
+`ci-followups-20261020/pr222-9117-construction-reader-source-diagnosis-20261023.md`
+(SHA-256 `409d734a24971b8a48fc67d930dba04bbb399bef9f26e7d397ccf026e1ea7c77`)
+and `pr222-9117-construction-reader-nested-shapes-20261023.md`
+(`f9babcf21ca7b26e3dc46d670d6741d51acde707359962c1483ced1b405970a0`).
+
+### Authentic test roots live until package exit
+
+Commit `92fa55ca862f1f5ba255e5ac721dac3590f58af8` changes only test fixtures
+and test support. Authentic fixtures in eight packages retain unique private
+roots until `TestMain` finishes, matching the process lifetime of sealed
+registry identities. The production registry, collision predicates and absent-root
+guards are unchanged. Identity/drift fixtures that deliberately remove roots
+continue to use their existing scoped lifetime.
+
+The helper removes only its recorded process root after validating its lexical
+scope and the exact non-symlink parent, root and exclusive marker identities.
+It proves absence after deletion, and cleanup failure makes an otherwise passing
+package fail. The process root and fixture children are private; the parent may
+be the system temporary directory. These are observed identity checks, not an
+atomic guarantee against a hostile concurrent writer.
+
+Focused native Linux execution passed nine outer parents and four direct
+children across eight package binaries. All eight invoke the new `TestMain` and
+exit zero. Separate cleanup controls passed two parents and three children,
+including preservation of an external symlink target. Windows could not create
+that symlink and records the limitation. The earlier Windows fixture run passed
+ten selected parents, including its platform collision control; selected image
+and controller children do not constitute full parent scenario sweeps.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- Exact 21-file manifest: `lifetime-cleanup-source-20261023T223929Z/source.json`,
+  SHA-256 `60e3b21df68c6ef0c6250af2bc5ffd8a70e7c108cb8a30c5bdbf08a8212b368d`.
+- Native Linux commands, binaries and raw logs:
+  `lifetime-linux-20261023T224044Z/`; temporary files used private Linux `/tmp`.
+- Cleanup controls: `lifetime-cleanup-focused-20261023T224004Z/`.
+- Source security review: `retained-root-cleanup-security-successor.md` in the
+  manifest directory, SHA-256
+  `75fc147212fb3265bb3b041be1d4858ee2ea7512cb9782d85bb73f2bd4d50efb`.
+- Independent source/command/binary/raw audit:
+  `retained-lifetime-root-audit-20261023.json`, SHA-256
+  `73e0e52c6496a56651ad96f1ee8ffd079dacc73a14acd90ac03fd9fea4bdfb5f`.
+
+Formatting and diff checks exited zero with empty stdout. The initial static
+receipt incorrectly treated 11 Windows line-ending warnings as failures;
+`lifetime-static-20261023T224228Z/receipt-erratum.json` preserves and corrects
+that classification without replaying tests. Its SHA-256 is
+`77e22568b4bc2509f254ded410a0025eadb6ec592821587beab7041e9e7fbac2`.
+These focused results do not establish full-suite, race or Docker acceptance.
+
+### Startup-only Docker inspection projection
+
+Commit `8ee108102a984a4916883d85640f74ff41eeb042` adds private container and
+network templates for the startup reader. They explicitly project the fields
+already consumed by Rig's validators from nested mounts, network attachments,
+configured networks, IPAM and members. The global inspection formats remain
+unchanged. Detailed reads still require exact full IDs and strict JSON decoding,
+including unknown-field, recursive duplicate-key and trailing-value refusal.
+Ownership, census, resource limits, port and network validation, command bounds,
+body clearing and observation ordering remain intact.
+
+The initial five-parent Windows gate passed four parents and failed the shared
+empty-owner transcript because its controlled runner returned the old network
+shape. After correcting that narrow test-support dispatch, a successor passed
+the shared transcript and direct projection parent, plus all seven test-support
+parents. Together, these runs cover five distinct ingress parents and seven
+test-support parents. The original failure remains recorded; the four original
+passes were not rerun wholesale.
+
+The direct projection controls render the actual templates against representative
+Docker-shaped objects. They cover omitted unconsumed fields; nil, empty and
+multiple nested collections; refusal of the old full payload shape; and unknown
+or duplicate fields in both detailed readers. These are controlled template and
+reader tests, not execution of the Docker CLI. Stable gateway, typed recovery
+and empty bootstrap behavior are covered by the other selected ingress parents.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- Initial gate: `startup-projection-20261023T225223Z/receipt.json`, SHA-256
+  `32dbd7b141d52fd3d9228133a6f7cd23898061878f6703ab047360c4a563aefe`.
+  Its additive `receipt-census-erratum.json` restores the test names that the
+  receipt parser incorrectly recorded as empty; it does not change raw outcomes.
+- Focused successor: `startup-projection-successor-20261023T225709Z/receipt.json`,
+  SHA-256 `9d59ff578a7ad8b4935ab6594795eece4a58f78fc3fdd419993d06998bd25225`.
+  Both four-file manifests match
+  `65bc34cda6be1bdf97e27add4d90c38d6b21c20fd931e30856f4af59c8672135`.
+- Source security review in the successor directory:
+  `startup-projection-source-security-review.md`, SHA-256
+  `1750a38d2672cb93d0dc1048add383ff1f941d85adb2226638db21982b2e0787`.
+- Independent raw/binary/source audit: `startup-projection-root-audit-20261023.json`,
+  SHA-256 `66181ace6b4918aec9a51b08447bb660650d3670c9a25ceff2f39ec264ae8c8c`.
+
+Focused execution used Windows/amd64, `CGO_ENABLED=0`, automatic toolchain
+selection and empty `GOFLAGS`. Separate formatting, ingress/test-support vet,
+live-tagged ingress compilation and canonical-generation checks passed with
+local toolchain selection and empty `GOFLAGS`. No module files changed. Static
+receipt `startup-projection-static-20261023T225859Z/receipt.json` has SHA-256
+`b3f834b42e8470fd8562fd6729ad24da2bf5edbebb8cb06a2c057e84cbb12865`.
+Tagged compilation ran no Docker tests. Full-suite, native Linux/race and hosted
+Docker acceptance for this reader change remain open.
 
 ## Follow-up hosted run: 23 October 2026
 
