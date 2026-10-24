@@ -17,7 +17,23 @@ cat > "$temp/bin/go" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$@" > "$RIG_INGRESS_SELECTOR_ARGS"
 case "${RIG_INGRESS_SELECTOR_OUTPUT:-parent}" in
-  parent) printf '{"Action":"pass","Test":"TestSelectorControl"}\n' ;;
+  parent)
+    run_pattern=''
+    for ((index=1; index<=$#; index++)); do
+      if [[ "${!index}" == -run && $((index + 1)) -le $# ]]; then
+        next=$((index + 1))
+        run_pattern="${!next}"
+      fi
+    done
+    count=1
+    case "$run_pattern" in
+      *TestGeneratedDomainA0*) count=4 ;;
+      *TestGeneratedDomainCold*) count=19 ;;
+    esac
+    for ((index=0; index<count; index++)); do
+      printf '{"Action":"pass","Test":"TestSelectorControl%s"}\n' "$index"
+    done
+    ;;
   child) printf '{"Action":"pass","Test":"TestSelectorControl/child"}\n' ;;
   empty) : ;;
 esac
@@ -49,13 +65,15 @@ handover='^TestGatewayRebindTypedHandover'
 domain='^TestGeneratedDomain'
 domain_startup='^TestGeneratedDomain(Startup|ProtectedStartup)'
 domain_stable='^TestGeneratedDomainStartupClassifiesStableGateway'
+domain_a0='^TestGeneratedDomainA0(CommittedV2NamespaceRequiresColdAccounting|CommittedV2NamespaceRequiresColdAccountingPart2|GatewayOnlyNamespaceRemainsExact|GatewayOnlyNamespaceRemainsExactPart2)'
+domain_cold='^TestGeneratedDomainCold(ReconstructsExactTwoComponentCurrentRoster|ReconstructsExactTwoComponentCurrentRosterPart2|AcceptsDockerMergedCandidateContainerLabels|RejectsTwoComponentGroupAttestationDrift|RejectsTwoComponentGroupAttestationDriftPart2|RejectsPersistedBuilderNamespaceDrift|RejectsPersistedBuilderNamespaceDriftPart2|RejectsPersistedBuilderIdentityAndReadDrift|RejectsPersistedBuilderIdentityAndReadDriftPart2|RejectsPersistedBuilderPhysicalPolicyDrift|RejectsPersistedBuilderPhysicalPolicyDriftPart2|RejectsPersistedBuilderRequiredNetworkOptions|RejectsPersistedBuilderRequiredNetworkOptionsPart2|RejectsPersistedBuilderNetworkOptionCorrespondence|RejectsPersistedBuilderNetworkOptionCorrespondencePart2|RejectsPersistedBuilderFinalIdentityDrift|RejectsPersistedBuilderFinalIdentityDriftPart2|RejectsTwoComponentCensusDetails|RejectsTwoComponentCensusDetailsPart2)'
 capacity='^TestGeneratedIngressCapacity'
 gateway_operations='^Test(Prepare|Observe|Recover|Commit|Retire)Gateway'
 old_remainder_skip='^TestGatewayV2|^Test(GatewayRebind|InspectGatewayRebind)|^Test(ManagedGatewayCurrent|GatewayCurrent|InspectGatewayCurrent)'
 remainder_skip="$old_remainder_skip|$domain|$capacity|$gateway_operations"
 typed_suites=(rebind-typed-withdrawal rebind-typed-completed rebind-typed-handover rebind-typed-runtime)
 composition_suites=(rebind-composition-native rebind-composition-startup rebind-composition-transferred rebind-composition-second-generation rebind-composition-legacy-source)
-remainder_suites=(domain-construction domain-startup-stable domain-startup ingress-capacity gateway-operations ingress-remainder)
+remainder_suites=(domain-construction domain-a0 domain-cold domain-startup-stable domain-startup ingress-capacity gateway-operations ingress-remainder)
 suites=("${typed_suites[@]}" "${composition_suites[@]}" "${remainder_suites[@]}")
 runtime_packages=(
   ./internal/projectanalysis
@@ -97,6 +115,8 @@ ingress_suites=(
   current-serving-predecessor
   current-serving
   domain-construction
+  domain-a0
+  domain-cold
   domain-startup-stable
   domain-startup
   ingress-capacity
@@ -154,7 +174,9 @@ for mode in default race plain; do
       rebind-composition-transferred) expected+=("$transferred") ;;
       rebind-composition-second-generation) expected+=("$second") ;;
       rebind-composition-legacy-source) expected+=("$legacy") ;;
-      domain-construction) expected+=("$domain" -skip "$domain_startup") ;;
+      domain-construction) expected+=("$domain" -skip "$domain_startup|$domain_a0|$domain_cold") ;;
+      domain-a0) expected+=("$domain_a0") ;;
+      domain-cold) expected+=("$domain_cold") ;;
       domain-startup-stable) expected+=("$domain_stable") ;;
       domain-startup) expected+=("$domain_startup" -skip "$domain_stable") ;;
       ingress-capacity) expected+=("$capacity") ;;
@@ -201,6 +223,89 @@ done <<'EOF'
 TestGeneratedDomainEmptyBootstrapEffectBoundaries domain-construction
 TestGeneratedDomainConstructionReconstructsColdAccounting domain-construction
 TestGeneratedDomainRegistryFutureControl domain-construction
+TestGeneratedDomainColdBuilderContainerProjectionHonorsDockerTypedAndRawFallbackFields domain-construction
+TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccounting domain-a0
+TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccountingPart2 domain-a0
+TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExact domain-a0
+TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExactPart2 domain-a0
+TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster domain-cold
+TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRosterPart2 domain-cold
+TestGeneratedDomainColdAcceptsDockerMergedCandidateContainerLabels domain-cold
+TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDrift domain-cold
+TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDriftPart2 domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDrift domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDriftPart2 domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDrift domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDriftPart2 domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDrift domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDriftPart2 domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptions domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptionsPart2 domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondence domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondencePart2 domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDrift domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDriftPart2 domain-cold
+TestGeneratedDomainColdRejectsTwoComponentCensusDetails domain-cold
+TestGeneratedDomainColdRejectsTwoComponentCensusDetailsPart2 domain-cold
+TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccounting/exact_two_app_v2_and_builder_namespace domain-a0
+TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccounting/missing_second_app_frontend domain-a0
+TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccounting/crossed_second_app_frontend domain-a0
+TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccountingPart2/extra_selected_resource domain-a0
+TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccountingPart2/unowned_prefixed_application_resource domain-a0
+TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccountingPart2/crossed_persisted_builder_resource domain-a0
+TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExact/exact_gateway_only_namespace domain-a0
+TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExact/missing_gateway_object domain-a0
+TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExact/extra_gateway_object domain-a0
+TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExactPart2/crossed_gateway_expectation domain-a0
+TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExactPart2/malformed_gateway_expectation domain-a0
+TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster/exact_api_and_frontend_without_builder domain-cold
+TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster/exact_api_frontend_and_persisted_builder domain-cold
+TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster/writer_accepted_persisted_builder_network_options domain-cold
+TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRosterPart2/missing_frontend domain-cold
+TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRosterPart2/crossed_frontend domain-cold
+TestGeneratedDomainColdAcceptsDockerMergedCandidateContainerLabels/docker_merged_authenticated_definition domain-cold
+TestGeneratedDomainColdAcceptsDockerMergedCandidateContainerLabels/missing_authenticated_definition domain-cold
+TestGeneratedDomainColdAcceptsDockerMergedCandidateContainerLabels/crossed_authenticated_definition domain-cold
+TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDrift/cold_group_image_attestation_failure domain-cold
+TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDrift/cold_group_container_attestation_failure domain-cold
+TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDrift/cold_group_network_attestation_failure domain-cold
+TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDriftPart2/nested_gateway_reason_remains_authoritative domain-cold
+TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDriftPart2/cold_group_gateway_attestation_failure domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDrift/orphan_persisted_builder_label domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDrift/missing_persisted_builder_network domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDrift/crossed_persisted_builder_identity domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDriftPart2/persisted_builder_identity_without_resources domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDriftPart2/cold_group_structural_fallback_remains_generic domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDrift/persisted_builder_resources_without_identity domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDrift/malformed_persisted_builder_identity domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDrift/extra_persisted_builder_resource domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDriftPart2/persisted_builder_container_read_failure domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDriftPart2/persisted_builder_network_read_failure domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDrift/persisted_builder_image_read_failure domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDrift/invalid_persisted_builder_container_configuration domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDrift/stopped_persisted_builder_container domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDriftPart2/crossed_persisted_builder_image domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDriftPart2/extra_persisted_builder_network_member domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptions/missing_persisted_builder_census_required_network_option domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptions/true_persisted_builder_census_required_network_option domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptions/other_persisted_builder_census_required_network_option domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptionsPart2/missing_persisted_builder_detailed_required_network_option domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptionsPart2/true_persisted_builder_detailed_required_network_option domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondence/other_persisted_builder_detailed_required_network_option domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondence/crossed_persisted_builder_census_network_options domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondence/persisted_builder_network_option_added_between_reads domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondencePart2/persisted_builder_network_option_removed_between_reads domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondencePart2/persisted_builder_network_option_changed_between_reads domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDrift/crossed_persisted_builder_container_attachment domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDrift/labelled_persisted_builder_image domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDrift/persisted_builder_identity_changes_during_accounting domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDriftPart2/persisted_builder_identity_file_replaced_with_same_bytes domain-cold
+TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDriftPart2/persisted_builder_identity_reencoded_during_accounting domain-cold
+TestGeneratedDomainColdRejectsTwoComponentCensusDetails/exact_rig_labels domain-cold
+TestGeneratedDomainColdRejectsTwoComponentCensusDetails/application_network_shape domain-cold
+TestGeneratedDomainColdRejectsTwoComponentCensusDetails/application_network_options domain-cold
+TestGeneratedDomainColdRejectsTwoComponentCensusDetailsPart2/missing_frontend_image domain-cold
+TestGeneratedDomainColdRejectsTwoComponentCensusDetailsPart2/missing_application_network domain-cold
 TestGeneratedDomainStartupClassifiesStableGateway domain-startup-stable
 TestGeneratedDomainStartupClassifiesStableGatewayFutureControl domain-startup-stable
 TestGeneratedDomainStartupRequiresExactTypedRecovery domain-startup
