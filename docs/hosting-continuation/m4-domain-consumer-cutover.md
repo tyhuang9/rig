@@ -17,6 +17,71 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Cold-group diagnostics and latest hosted boundaries
+
+Commit `672c3c81bb34ef229414277f39680fdb66390c5b` adds five fixed private
+reasons at the existing cold-group image, container, network, census and final
+gateway refusal returns. Existing predicates, read order, effects, generic
+structural fallback, nested diagnostics and error-cause visibility remain
+unchanged. The hostd test projection accepts only the corresponding closed
+stage/reason pairs. No raw cause, path or resource identity is rendered.
+
+The focused Windows run at 05:27:10–05:28:10 UTC on 24 October 2026 built and
+discovered exactly these three parents before execution:
+
+- `TestGeneratedDomainConstructionDiagnosticClosedAttribution`
+- `TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster`
+- `TestLiveHostdRebindClosedDiagnosticControls`
+
+The ingress selection passed 60 unique names, including its two parents; hostd
+passed 187 unique names, including its parent. Subprocess echoes are deduplicated;
+these are test-name counts, not process counts. There were no failures or skips.
+Formatting, ingress vet, tagged hostd vet/build and canonical generation passed.
+Six source hashes were unchanged during the run. The earlier development runs
+failed on incorrect control expectations and remain non-acceptance evidence.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Formal receipt | `82f4a7bb2fc61b35c57e135d282ea1122b322fd6cd92ff0bb10d0237a024a1fb` |
+| Ingress raw results | `e8614f511397e8b10debae04a30264a0e5c8cde4342db647538a7d1219c6d230` |
+| Hostd raw results | `61879d9e82f11fe88d39a95fbbeabcd4540d9ee96082405d9e163ad7d60a36e3` |
+| Source/security review | `1ee77e3689173d67762ce4cfd6afbd713a51d462114e157e46e36d8894e97f96` |
+| Final integration review | `47d4d86112dd1ae6136962da0661fea3c6c4392e4020b751e5bc112f2d3d2a55` |
+| Independent root audit | `29d0c6d3496ea447c3226738aeacc0ac578abe1388bb3c4ce4f7a4a57fc79c99` |
+
+The formal receipt and retained commands are under
+`cold-group-finite-reasons-final-20261024T052634Z` in the local PR #222 repair
+evidence. The root audit independently verifies source, binary, raw-log and
+review hashes, exact discovery and the unique RUN/PASS census. This is scoped
+local diagnostic verification; it is not a Docker repair or race acceptance.
+
+On the preceding published `5a74efe` head, the
+[A0 Docker job](https://github.com/tyhuang9/rig/actions/runs/40064432776/job/120784712976)
+failed after advancing from `startup_observation/docker_attestation` to
+`cold_construction/cold_group_attestation`. Its raw SHA-256 is
+`9149bddf0b87862db482f70cb7c424ba1ede88b0c1a63abe18e8834355a375e9`.
+This establishes progress past the earlier startup boundary, not a successful
+restart. The new diagnostic reasons require a hosted successor to narrow it.
+
+The same head's
+[Linux race domain-construction job](https://github.com/tyhuang9/rig/actions/runs/40064432946/job/120785043487)
+failed only `TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster`
+at 90.02 seconds. Its isolated parent exhausted the 90-second aggregate limit;
+the active `missing_persisted_builder_network` child had run for nine seconds.
+No data-race marker was present. This does not establish a defect in that child.
+Raw SHA-256:
+`0f9be1f196175ad68efc9af7a4d5235558ac957732a29b199dcba4d3c54ce491`.
+A bounded test partition follow-up remains open; coverage and time limits must
+be preserved.
+
+At 05:26:45 UTC the preceding head had 18 failed, 33 successful, 14 running,
+76 queued and two skipped checks. All 18 failed jobs were captured and indexed;
+the snapshot SHA-256 is
+`f75d1ad8a2b7d91a9b32099d6ae9cc00ee31d564c8d2dffa8e486837062e6ae7`.
+Actual stopped-stage Docker replay, full hosted CI, predecessor retirement and
+M4 remain incomplete. This diagnostic checkpoint batches with the private-root
+fixture correction below; neither establishes that the hosted failures are fixed.
+
 ## Stopped-stage manifest root privacy
 
 The [stopped-stage Docker job at `34a5268`](https://github.com/tyhuang9/rig/actions/runs/40062072608/job/120777536330)
