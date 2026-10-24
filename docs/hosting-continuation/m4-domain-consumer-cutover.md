@@ -17,6 +17,104 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## LAN live fixtures preserve the completed domain's driver family
+
+Commit `4fd8c4b645dd9c98e5ea523a223ea03a913d0188` removes exactly two calls to
+`TraceGatewayV2LANGrantForLiveDocker`, one in each controller LAN fixture.
+Those calls installed a private driver after complete-domain construction.
+Typed admission requires the sealed driver's identity to remain unchanged, so
+even the earlier upgrade request was refused before any grant trace could run.
+The outer server wrapper still records grant outcomes; all upgrade, route,
+database, Docker and restart assertions remain. Production guards are unchanged.
+
+Both exact live parents were discovered. Live-tagged controller compilation and
+vet, formatting, canonical generation and diff checks passed. The two Docker
+journeys were not executed locally. Evidence under
+`pr222-ci-repair-20261023T2125Z/`:
+
+- `lan-live-hook-removal-20261024T004407Z/receipt.json`, SHA-256
+  `9a3cc5482414accd6c6b11eb476f240ce6cbf1304293bba5c5a1a4660f2acdbf`.
+- `lan-live-hook-removal-root-audit-20261024.json`, SHA-256
+  `5daeaa982ac40e83427bdfef9c26cdb4a6bf51783d2978de5db2cbcfd98d283a`.
+  The audit proves the exact two deletions and retained assertions. The original
+  metadata contains a stale proposed output-directory label; the actual receipt
+  timestamps and source hashes identify the run. Formatter and vet evidence
+  retains exit records without dedicated raw logs.
+- `lan-upgrade-503-hook-incompatibility-20261024.md`, SHA-256
+  `8fb30b25ea1882e2f92f452dfda66476ce9fccae13b797507c09f93d36647d4f`,
+  records the immutable baseline source cause and final scoped review.
+
+## Follow-up Windows loopback drift fixture
+
+Commit `4ff67898ec861b13b3f9d95d2d4f0aaa617d750f` fixes the negative fixture
+`TestGatewayRebindFinalHandoverFreshLoopbackHeadDriftPreventsAllEffects`. It now
+uses the actual guarded loopback application's ID after checking fixture
+provenance. Its deliberately corrupting SQL also drops the newer activation
+guard alongside the two existing test-only guard removals. Production triggers
+remain unchanged. The test still requires exactly one modified row, rejected
+handover, 12 unchanged protected records, no terminal record and zero effects.
+
+The first ID-only attempt failed at the activation guard and remains recorded.
+The corrected source passed exact parent discovery and execution on Windows,
+with no failure or skip, plus compilation, formatting, ingress vet and canonical
+generation. Final source SHA-256:
+`fff4930ee58080ee4b70f7cd4c9608b4681f47ea25368b7ffe3365b31842afee`.
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `fresh-loopback-head-drift-successor-20261024T003015Z/receipt.json`, SHA-256
+  `bcbf3685e735158af5eec71f1f68b3824b6ce87475dcc4bdbe79e846641a101f`.
+- `fresh-loopback-head-drift-root-audit-20261024.json`, SHA-256
+  `697f95ae99d9114d0273ebd288f0a99fefa88e10e5a7b9683b23eb8417be5626`.
+
+This is a focused local fixture result, not full Windows, race or Docker
+acceptance. The correction is not present in hosted head `7791d31` below.
+
+## Hosted four-unit checkpoint: remaining construction and replay failures
+
+Published head `7791d316ed03af6b57bcda4469a2f31ba5bb59b9` was tested through
+merge `8156e3854e8535e03f2bf10cb9d2584a3a4133c6`, whose tree matches the head.
+At 00:46:17 UTC on 24 October it had 18 failed checks, 19 successful, 14 running,
+90 queued and two skipped. Snapshot SHA-256:
+`d7da043d6ccbf510459d4698ea6b564e1bb6f2f7c3ed5669f593be4f4fcee336`.
+These are partial check counts, not a defect count or milestone acceptance.
+
+The TLS and process-kill journeys again pass healthy-container and Chromium
+checks before fresh-child construction fails. Their finite diagnostics now
+identify generated-domain and runtime-composition stages respectively. LAN
+tests reach upgrade requests returning `lan_gateway_unavailable`.
+
+The V2 fixture correction advances both hosted parents to their later legacy
+Manager reconstruction. Several rebind fixtures fail at the same unsupported
+same-process reconstruction after a complete domain has reserved the namespace.
+Some occur before the actual test journey; others occur only after actual
+stopped-stage or serving-stage assertions. Their intended fresh replay and
+lost-acknowledgment checks must be preserved when correcting the fixtures.
+
+The [migration approval journey](https://github.com/tyhuang9/rig/actions/runs/40045049124/job/120724748245)
+explicitly records `previous_retirement` / `retirement_unavailable`: migration
+succeeded with one runner call, while attempt two waits for reconciliation with
+its runtime draining. That reaches the unfinished predecessor-retirement step;
+it does not establish migration replay or justify bypassing the pause. Raw log
+SHA-256: `220d501766c327deef127fa2adcdc279bfd1fbec1632b04f21af2764dc78b566`.
+
+The first ten failure logs are indexed in
+`pr222-7791-first-failure-batch-20261024.json`, SHA-256
+`bf3654ada60662f791fcb7cb80fda0327ec4236af1bbf36727533fec5cc91de5`.
+The read-only Manager boundary map is
+`pr222-7791-manager-reopen-source-map-20261024.md`, SHA-256
+`a146882b03c1f59318da144f6f6dc6276e7050587a1dca1258f6009ccf54741f`.
+Both live under the existing `ci-followups-20261020/` evidence directory.
+Six additional failures are indexed in
+`pr222-7791-second-failure-batch-20261024.json`, SHA-256
+`ec503cae0480b43e95e72253d40eeb4ddb61f2f04fabff88c1a8b0d5eb2fd551`.
+The final two captured jobs repeat the initial cross-store Manager reopen and
+the Windows drift fixture failure already corrected locally. Their raw log
+SHA-256 values are respectively
+`3b1f1f7e1ecd9ea96a48768cfc611b0a7291c40c54bebb698a2fc6bd2220dcdc`
+and `f49204b793bf676b9e5c6d8d1747a236b6ff9f4381c95b9acbdf0215316fcd80`.
+The cold construction baseline, actual Docker replays and E5 retirement remain
+open. M4 is incomplete.
+
 ## Concrete gateway V2 fixture and completed-session release
 
 Commit `8ab5b21c9289fa4678d391efbbdd7cf7c53fe078` repairs two fixture
