@@ -174,7 +174,7 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 }
 
 func newGeneratedMigrationFixtureOnDomainWithComponents(t *testing.T, identity generatedDomainIdentityFixture,
-	planComponentNames, runtimeComponentNames []string,
+	planComponentNames, runtimeComponentNames []string, explicitPlan ...deploymentplans.Plan,
 ) *generatedMigrationFixture {
 	t.Helper()
 	if identity.stores == nil || !identity.stores.ConfiguredForDomain(identity.dataRoot,
@@ -224,14 +224,14 @@ func newGeneratedMigrationFixtureOnDomainWithComponents(t *testing.T, identity g
 	}
 	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, bindings, repository,
 		stores, plans, configuration,
-		identity.options.WorkingDirectory, planComponentNames, runtimeComponentNames)
+		identity.options.WorkingDirectory, planComponentNames, runtimeComponentNames, explicitPlan...)
 }
 
 func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobService *jobs.Service,
 	bindings *deploymentbinding.Repository,
 	repository *deployments.Repository, stores *deployments.GeneratedOwnerStores,
 	plans *deploymentplans.Store, configuration *appconfig.Store, workingDirectory string,
-	planComponentNames, runtimeComponentNames []string,
+	planComponentNames, runtimeComponentNames []string, explicitPlan ...deploymentplans.Plan,
 ) *generatedMigrationFixture {
 	t.Helper()
 	if db == nil || jobService == nil || bindings == nil || repository == nil || stores == nil || plans == nil ||
@@ -273,11 +273,9 @@ func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobS
 	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "runCommand", "internalPort", "healthProbe"}
 	components := make([]deploymentplans.Component, 0, len(planComponentNames))
 	provenance := make([]deploymentplans.FieldProvenance, 0, len(planComponentNames)*len(fields))
-	configurationComponents := make([]appconfig.ComponentTarget, 0, len(planComponentNames))
 	for _, name := range planComponentNames {
 		root := "apps/" + name
 		components = append(components, deploymentplans.Component{Name: name, Role: "server", RootDirectory: root, PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: root, NodeVersion: "24", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health"})
-		configurationComponents = append(configurationComponents, appconfig.ComponentTarget{Name: name, Role: "server"})
 		for _, field := range fields {
 			provenance = append(provenance, deploymentplans.FieldProvenance{Field: "components." + name + "." + field, Origin: deploymentplans.ProvenanceInferred, Confidence: 100, Evidence: []string{"package.json"}})
 		}
@@ -289,6 +287,16 @@ func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobS
 		Components:      components,
 		FieldProvenance: provenance,
 		Migration:       &deploymentplans.Migration{ComponentName: "api", RootDirectory: "apps/api", Command: "npm run migrate -- --locked", EnvironmentKeys: []string{"DATABASE_URL"}, EvidenceDigest: strings.Repeat("b", 64), Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending}},
+	}
+	if len(explicitPlan) > 1 {
+		t.Fatal("generated migration fixture accepts one explicit plan")
+	}
+	if len(explicitPlan) == 1 {
+		plan = explicitPlan[0]
+	}
+	configurationComponents := make([]appconfig.ComponentTarget, len(plan.Components))
+	for index, component := range plan.Components {
+		configurationComponents[index] = appconfig.ComponentTarget{Name: component.Name, Role: component.Role}
 	}
 	revision, err := plans.Replace(context.Background(), appID, actorID, deploymentplans.ReplaceInput{Plan: plan})
 	if err != nil {
@@ -348,8 +356,15 @@ func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobS
 	}
 	artifactID := ""
 	buildDigest := strings.Repeat("d", 64)
-	imageID := "sha256:" + strings.Repeat("e", 64)
-	for _, name := range runtimeComponentNames {
+	for index, name := range runtimeComponentNames {
+		imageDigit := "e"
+		if len(explicitPlan) == 1 {
+			imageDigit = fmt.Sprintf("%x", 14+index)
+			if len(imageDigit) != 1 {
+				t.Fatal("explicit generated migration plan supports at most two component images")
+			}
+		}
+		imageID := "sha256:" + strings.Repeat(imageDigit, 64)
 		componentArtifactID := uuid.NewString()
 		if _, err := db.Exec(`INSERT INTO generated_image_artifacts(id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,'test-compiler',?,3,?,'ready',?,?,?)`, componentArtifactID, releaseID, revision.ID, revision.RevisionNumber, name, buildDigest, imageID, now, now, now); err != nil {
 			t.Fatal(err)

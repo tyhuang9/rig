@@ -35,6 +35,7 @@ type generatedDomainConstructionRunner struct {
 	blocked   bool
 	commands  [][]string
 	candidate *candidateOwnerRunner
+	roster    runtimeprocess.CommandRunner
 	capacity  []byte
 }
 
@@ -78,6 +79,9 @@ func (r *generatedDomainConstructionRunner) Run(ctx context.Context,
 		args[0] == "container" && args[1] == "inspect" && args[2] == "--format" &&
 		args[3] == caddyInspectFormat && args[4] == caddyContainerName {
 		return jsonResult(r.delegate.gateway.container), nil
+	}
+	if r.roster != nil && generatedDomainCandidateInspectionCommand(args) {
+		return r.roster.Run(ctx, request)
 	}
 	if r.candidate != nil && generatedDomainCandidateInspectionCommand(args) {
 		candidateCommand := true
