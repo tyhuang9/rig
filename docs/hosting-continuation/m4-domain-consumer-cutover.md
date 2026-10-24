@@ -17,6 +17,94 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Stopped-stage manifest root privacy
+
+The [stopped-stage Docker job at `34a5268`](https://github.com/tyhuang9/rig/actions/runs/40062072608/job/120777536330)
+failed before child launch at `write private stopped-stage replay manifest`.
+Its raw SHA-256 is
+`9d15aec0955cd8aa50bd1b53ddfe2080343b266395ecd28333c7ff8b8547e64d`.
+The message covers validation and writing, so it does not identify the failed
+subcheck or prove a unique hosted cause.
+
+Source review found a concrete fixture mismatch: the live fixture used ordinary
+`t.TempDir()` without establishing the exact private mode required by the
+manifest. Its local protocol positive used a different retained-root allocator
+that already established that mode. Native Linux reproduction at
+05:06:20–05:06:33 UTC on 24 October used ordinary, unmodified `t.TempDir()`
+through the strict protocol and failed the exact-private manifest case at
+directory zero. Build and discovery passed; the run failed. The other control
+that depended on writing a valid manifest also failed during setup and is not
+counted as independent negative evidence.
+
+Commit `b75cf15daef63f5501aaa9df0d7e19a70646e063` shares a fresh-root allocator between the
+live fixture and protocol fixture. It creates the root itself, applies `0700`
+on Linux, and immediately validates it before state or Docker setup. Windows
+creates a protected child below its own temporary root through the existing
+private-directory creator and validates that leaf. Both paths remain inside
+the test cleanup tree. The helper accepts no caller-supplied path. The Linux negative control broadens
+only its owned root, then requires refusal, absence of a manifest, and unchanged
+`0755` permissions. Manifest validation and production code remain unchanged.
+
+The first successor at 05:07:25–05:07:45 passed 26 native Linux protocol cases
+but failed overall because of a malformed Windows flag invocation. A corrected
+invocation then exposed a real Windows DACL refusal: chmod alone did not create
+the required protected ACL. The rebuilt final Windows binary passed 24 cases at
+05:10:36–05:10:45. Linux's accepted 26 passes are reused through an exact
+source-impact proof that the final change affects only the Windows branch.
+The prior source reconstruction is explicitly labeled as created after the run;
+its hash matches the recorded Linux source. Earlier failures remain retained.
+
+Both platforms discovered the exact protocol parent, live parent and live
+child. Only the protocol parent executed. Formatting, tagged ingress vet,
+canonical generation and diff checks passed at 05:11:32–05:11:37. Root audited
+source, raw RUN/PASS census, binary and discovery hashes, static results,
+source-impact closure and reviews before the exact two-file commit.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `stopped-stage-private-root-windows-final-20261024T051036Z/composite.json` | `f0df9812760a6bab4acc9708fae0b355082eb50849415c89c28a7b09f1ab6028` |
+| `stopped-stage-private-root-static-20261024T051132Z/receipt.json` | `52df5429410e6b8559744605c55451242a5ba52ac874f8999428118dd28a9659` |
+| `stopped-stage-manifest-windows-private-root-source-security-supplement-20261024.md` | `fab7382eb618cbdcac943d9c1fb30a64dcf23eef8982a871da840dd02709d123` |
+| `stopped-stage-private-root-root-audit-20261024.json` | `32ee56e2030e167314cb73cd1863bb72bfb5a67bc1dde82c7cdfe4379d40832f` |
+| `pr222-stopped-stage-owned-root-final-integration-20261024.md` | `4c1119e20840c4dbe1e74ba25a68a7df802c435148d3ec344acd17c827f5483d` |
+
+This establishes portable local protocol behavior and the fixture precondition
+repair. Actual Docker child replay, unchanged physical state and cleanup remain
+hosted gates. The original hosted failure may have an additional cause.
+
+## Hosted checkpoint on the published A0 repair
+
+Published `5a74efe220be52a1bc5aedd5056265e6d2e922fd` contains the A0 ordering and
+two rebind-fixture corrections. Its synthetic merge is
+`6cdef68d0eed5b6fa78aad0fb7b7612fe76bc0a1`, with identical tree
+`8ec8f1cfbdf3b2676db463137b7fb6c2bf01934b`; binding SHA-256:
+`b9269d9518fdd3b18e1f02dc37ea6689c023bcbe08a399ef6c7f1be8e79a0c0e`.
+
+The partial snapshot at 05:13:03 UTC has 13 failures, 13 successes, 17 running,
+97 queued and one skipped check. All failures are captured once in
+`pr222-5a74-second-failure-batch-20261024.json`, SHA-256
+`f96b57dd52e865d26d16054d888c09916c34545702c2b866f01181dcfdd1d38c`.
+
+- [TLS restart](https://github.com/tyhuang9/rig/actions/runs/40064432739/job/120784595028)
+  and [process-kill restart](https://github.com/tyhuang9/rig/actions/runs/40064432739/job/120784594895)
+  retain `cold_construction/cold_group_attestation`. Their distinct physical
+  subchecks remain unresolved; fixed private diagnostics are planned.
+- Migration and both LAN journeys retain `previous_retirement` /
+  `retirement_unavailable`. Rebind proposal, commit/rollback, stage/final-config
+  and stage-start jobs retain their recorded construction boundaries.
+- [Stopped-stage replay](https://github.com/tyhuang9/rig/actions/runs/40064432776/job/120784712992)
+  again fails before child launch at the private manifest write. Raw SHA-256:
+  `82ce7d33cbed68e8b8ebf0bd8c1b4fa9b546c964a710a7c8feabb49835a13688`.
+  This head predates the private-root fixture correction above.
+- [Full-hostd A0](https://github.com/tyhuang9/rig/actions/runs/40064432776/job/120784712976)
+  was still queued at the dedicated 05:10:42 observation. No hosted A0 success
+  is claimed. The next push waits for this gate to avoid cancelling it.
+
+The failed and queued checks remain open. This snapshot does not establish
+complete Docker or race acceptance, E5 or M4 completion.
+
 ## Rebind authority and corruption-fixture alignment
 
 Commit `3daf9ce085740cb3033d3ec45c4a2320d47ddd45` updates two tests without
