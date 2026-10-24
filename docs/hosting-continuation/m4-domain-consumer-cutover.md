@@ -17,6 +17,63 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Bounded cold-roster process groups
+
+Commit `61119ae5063e5551adb8d85ef023c049121336d8` changes only the two-component
+cold-roster test file. Its former 40-case parent is split into eight top-level
+parents containing five cases each. The original parent retains the five core
+roster cases. All 38 table definitions, their shared executor, the two special
+control bodies and all child suffixes are preserved. Both fresh-process
+isolation layers, their 90-second limits, and the 32-minute CI package bound
+remain unchanged. The existing `TestGeneratedDomain` selector includes every
+new parent without a workflow change.
+
+One retained Windows non-race build and run at 05:42:06–05:42:53 UTC on
+24 October 2026 discovered exactly eight parents and passed 48 unique names:
+eight parents and all 40 mapped children. There were no missing, unexpected,
+duplicated, failed or skipped cases after subprocess echoes were deduplicated.
+Formatting, ingress vet and canonical generation passed on the unchanged final
+source hash. The same hosted race selector remains required; the local run
+does not establish that every group completes within its limit under race CI.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Final one-file source | `b7fc2ae7d66893d5327792fc8fee84e87c941e7d9373456a1d22fed52e810043` |
+| Receipt | `205475f08c425d7be654063398868fad2db63e119debea12dda317244e96589c` |
+| Raw results | `22d2c9838d5fac934f0f420882e05622187106c01c8e32190bb36fc46950362e` |
+| Source/security review | `cdb0fcb8dbccdf144698cdd71fbff7656325ac595947d1a70a1d9d0c844049eb` |
+| Independent root audit | `4c0d61d8bd6c8be49d082f2b69a3f2f3c796b2d8eef92b79a3b1b939fad0b254` |
+
+The retained command arrays, original source, exact parent-to-child mapping and
+preservation comparison are under `cold-two-component-partition-20261024T053726Z`.
+The audit checks every expected name, raw result, binary, source and evidence
+hash, plus unchanged isolation helpers and CI selection. No production code or
+Docker behavior changes in this test-only checkpoint.
+
+### First hosted evidence from the diagnostic successor
+
+Published head `3a5551c` ran through merge checkout
+`cbac40d53d8aa5c2c935972d79e9bbadbaeaeed7`, whose tree exactly matches the head.
+Its [TLS journey](https://github.com/tyhuang9/rig/actions/runs/40066795522/job/120791649038)
+and [process-kill journey](https://github.com/tyhuang9/rig/actions/runs/40066795522/job/120791648863)
+both now report `cold_construction/cold_group_census`. The TLS journey first
+observes healthy containers, successful external-dependency outage recovery and
+the Chromium create flow. Restart still fails. Raw SHA-256 values are
+`c9f3949092703ca750d5886167f80c56ed05b0616d26fa5801f29267ed8064f8`
+and `9a8c4d53a8d290af660d9d4c43900cb607c4d89ff239557dc4f68339d0fc80eb`.
+The narrower code identifies the census comparison boundary, not the exact
+resource, label or missing-set predicate; source investigation remains open.
+
+At 05:42:14 UTC this head had six failed, seven successful, 14 running,
+113 queued and one skipped check. The six captured failures also include
+migration and LAN predecessor-retirement refusal, cross-store proposal startup,
+and final-config restart. Snapshot SHA-256:
+`b6759fbc848a0affdf0c83a6a652ffe0b644318feb6807d2d6742766b09118c4`;
+capture index SHA-256:
+`cac095fa951a50347fc7911b7819094416eba6cc0944e7f5486bbc0fd37aa7bd`.
+Stopped-stage Docker replay had not completed in that snapshot. No failed gate
+is waived, and full CI, E5 and M4 remain incomplete.
+
 ## Cold-group diagnostics and latest hosted boundaries
 
 Commit `672c3c81bb34ef229414277f39680fdb66390c5b` adds five fixed private
