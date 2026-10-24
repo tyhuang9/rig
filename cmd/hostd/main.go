@@ -102,6 +102,15 @@ func normalizeHostdDaemonAssembly(assembly hostdDaemonAssemblyOptions) hostdDaem
 	return assembly
 }
 
+func openControllerDatabase(ctx context.Context, configuration config.Config,
+	ownerLease *controllerowner.Lease,
+) (*sql.DB, error) {
+	if configuration.GeneratedRuntime {
+		return database.OpenForGeneratedDomain(ctx, configuration.DataRoot, ownerLease)
+	}
+	return database.Open(configuration.DataRoot)
+}
+
 func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) int {
 	assembly = normalizeHostdDaemonAssembly(assembly)
 	if assembly.listen == nil {
@@ -155,7 +164,7 @@ func runServerWithAssembly(args []string, assembly hostdDaemonAssemblyOptions) i
 			logger.Warn("owned gateway stopped after startup reconciliation failure")
 		}
 	}
-	db, err := database.Open(cfg.DataRoot)
+	db, err := openControllerDatabase(context.Background(), cfg, ownerLease)
 	if err != nil {
 		logger.Error("database startup failed", "error", err)
 		emergencyStop()

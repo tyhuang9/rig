@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -9,8 +10,98 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostd/hostd/internal/config"
+	"github.com/hostd/hostd/internal/controllerowner"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/runtime/docker"
 	"github.com/hostd/hostd/internal/secretfile"
 )
+
+func TestControllerDatabaseOpenerPreservesRuntimeModeAndOwnerProof(t *testing.T) {
+	open := openControllerDatabase
+	newBoundary := func(t *testing.T) (string, *controllerowner.Lease) {
+		t.Helper()
+		dataRoot := filepath.Join(t.TempDir(), "state")
+		if err := os.Mkdir(dataRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		directories, err := docker.PrepareControllerDirectories(dataRoot)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease, err := controllerowner.Acquire(context.Background(), directories.WorkingDirectory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = lease.Close() })
+		return dataRoot, lease
+	}
+
+	t.Run("generated runtime binds exact owner and database", func(t *testing.T) {
+		dataRoot, lease := newBoundary(t)
+		db, err := open(context.Background(), config.Config{DataRoot: dataRoot, GeneratedRuntime: true}, lease)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		if identity, err := database.GeneratedDomainFileIdentity(context.Background(), db, dataRoot); err != nil || identity == nil {
+			t.Fatalf("generated runtime database identity = %v, %v", identity, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name          string
+		configuration config.Config
+	}{
+		{name: "disabled runtime remains generic", configuration: config.Config{}},
+		{name: "compose runtime remains generic", configuration: config.Config{ComposeRuntime: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dataRoot := filepath.Join(t.TempDir(), "state")
+			test.configuration.DataRoot = dataRoot
+			db, err := open(context.Background(), test.configuration, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			if _, err := database.GeneratedDomainFileIdentity(context.Background(), db, dataRoot); err == nil {
+				t.Fatal("non-generated runtime database acquired generated-domain provenance")
+			}
+		})
+	}
+
+	t.Run("generated runtime refuses missing owner lease", func(t *testing.T) {
+		dataRoot, lease := newBoundary(t)
+		if err := lease.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, err := open(context.Background(), config.Config{DataRoot: dataRoot, GeneratedRuntime: true}, nil)
+		if db != nil {
+			_ = db.Close()
+		}
+		if db != nil || err == nil {
+			t.Fatalf("generated runtime missing-lease open = %v, %v", db, err)
+		}
+		if _, statErr := os.Stat(filepath.Join(dataRoot, "control.db")); !os.IsNotExist(statErr) {
+			t.Fatalf("generated runtime missing-lease open touched database: %v", statErr)
+		}
+	})
+
+	t.Run("generated runtime refuses foreign owner lease", func(t *testing.T) {
+		dataRoot, _ := newBoundary(t)
+		_, foreignLease := newBoundary(t)
+		db, err := open(context.Background(), config.Config{DataRoot: dataRoot, GeneratedRuntime: true}, foreignLease)
+		if db != nil {
+			_ = db.Close()
+		}
+		if db != nil || err == nil {
+			t.Fatalf("generated runtime foreign-lease open = %v, %v", db, err)
+		}
+		if _, statErr := os.Stat(filepath.Join(dataRoot, "control.db")); !os.IsNotExist(statErr) {
+			t.Fatalf("generated runtime foreign-lease open touched database: %v", statErr)
+		}
+	})
+}
 
 func TestStartupRejectsNonLoopbackBeforeDataRootCreation(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "must-not-exist")
