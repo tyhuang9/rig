@@ -59,10 +59,18 @@ type generatedDomainA0RouteSnapshot struct {
 }
 
 func TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccounting(t *testing.T) {
+	generatedDomainA0CommittedV2NamespacePartition(t, 0, 3)
+}
+
+func TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccountingPart2(t *testing.T) {
+	generatedDomainA0CommittedV2NamespacePartition(t, 3, 6)
+}
+
+func generatedDomainA0CommittedV2NamespacePartition(t *testing.T, start, end int) {
 	if !generatedDomainRegistryIsolated(t) {
 		return
 	}
-	for _, test := range []struct {
+	cases := []struct {
 		name   string
 		mutate func(*generatedDomainA0NamespaceFixture)
 		pass   bool
@@ -95,7 +103,8 @@ func TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccounting(t *testing.
 			}
 			t.Fatal("persisted builder container is absent from the A0 namespace")
 		}},
-	} {
+	}
+	for _, test := range cases[start:end] {
 		t.Run(test.name, func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture := newGeneratedDomainA0NamespaceFixture(t)
@@ -135,10 +144,18 @@ func TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccounting(t *testing.
 }
 
 func TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExact(t *testing.T) {
+	generatedDomainA0GatewayOnlyNamespacePartition(t, 0, 3)
+}
+
+func TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExactPart2(t *testing.T) {
+	generatedDomainA0GatewayOnlyNamespacePartition(t, 3, 5)
+}
+
+func generatedDomainA0GatewayOnlyNamespacePartition(t *testing.T, start, end int) {
 	if !generatedDomainRegistryIsolated(t) {
 		return
 	}
-	for _, test := range []struct {
+	cases := []struct {
 		name            string
 		mutate          func(*generatedDomainConstructionFixture)
 		pass            bool
@@ -183,7 +200,8 @@ func TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExact(t *testing.T) {
 					t.Fatal("install malformed A0 gateway expectation")
 				}
 			}},
-	} {
+	}
+	for _, test := range cases[start:end] {
 		t.Run(test.name, func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture := newGeneratedDomainStableConstructionFixture(t)

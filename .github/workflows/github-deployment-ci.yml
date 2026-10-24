@@ -253,6 +253,8 @@ jobs:
           - current-serving-predecessor
           - current-serving
           - domain-construction
+          - domain-a0
+          - domain-cold
           - domain-startup-stable
           - domain-startup
           - ingress-capacity

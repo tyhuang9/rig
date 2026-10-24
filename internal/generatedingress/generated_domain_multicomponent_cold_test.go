@@ -70,13 +70,21 @@ type generatedDomainTwoComponentColdPartition uint8
 
 const (
 	generatedDomainTwoComponentColdBaseline generatedDomainTwoComponentColdPartition = iota
+	generatedDomainTwoComponentColdBaselinePart2
 	generatedDomainTwoComponentColdGroupAttestation
+	generatedDomainTwoComponentColdGroupAttestationPart2
 	generatedDomainTwoComponentColdBuilderNamespace
+	generatedDomainTwoComponentColdBuilderNamespacePart2
 	generatedDomainTwoComponentColdBuilderIdentityAndRead
+	generatedDomainTwoComponentColdBuilderIdentityAndReadPart2
 	generatedDomainTwoComponentColdBuilderPhysicalPolicy
+	generatedDomainTwoComponentColdBuilderPhysicalPolicyPart2
 	generatedDomainTwoComponentColdBuilderRequiredNetworkOptions
+	generatedDomainTwoComponentColdBuilderRequiredNetworkOptionsPart2
 	generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondence
+	generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondencePart2
 	generatedDomainTwoComponentColdBuilderFinalIdentity
+	generatedDomainTwoComponentColdBuilderFinalIdentityPart2
 )
 
 type generatedDomainTwoComponentRouteRunner struct {
@@ -303,6 +311,10 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBaseline)
 }
 
+func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRosterPart2(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBaselinePart2)
+}
+
 func TestGeneratedDomainColdAcceptsDockerMergedCandidateContainerLabels(t *testing.T) {
 	if !generatedDomainRegistryIsolated(t) {
 		return
@@ -428,35 +440,71 @@ func TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDrift(t *testing.
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdGroupAttestation)
 }
 
+func TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDriftPart2(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdGroupAttestationPart2)
+}
+
 func TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDrift(t *testing.T) {
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderNamespace)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDriftPart2(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderNamespacePart2)
 }
 
 func TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDrift(t *testing.T) {
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderIdentityAndRead)
 }
 
+func TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDriftPart2(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderIdentityAndReadPart2)
+}
+
 func TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDrift(t *testing.T) {
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderPhysicalPolicy)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDriftPart2(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderPhysicalPolicyPart2)
 }
 
 func TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptions(t *testing.T) {
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderRequiredNetworkOptions)
 }
 
+func TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptionsPart2(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderRequiredNetworkOptionsPart2)
+}
+
 func TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondence(t *testing.T) {
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondence)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondencePart2(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondencePart2)
 }
 
 func TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDrift(t *testing.T) {
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderFinalIdentity)
 }
 
+func TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDriftPart2(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderFinalIdentityPart2)
+}
+
 func TestGeneratedDomainColdRejectsTwoComponentCensusDetails(t *testing.T) {
+	testGeneratedDomainTwoComponentCensusDetails(t, 0, 3)
+}
+
+func TestGeneratedDomainColdRejectsTwoComponentCensusDetailsPart2(t *testing.T) {
+	testGeneratedDomainTwoComponentCensusDetails(t, 3, 5)
+}
+
+func testGeneratedDomainTwoComponentCensusDetails(t *testing.T, start, end int) {
 	if !generatedDomainRegistryIsolated(t) {
 		return
 	}
-	for _, test := range []struct {
+	cases := []struct {
 		name   string
 		mutate func(*generatedDomainTwoComponentColdFixture)
 		reason generatedDomainConstructionReason
@@ -522,7 +570,8 @@ func TestGeneratedDomainColdRejectsTwoComponentCensusDetails(t *testing.T) {
 			}
 			fixture.runner.delegate.objects = objects
 		}, reason: generatedDomainConstructionReasonColdGroupMissingNetwork},
-	} {
+	}
+	for _, test := range cases[start:end] {
 		t.Run(test.name, func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture := newGeneratedDomainTwoComponentColdFixture(t)
@@ -755,21 +804,37 @@ func generatedDomainTwoComponentColdPartitionBounds(t *testing.T,
 	t.Helper()
 	switch partition {
 	case generatedDomainTwoComponentColdBaseline:
-		return 0, 5
+		return 0, 3
+	case generatedDomainTwoComponentColdBaselinePart2:
+		return 3, 5
 	case generatedDomainTwoComponentColdGroupAttestation:
-		return 5, 9
+		return 5, 8
+	case generatedDomainTwoComponentColdGroupAttestationPart2:
+		return 8, 9
 	case generatedDomainTwoComponentColdBuilderNamespace:
-		return 9, 13
+		return 9, 12
+	case generatedDomainTwoComponentColdBuilderNamespacePart2:
+		return 12, 13
 	case generatedDomainTwoComponentColdBuilderIdentityAndRead:
-		return 13, 18
+		return 13, 16
+	case generatedDomainTwoComponentColdBuilderIdentityAndReadPart2:
+		return 16, 18
 	case generatedDomainTwoComponentColdBuilderPhysicalPolicy:
-		return 18, 23
+		return 18, 21
+	case generatedDomainTwoComponentColdBuilderPhysicalPolicyPart2:
+		return 21, 23
 	case generatedDomainTwoComponentColdBuilderRequiredNetworkOptions:
-		return 23, 28
+		return 23, 26
+	case generatedDomainTwoComponentColdBuilderRequiredNetworkOptionsPart2:
+		return 26, 28
 	case generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondence:
-		return 28, 33
+		return 28, 31
+	case generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondencePart2:
+		return 31, 33
 	case generatedDomainTwoComponentColdBuilderFinalIdentity:
-		return 33, 38
+		return 33, 36
+	case generatedDomainTwoComponentColdBuilderFinalIdentityPart2:
+		return 36, 38
 	default:
 		t.Fatalf("unknown two-component cold partition: %d", partition)
 		return 0, 0
@@ -860,7 +925,7 @@ func testGeneratedDomainTwoComponentColdPartition(t *testing.T,
 		})
 	}
 
-	if partition == generatedDomainTwoComponentColdGroupAttestation {
+	if partition == generatedDomainTwoComponentColdGroupAttestationPart2 {
 		t.Run("cold_group_gateway_attestation_failure", func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
@@ -896,7 +961,7 @@ func testGeneratedDomainTwoComponentColdPartition(t *testing.T,
 		})
 	}
 
-	if partition == generatedDomainTwoComponentColdBuilderNamespace {
+	if partition == generatedDomainTwoComponentColdBuilderNamespacePart2 {
 		t.Run("cold_group_structural_fallback_remains_generic", func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
