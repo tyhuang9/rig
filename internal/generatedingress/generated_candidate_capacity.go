@@ -65,6 +65,8 @@ type candidateImmutablePins struct {
 type candidateCapacityGroup struct {
 	mu      sync.Mutex
 	changed *sync.Cond
+	ledger  *candidateCapacityLedger
+	key     candidateCapacityGroupKey
 
 	pins       candidateImmutablePins
 	components []string
@@ -96,11 +98,22 @@ const (
 	candidateChargeReleased
 )
 
+type candidateAccountingOwner uint8
+
+const (
+	candidateAccountingCandidate candidateAccountingOwner = iota
+	candidateAccountingTransferring
+	candidateAccountingRouteActive
+	candidateAccountingPredecessorRetiring
+	candidateAccountingPredecessorRetired
+)
+
 type candidateCapacityCharge struct {
 	epoch uint64
 	lease *generatedcapacity.Lease
 	refs  int
 	state candidateChargeState
+	owner candidateAccountingOwner
 
 	receiptRetained  bool
 	explicitRetained bool
@@ -230,6 +243,29 @@ type candidateRetirementRosterOperation struct {
 	byName    map[string]*candidateCapacityComponent
 }
 
+type candidateAccountingHandoffEntry struct {
+	component *candidateCapacityComponent
+	charge    *candidateCapacityCharge
+	receipt   *candidateReceiptTombstone
+	epoch     uint64
+	lease     *generatedcapacity.Lease
+}
+
+// candidateAccountingHandoffOperation owns no release authority. Unit 2B
+// records only the complete in-process ownership transfer while every exact
+// raw lease remains live. The later opaque Unit 2C operation owns gateway
+// unlock, predecessor once-release and terminal durable readback.
+type candidateAccountingHandoffOperation struct {
+	mu sync.Mutex
+
+	ledger           *candidateCapacityLedger
+	successorGroup   *candidateCapacityGroup
+	predecessorGroup *candidateCapacityGroup
+	successor        []candidateAccountingHandoffEntry
+	predecessor      []candidateAccountingHandoffEntry
+	gatewayUnlocked  bool
+}
+
 // candidateReceiptSnapshot is read-only evidence. It exposes no transition or
 // release capability and its fields remain private to the concrete owner.
 type candidateReceiptSnapshot struct {
@@ -247,6 +283,7 @@ type candidateReceiptSnapshot struct {
 
 	chargeEpoch        uint64
 	chargeState        candidateChargeState
+	accountingOwner    candidateAccountingOwner
 	accountingRetained bool
 	receiptRetained    bool
 	explicitRetained   bool
@@ -285,7 +322,7 @@ func (l *candidateCapacityLedger) reserve(
 	l.mu.Lock()
 	group := l.groups[key]
 	if group == nil {
-		group = newCandidateCapacityGroup(normalized)
+		group = newCandidateCapacityGroup(l, key, normalized)
 		l.groups[key] = group
 	}
 	l.mu.Unlock()
@@ -313,6 +350,7 @@ func (l *candidateCapacityLedger) enterRetirementRoster(appID, deploymentID stri
 	for _, name := range group.components {
 		component := group.byName[name]
 		if component == nil || component.charge == nil || component.charge.state != candidateChargeActive ||
+			!candidateAccountingOwnerCanBecomePredecessor(component.charge.owner) ||
 			component.charge.logicallyRetired || component.receipt == nil || component.receipt.id != receipts[name] {
 			return nil, errCandidateReceiptMismatch
 		}
@@ -345,6 +383,10 @@ func (l *candidateCapacityLedger) enterRetirementRoster(appID, deploymentID stri
 		operation.byName[name] = component
 	}
 	return operation, nil
+}
+
+func candidateAccountingOwnerCanBecomePredecessor(owner candidateAccountingOwner) bool {
+	return owner == candidateAccountingCandidate || owner == candidateAccountingRouteActive
 }
 
 func (o *candidateRetirementRosterOperation) enterCommand(componentName string, command candidateCommand) error {
@@ -417,7 +459,8 @@ func (o *candidateRetirementRosterOperation) latchMutationUnquiesced(componentNa
 }
 
 func (o *candidateRetirementRosterOperation) validComponentLocked(component *candidateCapacityComponent) bool {
-	if component == nil || component.charge == nil || component.charge.state != candidateChargeActive || component.charge.logicallyRetired {
+	if component == nil || component.charge == nil || component.charge.state != candidateChargeActive ||
+		!candidateAccountingOwnerCanBecomePredecessor(component.charge.owner) || component.charge.logicallyRetired {
 		return false
 	}
 	for _, token := range o.tokens {
@@ -442,6 +485,230 @@ func (o *candidateRetirementRosterOperation) leave() {
 	o.group.mu.Unlock()
 }
 
+// beginAccountingHandoff changes only private process-local ownership. Both
+// complete rosters are validated before any member changes, and every raw
+// lease remains held. A nil predecessor is the exact empty-predecessor case.
+func (l *candidateCapacityLedger) beginAccountingHandoff(
+	successor *candidateRosterOperation,
+	predecessor *candidateRetirementRosterOperation,
+) (*candidateAccountingHandoffOperation, error) {
+	if l == nil || l.budget == nil || successor == nil || successor.group == nil ||
+		successor.reservation == nil || successor.reservation.ledger != l ||
+		successor.group.ledger != l || successor.lifecycle == nil || successor.lifecycle.done.Load() {
+		return nil, errCandidateCapacityInvalid
+	}
+	var predecessorGroup *candidateCapacityGroup
+	if predecessor != nil {
+		predecessorGroup = predecessor.group
+		if predecessorGroup == nil || predecessorGroup.ledger != l || predecessor.lifecycle == nil ||
+			predecessor.lifecycle.done.Load() || predecessorGroup == successor.group {
+			return nil, errCandidateCapacityInvalid
+		}
+	}
+
+	unlock := lockCandidateAccountingGroups(successor.group, predecessorGroup)
+	defer unlock()
+	successorEntries, err := validateCandidateAccountingSuccessorLocked(successor)
+	if err != nil {
+		return nil, err
+	}
+	predecessorEntries, err := validateCandidateAccountingPredecessorLocked(predecessor)
+	if err != nil {
+		return nil, err
+	}
+
+	// The complete successor batch is detached from this reservation while
+	// both group locks are held. Other aliases may detach later, but their
+	// release path cannot retire a transferring or route-active charge.
+	for _, entry := range successorEntries {
+		binding := successor.reservation.bindings[entry.component.name]
+		binding.charge.refs--
+		binding.attached = false
+		entry.charge.explicitRetained = true
+		entry.charge.owner = candidateAccountingTransferring
+	}
+	for _, entry := range predecessorEntries {
+		entry.charge.explicitRetained = true
+		entry.charge.owner = candidateAccountingPredecessorRetiring
+	}
+	return &candidateAccountingHandoffOperation{
+		ledger:           l,
+		successorGroup:   successor.group,
+		predecessorGroup: predecessorGroup,
+		successor:        successorEntries,
+		predecessor:      predecessorEntries,
+	}, nil
+}
+
+// markGatewayUnlocked is called only by the later opaque handoff owner after
+// its gateway unlock succeeds. It promotes the entire exact successor roster
+// to route-active ownership without releasing any lease. Predecessor leases
+// remain live and predecessor-retiring for Unit 2C's finite once-release.
+func (o *candidateAccountingHandoffOperation) markGatewayUnlocked() error {
+	if o == nil || o.ledger == nil || o.successorGroup == nil || len(o.successor) == 0 {
+		return errCandidateCapacityInvalid
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	unlock := lockCandidateAccountingGroups(o.successorGroup, o.predecessorGroup)
+	defer unlock()
+
+	expectedSuccessorOwner := candidateAccountingTransferring
+	if o.gatewayUnlocked {
+		expectedSuccessorOwner = candidateAccountingRouteActive
+	}
+	for _, entry := range o.successor {
+		if !validCandidateAccountingEntryLocked(entry, o.successorGroup, expectedSuccessorOwner,
+			candidatePhysicalHandedToRoute) {
+			return errCandidateCapacityStale
+		}
+	}
+	for _, entry := range o.predecessor {
+		if !validCandidateAccountingEntryLocked(entry, o.predecessorGroup,
+			candidateAccountingPredecessorRetiring, candidatePhysicalConfirmedAbsent) {
+			return errCandidateCapacityStale
+		}
+	}
+	if o.gatewayUnlocked {
+		return nil
+	}
+	for _, entry := range o.successor {
+		entry.charge.owner = candidateAccountingRouteActive
+	}
+	o.gatewayUnlocked = true
+	return nil
+}
+
+func validateCandidateAccountingSuccessorLocked(
+	operation *candidateRosterOperation,
+) ([]candidateAccountingHandoffEntry, error) {
+	group := operation.group
+	if operation.lifecycle.done.Load() || operation.reservation.group != group || group.reserving ||
+		len(operation.tokens) != len(group.components) || len(operation.reservation.bindings) != len(group.components) {
+		return nil, errCandidateCapacityStale
+	}
+	tokens, ok := candidateAccountingTokensLocked(group, operation.tokens)
+	if !ok {
+		return nil, errCandidateCapacityStale
+	}
+	entries := make([]candidateAccountingHandoffEntry, 0, len(group.components))
+	for _, name := range group.components {
+		component := group.byName[name]
+		binding := operation.reservation.bindings[name]
+		_, found := tokens[component]
+		if component == nil || !found || !validCandidateBindingLocked(binding) ||
+			binding.component != component || binding.charge.lease == nil ||
+			binding.charge.owner != candidateAccountingCandidate || component.receipt == nil {
+			return nil, errCandidateCapacityStale
+		}
+		word := component.receipt.state.Load()
+		if word&candidateReceiptUnquiesced != 0 {
+			return nil, errCandidateMutationUnquiesced
+		}
+		if candidatePhysicalFromWord(word) != candidatePhysicalHandedToRoute {
+			return nil, errCandidatePhysicalTransition
+		}
+		entries = append(entries, candidateAccountingHandoffEntry{
+			component: component, charge: binding.charge, receipt: component.receipt,
+			epoch: binding.charge.epoch, lease: binding.charge.lease,
+		})
+	}
+	return entries, nil
+}
+
+func validateCandidateAccountingPredecessorLocked(
+	operation *candidateRetirementRosterOperation,
+) ([]candidateAccountingHandoffEntry, error) {
+	if operation == nil {
+		return nil, nil
+	}
+	group := operation.group
+	if operation.lifecycle.done.Load() || group.reserving || len(operation.tokens) != len(group.components) ||
+		len(operation.byName) != len(group.components) {
+		return nil, errCandidateCapacityStale
+	}
+	tokens, ok := candidateAccountingTokensLocked(group, operation.tokens)
+	if !ok {
+		return nil, errCandidateCapacityStale
+	}
+	entries := make([]candidateAccountingHandoffEntry, 0, len(group.components))
+	for _, name := range group.components {
+		component := group.byName[name]
+		_, found := tokens[component]
+		if component == nil || operation.byName[name] != component || !found || component.charge == nil ||
+			component.charge.state != candidateChargeActive || component.charge.lease == nil ||
+			!candidateAccountingOwnerCanBecomePredecessor(component.charge.owner) ||
+			component.charge.logicallyRetired || !component.charge.explicitRetained || component.receipt == nil {
+			return nil, errCandidateCapacityStale
+		}
+		word := component.receipt.state.Load()
+		if word&candidateReceiptUnquiesced != 0 {
+			return nil, errCandidateMutationUnquiesced
+		}
+		if candidatePhysicalFromWord(word) != candidatePhysicalConfirmedAbsent {
+			return nil, errCandidatePhysicalTransition
+		}
+		entries = append(entries, candidateAccountingHandoffEntry{
+			component: component, charge: component.charge, receipt: component.receipt,
+			epoch: component.charge.epoch, lease: component.charge.lease,
+		})
+	}
+	return entries, nil
+}
+
+func candidateAccountingTokensLocked(group *candidateCapacityGroup,
+	tokens []candidateRosterToken,
+) (map[*candidateCapacityComponent]uint64, bool) {
+	values := make(map[*candidateCapacityComponent]uint64, len(tokens))
+	for _, token := range tokens {
+		if token.component == nil || group.byName[token.component.name] != token.component ||
+			!token.component.tokenHeld || token.component.tokenGeneration != token.generation {
+			return nil, false
+		}
+		if _, exists := values[token.component]; exists {
+			return nil, false
+		}
+		values[token.component] = token.generation
+	}
+	return values, len(values) == len(group.components)
+}
+
+func validCandidateAccountingEntryLocked(entry candidateAccountingHandoffEntry,
+	group *candidateCapacityGroup, owner candidateAccountingOwner, physical candidatePhysicalState,
+) bool {
+	if group == nil || entry.component == nil || group.byName[entry.component.name] != entry.component ||
+		entry.component.charge != entry.charge || entry.charge == nil || entry.charge.epoch != entry.epoch ||
+		entry.charge.lease != entry.lease || entry.lease == nil || entry.charge.state != candidateChargeActive ||
+		entry.charge.owner != owner || !entry.charge.explicitRetained || entry.charge.logicallyRetired ||
+		entry.component.receipt != entry.receipt ||
+		entry.receipt == nil {
+		return false
+	}
+	word := entry.receipt.state.Load()
+	return word&candidateReceiptUnquiesced == 0 && candidatePhysicalFromWord(word) == physical
+}
+
+func lockCandidateAccountingGroups(successor, predecessor *candidateCapacityGroup) func() {
+	if predecessor == nil {
+		successor.mu.Lock()
+		return successor.mu.Unlock
+	}
+	first, second := successor, predecessor
+	if candidateCapacityGroupKeyLess(predecessor.key, successor.key) {
+		first, second = predecessor, successor
+	}
+	first.mu.Lock()
+	second.mu.Lock()
+	return func() {
+		second.mu.Unlock()
+		first.mu.Unlock()
+	}
+}
+
+func candidateCapacityGroupKeyLess(left, right candidateCapacityGroupKey) bool {
+	return left.appID < right.appID || left.appID == right.appID && left.deploymentID < right.deploymentID
+}
+
 func normalizeCandidateGroupSpec(spec candidateGroupSpec) (candidateGroupSpec, error) {
 	if spec.appID == "" || spec.deploymentID == "" || len(spec.components) == 0 ||
 		spec.limits.MemoryBytes == 0 || spec.limits.DiskBytes == 0 {
@@ -458,8 +725,12 @@ func normalizeCandidateGroupSpec(spec candidateGroupSpec) (candidateGroupSpec, e
 	return spec, nil
 }
 
-func newCandidateCapacityGroup(spec candidateGroupSpec) *candidateCapacityGroup {
+func newCandidateCapacityGroup(ledger *candidateCapacityLedger, key candidateCapacityGroupKey,
+	spec candidateGroupSpec,
+) *candidateCapacityGroup {
 	group := &candidateCapacityGroup{
+		ledger:     ledger,
+		key:        key,
 		pins:       spec.pins,
 		components: append([]string(nil), spec.components...),
 		limits:     spec.limits,
@@ -490,7 +761,7 @@ func (l *candidateCapacityLedger) seedColdOwnership(spec candidateGroupSpec,
 	l.mu.Lock()
 	group := l.groups[key]
 	if group == nil {
-		group = newCandidateCapacityGroup(normalized)
+		group = newCandidateCapacityGroup(l, key, normalized)
 		l.groups[key] = group
 	}
 	l.mu.Unlock()
@@ -546,6 +817,10 @@ func (g *candidateCapacityGroup) reserve(
 	missing := make([]*candidateCapacityComponent, 0, len(g.components))
 	for _, name := range g.components {
 		component := g.byName[name]
+		if component.charge != nil && component.charge.owner != candidateAccountingCandidate {
+			g.mu.Unlock()
+			return nil, errCandidateCapacityStale
+		}
 		if component.charge != nil && component.charge.logicallyRetired {
 			err := candidateComponentAllowsFreshCharge(component)
 			if err == nil {
@@ -774,7 +1049,7 @@ func (r *candidateCapacityReservation) releaseBindings() error {
 			return errCandidateCapacityStale
 		}
 		if binding.attached && !validCandidateBindingLocked(binding) &&
-			!terminalCandidateBindingLocked(binding) {
+			!transferredCandidateBindingLocked(binding) && !terminalCandidateBindingLocked(binding) {
 			g.mu.Unlock()
 			return errCandidateCapacityStale
 		}
@@ -787,6 +1062,11 @@ func (r *candidateCapacityReservation) releaseBindings() error {
 			continue
 		}
 		if terminalCandidateBindingLocked(binding) {
+			binding.attached = false
+			continue
+		}
+		if transferredCandidateBindingLocked(binding) {
+			binding.charge.refs--
 			binding.attached = false
 			continue
 		}
@@ -813,6 +1093,7 @@ func candidateChargeCanRetire(
 	binding *candidateCapacityBinding,
 ) bool {
 	if component == nil || charge == nil || binding == nil || charge.state != candidateChargeActive ||
+		charge.owner != candidateAccountingCandidate ||
 		charge.refs != 0 || charge.receiptRetained || charge.explicitRetained ||
 		charge.logicallyRetired || charge.lease == nil {
 		return false
@@ -858,8 +1139,17 @@ func releaseRetiringCandidateCharges(
 
 func validCandidateBindingLocked(binding *candidateCapacityBinding) bool {
 	return exactCandidateBindingLocked(binding) && binding.attached &&
-		binding.charge.state == candidateChargeActive && !binding.charge.logicallyRetired &&
+		binding.charge.state == candidateChargeActive && binding.charge.owner == candidateAccountingCandidate &&
+		!binding.charge.logicallyRetired &&
 		binding.charge.refs > 0
+}
+
+func transferredCandidateBindingLocked(binding *candidateCapacityBinding) bool {
+	return exactCandidateBindingLocked(binding) && binding.attached &&
+		binding.charge.state == candidateChargeActive &&
+		(binding.charge.owner == candidateAccountingTransferring ||
+			binding.charge.owner == candidateAccountingRouteActive ||
+			binding.charge.owner == candidateAccountingPredecessorRetiring)
 }
 
 func terminalCandidateBindingLocked(binding *candidateCapacityBinding) bool {
@@ -1385,6 +1675,7 @@ func candidateSnapshotLocked(
 		mutationUnquiesced: word&candidateReceiptUnquiesced != 0,
 		chargeEpoch:        charge.epoch,
 		chargeState:        charge.state,
+		accountingOwner:    charge.owner,
 		accountingRetained: charge.receiptRetained || charge.explicitRetained,
 		receiptRetained:    charge.receiptRetained,
 		explicitRetained:   charge.explicitRetained,
