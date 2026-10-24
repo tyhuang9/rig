@@ -483,6 +483,10 @@ func controllerChildConstructionDiagnosticKnownPair(stage, reason string) bool {
 		switch reason {
 		case "input", "path_identity", "state_store", "assembly", "fence", "stability",
 			"cold_accounting", "cold_group_reconstruction", "cold_builder_attestation",
+			"cold_builder_identity", "cold_builder_census", "cold_builder_container_read",
+			"cold_builder_network_read", "cold_builder_image_read", "cold_builder_container_policy",
+			"cold_builder_network_policy", "cold_builder_image_policy", "cold_builder_correspondence",
+			"cold_builder_repeated", "cold_builder_final",
 			"cold_reservation", "cold_ownership", "cold_head", "cold_group_attestation",
 			"cold_manifest", "lock", "release", "final_validation":
 			return true

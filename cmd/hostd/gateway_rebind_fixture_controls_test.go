@@ -32,6 +32,9 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	knownRuntime := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"runtime composition failed","error":"` + secret + `"}`
 	constructionError := "generated domain construction was refused: stage=empty_final_locked reason=docker_static_response"
 	knownConstruction := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"generated domain construction failed","error":"` + constructionError + `"}`
+	coldBuilderConstruction := func(reason string) string {
+		return `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"generated domain construction failed","error":"generated domain construction was refused: stage=cold_construction reason=` + reason + `"}`
+	}
 	knownGateway := `{"msg":"gateway startup inspection failed","error":"/private/path ` + secret + `"}`
 	knownGatewayCheckpoint := `{"msg":"gateway startup inspection failed","startup_checkpoint":"upgrade_gateway_lock","error":"/private/path ` + secret + `"}`
 	unknownGatewayCheckpoint := `{"msg":"gateway startup inspection failed","startup_checkpoint":"forged-checkpoint","error":"/private/path ` + secret + `"}`
@@ -46,6 +49,17 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	}{
 		{name: "known exact message", stderr: knownRuntime, wantCode: "runtime_composition"},
 		{name: "known generated domain construction", stderr: knownConstruction, wantCode: "construction=empty_final_locked/docker_static_response"},
+		{name: "construction cold builder identity", stderr: coldBuilderConstruction("cold_builder_identity"), wantCode: "construction=cold_construction/cold_builder_identity"},
+		{name: "construction cold builder census", stderr: coldBuilderConstruction("cold_builder_census"), wantCode: "construction=cold_construction/cold_builder_census"},
+		{name: "construction cold builder container read", stderr: coldBuilderConstruction("cold_builder_container_read"), wantCode: "construction=cold_construction/cold_builder_container_read"},
+		{name: "construction cold builder network read", stderr: coldBuilderConstruction("cold_builder_network_read"), wantCode: "construction=cold_construction/cold_builder_network_read"},
+		{name: "construction cold builder image read", stderr: coldBuilderConstruction("cold_builder_image_read"), wantCode: "construction=cold_construction/cold_builder_image_read"},
+		{name: "construction cold builder container policy", stderr: coldBuilderConstruction("cold_builder_container_policy"), wantCode: "construction=cold_construction/cold_builder_container_policy"},
+		{name: "construction cold builder network policy", stderr: coldBuilderConstruction("cold_builder_network_policy"), wantCode: "construction=cold_construction/cold_builder_network_policy"},
+		{name: "construction cold builder image policy", stderr: coldBuilderConstruction("cold_builder_image_policy"), wantCode: "construction=cold_construction/cold_builder_image_policy"},
+		{name: "construction cold builder correspondence", stderr: coldBuilderConstruction("cold_builder_correspondence"), wantCode: "construction=cold_construction/cold_builder_correspondence"},
+		{name: "construction cold builder repeated", stderr: coldBuilderConstruction("cold_builder_repeated"), wantCode: "construction=cold_construction/cold_builder_repeated"},
+		{name: "construction cold builder final", stderr: coldBuilderConstruction("cold_builder_final"), wantCode: "construction=cold_construction/cold_builder_final"},
 		{name: "construction unrelated slog field is ignored", stderr: `{"time":"2026-10-15T00:00:00Z","level":"ERROR","source":{"function":"main.runServerWithAssembly"},"msg":"generated domain construction failed","error":"` + constructionError + `"}`, wantCode: "construction=empty_final_locked/docker_static_response"},
 		{name: "construction missing error", stderr: `{"msg":"generated domain construction failed"}`},
 		{name: "construction non string error", stderr: `{"msg":"generated domain construction failed","error":{"value":"` + constructionError + `"}}`},
@@ -58,6 +72,7 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		{name: "construction suffixed error", stderr: `{"msg":"generated domain construction failed","error":"` + constructionError + ` ` + secret + `"}`},
 		{name: "construction unknown pair", stderr: `{"msg":"generated domain construction failed","error":"generated domain construction was refused: stage=private reason=private"}`},
 		{name: "construction crossed pair", stderr: `{"msg":"generated domain construction failed","error":"generated domain construction was refused: stage=cold_construction reason=docker_network"}`},
+		{name: "construction crossed cold builder pair", stderr: `{"msg":"generated domain construction failed","error":"generated domain construction was refused: stage=empty_construction reason=cold_builder_identity"}`},
 		{name: "construction malformed JSON", stderr: `{"msg":"generated domain construction failed","error":"` + constructionError + `"`},
 		{name: "primary precedes emergency stop", stderr: knownGateway + "\n" + secondary, wantCode: "gateway_inspection"},
 		{name: "known gateway checkpoint", stderr: knownGatewayCheckpoint, wantCode: "upgrade_gateway_lock"},
@@ -242,6 +257,17 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 			{name: "controller cold accounting", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_accounting"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_accounting"},
 			{name: "controller cold group reconstruction", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_group_reconstruction"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_group_reconstruction"},
 			{name: "process kill cold builder attestation", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_builder_attestation"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_builder_attestation"},
+			{name: "controller cold builder identity", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_builder_identity"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_builder_identity"},
+			{name: "process kill cold builder census", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_builder_census"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_builder_census"},
+			{name: "controller cold builder container read", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_builder_container_read"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_builder_container_read"},
+			{name: "process kill cold builder network read", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_builder_network_read"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_builder_network_read"},
+			{name: "controller cold builder image read", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_builder_image_read"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_builder_image_read"},
+			{name: "process kill cold builder container policy", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_builder_container_policy"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_builder_container_policy"},
+			{name: "controller cold builder network policy", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_builder_network_policy"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_builder_network_policy"},
+			{name: "process kill cold builder image policy", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_builder_image_policy"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_builder_image_policy"},
+			{name: "controller cold builder correspondence", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_builder_correspondence"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_builder_correspondence"},
+			{name: "process kill cold builder repeated", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_builder_repeated"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_builder_repeated"},
+			{name: "controller cold builder final", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_builder_final"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_builder_final"},
 			{name: "controller cold reservation", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_reservation"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_reservation"},
 			{name: "process kill cold ownership", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_ownership"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_ownership"},
 			{name: "controller cold head", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_head"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_head"},
@@ -262,6 +288,7 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 			{name: "construction missing stage", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":"generated_domain","child_result":"failed","construction_reason":"state_store"}`},
 			{name: "construction crossed pair", value: constructionRecord("controller_restart", "generated_domain", "join", "docker_network")},
 			{name: "construction crossed cold pair", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "docker_network")},
+			{name: "construction crossed cold builder pair", value: constructionRecord("controller_restart", "generated_domain", "empty_construction", "cold_builder_identity")},
 			{name: "construction unknown reason", value: constructionRecord("controller_restart", "generated_domain", "stable_final", "private_path")},
 			{name: "construction duplicate stage", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":"generated_domain","child_result":"failed","construction_stage":"stable_final","construction_stage":"join","construction_reason":"state_store"}`},
 			{name: "construction case folded reason", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":"generated_domain","child_result":"failed","construction_stage":"stable_final","Construction_Reason":"state_store"}`},

@@ -68,6 +68,11 @@ func (a generatedDomainColdBuilderAccount) accounts(object generatedDomainDocker
 		object.kind == "network" && object.id == a.networkID
 }
 
+func generatedDomainColdBuilderRefusal(reason generatedDomainConstructionReason) error {
+	return newGeneratedDomainConstructionDiagnostic(generatedDomainConstructionStageColdConstruction,
+		reason, errGeneratedDomainConstructionRefused)
+}
+
 func attestGeneratedDomainColdBuilder(ctx context.Context, manager *Manager,
 	authority *GeneratedCandidateAuthority, snapshot generatedDomainDockerStartupSnapshot,
 ) (generatedDomainColdBuilderAccount, error) {
@@ -79,32 +84,43 @@ func attestGeneratedDomainColdBuilder(ctx context.Context, manager *Manager,
 		manager.options.WorkingDirectory != authority.options.WorkingDirectory ||
 		manager.options.CommandTimeout != authority.options.CommandTimeout ||
 		manager.options.OutputLimit != authority.options.OutputLimit {
-		return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+			generatedDomainConstructionReasonInput)
 	}
 	initial, err := readGeneratedDomainColdBuilderState(manager.options.DataRoot)
 	if err != nil {
-		return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+			generatedDomainConstructionReasonColdBuilderIdentity)
 	}
 	containerObject, networkObject, objectCount := generatedDomainColdBuilderObjects(snapshot.objects, initial.identity)
 	if !initial.found {
 		if objectCount != 0 {
-			return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
+			return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+				generatedDomainConstructionReasonColdBuilderCensus)
 		}
 		final, finalErr := readGeneratedDomainColdBuilderState(manager.options.DataRoot)
 		if finalErr != nil || final.found || !sameGeneratedDomainColdBuilderDirectory(initial.directory, final.directory) {
-			return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
+			return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+				generatedDomainConstructionReasonColdBuilderFinal)
 		}
 		return generatedDomainColdBuilderAccount{}, nil
 	}
 	if objectCount != 2 || containerObject == nil || networkObject == nil ||
 		!generatedDomainCanonicalDockerID(containerObject.id, false) ||
-		!generatedDomainCanonicalDockerID(networkObject.id, false) ||
-		!generatedDomainExactRigLabels(containerObject.labels,
-			generatedbuilder.ContainerLabels(initial.identity, generatedbuilder.DefaultStateQuotaBytes)) ||
-		!generatedDomainExactRigLabels(networkObject.labels, generatedbuilder.NetworkLabels(initial.identity)) ||
+		!generatedDomainCanonicalDockerID(networkObject.id, false) {
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+			generatedDomainConstructionReasonColdBuilderCensus)
+	}
+	if !generatedDomainExactRigLabels(containerObject.labels,
+		generatedbuilder.ContainerLabels(initial.identity, generatedbuilder.DefaultStateQuotaBytes)) {
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+			generatedDomainConstructionReasonColdBuilderContainerPolicy)
+	}
+	if !generatedDomainExactRigLabels(networkObject.labels, generatedbuilder.NetworkLabels(initial.identity)) ||
 		networkObject.data.driver != "bridge" || networkObject.data.scope != "local" ||
 		networkObject.data.options["com.docker.network.bridge.enable_icc"] != "false" {
-		return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+			generatedDomainConstructionReasonColdBuilderNetworkPolicy)
 	}
 	reader := &generatedDomainStartupReader{runner: manager.runner,
 		options: generatedDomainOptions{DockerExecutable: manager.options.DockerExecutable,
@@ -115,20 +131,31 @@ func attestGeneratedDomainColdBuilder(ctx context.Context, manager *Manager,
 			CommandTimeout:        manager.options.CommandTimeout,
 			OutputLimit:           manager.options.OutputLimit},
 		environment: append([]string(nil), manager.dockerEnv...)}
-	first, err := readGeneratedDomainColdBuilderPhysical(ctx, reader, *containerObject, *networkObject)
-	if err != nil || !matchesGeneratedDomainColdBuilderPhysical(first, initial.identity,
-		containerObject.id, networkObject.id) ||
-		!reflect.DeepEqual(networkObject.data.options, first.network.Options) {
-		return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
+	first, readReason, err := readGeneratedDomainColdBuilderPhysical(ctx, reader, *containerObject, *networkObject)
+	if err != nil {
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(readReason)
 	}
-	second, err := readGeneratedDomainColdBuilderPhysical(ctx, reader, *containerObject, *networkObject)
-	if err != nil || !reflect.DeepEqual(first, second) {
-		return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
+	if policyReason := generatedDomainColdBuilderPhysicalPolicy(first, initial.identity,
+		containerObject.id, networkObject.id); policyReason != "" {
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(policyReason)
+	}
+	if !reflect.DeepEqual(networkObject.data.options, first.network.Options) {
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+			generatedDomainConstructionReasonColdBuilderCorrespondence)
+	}
+	second, readReason, err := readGeneratedDomainColdBuilderPhysical(ctx, reader, *containerObject, *networkObject)
+	if err != nil {
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(readReason)
+	}
+	if !reflect.DeepEqual(first, second) {
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+			generatedDomainConstructionReasonColdBuilderRepeated)
 	}
 	final, err := readGeneratedDomainColdBuilderState(manager.options.DataRoot)
 	if err != nil || !final.found || !initial.directory.Same(final.directory) ||
 		!initial.identityFile.Same(final.identityFile) || initial.identity != final.identity {
-		return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
+		return generatedDomainColdBuilderAccount{}, generatedDomainColdBuilderRefusal(
+			generatedDomainConstructionReasonColdBuilderFinal)
 	}
 	return generatedDomainColdBuilderAccount{containerID: containerObject.id, networkID: networkObject.id}, nil
 }
@@ -210,66 +237,88 @@ func generatedDomainColdBuilderObject(object generatedDomainDockerObject) bool {
 
 func readGeneratedDomainColdBuilderPhysical(ctx context.Context, reader *generatedDomainStartupReader,
 	containerObject, networkObject generatedDomainDockerObject,
-) (generatedDomainColdBuilderPhysical, error) {
+) (generatedDomainColdBuilderPhysical, generatedDomainConstructionReason, error) {
 	deadline := time.Now().Add(generatedDomainStartupObservationTimeout)
 	containerBody, err := reader.runRead(ctx, deadline, "container", "inspect", "--format",
 		generatedDomainColdBuilderContainerInspectFormat, containerObject.id)
 	if err != nil {
-		return generatedDomainColdBuilderPhysical{}, err
+		return generatedDomainColdBuilderPhysical{}, generatedDomainConstructionReasonColdBuilderContainerRead, err
 	}
 	container, decodeErr := generatedbuilder.DecodeContainer(containerBody)
 	clear(containerBody)
 	if decodeErr != nil {
-		return generatedDomainColdBuilderPhysical{}, decodeErr
+		return generatedDomainColdBuilderPhysical{}, generatedDomainConstructionReasonColdBuilderContainerRead, decodeErr
 	}
 	if !generatedDomainCanonicalDockerID(container.Image, true) {
-		return generatedDomainColdBuilderPhysical{}, errors.New("generated builder image identity is invalid")
+		return generatedDomainColdBuilderPhysical{}, generatedDomainConstructionReasonColdBuilderContainerRead,
+			errors.New("generated builder image identity is invalid")
 	}
 	networkBody, err := reader.runRead(ctx, deadline, "network", "inspect", "--format",
 		generatedDomainColdBuilderNetworkInspectFormat, networkObject.id)
 	if err != nil {
-		return generatedDomainColdBuilderPhysical{}, err
+		return generatedDomainColdBuilderPhysical{}, generatedDomainConstructionReasonColdBuilderNetworkRead, err
 	}
 	network, decodeErr := generatedbuilder.DecodeNetwork(networkBody)
 	clear(networkBody)
 	if decodeErr != nil {
-		return generatedDomainColdBuilderPhysical{}, decodeErr
+		return generatedDomainColdBuilderPhysical{}, generatedDomainConstructionReasonColdBuilderNetworkRead, decodeErr
 	}
 	imageBody, err := reader.runRead(ctx, deadline, "image", "inspect", "--format",
 		generatedDomainColdBuilderImageInspectFormat, container.Image)
 	if err != nil {
-		return generatedDomainColdBuilderPhysical{}, err
+		return generatedDomainColdBuilderPhysical{}, generatedDomainConstructionReasonColdBuilderImageRead, err
 	}
 	image, decodeErr := generatedbuilder.DecodeImage(imageBody)
 	clear(imageBody)
 	if decodeErr != nil {
-		return generatedDomainColdBuilderPhysical{}, decodeErr
+		return generatedDomainColdBuilderPhysical{}, generatedDomainConstructionReasonColdBuilderImageRead, decodeErr
 	}
-	return generatedDomainColdBuilderPhysical{container: container, network: network, image: image}, nil
+	return generatedDomainColdBuilderPhysical{container: container, network: network, image: image}, "", nil
 }
 
-func matchesGeneratedDomainColdBuilderPhysical(value generatedDomainColdBuilderPhysical,
+func generatedDomainColdBuilderPhysicalPolicy(value generatedDomainColdBuilderPhysical,
 	identity generatedbuilder.Identity, containerID, networkID string,
-) bool {
-	if value.container.ID != containerID || value.network.ID != networkID ||
-		!generatedbuilder.MatchesContainerConfiguration(value.container, identity,
-			generatedbuilder.DefaultStateQuotaBytes) || !generatedbuilder.ContainerReady(value.container) ||
-		!generatedbuilder.MatchesContainerNetwork(value.container, identity, networkID) ||
-		!generatedbuilder.MatchesNetwork(value.network, identity) ||
-		!generatedDomainExactRigLabels(value.container.Config.Labels,
-			generatedbuilder.ContainerLabels(identity, generatedbuilder.DefaultStateQuotaBytes)) ||
-		!generatedDomainExactRigLabels(value.network.Labels, generatedbuilder.NetworkLabels(identity)) ||
-		len(value.network.Containers) != 1 || value.image.ID != value.container.Image {
-		return false
+) generatedDomainConstructionReason {
+	if value.container.ID != containerID {
+		return generatedDomainConstructionReasonColdBuilderContainerPolicy
+	}
+	if value.network.ID != networkID {
+		return generatedDomainConstructionReasonColdBuilderNetworkPolicy
+	}
+	if !generatedbuilder.MatchesContainerConfiguration(value.container, identity,
+		generatedbuilder.DefaultStateQuotaBytes) {
+		return generatedDomainConstructionReasonColdBuilderContainerPolicy
+	}
+	if !generatedbuilder.ContainerReady(value.container) {
+		return generatedDomainConstructionReasonColdBuilderContainerPolicy
+	}
+	if !generatedbuilder.MatchesContainerNetwork(value.container, identity, networkID) {
+		return generatedDomainConstructionReasonColdBuilderContainerPolicy
+	}
+	if !generatedbuilder.MatchesNetwork(value.network, identity) {
+		return generatedDomainConstructionReasonColdBuilderNetworkPolicy
+	}
+	if !generatedDomainExactRigLabels(value.container.Config.Labels,
+		generatedbuilder.ContainerLabels(identity, generatedbuilder.DefaultStateQuotaBytes)) {
+		return generatedDomainConstructionReasonColdBuilderContainerPolicy
+	}
+	if !generatedDomainExactRigLabels(value.network.Labels, generatedbuilder.NetworkLabels(identity)) {
+		return generatedDomainConstructionReasonColdBuilderNetworkPolicy
+	}
+	if len(value.network.Containers) != 1 {
+		return generatedDomainConstructionReasonColdBuilderNetworkPolicy
+	}
+	if value.image.ID != value.container.Image {
+		return generatedDomainConstructionReasonColdBuilderImagePolicy
 	}
 	member, ok := value.network.Containers[containerID]
 	if !ok || member.Name != generatedbuilder.ContainerName(identity) {
-		return false
+		return generatedDomainConstructionReasonColdBuilderNetworkPolicy
 	}
 	for key := range value.image.Labels {
 		if strings.HasPrefix(key, "rig.") || strings.HasPrefix(key, "io.rig.") {
-			return false
+			return generatedDomainConstructionReasonColdBuilderImagePolicy
 		}
 	}
-	return true
+	return ""
 }

@@ -51,6 +51,26 @@ type generatedDomainTwoComponentRouteRunner struct {
 	builder            *generatedDomainColdBuilderPhysical
 	afterFirstPhysical func()
 	imageReads         int
+	builderReads       int
+	failBuilderReadAt  int
+}
+
+const generatedDomainTwoComponentBuilderPrivateReadError = "private persisted builder observation failed"
+
+func (r *generatedDomainTwoComponentRouteRunner) builderResult(
+	result runtimeprocess.CommandResult, image bool,
+) (runtimeprocess.CommandResult, error) {
+	r.builderReads++
+	if r.builderReads == r.failBuilderReadAt {
+		return runtimeprocess.CommandResult{}, errors.New(generatedDomainTwoComponentBuilderPrivateReadError)
+	}
+	if image {
+		r.imageReads++
+		if r.imageReads == 1 && r.afterFirstPhysical != nil {
+			r.afterFirstPhysical()
+		}
+	}
+	return result, nil
 }
 
 func (r *generatedDomainTwoComponentRouteRunner) Run(ctx context.Context,
@@ -65,18 +85,13 @@ func (r *generatedDomainTwoComponentRouteRunner) Run(ctx context.Context,
 		switch {
 		case request.Args[0] == "container" && request.Args[3] == generatedDomainColdBuilderContainerInspectFormat &&
 			request.Args[4] == r.builder.container.ID:
-			return jsonResult(r.builder.container), nil
+			return r.builderResult(jsonResult(r.builder.container), false)
 		case request.Args[0] == "network" && request.Args[3] == generatedDomainColdBuilderNetworkInspectFormat &&
 			request.Args[4] == r.builder.network.ID:
-			return jsonResult(r.builder.network), nil
+			return r.builderResult(jsonResult(r.builder.network), false)
 		case request.Args[0] == "image" && request.Args[3] == generatedDomainColdBuilderImageInspectFormat &&
 			request.Args[4] == r.builder.container.Image:
-			result := jsonResult(r.builder.image)
-			r.imageReads++
-			if r.imageReads == 1 && r.afterFirstPhysical != nil {
-				r.afterFirstPhysical()
-			}
-			return result, nil
+			return r.builderResult(jsonResult(r.builder.image), true)
 		}
 	}
 	return r.delegate.Run(ctx, request)
@@ -143,11 +158,11 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 		{name: "orphan_persisted_builder_label", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = append(fixture.runner.delegate.objects, generatedDomainDockerObject{
 				kind: "volume", name: "ordinary-volume", labels: map[string]string{"rig.builder": "orphan"}})
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderCensus},
 		{name: "missing_persisted_builder_network", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentObject(
 				fixture.runner.delegate.objects, "network", "rig-buildnet-"+generatedDomainTwoComponentBuilderSuffix)
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderCensus},
 		{name: "crossed_persisted_builder_identity", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			for index := range fixture.runner.delegate.objects {
 				object := &fixture.runner.delegate.objects[index]
@@ -157,72 +172,81 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 				}
 			}
 			t.Fatal("persisted builder container is absent from the cold census")
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderContainerPolicy},
 		{name: "persisted_builder_identity_without_resources", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentObject(
 				fixture.runner.delegate.objects, "container", generatedbuilder.ContainerName(fixture.builder.identity))
 			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentObject(
 				fixture.runner.delegate.objects, "network", fixture.builder.identity.NetworkName)
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderCensus},
 		{name: "persisted_builder_resources_without_identity", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			if err := os.Remove(filepath.Join(fixture.builder.directory.Root(), generatedbuilder.IdentityFilename)); err != nil {
 				t.Fatal(err)
 			}
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderCensus},
 		{name: "malformed_persisted_builder_identity", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			replaceGeneratedDomainTwoComponentBuilderIdentity(t, fixture.builder,
 				[]byte(`{"schema":2,"builderName":"rig-buildkit-aaaaaaaaaaaaaaaaaaaaaaaa",`+
 					`"nodeName":"rig-node-aaaaaaaaaaaaaaaaaaaaaaaa",`+
 					`"networkName":"rig-buildnet-aaaaaaaaaaaaaaaaaaaaaaaa","unknown":true}`))
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderIdentity},
 		{name: "extra_persisted_builder_resource", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = append(fixture.runner.delegate.objects, generatedDomainDockerObject{
 				kind: "container", id: strings.Repeat("f", 64), name: "rig-buildkitd-bbbbbbbbbbbbbbbbbbbbbbbb",
 				labels: map[string]string{"rig.controller": "generated-builder"}})
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderCensus},
+		{name: "persisted_builder_container_read_failure", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.runner.failBuilderReadAt = 1
+		}, reason: generatedDomainConstructionReasonColdBuilderContainerRead},
+		{name: "persisted_builder_network_read_failure", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.runner.failBuilderReadAt = 2
+		}, reason: generatedDomainConstructionReasonColdBuilderNetworkRead},
+		{name: "persisted_builder_image_read_failure", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.runner.failBuilderReadAt = 3
+		}, reason: generatedDomainConstructionReasonColdBuilderImageRead},
 		{name: "invalid_persisted_builder_container_configuration", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.container.HostConfig.Memory++
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderContainerPolicy},
 		{name: "stopped_persisted_builder_container", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.container.State.Running = false
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderContainerPolicy},
 		{name: "crossed_persisted_builder_image", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.image.ID = "sha256:" + strings.Repeat("f", 64)
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderImagePolicy},
 		{name: "extra_persisted_builder_network_member", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.network.Containers[strings.Repeat("f", 64)] = generatedbuilder.NetworkContainer{
 				Name: "foreign", IPv4Address: "172.30.0.3/16"}
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderNetworkPolicy},
 		{name: "missing_persisted_builder_census_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			const option = "com.docker.network.bridge.enable_icc"
 			delete(generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options, option)
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderNetworkPolicy},
 		{name: "true_persisted_builder_census_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			const option = "com.docker.network.bridge.enable_icc"
 			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options[option] = "true"
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderNetworkPolicy},
 		{name: "other_persisted_builder_census_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			const option = "com.docker.network.bridge.enable_icc"
 			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options[option] = "unexpected"
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderNetworkPolicy},
 		{name: "missing_persisted_builder_detailed_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			delete(fixture.builder.physical.network.Options, "com.docker.network.bridge.enable_icc")
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderNetworkPolicy},
 		{name: "true_persisted_builder_detailed_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.network.Options["com.docker.network.bridge.enable_icc"] = "true"
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderNetworkPolicy},
 		{name: "other_persisted_builder_detailed_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.network.Options["com.docker.network.bridge.enable_icc"] = "unexpected"
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderNetworkPolicy},
 		{name: "crossed_persisted_builder_census_network_options", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).
 				data.options["com.docker.network.bridge.enable_ip_masquerade"] = "true"
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderCorrespondence},
 		{name: "persisted_builder_network_option_added_between_reads", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.runner.afterFirstPhysical = func() {
 				fixture.builder.physical.network.Options["com.docker.network.bridge.enable_ip_masquerade"] = "true"
 			}
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderRepeated},
 		{name: "persisted_builder_network_option_removed_between_reads", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			const option = "com.docker.network.bridge.enable_ip_masquerade"
 			fixture.builder.physical.network.Options[option] = "true"
@@ -230,7 +254,7 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 			fixture.builder.runner.afterFirstPhysical = func() {
 				delete(fixture.builder.physical.network.Options, option)
 			}
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderRepeated},
 		{name: "persisted_builder_network_option_changed_between_reads", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			const option = "com.docker.network.bridge.enable_ip_masquerade"
 			fixture.builder.physical.network.Options[option] = "true"
@@ -238,14 +262,14 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 			fixture.builder.runner.afterFirstPhysical = func() {
 				fixture.builder.physical.network.Options[option] = "false"
 			}
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderRepeated},
 		{name: "crossed_persisted_builder_container_attachment", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.container.NetworkSettings.Networks[fixture.builder.identity.NetworkName] =
 				json.RawMessage(`{"NetworkID":"` + strings.Repeat("f", 64) + `"}`)
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderContainerPolicy},
 		{name: "labelled_persisted_builder_image", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.image.Labels["rig.controller"] = "generated-builder"
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderImagePolicy},
 		{name: "persisted_builder_identity_changes_during_accounting", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.runner.afterFirstPhysical = func() {
 				changed := fixture.builder.identity
@@ -256,7 +280,7 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 				}
 				replaceGeneratedDomainTwoComponentBuilderIdentity(t, fixture.builder, body)
 			}
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderFinal},
 		{name: "persisted_builder_identity_file_replaced_with_same_bytes", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.runner.afterFirstPhysical = func() {
 				body, err := generatedbuilder.EncodeIdentity(fixture.builder.identity)
@@ -265,7 +289,7 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 				}
 				replaceGeneratedDomainTwoComponentBuilderIdentity(t, fixture.builder, body)
 			}
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderFinal},
 		{name: "persisted_builder_identity_reencoded_during_accounting", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.runner.afterFirstPhysical = func() {
 				body := []byte(`{"schema":2, "builderName":"` + fixture.builder.identity.BuilderName +
@@ -277,7 +301,7 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 				}
 				clear(body)
 			}
-		}},
+		}, reason: generatedDomainConstructionReasonColdBuilderFinal},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
@@ -323,6 +347,10 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 					if !errors.As(err, &diagnostic) || diagnostic == nil ||
 						diagnostic.stage != generatedDomainConstructionStageColdConstruction || diagnostic.reason != reason {
 						t.Fatalf("invalid two-component cold reason = %#v, want %q", diagnostic, reason)
+					}
+					if generatedDomainDiagnosticErrorTreeContains(err,
+						generatedDomainTwoComponentBuilderPrivateReadError) {
+						t.Fatalf("invalid two-component cold reason exposed private read error: %v", err)
 					}
 				}
 				for _, command := range fixture.runner.snapshot() {
