@@ -17,6 +17,64 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Stopped-stage Docker acceptance and precise census follow-up
+
+The [stopped-stage Docker job](https://github.com/tyhuang9/rig/actions/runs/40066795509/job/120791649086)
+passed on published `3a5551c` from 05:50:17 to 05:52:24 UTC on 24 October 2026.
+Its selected `TestLiveGatewayRebindSuccessorStoppedStageContainer` parent passed
+in 76.30 seconds, with no failed or skipped selected test. Raw SHA-256:
+`c5d8c1b8d8f1e07b116198a44447c4f40413336fa184e3c21106d52aeedf7410`.
+The captured checkout is `cbac40d53d8aa5c2c935972d79e9bbadbaeaeed7`, with exactly
+the published head's tree.
+
+That parent requires a fresh child process to complete the closed replay
+protocol. The child reconstructs the real manager and sequence-six history,
+replays through the production path without a container create, and verifies
+unchanged protected bytes and exact physical proof. Parent assertions also
+cover unchanged SQLite claim, route, predecessor and host topology, no routed
+application request, and the owned-resource cleanup checks. Successful child
+output is captured internally; the external log contains the parent result,
+not a separate child result. This closes this particular live replay gate;
+other Docker journeys, full CI, E5 and M4 remain open.
+
+Commit `5df42146feabab5a7788edfcc4816a941863e047` narrows the remaining generic
+cold-group census refusal into seven fixed codes: correspondence, Rig labels,
+network shape, network options, missing container, missing image and missing
+network. It uses only already projected data and existing expected/seen sets.
+Check order, seen-set insertion, strict predicates, refusal sentinel, nested
+diagnostics, read counts and effects remain unchanged. No resource values or
+raw errors are rendered. In particular, this does not relax the empty network
+options predicate or claim that options caused the hosted failures.
+
+The retained four-parent Windows run at 05:52:39–05:53:15 UTC built and
+discovered three ingress parents and one hostd parent. Ingress passed 31 unique
+names (three parents and 28 children); hostd passed 203 (one and 202). There were
+no failures or skips. The new five-case census parent keeps both process
+isolation layers; all eight earlier partition parents remain five cases each.
+The original baseline parent reran with its two more precise expectations.
+Formatting, ingress vet, tagged hostd build/vet and canonical generation passed.
+The six source hashes were unchanged during this run.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Four-parent receipt | `1e97e45f22734b8f1c22db90b2c030b2321b88d4ecd44f5c204b0e27d1d76e9c` |
+| Ingress raw results | `a902fa7d7ed270243c121082258b8909611940745c8376295b2eb3607a6959fb` |
+| Hostd raw results | `c179ebeed1643f592ab50eaaac29711457bb8a90a4545cdfe3123852f14557c5` |
+| Source/security review | `becc837afada359cca36651d2808fbc91cceb81cdcfccf7424ea83efcf80f75a` |
+| Independent root audit | `3274affb4f1126032a49906c7c5ef0b198d72b5c0952c1bbc93b347b840669d9` |
+
+Commands, binaries, exact source bindings and raw logs are retained under
+`cold-group-census-finite-reasons-final-20261024T055236Z`. These are scoped local
+diagnostic checks; hosted successor evidence must identify the actual refusal
+and verify the partition under race detection.
+
+The preceding head's 05:49:11 UTC snapshot had 12 failed, 15 successful,
+14 running, 99 queued and one skipped check. All 12 failures were captured once;
+index SHA-256:
+`3525cb2c1253d52ac8d2958b68e2686c2464546a02eaa1eb34d2858fe1819878`.
+The subsequent stopped-stage success above supersedes only its queued status.
+No other failure is treated as resolved by that success.
+
 ## Bounded cold-roster process groups
 
 Commit `61119ae5063e5551adb8d85ef023c049121336d8` changes only the two-component
