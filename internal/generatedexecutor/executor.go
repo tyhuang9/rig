@@ -53,7 +53,7 @@ type Executor struct {
 type routeController interface {
 	activate(context.Context, *generatedingress.GeneratedCandidateExecution,
 		generatedruntime.RouteSwitchRequest, generatedruntimestate.Deployment,
-	) (generatedruntimestate.Deployment, error)
+	) (routeActivation, error)
 	attestPublished(context.Context, deploymentexecution.Claim, string) error
 }
 
@@ -65,15 +65,16 @@ func (c generatedRouteController) activate(ctx context.Context,
 	execution *generatedingress.GeneratedCandidateExecution,
 	request generatedruntime.RouteSwitchRequest,
 	_ generatedruntimestate.Deployment,
-) (generatedruntimestate.Deployment, error) {
+) (routeActivation, error) {
 	if c.authority == nil {
-		return generatedruntimestate.Deployment{}, errors.New("generated route authority is unavailable")
+		return routeActivation{}, errors.New("generated route authority is unavailable")
 	}
 	pinned, err := c.authority.Pin(ctx, execution, request)
 	if err != nil {
-		return generatedruntimestate.Deployment{}, err
+		return routeActivation{}, err
 	}
-	return pinned.Activate(ctx)
+	deployment, retirement, err := pinned.ActivateWithPredecessorRetirement(ctx)
+	return routeActivation{deployment: deployment, retirement: retirement}, err
 }
 
 func (c generatedRouteController) attestPublished(ctx context.Context, claim deploymentexecution.Claim, deploymentID string) error {
@@ -296,6 +297,12 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			candidateExecution.Leave()
 		}
 	}()
+	var retirement predecessorRetirement
+	defer func() {
+		if retirement != nil {
+			retirement.Leave()
+		}
+	}()
 	for {
 		switch runtimeDeployment.Phase {
 		case generatedruntimestate.PhaseBuilding:
@@ -395,7 +402,7 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			if observeErr != nil {
 				return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, observeErr)
 			}
-			advanced, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidateExecution, candidates)
+			advanced, sealedRetirement, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidateExecution, candidates)
 			if switchErr != nil {
 				// FinishHealth irreversibly closed inactive cleanup before route
 				// publication. Route failures always preserve these candidates.
@@ -403,35 +410,21 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			runtimeDeployment = advanced
+			retirement = sealedRetirement
 
 		case generatedruntimestate.PhaseDraining:
-			if err = e.routes.attestPublished(ctx, claim, deployment.ID); err != nil {
-				// A durable receipt resolves the activation write, but retry still
-				// needs a fresh physical route proof before cleanup or success.
-				e.observeRoutePauseError(ctx, routePauseStageRouteSwitch, err)
-				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
-			}
-			if err = e.drainPrevious(ctx, resolved, runtimeDeployment); err != nil {
-				// The new slot is already active. Keep the deployment and job
-				// nonterminal so retry or restart recovery can finish old-slot cleanup.
-				e.observeRoutePauseError(ctx, routePauseStagePreviousRetirement, err)
-				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
-			}
-			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, "")
-			if advanceErr != nil {
-				e.observeRoutePauseError(ctx, routePauseStageRuntimeSuccessAdvance, advanceErr)
-				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
-			}
-			runtimeDeployment = advanced
-			if err = report(reporter, jobs.Running, "finalize", 100); err != nil {
-				return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
-			}
-			if deployment.Status != deployments.Succeeded {
-				if _, err = e.deployments.Transition(ctx, deployment.AppID, deployment.ID, deployments.Succeeded, ""); err != nil {
-					return jobs.ExecutionResult{}, executionError("internal_error")
+			if retirement == nil {
+				err = deployments.ErrGeneratedCandidateRetirementUnavailable
+			} else {
+				err = e.retirePrevious(ctx, retirement)
+				if err == nil {
+					// Unit 1 deliberately stops before accounting handoff and atomic
+					// completion. Keep the deployment Draining at the existing pause.
+					err = deployments.ErrGeneratedCandidateRetirementUnavailable
 				}
 			}
-			return jobs.ExecutionResult{CompletionCode: "deployment_completed"}, nil
+			e.observeRoutePauseError(ctx, routePauseStagePreviousRetirement, err)
+			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 
 		default:
 			return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)

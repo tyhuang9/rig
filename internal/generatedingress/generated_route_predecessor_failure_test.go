@@ -524,8 +524,9 @@ func newGeneratedRoutePredecessorManagerFixture(t *testing.T) (*Manager, *ingres
 }
 
 type generatedRouteCandidateRunner struct {
-	delegate *candidateOwnerRunner
-	physical map[string]candidateOwnerPhysical
+	delegate      *candidateOwnerRunner
+	physical      map[string]candidateOwnerPhysical
+	beforeInspect func(string)
 }
 
 func (r *generatedRouteCandidateRunner) Run(ctx context.Context,
@@ -534,15 +535,36 @@ func (r *generatedRouteCandidateRunner) Run(ctx context.Context,
 	kind := candidateOwnerKind(request)
 	if kind == candidateOwnerInspect {
 		target := request.Args[len(request.Args)-1]
+		if r.beforeInspect != nil {
+			r.beforeInspect(target)
+		}
 		for _, physical := range r.physical {
 			if target == physical.containerID || target == physical.policy.identity.ContainerName {
 				r.delegate.mu.Lock()
 				r.delegate.requestsLog = append(r.delegate.requestsLog, copyCandidateOwnerRequest(request))
 				r.delegate.mu.Unlock()
+				if !physical.exists {
+					return r.delegate.absentResult(target)
+				}
 				return r.delegate.inspectResult(candidateOwnerPhysicalInspection(physical)), nil
 			}
 		}
 		return r.delegate.absentResult(target)
+	}
+	if kind == candidateOwnerImageInspect || kind == candidateOwnerNetworkInspect {
+		bound := r.delegate.snapshot()
+		target := request.Args[len(request.Args)-1]
+		for _, physical := range r.physical {
+			matches := kind == candidateOwnerImageInspect && target == physical.policy.identity.ImageContentID ||
+				kind == candidateOwnerNetworkInspect && target == physical.policy.identity.NetworkName
+			if matches {
+				r.delegate.setPhysical(physical)
+				break
+			}
+		}
+		result, err := r.delegate.Run(ctx, request)
+		r.delegate.setPhysical(bound)
+		return result, err
 	}
 	if kind == candidateOwnerStart || kind == candidateOwnerStop || kind == candidateOwnerRemove {
 		target := request.Args[len(request.Args)-1]

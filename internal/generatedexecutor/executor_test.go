@@ -503,17 +503,22 @@ func (f *fakeAuthorization) Authorize(ctx context.Context, request Authorization
 }
 
 type fakeRoutes struct {
-	events          *[]string
-	requests        []generatedruntime.RouteSwitchRequest
-	inputs          []generatedruntimestate.Deployment
-	delegate        routeController
-	lastErr         error
-	err             error
-	errs            []error
-	postActivateErr error
-	delegateCalls   int
-	attestErr       error
-	attestCalls     int
+	events            *[]string
+	requests          []generatedruntime.RouteSwitchRequest
+	inputs            []generatedruntimestate.Deployment
+	delegate          routeController
+	lastErr           error
+	err               error
+	errs              []error
+	postActivateErr   error
+	lastActivation    routeActivation
+	delegateCalls     int
+	attestErr         error
+	attestCalls       int
+	retirementCalls   int
+	retirementErr     error
+	retirementBlock   error
+	retirementContext func(context.Context) context.Context
 }
 
 func (f *fakeRoutes) attestPublished(ctx context.Context, claim deploymentexecution.Claim, deploymentID string) error {
@@ -539,24 +544,28 @@ func (f *fakeRoutes) Switch(_ context.Context, request generatedruntime.RouteSwi
 
 func (f *fakeRoutes) activate(ctx context.Context, execution *generatedingress.GeneratedCandidateExecution,
 	request generatedruntime.RouteSwitchRequest, current generatedruntimestate.Deployment,
-) (generatedruntimestate.Deployment, error) {
+) (routeActivation, error) {
 	f.inputs = append(f.inputs, current)
 	call := len(f.requests)
 	if call < len(f.errs) && f.errs[call] != nil {
 		*f.events = append(*f.events, "route")
 		f.requests = append(f.requests, request)
-		return generatedruntimestate.Deployment{}, f.errs[call]
+		return routeActivation{}, f.errs[call]
 	}
 	if f.err != nil {
 		*f.events = append(*f.events, "route")
 		f.requests = append(f.requests, request)
-		return generatedruntimestate.Deployment{}, f.err
+		return routeActivation{}, f.err
 	}
 	if f.delegate != nil {
 		*f.events = append(*f.events, "route")
 		f.requests = append(f.requests, request)
 		f.delegateCalls++
 		updated, err := f.delegate.activate(ctx, execution, request, current)
+		if updated.retirement != nil {
+			updated.retirement = &recordingPredecessorRetirement{delegate: updated.retirement, owner: f}
+		}
+		f.lastActivation = updated
 		f.lastErr = err
 		if err == nil && f.postActivateErr != nil {
 			err, f.postActivateErr = f.postActivateErr, nil
@@ -565,11 +574,45 @@ func (f *fakeRoutes) activate(ctx context.Context, execution *generatedingress.G
 		return updated, err
 	}
 	if err := f.Switch(context.Background(), request); err != nil {
-		return generatedruntimestate.Deployment{}, err
+		return routeActivation{}, err
 	}
 	current.Phase = generatedruntimestate.PhaseDraining
-	return current, nil
+	return routeActivation{deployment: current, retirement: &fakePredecessorRetirement{}}, nil
 }
+
+type recordingPredecessorRetirement struct {
+	delegate predecessorRetirement
+	owner    *fakeRoutes
+}
+
+func (r *recordingPredecessorRetirement) Retire(ctx context.Context) (generatedruntimestate.PredecessorRetirementReceipt, error) {
+	r.owner.retirementCalls++
+	if r.owner.retirementBlock != nil {
+		r.owner.retirementErr = r.owner.retirementBlock
+		return generatedruntimestate.PredecessorRetirementReceipt{}, r.owner.retirementBlock
+	}
+	if r.owner.retirementContext != nil {
+		ctx = r.owner.retirementContext(ctx)
+	}
+	receipt, err := r.delegate.Retire(ctx)
+	r.owner.retirementErr = err
+	return receipt, err
+}
+
+func (r *recordingPredecessorRetirement) Leave() { r.delegate.Leave() }
+
+type fakePredecessorRetirement struct {
+	err   error
+	calls int
+	left  bool
+}
+
+func (f *fakePredecessorRetirement) Retire(context.Context) (generatedruntimestate.PredecessorRetirementReceipt, error) {
+	f.calls++
+	return generatedruntimestate.PredecessorRetirementReceipt{}, f.err
+}
+
+func (f *fakePredecessorRetirement) Leave() { f.left = true }
 
 type candidateMayBeLiveRouteError struct{}
 
@@ -1769,13 +1812,60 @@ func generatedExecutorActivationReceiptCount(t *testing.T, fixture *sealedExecut
 	return count
 }
 
-func TestGeneratedExecutorResumesDurablePostActivationWithoutRepublishingRoute(t *testing.T) {
+func generatedExecutorRetirementReceiptCount(t *testing.T, fixture *sealedExecutorFixture) int {
+	t.Helper()
+	var count int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func TestGeneratedExecutorImmediateRetirementRecordsReceiptAndKeepsCompletionClosed(t *testing.T) {
+	fixture := newSealedExecutorFixture(t)
+
+	result, err := fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || result.CompletionCode != "" {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		deployment.Status == deployments.Succeeded || deployment.Status == deployments.Failed ||
+		fixture.routes.delegateCalls != 1 || len(fixture.routes.requests) != 1 ||
+		generatedExecutorActivationReceiptCount(t, fixture) != 1 ||
+		generatedExecutorRetirementReceiptCount(t, fixture) != 1 ||
+		fixture.routes.retirementCalls != 1 || fixture.routes.retirementErr != nil {
+		t.Fatalf("runtime=%+v deployment=%+v route calls=%d/%d activation=%+v activation error=%v activation receipts=%d retirement receipts=%d retirement calls=%d error=%v",
+			runtimeDeployment, deployment, fixture.routes.delegateCalls, len(fixture.routes.requests),
+			fixture.routes.lastActivation.deployment, fixture.routes.lastErr,
+			generatedExecutorActivationReceiptCount(t, fixture), generatedExecutorRetirementReceiptCount(t, fixture),
+			fixture.routes.retirementCalls, fixture.routes.retirementErr)
+	}
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 {
+		t.Fatalf("empty-predecessor retirement reached legacy effects: runtime stops=%d docker stops=%d removals=%d",
+			fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
+	}
+	if fixture.routes.lastActivation.retirement == nil {
+		t.Fatal("immediate route activation did not retain its retirement handle")
+	}
+	if _, err := fixture.routes.lastActivation.retirement.Retire(context.Background()); !errors.Is(err, deploymentexecution.ErrScopeUnavailable) {
+		t.Fatalf("executor return leaked a live retirement handle: %v", err)
+	}
+}
+
+func TestGeneratedExecutorPostActivationProofLossRemainsClosedWithoutRepublishingRoute(t *testing.T) {
 	fixture := newSealedExecutorFixture(t)
 	fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
 
 	result, err := fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || len(fixture.routes.requests) != 1 {
 		t.Fatalf("first result=%+v err=%v routes=%+v", result, err, fixture.routes.requests)
+	}
+	if fixture.routes.lastActivation.retirement == nil {
+		t.Fatal("post-activation failure did not return the private retirement handle")
+	}
+	if _, err := fixture.routes.lastActivation.retirement.Retire(context.Background()); !errors.Is(err, deploymentexecution.ErrScopeUnavailable) {
+		t.Fatalf("escaped post-activation retirement remained live: %v", err)
 	}
 	// A scheduler retry has a fresh worker attempt, while the durable route
 	// receipt remains bound to the original activation attempt.
@@ -1794,10 +1884,12 @@ func TestGeneratedExecutorResumesDurablePostActivationWithoutRepublishingRoute(t
 	}
 
 	result, err = fixture.execute()
-	if err != nil || result.CompletionCode != "deployment_completed" {
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || result.CompletionCode != "" {
 		t.Fatalf("retry result=%+v err=%v", result, err)
 	}
-	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 1 || fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 || runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded {
+	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 1 ||
+		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 0 ||
+		runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
 		t.Fatalf("routes=%+v runtime=%+v", fixture.routes.requests, runtimeDeployment)
 	}
 	var receiptAttempt int
@@ -1974,29 +2066,60 @@ func TestGeneratedExecutorDurablePostActivationRejectsCrossedReceiptLineage(t *t
 
 func TestGeneratedExecutorDoesNotRetirePredecessorWhenReceiptOwnedStopRefuses(t *testing.T) {
 	fixture := newSealedExecutorFixture(t)
-	if _, err := fixture.execute(); err != nil {
-		t.Fatal(err)
-	}
-	oldDeploymentID := fixture.deployment(t).ID
-	fixture.nextDeployment(t)
-	fixture.routes.requests = nil
-	fixture.routes.delegateCalls = 0
-	fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
+	fixture.capacity.SetCapacity(128<<20, 128<<20)
+	checkCompetitor := fixture.capacityCompetitor(t)
+	refusal := errors.New("route-owned predecessor retirement unavailable")
+	fixture.routes.retirementBlock = refusal
 
 	result, err := fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
-		t.Fatalf("first result=%+v err=%v", result, err)
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	fixture.runtime.stopErrs = []error{errors.New("route-owned predecessor retirement unavailable")}
-	result, err = fixture.execute()
+	runtimeDeployment := fixture.runtimeDeployment(t)
+	if len(fixture.routes.requests) != 1 || fixture.routes.delegateCalls != 1 ||
+		fixture.routes.retirementCalls != 1 || !errors.Is(fixture.routes.retirementErr, refusal) ||
+		fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
+		runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		generatedExecutorRetirementReceiptCount(t, fixture) != 0 {
+		t.Fatalf("routes=%+v retirement=%d/%v stopped=%d docker=%d/%d runtime=%+v receipts=%d",
+			fixture.routes.requests, fixture.routes.retirementCalls, fixture.routes.retirementErr,
+			fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls,
+			runtimeDeployment, generatedExecutorRetirementReceiptCount(t, fixture))
+	}
+	if fixture.routes.lastActivation.retirement == nil {
+		t.Fatal("refused executor path lost the receipt-owned retirement handle")
+	}
+	checkCompetitor(true)
+}
+
+func TestGeneratedExecutorReceiptOwnedRetirementOwnsSingleDrainWaitAndCancellation(t *testing.T) {
+	fixture := newSealedExecutorFixture(t)
+	fixture.executor.options.DrainPeriod = time.Second
+	executorDrainCalls := 0
+	fixture.executor.waitDrain = func(context.Context, time.Duration) error {
+		executorDrainCalls++
+		return errors.New("executor attempted a duplicate drain wait")
+	}
+	fixture.routes.retirementContext = func(ctx context.Context) context.Context {
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		return cancelled
+	}
+
+	result, err := fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
-		t.Fatalf("retry result=%+v err=%v", result, err)
+		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 1 || fixture.routes.delegateCalls != 1 || fixture.runtime.stopCalls != 1 || fixture.runner.stopCalls != 0 || runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
-		t.Fatalf("routes=%+v stopped=%d docker stops=%d runtime=%+v", fixture.routes.requests, fixture.runtime.stopCalls, fixture.runner.stopCalls, runtimeDeployment)
-	}
-	if previous, getErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); getErr != nil || previous.Components[0].State != generatedruntimestate.ComponentDraining {
-		t.Fatalf("predecessor ownership changed: deployment=%+v error=%v", previous, getErr)
+	runtimeDeployment := fixture.runtimeDeployment(t)
+	if executorDrainCalls != 0 || fixture.routes.retirementCalls != 1 ||
+		!errors.Is(fixture.routes.retirementErr, context.Canceled) ||
+		fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
+		runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		generatedExecutorRetirementReceiptCount(t, fixture) != 0 {
+		t.Fatalf("executor waits=%d retirement=%d/%v stopped=%d docker=%d/%d runtime=%+v receipts=%d",
+			executorDrainCalls, fixture.routes.retirementCalls, fixture.routes.retirementErr,
+			fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls,
+			runtimeDeployment, generatedExecutorRetirementReceiptCount(t, fixture))
 	}
 }
 

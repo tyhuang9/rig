@@ -936,6 +936,75 @@ func TestCandidateMutationUnquiescedRetainsChargeAndRefusesLaterMutations(t *tes
 	}
 }
 
+func TestCandidateRetirementRosterRetainsExactHandedCharges(t *testing.T) {
+	ledger, _, _ := candidateCapacityTestLedger(t, 20, 20)
+	spec := candidateCapacityTestSpec("app-1", "deployment-1", "api", "web")
+	reservation := candidateCapacityTestReserve(t, ledger, spec)
+	receipts := map[string]string{"api": "receipt-api", "web": "receipt-web"}
+	for component, receipt := range receipts {
+		candidateCapacityTestRecordReceipt(t, reservation, component, receipt, candidateReceiptCommitAcknowledged)
+		candidateCapacityTestMarkPresent(t, reservation, component, receipt)
+	}
+	handoff, err := reservation.closeCleanupAndEnterRoster(receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handoff.markHandedToRoute(); err != nil {
+		t.Fatal(err)
+	}
+	handoff.leave()
+	if err := reservation.release(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("exact_full_roster_retains_charges", func(t *testing.T) {
+		operation, err := ledger.enterRetirementRoster("app-1", "deployment-1", receipts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer operation.leave()
+		if err := operation.enterCommand("api", candidateCommandStop); err != nil {
+			t.Fatal(err)
+		}
+		if err := operation.enterCommand("api", candidateCommandRemove); err != nil {
+			t.Fatal(err)
+		}
+		if err := operation.markConfirmedAbsentRetained("api"); err != nil {
+			t.Fatal(err)
+		}
+		component := operation.byName["api"]
+		if component.charge.state != candidateChargeActive || !component.charge.explicitRetained ||
+			component.charge.logicallyRetired || candidatePhysicalFromWord(component.receipt.state.Load()) != candidatePhysicalConfirmedAbsent {
+			t.Fatalf("retirement charge=%+v word=%d", component.charge, component.receipt.state.Load())
+		}
+	})
+
+	t.Run("partial_roster_refuses", func(t *testing.T) {
+		if _, err := ledger.enterRetirementRoster("app-1", "deployment-1", map[string]string{"api": "receipt-api"}); !errors.Is(err, errCandidateReceiptMismatch) && !errors.Is(err, errCandidateCapacityBusy) {
+			t.Fatalf("partial roster error = %v", err)
+		}
+	})
+
+	t.Run("crossed_receipt_refuses", func(t *testing.T) {
+		if _, err := ledger.enterRetirementRoster("app-1", "deployment-1", map[string]string{
+			"api": "receipt-web", "web": "receipt-api",
+		}); !errors.Is(err, errCandidateReceiptMismatch) {
+			t.Fatalf("crossed receipt error = %v", err)
+		}
+	})
+
+	t.Run("duplicate_command_refuses", func(t *testing.T) {
+		operation, err := ledger.enterRetirementRoster("app-1", "deployment-1", receipts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer operation.leave()
+		if err := operation.enterCommand("api", candidateCommandStop); !errors.Is(err, errCandidateCommandEntered) {
+			t.Fatalf("duplicate stop error = %v", err)
+		}
+	})
+}
+
 func TestCandidateInvalidAndZeroValuesRefuseSafely(t *testing.T) {
 	if _, err := newCandidateCapacityLedger(nil); !errors.Is(err, errCandidateCapacityInvalid) {
 		t.Fatalf("nil budget error = %v", err)

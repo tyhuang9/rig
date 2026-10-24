@@ -21,6 +21,16 @@ import (
 	"github.com/hostd/hostd/internal/releasesnapshot"
 )
 
+type predecessorRetirement interface {
+	Retire(context.Context) (generatedruntimestate.PredecessorRetirementReceipt, error)
+	Leave()
+}
+
+type routeActivation struct {
+	deployment generatedruntimestate.Deployment
+	retirement predecessorRetirement
+}
+
 var ErrInsufficientReplacementCapacity = errors.New("insufficient generated replacement capacity")
 
 type applicationReader interface {
