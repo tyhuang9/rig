@@ -81,11 +81,9 @@ func TestLiveGatewayV2UpgradeCommitAndRestart(t *testing.T) {
 		imageTag:         "rig-generated-gateway-v2-live:commit",
 		applicationReply: "gateway-v2-commit",
 	})
-	trace := liveGatewayV2InstallOperationTrace(fixture)
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
 	if err != nil || result.Outcome != GatewayV2UpgradeCommitted {
-		trace.log(t)
 		liveGatewayV2LogOperationDiagnostic(t, fixture)
 		failLiveIngress(t, "commit gateway-v2 upgrade", err)
 	}
@@ -135,7 +133,6 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 		imageTag:         "rig-generated-gateway-v2-live:conflict",
 		applicationReply: "gateway-v2-conflict",
 	})
-	trace := liveGatewayV2InstallOperationTrace(fixture)
 
 	var conflictID string
 	t.Cleanup(func() {
@@ -147,7 +144,6 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
-		trace.log(t)
 		liveGatewayV2LogOperationDiagnostic(t, fixture)
 		t.Fatalf("bind-conflict upgrade = %+v, err=%v", result, err)
 	}
@@ -275,6 +271,14 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	}
 	fixture.request = liveGatewayV2Request(t, spec, selected, port)
 	liveGatewayV2AssertSourceAttestation(t, fixture)
+	session := authority.sessions[candidate.DeploymentID]
+	if session == nil {
+		t.Fatal("release gateway-v2 source candidate authority: missing original session")
+	}
+	// The source candidate is complete. Retain its immutable history for the
+	// read-only restart checks, but release its effects scope before a later
+	// gateway-v2 stage acquires that scope. The registered cleanup is idempotent.
+	session.Close()
 	return fixture
 }
 
