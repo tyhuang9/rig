@@ -17,6 +17,76 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Retained-builder Docker inspect template repair
+
+Commit `c31be537fac54aa23eb56dc20a39fbd5dfcbc792` changes two container-inspect
+selectors to the exported Docker fields `CPUPeriod` and `CPUQuota`. Output JSON
+keys remain `CpuPeriod` and `CpuQuota`. Strict decoding, policy checks, identity,
+resource limits, reads and effects remain unchanged.
+
+The complete [Docker CLI v28.0.4 renderer](https://github.com/docker/cli/blob/v28.0.4/cli/command/inspect/inspector.go)
+tries the typed response first, then raw JSON with `UseNumber` and
+`missingkey=error`. The former complete template fails typed execution at
+`CpuPeriod`; its raw fallback also fails because `.ID` addresses a raw `Id` key.
+The corrected template succeeds on the typed path and strict-decodes to the
+existing projection. A regression models both renderer paths and explicitly
+binds the successful template to the actual production constant.
+
+The original typed-only red and review were insufficient to establish the
+whole CLI contract. Their evidence and the subsequent hold remain preserved.
+The first full-renderer attempt incorrectly expected the legacy fallback to
+succeed; its failure established the second boundary. The final successor
+checks both legacy failures and corrected success. An intermediate test lacked
+the production-constant binding; its results are superseded by the final test.
+An earlier tool yield was initially mistaken for process termination; the
+original process completed normally and was not duplicated.
+
+Final Windows execution at 03:38:46–03:39:23 UTC on 24 October passes both
+selected parents and all 34 distinct roster children, with no failures or
+skips. Explicit discovery, retained binary and before/after source hashes bind
+the result. Formatting, `go vet ./internal/generatedingress`, canonical
+generation and diff checks passed at 03:39:36–03:39:41. Source/security review
+closed the fallback hold; root independently verified the receipts, source
+hashes, binary, raw outcomes, official source chain and review.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `cold-builder-template-contract-20261024T0331Z/renderer-fallback-authoritative-addendum.json` | `12d39019e22abb68f9da70d0afabc2438cd1933952eff6c2ba1db8f764ae14df` |
+| `cold-builder-template-final2-20261024T033846Z/receipt.json` | `eb3dcc9a5475408baca35d8b9349cfa7cafd0d799e5e6a6b89cb7e5bf11ea50d` |
+| `cold-builder-template-final2-static-20261024T033936Z/receipt.json` | `15d6678a71f4025abf0d38d6e3c305ebf187de0b4fc5ddefa03948d99b2d7248` |
+| `cold-builder-template-docker-cli-final-security-supplement-20261024.md` | `e29591458d8888c983fddadf284899eaeb1665b621ed42086bdb57fe4258882f` |
+| `cold-builder-template-root-audit-20261024.json` | `ccb3506eea44b817df91208c479e13860cab9402fa882de595baa2d142577857` |
+
+This establishes a rendering contract repair. Actual hosted Docker execution
+must still verify the controller journeys; no sole-cause or M4 acceptance is
+claimed. Local Docker and race execution remain unavailable.
+
+## Hosted opener successor
+
+Published `ec5a899969f05cec7a304daa3291b5ace7f970c8` advances the
+[full-hostd diagnostic](https://github.com/tyhuang9/rig/actions/runs/40058334785/job/120766427522)
+from `startup_observation/physical_identity` to
+`startup_observation/docker_attestation`. Its raw log SHA-256 is
+`ed7029711a594a5e1a3ab96fc9baef4fd18e1d8a867428fa37bda2e4159d9670`.
+This confirms progress past the earlier identity refusal, not successful
+controller startup. The next predicate requires a separate source trace.
+
+The same head's TLS and process-kill controller jobs retain
+`cold_construction/cold_builder_container_read`. The stopped-container and
+data-volume replay fixtures still fail at fresh manager construction. Their
+same-process lifetime issue is mapped but not yet repaired. Predecessor
+retirement remains open.
+
+At 03:41:25 UTC the partial snapshot has 15 failures, 15 successes, 16 running,
+94 queued and one skipped. All 15 failures are retained once in
+`pr222-ec5-third-failure-batch-20261024.json`, SHA-256
+`559affa71af16d5c7a7b1ac7a0ec85df92b237b2882c63bfeee76c0a701e45c8`.
+The jobs execute synthetic merge `d7ce62a41057cac98f51126621b6e675baa32ad5`,
+tree `59b2cbf896ac54272f6fa4397feb0e8a0f8683c7`, identical to the published head.
+No failures have been waived or converted to acceptance.
+
 ## Authenticated database opening in full hostd
 
 The full-controller `startup_observation/physical_identity` failure exposed a
