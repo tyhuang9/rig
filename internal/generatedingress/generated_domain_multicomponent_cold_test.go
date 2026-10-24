@@ -4,26 +4,41 @@ package generatedingress
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
 
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/generatedbuilder"
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/projectanalysis"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
 
+const generatedDomainTwoComponentBuilderSuffix = "aaaaaaaaaaaaaaaaaaaaaaaa"
+
 type generatedDomainTwoComponentColdFixture struct {
-	identity    generatedDomainIdentityFixture
-	migration   *generatedMigrationFixture
-	runner      *generatedDomainConstructionRunner
-	environment *candidateFactoryEnvironment
+	identity     generatedDomainIdentityFixture
+	migration    *generatedMigrationFixture
+	runner       *generatedDomainConstructionRunner
+	construction runtimeprocess.CommandRunner
+	builder      *generatedDomainTwoComponentBuilderFixture
+	environment  *candidateFactoryEnvironment
+}
+
+type generatedDomainTwoComponentBuilderFixture struct {
+	directory *securetemp.GeneratedBuilderDirectory
+	identity  generatedbuilder.Identity
+	physical  generatedDomainColdBuilderPhysical
+	runner    *generatedDomainTwoComponentRouteRunner
 }
 
 type generatedDomainCandidateRosterRunner struct {
@@ -31,16 +46,38 @@ type generatedDomainCandidateRosterRunner struct {
 }
 
 type generatedDomainTwoComponentRouteRunner struct {
-	daemonID string
-	delegate *generatedRoutePredecessorRunner
+	daemonID           string
+	delegate           runtimeprocess.CommandRunner
+	builder            *generatedDomainColdBuilderPhysical
+	afterFirstPhysical func()
+	imageReads         int
 }
 
 func (r *generatedDomainTwoComponentRouteRunner) Run(ctx context.Context,
 	request runtimeprocess.CommandRequest,
 ) (runtimeprocess.CommandResult, error) {
-	if len(request.Args) == 3 && request.Args[0] == "info" && request.Args[1] == "--format" &&
+	if r.daemonID != "" && len(request.Args) == 3 && request.Args[0] == "info" && request.Args[1] == "--format" &&
 		request.Args[2] == "{{json .ID}}" {
 		return jsonResult(r.daemonID), nil
+	}
+	if r.builder != nil && len(request.Args) == 5 && request.Args[1] == "inspect" &&
+		request.Args[2] == "--format" {
+		switch {
+		case request.Args[0] == "container" && request.Args[3] == generatedDomainColdBuilderContainerInspectFormat &&
+			request.Args[4] == r.builder.container.ID:
+			return jsonResult(r.builder.container), nil
+		case request.Args[0] == "network" && request.Args[3] == generatedDomainColdBuilderNetworkInspectFormat &&
+			request.Args[4] == r.builder.network.ID:
+			return jsonResult(r.builder.network), nil
+		case request.Args[0] == "image" && request.Args[3] == generatedDomainColdBuilderImageInspectFormat &&
+			request.Args[4] == r.builder.container.Image:
+			result := jsonResult(r.builder.image)
+			r.imageReads++
+			if r.imageReads == 1 && r.afterFirstPhysical != nil {
+				r.afterFirstPhysical()
+			}
+			return result, nil
+		}
 	}
 	return r.delegate.Run(ctx, request)
 }
@@ -73,11 +110,13 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 		return
 	}
 	for _, test := range []struct {
-		name   string
-		mutate func(*generatedDomainTwoComponentColdFixture)
-		pass   bool
+		name    string
+		builder bool
+		mutate  func(*generatedDomainTwoComponentColdFixture)
+		pass    bool
 	}{
-		{name: "exact_api_and_frontend", pass: true},
+		{name: "exact_api_and_frontend_without_builder", pass: true},
+		{name: "exact_api_frontend_and_persisted_builder", builder: true, pass: true},
 		{name: "missing_frontend", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentContainer(
 				fixture.runner.delegate.objects, "frontend")
@@ -92,15 +131,110 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 			}
 			t.Fatal("frontend container is absent from the cold census")
 		}},
+		{name: "orphan_persisted_builder_label", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.runner.delegate.objects = append(fixture.runner.delegate.objects, generatedDomainDockerObject{
+				kind: "volume", name: "ordinary-volume", labels: map[string]string{"rig.builder": "orphan"}})
+		}},
+		{name: "missing_persisted_builder_network", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentObject(
+				fixture.runner.delegate.objects, "network", "rig-buildnet-"+generatedDomainTwoComponentBuilderSuffix)
+		}},
+		{name: "crossed_persisted_builder_identity", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			for index := range fixture.runner.delegate.objects {
+				object := &fixture.runner.delegate.objects[index]
+				if object.kind == "container" && object.name == "rig-buildkitd-"+generatedDomainTwoComponentBuilderSuffix {
+					object.labels["rig.builder"] = "rig-buildkit-bbbbbbbbbbbbbbbbbbbbbbbb"
+					return
+				}
+			}
+			t.Fatal("persisted builder container is absent from the cold census")
+		}},
+		{name: "persisted_builder_identity_without_resources", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentObject(
+				fixture.runner.delegate.objects, "container", generatedbuilder.ContainerName(fixture.builder.identity))
+			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentObject(
+				fixture.runner.delegate.objects, "network", fixture.builder.identity.NetworkName)
+		}},
+		{name: "persisted_builder_resources_without_identity", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			if err := os.Remove(filepath.Join(fixture.builder.directory.Root(), generatedbuilder.IdentityFilename)); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "malformed_persisted_builder_identity", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			replaceGeneratedDomainTwoComponentBuilderIdentity(t, fixture.builder,
+				[]byte(`{"schema":2,"builderName":"rig-buildkit-aaaaaaaaaaaaaaaaaaaaaaaa",`+
+					`"nodeName":"rig-node-aaaaaaaaaaaaaaaaaaaaaaaa",`+
+					`"networkName":"rig-buildnet-aaaaaaaaaaaaaaaaaaaaaaaa","unknown":true}`))
+		}},
+		{name: "extra_persisted_builder_resource", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.runner.delegate.objects = append(fixture.runner.delegate.objects, generatedDomainDockerObject{
+				kind: "container", id: strings.Repeat("f", 64), name: "rig-buildkitd-bbbbbbbbbbbbbbbbbbbbbbbb",
+				labels: map[string]string{"rig.controller": "generated-builder"}})
+		}},
+		{name: "invalid_persisted_builder_container_configuration", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.container.HostConfig.Memory++
+		}},
+		{name: "stopped_persisted_builder_container", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.container.State.Running = false
+		}},
+		{name: "crossed_persisted_builder_image", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.image.ID = "sha256:" + strings.Repeat("f", 64)
+		}},
+		{name: "extra_persisted_builder_network_member", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.network.Containers[strings.Repeat("f", 64)] = generatedbuilder.NetworkContainer{
+				Name: "foreign", IPv4Address: "172.30.0.3/16"}
+		}},
+		{name: "invalid_persisted_builder_network_configuration", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.network.Options["external.option"] = "unexpected"
+		}},
+		{name: "crossed_persisted_builder_container_attachment", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.container.NetworkSettings.Networks[fixture.builder.identity.NetworkName] =
+				json.RawMessage(`{"NetworkID":"` + strings.Repeat("f", 64) + `"}`)
+		}},
+		{name: "labelled_persisted_builder_image", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.image.Labels["rig.controller"] = "generated-builder"
+		}},
+		{name: "persisted_builder_identity_changes_during_accounting", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.runner.afterFirstPhysical = func() {
+				changed := fixture.builder.identity
+				changed.NetworkName = "rig-buildnet-bbbbbbbbbbbbbbbbbbbbbbbb"
+				body, err := generatedbuilder.EncodeIdentity(changed)
+				if err != nil {
+					t.Fatal(err)
+				}
+				replaceGeneratedDomainTwoComponentBuilderIdentity(t, fixture.builder, body)
+			}
+		}},
+		{name: "persisted_builder_identity_file_replaced_with_same_bytes", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.runner.afterFirstPhysical = func() {
+				body, err := generatedbuilder.EncodeIdentity(fixture.builder.identity)
+				if err != nil {
+					t.Fatal(err)
+				}
+				replaceGeneratedDomainTwoComponentBuilderIdentity(t, fixture.builder, body)
+			}
+		}},
+		{name: "persisted_builder_identity_reencoded_during_accounting", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.runner.afterFirstPhysical = func() {
+				body := []byte(`{"schema":2, "builderName":"` + fixture.builder.identity.BuilderName +
+					`", "nodeName":"` + fixture.builder.identity.NodeName + `", "networkName":"` +
+					fixture.builder.identity.NetworkName + `"}`)
+				path := filepath.Join(fixture.builder.directory.Root(), generatedbuilder.IdentityFilename)
+				if err := os.WriteFile(path, body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				clear(body)
+			}
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
-				fixture := newGeneratedDomainTwoComponentColdFixture(t)
+				fixture := newGeneratedDomainTwoComponentColdFixture(t, test.builder)
 				if test.mutate != nil {
 					test.mutate(&fixture)
 				}
 				result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
-					fixture.runner, fixture.environment, fixture.identity.options)
+					fixture.construction, fixture.environment, fixture.identity.options)
 				if test.pass {
 					if err != nil || result == nil || result.cold == nil || len(result.cold.groups) != 1 {
 						t.Fatalf("two-component cold construction = %#v, %v", result, err)
@@ -138,8 +272,12 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 	}
 }
 
-func newGeneratedDomainTwoComponentColdFixture(t *testing.T) generatedDomainTwoComponentColdFixture {
+func newGeneratedDomainTwoComponentColdFixture(t *testing.T, builderOptions ...bool) generatedDomainTwoComponentColdFixture {
 	t.Helper()
+	withBuilder := len(builderOptions) == 1 && builderOptions[0]
+	if len(builderOptions) > 1 {
+		t.Fatal("two-component cold fixture accepts at most one builder option")
+	}
 	identity := newGeneratedDomainIdentityFixture(t)
 	plan := generatedDomainTwoComponentPlan()
 	migration := newGeneratedMigrationFixtureOnDomainWithComponents(t, identity,
@@ -304,6 +442,7 @@ func newGeneratedDomainTwoComponentColdFixture(t *testing.T) generatedDomainTwoC
 		switch objects[index].name {
 		case caddyContainerName:
 			objects[index].id = observation.V1Container.ID
+			objects[index].labels["rig.live"] = "generated-domain-two-component-cold"
 		case caddyNetworkName:
 			objects[index].id = observation.V1NetworkID
 			objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Network.Driver,
@@ -344,12 +483,110 @@ func newGeneratedDomainTwoComponentColdFixture(t *testing.T) generatedDomainTwoC
 		labels: map[string]string{"io.rig.managed": "generated-runtime-network",
 			"io.rig.application": physicalRoster[0].policy.identity.AppID},
 		data: generatedDomainDockerObjectData{driver: "bridge", scope: "local", options: map[string]string{}}})
+	var builder *generatedDomainTwoComponentBuilderFixture
+	if withBuilder {
+		builderObjects, builderFixture := generatedDomainTwoComponentBuilderObjects(t, identity.dataRoot)
+		objects = append(objects, builderObjects...)
+		builder = &builderFixture
+	}
 	identity.options.HostPort = journal.Source.LocalHostPort
 	runner := &generatedDomainConstructionRunner{roster: &generatedDomainCandidateRosterRunner{physical: physicalRoster},
 		delegate: &generatedDomainRecoveryCensusRunner{daemonID: "generated-domain-two-component-cold",
 			objects: objects, imageID: observation.Image.ID, gateway: gateway}}
+	var construction runtimeprocess.CommandRunner = runner
+	if builder != nil {
+		builder.runner = &generatedDomainTwoComponentRouteRunner{delegate: runner, builder: &builder.physical}
+		construction = builder.runner
+	}
 	return generatedDomainTwoComponentColdFixture{identity: identity, migration: migration, runner: runner,
-		environment: &candidateFactoryEnvironment{path: t.TempDir()}}
+		construction: construction, builder: builder, environment: &candidateFactoryEnvironment{path: t.TempDir()}}
+}
+
+func generatedDomainTwoComponentBuilderObjects(t *testing.T, dataRoot string) (
+	[]generatedDomainDockerObject, generatedDomainTwoComponentBuilderFixture,
+) {
+	t.Helper()
+	identity := generatedbuilder.Identity{Schema: generatedbuilder.StateSchema,
+		BuilderName: "rig-buildkit-" + generatedDomainTwoComponentBuilderSuffix,
+		NodeName:    "rig-node-" + generatedDomainTwoComponentBuilderSuffix,
+		NetworkName: "rig-buildnet-" + generatedDomainTwoComponentBuilderSuffix}
+	body, err := generatedbuilder.EncodeIdentity(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory, err := securetemp.NewGeneratedBuilderDirectory(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := directory.WriteNewFile(generatedbuilder.IdentityFilename, body); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := securetemp.OpenGeneratedBuilderDirectory(dataRoot)
+	if err != nil || !directory.Same(opened) {
+		t.Fatalf("reopen generated builder directory: same=%t err=%v", directory.Same(opened), err)
+	}
+	containerID := strings.Repeat("4", 64)
+	networkID := strings.Repeat("5", 64)
+	imageID := "sha256:" + strings.Repeat("3", 64)
+	var container generatedbuilder.Container
+	container.ID = containerID
+	container.Name = "/" + generatedbuilder.ContainerName(identity)
+	container.Image = imageID
+	container.State.Running = true
+	container.Config.Image = generatedbuilder.ImageReference
+	container.Config.Cmd = generatedbuilder.Command(generatedbuilder.DefaultStateQuotaBytes)
+	container.Config.Labels = generatedbuilder.ContainerLabels(identity, generatedbuilder.DefaultStateQuotaBytes)
+	container.HostConfig.Memory = generatedbuilder.MemoryLimit(generatedbuilder.DefaultStateQuotaBytes)
+	container.HostConfig.MemorySwap = generatedbuilder.MemoryLimit(generatedbuilder.DefaultStateQuotaBytes)
+	container.HostConfig.CPUPeriod = 100000
+	container.HostConfig.CPUQuota = 100000
+	container.HostConfig.PidsLimit = generatedbuilder.PIDsLimit
+	container.HostConfig.NetworkMode = identity.NetworkName
+	container.HostConfig.Privileged = true
+	container.HostConfig.Binds = []string{}
+	container.HostConfig.PortBindings = map[string]json.RawMessage{}
+	container.HostConfig.LogConfig.Type = "json-file"
+	container.HostConfig.LogConfig.Config = map[string]string{"max-size": "10m", "max-file": "1"}
+	container.HostConfig.RestartPolicy.Name = "unless-stopped"
+	tmpfs := &struct {
+		SizeBytes int64 `json:"SizeBytes"`
+		Mode      int64 `json:"Mode"`
+	}{SizeBytes: generatedbuilder.DefaultStateQuotaBytes, Mode: 0o700}
+	container.HostConfig.Mounts = []generatedbuilder.ConfiguredMount{{
+		Type: "tmpfs", Target: generatedbuilder.StatePath, TmpfsOptions: tmpfs}}
+	container.NetworkSettings.Networks = map[string]json.RawMessage{
+		identity.NetworkName: json.RawMessage(`{"NetworkID":"` + networkID + `"}`)}
+	container.Mounts = []generatedbuilder.Mount{{Type: "tmpfs", Destination: generatedbuilder.StatePath, RW: true}}
+	network := generatedbuilder.Network{ID: networkID, Name: identity.NetworkName,
+		Driver: "bridge", Scope: "local", Labels: generatedbuilder.NetworkLabels(identity),
+		Options: map[string]string{"com.docker.network.bridge.enable_icc": "false"},
+		Containers: map[string]generatedbuilder.NetworkContainer{containerID: {
+			Name: generatedbuilder.ContainerName(identity), IPv4Address: "172.30.0.2/16"}}}
+	image := generatedbuilder.Image{ID: imageID, Labels: map[string]string{}}
+	objects := []generatedDomainDockerObject{
+		{kind: "container", id: containerID, name: generatedbuilder.ContainerName(identity),
+			labels: cloneStringMap(container.Config.Labels)},
+		{kind: "network", id: networkID, name: identity.NetworkName,
+			labels: cloneStringMap(network.Labels),
+			data: generatedDomainDockerObjectData{driver: "bridge", scope: "local",
+				options: map[string]string{"com.docker.network.bridge.enable_icc": "false"}}},
+	}
+	return objects, generatedDomainTwoComponentBuilderFixture{directory: directory, identity: identity,
+		physical: generatedDomainColdBuilderPhysical{container: container, network: network, image: image}}
+}
+
+func replaceGeneratedDomainTwoComponentBuilderIdentity(t *testing.T,
+	fixture *generatedDomainTwoComponentBuilderFixture, body []byte,
+) {
+	t.Helper()
+	path := filepath.Join(fixture.directory.Root(), generatedbuilder.IdentityFilename)
+	if err := os.Rename(path, path+".replaced"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clear(body)
 }
 
 func generatedDomainTwoComponentPlan() deploymentplans.Plan {
@@ -396,6 +633,19 @@ func removeGeneratedDomainTwoComponentContainer(objects []generatedDomainDockerO
 	result := make([]generatedDomainDockerObject, 0, len(objects))
 	for _, object := range objects {
 		if object.kind == "container" && object.labels["io.rig.component"] == component {
+			continue
+		}
+		result = append(result, object)
+	}
+	return result
+}
+
+func removeGeneratedDomainTwoComponentObject(objects []generatedDomainDockerObject,
+	kind, name string,
+) []generatedDomainDockerObject {
+	result := make([]generatedDomainDockerObject, 0, len(objects))
+	for _, object := range objects {
+		if object.kind == kind && object.name == name {
 			continue
 		}
 		result = append(result, object)

@@ -86,6 +86,12 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 	if err != nil {
 		return generatedDomainColdManifest{}, err
 	}
+	// Persistent builder identity and physical ownership are part of the host
+	// census, not application capacity. Refuse incomplete or crossed builder
+	// state before installing any cold application accounting tombstones.
+	if _, err := attestGeneratedDomainColdBuilder(ctx, result.manager, result.candidates, observed.docker); err != nil {
+		return generatedDomainColdManifest{}, err
+	}
 	for index := range groups {
 		group := &groups[index]
 		spec := generatedDomainColdGroupSpec(result.candidates, *group)
@@ -927,6 +933,10 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 	containers := make(map[string]expectedObject)
 	images := make(map[string]expectedObject)
 	networks := make(map[string]expectedObject)
+	builder, err := attestGeneratedDomainColdBuilder(ctx, manager, authority, observed.docker)
+	if err != nil {
+		return err
+	}
 	for _, group := range groups {
 		for _, component := range group.snapshot.components {
 			if component.artifact != nil && component.artifact.imageContentID != "" {
@@ -1006,6 +1016,9 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 	seenImages := make(map[string]struct{}, len(images))
 	seenNetworks := make(map[string]struct{}, len(networks))
 	for _, object := range observed.docker.objects {
+		if builder.accounts(object) {
+			continue
+		}
 		name := object.name
 		if names := gateway.names[object.kind]; names != nil {
 			if _, ok := names[name]; ok {
