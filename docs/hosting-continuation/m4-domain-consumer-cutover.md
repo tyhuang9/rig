@@ -17,6 +17,113 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Closed attribution for child construction failures
+
+Commit `ce73d337090bfa6251a5fb10847c26a3d4c40365` adds optional paired
+`construction_stage` and `construction_reason` fields to the private test-child
+diagnostic. Only the existing controller-restart/generated-domain and
+process-kill/runtime-composition failure sites can emit an exact existing
+allowlisted pair. Public APIs, production construction decisions and fatal
+messages are unchanged. Unknown, partial, duplicate, mistyped and ineligible
+fields remain rejected, with the existing record and byte limits retained.
+
+The error traversal inspects at most 32 nodes. Security review found that the
+initial multi-error loop could still iterate an oversized child slice; the
+successor evaluates that slice once and caps it before iteration. The original
+review and passing pre-correction control run remain retained. The corrected
+Windows tagged control passes one parent and 123 distinct children, including
+two actual failing child processes that contain private token/path causes but
+emit only the closed diagnostic. No failure or skip was observed. Formatting,
+tagged controller vet and canonical generation also pass on unchanged source.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `child-construction-attribution-successor-20261024T010558Z/receipt.json`,
+  SHA-256 `b46053438a481b20854c375a15ef46a387a4d99a58dab8926f3b9368c7c62a00`.
+- `child-construction-attribution-static-20261024T010626Z/receipt.json`,
+  SHA-256 `ae0e0d06874a1203592c57566d870ce17dc4ef8fa3bb241e717f04efb44d1343`.
+- `child-construction-attribution-root-audit-20261024.json`, SHA-256
+  `f27deb34639bd78befc7b5f376de9d5e2a39238661039b6f40aa077427275d24`,
+  independently binds source, binary, exact discovery, raw unique results and
+  static records. Formatter and vet retain exit status without dedicated logs.
+- Successor source/security review SHA-256
+  `d747b1c914b7e622b879f904077856ca4185cb9d5cdc00baeedb2277efe28d3a`.
+
+This is partial attribution, not a construction repair. Early physical and
+reservation failures and portions of cold reconstruction still return bare
+sentinels or wrapped errors without a finite pair. Absence of the new fields in
+hosted output cannot identify the failed predicate. Actual Docker restart,
+full hosted/race acceptance, E5 and M4 completion remain open.
+
+## Retained API and frontend construction control
+
+Local commit `de8c592a9748dffe3fe29fe8f33d9c57bdabe080` adds a focused control
+for `newGeneratedDomainConstruction` with a retained API and static frontend.
+The fixture creates distinct images, containers and invocation receipts on one
+network, records health, activates a two-endpoint route, finishes durable state
+and releases its original execution, reservation and effects scopes before
+reconstruction. Missing or mismatched frontend census entries must be refused.
+All three cases require construction to avoid mutation and capacity commands.
+
+The optional explicit-plan fixture path supplies the new component roles and
+distinct images. Existing default fixtures retain their previous image values
+and roster behavior. No production file changes. The first attempt failed in
+the simulated ingress setup before construction and is retained as a fixture
+failure. After correcting that simulator, the exact Windows parent and three
+distinct cases passed. Subprocess echoes are not counted as additional cases.
+Formatting, ingress vet and canonical generation also passed on unchanged
+final source.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `two-component-cold-final-20261024T005529Z/receipt.json`, SHA-256
+  `638469b1607d85aa7d22325b21537ae3583470359454506f5e8438a4bcc00613`.
+- `two-component-cold-static-20261024T005814Z/receipt.json`, SHA-256
+  `fcc73663d8e972a2f35d1c2a711e6c766e6b9e295aadc646804e8ca6410bf8be`.
+- `two-component-cold-root-audit-20261024.json`, SHA-256
+  `bd5d4dcee447c80002d7cd8c548f6529e4f9a525068d14d00d61e901a0943121`,
+  binds the three source files, retained binary, discovery, distinct raw results
+  and static records. Formatter and vet have exit status without dedicated raw
+  logs.
+
+This passing simulation does not reproduce the hosted failure. It covers
+internal construction in isolated test processes, not the public constructor,
+an actual controller restart or real Docker. Those acceptance gaps remain open;
+no production fix or root-cause claim follows from this control.
+
+## Hosted LAN progress after the trace-driver correction
+
+Published `3fb6b9aae0f85079a26f4d33907eebb6517322ff` is bound to synthetic merge
+`6bc3ad5fc5421d61dab0254382a29b74a7fa3f1b`; both have tree
+`24d3cf7fc5975a279f710b77d0a15fcc867473ac`. At 00:56:21 UTC on 24 October,
+the partial run had six failed checks, six successful, 13 running, 115 queued
+and one skipped. Snapshot SHA-256:
+`69132d096e1dc57ef436564233a32969bc8ebe32ec9f6fb08db2f04aba449755`.
+
+The [two-app LAN job](https://github.com/tyhuang9/rig/actions/runs/40046853497/job/120730457647)
+now reaches the redeploy call at `hosting_lan_two_app_live_test.go:322`.
+Source ordering shows that its preceding committed upgrade, exact bindings,
+two grants, routing matrix, note isolation and network-namespace probes all
+completed. Its outer grant trace reports successful authorization, activation,
+release, grant and commit resolution for both applications. Redeployment then
+pauses explicitly at `previous_retirement` / `retirement_unavailable`, with two
+active components and a draining runtime. Raw log SHA-256:
+`ac20cb928faf958e4060ff6688e239cf82557619c547b5caa9557e1715ec3844`.
+
+The [LAN external-database job](https://github.com/tyhuang9/rig/actions/runs/40046853497/job/120730457736)
+similarly reaches redeployment at `hosting_lan_database_live_test.go:395` after
+its upgrade, grant, attested route, scoped-container and frontend-secret checks,
+external fixture identity checks and initial note write/read. It then records
+the same explicit retirement pause. Raw log SHA-256:
+`44d3ce655869a96f8cd9c80537edc22fd3bc9164e3c3cebe1aa3d842bc4a31a3`.
+
+These observed advances close the initial incompatible-hook failure. Both full
+journeys still fail, and later restart, persistence and redeployment assertions
+are not accepted. Docker namespace probes do not replace physical second-device
+LAN qualification. TLS and process-kill children still fail construction; the
+migration journey reaches the retirement pause, and stage-copy replay still
+fails its legacy Manager reopen. M4 and E5 remain incomplete.
+
 ## LAN live fixtures preserve the completed domain's driver family
 
 Commit `4fd8c4b645dd9c98e5ea523a223ea03a913d0188` removes exactly two calls to
