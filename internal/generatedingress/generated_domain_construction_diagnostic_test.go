@@ -100,6 +100,24 @@ func TestGeneratedDomainConstructionDiagnosticClosedAttribution(t *testing.T) {
 		if !errors.Is(cold, privateCause) {
 			t.Fatalf("cold boundary hid its previously visible cause: %v", cold)
 		}
+		for _, reason := range []generatedDomainConstructionReason{
+			generatedDomainConstructionReasonColdGroupReconstruction,
+			generatedDomainConstructionReasonColdBuilderAttestation,
+			generatedDomainConstructionReasonColdReservation,
+			generatedDomainConstructionReasonColdOwnership,
+			generatedDomainConstructionReasonColdHead,
+			generatedDomainConstructionReasonColdGroupAttestation,
+			generatedDomainConstructionReasonColdManifest,
+		} {
+			diagnostic := generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction, reason, privateCause)
+			assertGeneratedDomainConstructionDiagnostic(t, diagnostic,
+				generatedDomainConstructionStageColdConstruction, reason,
+				"generated domain construction was refused: stage=cold_construction reason="+string(reason))
+			if !errors.Is(diagnostic, privateCause) {
+				t.Fatalf("%s diagnostic hid its previously visible cause: %v", reason, diagnostic)
+			}
+		}
 
 		secondary := errors.New("secondary visible release error")
 		joined := errors.Join(cold, secondary)
@@ -204,8 +222,8 @@ func TestGeneratedDomainConstructionDiagnosticClosedAttribution(t *testing.T) {
 			}
 			assertGeneratedDomainConstructionDiagnostic(t, err,
 				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdAccounting,
-				"generated domain construction was refused: stage=cold_construction reason=cold_accounting")
+				generatedDomainConstructionReasonColdGroupAttestation,
+				"generated domain construction was refused: stage=cold_construction reason=cold_group_attestation")
 			if !errors.Is(err, errGeneratedDomainConstructionRefused) {
 				t.Fatalf("cold accounting diagnostic hid refusal sentinel: %v", err)
 			}

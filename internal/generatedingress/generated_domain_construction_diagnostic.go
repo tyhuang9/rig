@@ -28,35 +28,42 @@ const (
 type generatedDomainConstructionReason string
 
 const (
-	generatedDomainConstructionReasonInput                generatedDomainConstructionReason = "input"
-	generatedDomainConstructionReasonPhysicalIdentity     generatedDomainConstructionReason = "physical_identity"
-	generatedDomainConstructionReasonPathIdentity         generatedDomainConstructionReason = "path_identity"
-	generatedDomainConstructionReasonDatabase             generatedDomainConstructionReason = "database"
-	generatedDomainConstructionReasonProtectedState       generatedDomainConstructionReason = "protected_state"
-	generatedDomainConstructionReasonGatewayExpectation   generatedDomainConstructionReason = "gateway_expectation"
-	generatedDomainConstructionReasonDockerCensus         generatedDomainConstructionReason = "docker_census"
-	generatedDomainConstructionReasonDockerDaemon         generatedDomainConstructionReason = "docker_daemon"
-	generatedDomainConstructionReasonDockerAttestation    generatedDomainConstructionReason = "docker_attestation"
-	generatedDomainConstructionReasonDockerImage          generatedDomainConstructionReason = "docker_image"
-	generatedDomainConstructionReasonDockerContainer      generatedDomainConstructionReason = "docker_container"
-	generatedDomainConstructionReasonDockerVolume         generatedDomainConstructionReason = "docker_volume"
-	generatedDomainConstructionReasonDockerNetwork        generatedDomainConstructionReason = "docker_network"
-	generatedDomainConstructionReasonDockerRestartConfig  generatedDomainConstructionReason = "docker_restart_config"
-	generatedDomainConstructionReasonDockerLiveConfig     generatedDomainConstructionReason = "docker_live_config"
-	generatedDomainConstructionReasonDockerStaticResponse generatedDomainConstructionReason = "docker_static_response"
-	generatedDomainConstructionReasonStability            generatedDomainConstructionReason = "stability"
-	generatedDomainConstructionReasonClassification       generatedDomainConstructionReason = "classification"
-	generatedDomainConstructionReasonDisposition          generatedDomainConstructionReason = "disposition"
-	generatedDomainConstructionReasonRecovery             generatedDomainConstructionReason = "recovery"
-	generatedDomainConstructionReasonStateStore           generatedDomainConstructionReason = "state_store"
-	generatedDomainConstructionReasonManifest             generatedDomainConstructionReason = "manifest"
-	generatedDomainConstructionReasonProcessLatch         generatedDomainConstructionReason = "process_latch"
-	generatedDomainConstructionReasonFence                generatedDomainConstructionReason = "fence"
-	generatedDomainConstructionReasonAssembly             generatedDomainConstructionReason = "assembly"
-	generatedDomainConstructionReasonColdAccounting       generatedDomainConstructionReason = "cold_accounting"
-	generatedDomainConstructionReasonLock                 generatedDomainConstructionReason = "lock"
-	generatedDomainConstructionReasonRelease              generatedDomainConstructionReason = "release"
-	generatedDomainConstructionReasonFinalValidation      generatedDomainConstructionReason = "final_validation"
+	generatedDomainConstructionReasonInput                   generatedDomainConstructionReason = "input"
+	generatedDomainConstructionReasonPhysicalIdentity        generatedDomainConstructionReason = "physical_identity"
+	generatedDomainConstructionReasonPathIdentity            generatedDomainConstructionReason = "path_identity"
+	generatedDomainConstructionReasonDatabase                generatedDomainConstructionReason = "database"
+	generatedDomainConstructionReasonProtectedState          generatedDomainConstructionReason = "protected_state"
+	generatedDomainConstructionReasonGatewayExpectation      generatedDomainConstructionReason = "gateway_expectation"
+	generatedDomainConstructionReasonDockerCensus            generatedDomainConstructionReason = "docker_census"
+	generatedDomainConstructionReasonDockerDaemon            generatedDomainConstructionReason = "docker_daemon"
+	generatedDomainConstructionReasonDockerAttestation       generatedDomainConstructionReason = "docker_attestation"
+	generatedDomainConstructionReasonDockerImage             generatedDomainConstructionReason = "docker_image"
+	generatedDomainConstructionReasonDockerContainer         generatedDomainConstructionReason = "docker_container"
+	generatedDomainConstructionReasonDockerVolume            generatedDomainConstructionReason = "docker_volume"
+	generatedDomainConstructionReasonDockerNetwork           generatedDomainConstructionReason = "docker_network"
+	generatedDomainConstructionReasonDockerRestartConfig     generatedDomainConstructionReason = "docker_restart_config"
+	generatedDomainConstructionReasonDockerLiveConfig        generatedDomainConstructionReason = "docker_live_config"
+	generatedDomainConstructionReasonDockerStaticResponse    generatedDomainConstructionReason = "docker_static_response"
+	generatedDomainConstructionReasonStability               generatedDomainConstructionReason = "stability"
+	generatedDomainConstructionReasonClassification          generatedDomainConstructionReason = "classification"
+	generatedDomainConstructionReasonDisposition             generatedDomainConstructionReason = "disposition"
+	generatedDomainConstructionReasonRecovery                generatedDomainConstructionReason = "recovery"
+	generatedDomainConstructionReasonStateStore              generatedDomainConstructionReason = "state_store"
+	generatedDomainConstructionReasonManifest                generatedDomainConstructionReason = "manifest"
+	generatedDomainConstructionReasonProcessLatch            generatedDomainConstructionReason = "process_latch"
+	generatedDomainConstructionReasonFence                   generatedDomainConstructionReason = "fence"
+	generatedDomainConstructionReasonAssembly                generatedDomainConstructionReason = "assembly"
+	generatedDomainConstructionReasonColdAccounting          generatedDomainConstructionReason = "cold_accounting"
+	generatedDomainConstructionReasonColdGroupReconstruction generatedDomainConstructionReason = "cold_group_reconstruction"
+	generatedDomainConstructionReasonColdBuilderAttestation  generatedDomainConstructionReason = "cold_builder_attestation"
+	generatedDomainConstructionReasonColdReservation         generatedDomainConstructionReason = "cold_reservation"
+	generatedDomainConstructionReasonColdOwnership           generatedDomainConstructionReason = "cold_ownership"
+	generatedDomainConstructionReasonColdHead                generatedDomainConstructionReason = "cold_head"
+	generatedDomainConstructionReasonColdGroupAttestation    generatedDomainConstructionReason = "cold_group_attestation"
+	generatedDomainConstructionReasonColdManifest            generatedDomainConstructionReason = "cold_manifest"
+	generatedDomainConstructionReasonLock                    generatedDomainConstructionReason = "lock"
+	generatedDomainConstructionReasonRelease                 generatedDomainConstructionReason = "release"
+	generatedDomainConstructionReasonFinalValidation         generatedDomainConstructionReason = "final_validation"
 )
 
 type generatedDomainConstructionDiagnostic struct {
@@ -159,6 +166,13 @@ func validGeneratedDomainConstructionReason(reason generatedDomainConstructionRe
 		generatedDomainConstructionReasonFence,
 		generatedDomainConstructionReasonAssembly,
 		generatedDomainConstructionReasonColdAccounting,
+		generatedDomainConstructionReasonColdGroupReconstruction,
+		generatedDomainConstructionReasonColdBuilderAttestation,
+		generatedDomainConstructionReasonColdReservation,
+		generatedDomainConstructionReasonColdOwnership,
+		generatedDomainConstructionReasonColdHead,
+		generatedDomainConstructionReasonColdGroupAttestation,
+		generatedDomainConstructionReasonColdManifest,
 		generatedDomainConstructionReasonLock,
 		generatedDomainConstructionReasonRelease,
 		generatedDomainConstructionReasonFinalValidation:

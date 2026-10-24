@@ -84,13 +84,17 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 	}
 	groups, err := readGeneratedDomainColdGroups(ctx, result.candidates, observed)
 	if err != nil {
-		return generatedDomainColdManifest{}, err
+		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupReconstruction, err)
 	}
 	// Persistent builder identity and physical ownership are part of the host
 	// census, not application capacity. Refuse incomplete or crossed builder
 	// state before installing any cold application accounting tombstones.
 	if _, err := attestGeneratedDomainColdBuilder(ctx, result.manager, result.candidates, observed.docker); err != nil {
-		return generatedDomainColdManifest{}, err
+		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdBuilderAttestation, err)
 	}
 	for index := range groups {
 		group := &groups[index]
@@ -98,7 +102,9 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 		if group.kind == generatedDomainColdRisky {
 			reservation, reserveErr := result.candidates.ledger.reserve(ctx, spec)
 			if reserveErr != nil {
-				return generatedDomainColdManifest{}, reserveErr
+				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdReservation, reserveErr)
 			}
 			// Reconstruction is conservative: once raw shares are acquired they
 			// remain retained across every later refusal or uncertain observation.
@@ -106,11 +112,16 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 			seedErr := seedCandidateRisk(reservation, group.snapshot)
 			releaseErr := reservation.release()
 			if retainErr != nil || seedErr != nil || releaseErr != nil {
-				return generatedDomainColdManifest{}, errors.Join(retainErr, seedErr, releaseErr)
+				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdReservation,
+					errors.Join(retainErr, seedErr, releaseErr))
 			}
 		}
 		if err := result.candidates.ledger.seedColdOwnership(spec, group.receipts); err != nil {
-			return generatedDomainColdManifest{}, err
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdOwnership, err)
 		}
 		if group.bindHead {
 			var bindErr error
@@ -122,14 +133,24 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 					group.snapshot.observedHead)
 			}
 			if bindErr != nil {
-				return generatedDomainColdManifest{}, bindErr
+				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdHead, bindErr)
 			}
 		}
 	}
 	if err := attestGeneratedDomainColdGroups(ctx, result.manager, result.candidates, observed, groups); err != nil {
-		return generatedDomainColdManifest{}, err
+		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupAttestation, err)
 	}
-	return snapshotGeneratedDomainColdManifest(result.candidates)
+	manifest, err := snapshotGeneratedDomainColdManifest(result.candidates)
+	if err != nil {
+		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdManifest, err)
+	}
+	return manifest, nil
 }
 
 func verifyGeneratedDomainColdConstruction(ctx context.Context, reservation *generatedDomainReservation,

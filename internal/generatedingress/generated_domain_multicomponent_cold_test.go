@@ -114,13 +114,14 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 		builder bool
 		mutate  func(*generatedDomainTwoComponentColdFixture)
 		pass    bool
+		reason  generatedDomainConstructionReason
 	}{
 		{name: "exact_api_and_frontend_without_builder", pass: true},
 		{name: "exact_api_frontend_and_persisted_builder", builder: true, pass: true},
 		{name: "missing_frontend", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentContainer(
 				fixture.runner.delegate.objects, "frontend")
-		}},
+		}, reason: generatedDomainConstructionReasonColdGroupAttestation},
 		{name: "crossed_frontend", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			for index := range fixture.runner.delegate.objects {
 				object := &fixture.runner.delegate.objects[index]
@@ -130,7 +131,7 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 				}
 			}
 			t.Fatal("frontend container is absent from the cold census")
-		}},
+		}, reason: generatedDomainConstructionReasonColdGroupAttestation},
 		{name: "orphan_persisted_builder_label", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = append(fixture.runner.delegate.objects, generatedDomainDockerObject{
 				kind: "volume", name: "ordinary-volume", labels: map[string]string{"rig.builder": "orphan"}})
@@ -259,8 +260,19 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 					if !equalStrings(names, []string{"api", "frontend"}) || len(receipts) != 2 {
 						t.Fatalf("two-component cold names=%v receipts=%d", names, len(receipts))
 					}
-				} else if result != nil || err == nil || !errors.Is(err, errGeneratedDomainConstructionRefused) {
-					t.Fatalf("invalid two-component cold roster = %#v, %v", result, err)
+				} else {
+					if result != nil || err == nil || !errors.Is(err, errGeneratedDomainConstructionRefused) {
+						t.Fatalf("invalid two-component cold roster = %#v, %v", result, err)
+					}
+					reason := test.reason
+					if reason == "" {
+						reason = generatedDomainConstructionReasonColdBuilderAttestation
+					}
+					var diagnostic *generatedDomainConstructionDiagnostic
+					if !errors.As(err, &diagnostic) || diagnostic == nil ||
+						diagnostic.stage != generatedDomainConstructionStageColdConstruction || diagnostic.reason != reason {
+						t.Fatalf("invalid two-component cold reason = %#v, want %q", diagnostic, reason)
+					}
 				}
 				for _, command := range fixture.runner.snapshot() {
 					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
