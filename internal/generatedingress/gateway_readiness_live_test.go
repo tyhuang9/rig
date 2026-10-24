@@ -19,6 +19,7 @@ import (
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -43,14 +44,15 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	}
 
 	root := t.TempDir()
-	dockerConfig := filepath.Join(root, "docker-config")
-	working := filepath.Join(root, "working")
 	state := filepath.Join(root, "ingress-state")
-	for _, directory := range []string{dockerConfig, working, state} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal("create live gateway test directory")
-		}
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal("create live gateway controller state root:", err)
 	}
+	directories, err := runtimedocker.PrepareControllerDirectories(state)
+	if err != nil {
+		t.Fatal("prepare live gateway controller directories:", err)
+	}
+	dockerConfig, working := directories.DockerConfigDirectory, directories.WorkingDirectory
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -88,26 +90,14 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
-	authority := liveGeneratedDeployments(t, working)
-	engine, err := newLiveRuntimeEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
+	hostPort := freeLoopbackPort(t)
+	engineOptions := liveRuntimeEngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
-	})
-	if err != nil {
-		t.Fatal("create generated runtime")
 	}
-	accessRepository := liveGatewayAccessRepository(t, state)
-	ingress, err := New(runner, Options{
-		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
-		DataRoot: state, HostPort: freeLoopbackPort(t), CommandTimeout: 45 * time.Second,
-		PullTimeout: 5 * time.Minute, OutputLimit: liveDockerOutputLimit,
-		RebindFenceCheck:             accessRepository.CheckGatewayRebindFence,
-		RebindCurrentStateRepository: accessRepository,
-	})
-	if err != nil {
-		t.Fatal("create generated ingress")
-	}
+	authority, engine := liveGeneratedDeployments(t, ctx, state, runner, hostPort, engineOptions)
+	ingress := authority.domain.Gateway()
 
 	var candidates []liveRuntimeCandidate
 	t.Cleanup(func() {
@@ -122,7 +112,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	blueRoute := generatedroute.RouteSwitchRequest{
 		AppID: appA, ToSlot: blue.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(blue)},
 	}
-	if err := ingress.Switch(ctx, blueRoute); err != nil {
+	if err := authority.activate(t, blue, blueRoute); err != nil {
 		failLiveIngress(t, "route healthy blue candidate", err)
 	}
 	assertLiveOneShot(t, ctx, ingress.options.HostPort, appA, "/", "blue", "healthy blue route did not serve through Caddy")
@@ -130,7 +120,6 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	if err != nil || blueObservation.URL == "" || blueObservation.Slot != blue.Slot || !reflect.DeepEqual(blueObservation.Endpoints, blueRoute.Endpoints) {
 		t.Fatal("healthy blue route was not attested")
 	}
-	authority.published(t, ctx, ingress, blue)
 
 	loopbackSpec := liveCandidateSpec("green", appA, plan)
 	loopbackSpec.ActiveSlot = blue.Slot
@@ -145,7 +134,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	loopbackRoute := generatedroute.RouteSwitchRequest{
 		AppID: appA, FromSlot: blue.Slot, ToSlot: loopback.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(loopback)},
 	}
-	switchErr := ingress.Switch(ctx, loopbackRoute)
+	switchErr := authority.activate(t, loopback, loopbackRoute)
 	if !IsCode(switchErr, DiagnosticGatewayReadinessFailed) {
 		failLiveIngress(t, "loopback candidate did not report gateway readiness failure", switchErr)
 	}
@@ -175,10 +164,10 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	baselineSpec.ImageContentID = buildLiveGatewayImage(t, ctx, runner, docker, root, dockerConfig, images[4].tag, baselineSpec, "replacement-baseline", "0.0.0.0")
 	baseline := startLiveCandidate(t, ctx, engine, authority, baselineSpec)
 	candidates = append(candidates, baseline)
-	if err := ingress.Switch(ctx, generatedroute.RouteSwitchRequest{AppID: appC, ToSlot: baseline.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(baseline)}}); err != nil {
+	baselineRoute := generatedroute.RouteSwitchRequest{AppID: appC, ToSlot: baseline.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(baseline)}}
+	if err := authority.activate(t, baseline, baselineRoute); err != nil {
 		failLiveIngress(t, "route replacement baseline", err)
 	}
-	authority.published(t, ctx, ingress, baseline)
 
 	replacementSpec := liveCandidateSpec("green", appC, plan)
 	replacementSpec.ReleaseID = "d1111111-1111-4111-8111-111111111111"
@@ -193,11 +182,10 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	replacementRoute := generatedroute.RouteSwitchRequest{
 		AppID: appC, FromSlot: baseline.Slot, ToSlot: replacement.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(replacement)},
 	}
-	if err := ingress.Switch(ctx, replacementRoute); err != nil {
+	if err := authority.activate(t, replacement, replacementRoute); err != nil {
 		failLiveIngress(t, "route healthy replacement", err)
 	}
 	assertLiveOneShot(t, ctx, ingress.options.HostPort, appC, "/", "replacement", "healthy replacement did not serve through Caddy")
-	authority.published(t, ctx, ingress, replacement)
 
 	firstSpec := liveCandidateSpec("other", appB, plan)
 	firstSpec = authority.PrepareCandidate(t, ctx, firstSpec)
@@ -210,7 +198,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	firstRoute := generatedroute.RouteSwitchRequest{
 		AppID: appB, ToSlot: firstLoopback.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(firstLoopback)},
 	}
-	firstErr := ingress.Switch(ctx, firstRoute)
+	firstErr := authority.activate(t, firstLoopback, firstRoute)
 	if !IsCode(firstErr, DiagnosticGatewayReadinessFailed) || testRouteCandidateMayBeLive(firstErr) || !testRouteGatewayReadinessFailed(firstErr) {
 		failLiveIngress(t, "first loopback deployment did not fail safely", firstErr)
 	}

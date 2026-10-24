@@ -14,8 +14,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
+	"github.com/hostd/hostd/internal/controllerowner"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/projectanalysis"
@@ -25,6 +32,7 @@ import (
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 	"github.com/hostd/hostd/internal/sourceinspection"
+	generateddomaintest "github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 const (
@@ -78,6 +86,81 @@ func runLiveGeneratedImageCompilerMode(t *testing.T, manual bool, mode string) {
 	}
 	liveContext, cancelLive := context.WithTimeout(context.Background(), 7*time.Minute)
 	defer cancelLive()
+	controllerLease, err := controllerowner.Acquire(liveContext, controllerDirectories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire live generated controller owner")
+	}
+	t.Cleanup(func() { _ = controllerLease.Close() })
+	db, err := database.OpenForGeneratedDomain(liveContext, dataRoot, controllerLease)
+	if err != nil {
+		t.Fatal("open live generated runtime controller database")
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	lifecycle := applifecycle.New(db)
+	bindingValidator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+	if err != nil {
+		t.Fatal("prepare live deployment binding validator")
+	}
+	bindings, err := deploymentbinding.New(db, bindingValidator)
+	if err != nil {
+		t.Fatal("prepare live deployment bindings")
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
+	if err != nil {
+		t.Fatal("prepare live positive fence validator")
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, controllerDirectories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("prepare live generated deployment guard")
+	}
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal("prepare live generated plan store")
+	}
+	configuration, err := appconfig.New(db, dataRoot)
+	if err != nil {
+		t.Fatal("prepare live generated configuration store")
+	}
+	repository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
+	if err != nil {
+		t.Fatal("prepare live generated deployment repository")
+	}
+	stores, err := repository.GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal("capture live generated domain stores")
+	}
+	runtimeTemporary, err := securetemp.NewGeneratedRuntime(dataRoot)
+	if err != nil {
+		t.Fatal("live generated runtime temporary storage failed")
+	}
+	environment, err := generatedruntime.NewSecureEnvironmentStager(runtimeTemporary)
+	if err != nil {
+		t.Fatal("live generated runtime environment configuration failed")
+	}
+	runtimeOptions := generatedruntime.EngineOptions{
+		DockerExecutable: dockerExecutable, DockerEndpoint: dockerEndpoint,
+		DockerConfigDirectory: controllerDirectories.DockerConfigDirectory, WorkingDirectory: controllerDirectories.WorkingDirectory,
+		CommandTimeout: 30 * time.Second, HealthTimeout: 2 * time.Minute, HealthPollInterval: time.Second,
+		OutputLimit: 64 << 10,
+		Limits: generatedruntime.ContainerLimits{
+			MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256, TmpfsBytes: 64 << 20, LogSize: "10m", LogFiles: 3,
+		},
+		ReplacementDiskBytes: 256 << 20,
+	}
+	process := generateddomaintest.NewRunner(generateddomaintest.Options{Fallback: buildObservation})
+	domain, err := generatedingress.NewGeneratedDomain(liveContext, stores, process, environment, generatedingress.GeneratedDomainOptions{
+		DockerExecutable: runtimeOptions.DockerExecutable, DockerEndpoint: runtimeOptions.DockerEndpoint,
+		DockerConfigDirectory: runtimeOptions.DockerConfigDirectory, WorkingDirectory: runtimeOptions.WorkingDirectory,
+		DataRoot: dataRoot, HostPort: 8080, CommandTimeout: runtimeOptions.CommandTimeout, PullTimeout: 5 * time.Minute,
+		HealthTimeout: runtimeOptions.HealthTimeout, HealthPollInterval: runtimeOptions.HealthPollInterval,
+		OutputLimit: runtimeOptions.OutputLimit, MemoryBytes: runtimeOptions.Limits.MemoryBytes,
+		MilliCPUs: runtimeOptions.Limits.MilliCPUs, PIDs: runtimeOptions.Limits.PIDs,
+		TmpfsBytes: runtimeOptions.Limits.TmpfsBytes, LogSize: runtimeOptions.Limits.LogSize,
+		LogFiles: runtimeOptions.Limits.LogFiles, ReplacementDiskBytes: runtimeOptions.ReplacementDiskBytes,
+	})
+	if err != nil {
+		t.Fatal("construct live generated domain")
+	}
 
 	workspace := t.TempDir()
 	const componentRoot = "app root"
@@ -135,7 +218,7 @@ func runLiveGeneratedImageCompilerMode(t *testing.T, manual bool, mode string) {
 			t.Fatal("live manual setup digest failed")
 		}
 	}
-	authority := newGeneratedImageTestAuthority(t, release, revision, "app")
+	authority := newGeneratedImageTestAuthorityWithDependencies(t, db, repository, bindings, controllerDirectories.WorkingDirectory, release, revision, "app", "", 0)
 	release, revision = authority.release, authority.revision
 	builder, err := NewBuilderManager(authority.repository, buildObservation, BuilderManagerOptions{
 		DataRoot:         dataRoot,
@@ -193,18 +276,7 @@ func runLiveGeneratedImageCompilerMode(t *testing.T, manual bool, mode string) {
 		t.Fatal("live generated image temporary storage failed")
 	}
 	releaseReader := &compilerReleaseReader{release: release}
-	runtimeTemporary, err := securetemp.NewGeneratedRuntime(dataRoot)
-	if err != nil {
-		t.Fatal("live generated runtime temporary storage failed")
-	}
-	environment, err := generatedruntime.NewSecureEnvironmentStager(runtimeTemporary)
-	if err != nil {
-		t.Fatal("live generated runtime environment configuration failed")
-	}
-	validator, err := generatedruntime.NewEngine(buildObservation, environment, liveGeneratedImageCapacity{}, authority.repository, generatedruntime.EngineOptions{
-		DockerExecutable: dockerExecutable, DockerEndpoint: dockerEndpoint,
-		DockerConfigDirectory: controllerDirectories.DockerConfigDirectory, WorkingDirectory: controllerDirectories.WorkingDirectory,
-	})
+	validator, err := generatedruntime.NewEngine(process, environment, domain.Candidates(), runtimeOptions)
 	if err != nil {
 		t.Fatal("live generated image attestor configuration failed")
 	}
@@ -283,12 +355,6 @@ type liveGeneratedImageBuilderObservation struct {
 
 type liveGeneratedImageBuilderPreparer interface {
 	Prepare(context.Context) (BuilderSession, error)
-}
-
-type liveGeneratedImageCapacity struct{}
-
-func (liveGeneratedImageCapacity) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
-	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
 }
 
 type liveGeneratedImageBuildObservation struct {

@@ -106,7 +106,7 @@ func buildCandidatePolicy(
 	receipt candidateIntentSnapshot,
 	options GeneratedCandidateProcessOptions,
 ) (candidatePolicy, error) {
-	if err := validateCandidateRequest(pins); err != nil ||
+	if err := validateCandidateIdentityPins(pins); err != nil ||
 		!validGeneratedCandidateFixedOptions(options) ||
 		!validCandidatePolicyComponent(component) ||
 		!validCandidatePolicyArtifact(pins, component, artifact) ||
@@ -122,14 +122,14 @@ func buildCandidatePolicy(
 	runDigest := candidatePolicySHA256(component.RunCommand)
 	policy := candidatePolicy{
 		identity: generatedcontainer.Identity{
-			AppID: pins.claim.ApplicationID(), ReleaseID: pins.releaseID,
+			AppID: pins.applicationID(), ReleaseID: pins.releaseID,
 			DeploymentID: pins.deploymentID, ArtifactID: artifact.id,
 			DeploymentPlanRevisionID: pins.deploymentPlanRevisionID,
 			Component:                component.Name, Role: component.Role,
 			Technology: component.Technology, Slot: pins.candidateSlot,
 			ReceiptID:        receipt.id,
-			ContainerName:    generatedidentity.ContainerName(pins.claim.ApplicationID(), component.Name, slot),
-			NetworkName:      generatedidentity.NetworkName(pins.claim.ApplicationID()),
+			ContainerName:    generatedidentity.ContainerName(pins.applicationID(), component.Name, slot),
+			NetworkName:      generatedidentity.NetworkName(pins.applicationID()),
 			NetworkAlias:     generatedidentity.ContainerAlias(component.Name, slot),
 			ImageContentID:   artifact.imageContentID,
 			WorkingDirectory: workingDirectory, RunCommandDigest: runDigest,
@@ -149,7 +149,7 @@ func buildCandidatePolicy(
 	}
 	material := candidatePolicyDigestV1{
 		Version:       generatedCandidatePolicyVersion,
-		ApplicationID: pins.claim.ApplicationID(), DeploymentID: pins.deploymentID,
+		ApplicationID: pins.applicationID(), DeploymentID: pins.deploymentID,
 		ReleaseID:                    pins.releaseID,
 		ConfigurationRevisionID:      pins.configurationRevisionID,
 		ConfigurationRevisionNumber:  pins.configurationRevisionNumber,
@@ -260,18 +260,7 @@ func candidatePolicyCreateArgs(p candidatePolicy, environmentPath string) ([]str
 	if p.identity.Technology == "nextjs" {
 		args = append(args, "--tmpfs", p.identity.WorkingDirectory+"/.next/cache:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size="+strconv.FormatInt(generatedcontainer.NextCacheTmpfsBytes, 10))
 	}
-	labels := map[string]string{
-		"io.rig.managed":                "generated-runtime",
-		"io.rig.application":            p.identity.AppID,
-		"io.rig.release":                p.identity.ReleaseID,
-		"io.rig.deployment":             p.identity.DeploymentID,
-		"io.rig.artifact":               p.identity.ArtifactID,
-		"io.rig.plan":                   p.identity.DeploymentPlanRevisionID,
-		"io.rig.component":              p.identity.Component,
-		"io.rig.role":                   p.identity.Role,
-		"io.rig.slot":                   p.identity.Slot,
-		generatedcontainer.ReceiptLabel: p.identity.ReceiptID,
-	}
+	labels := candidatePolicyContainerLabels(p)
 	keys := make([]string, 0, len(labels))
 	for key := range labels {
 		keys = append(keys, key)
@@ -282,6 +271,22 @@ func candidatePolicyCreateArgs(p candidatePolicy, environmentPath string) ([]str
 	}
 	args = append(args, p.identity.ImageContentID, "/bin/sh", "-lc", p.runCommand)
 	return args, nil
+}
+
+func candidatePolicyContainerLabels(p candidatePolicy) map[string]string {
+	return map[string]string{
+		"io.rig.managed":                "generated-runtime",
+		"io.rig.application":            p.identity.AppID,
+		"io.rig.release":                p.identity.ReleaseID,
+		"io.rig.deployment":             p.identity.DeploymentID,
+		"io.rig.artifact":               p.identity.ArtifactID,
+		"io.rig.plan":                   p.identity.DeploymentPlanRevisionID,
+		"io.rig.component":              p.identity.Component,
+		"io.rig.definition":             p.buildDefinitionDigest,
+		"io.rig.role":                   p.identity.Role,
+		"io.rig.slot":                   p.identity.Slot,
+		generatedcontainer.ReceiptLabel: p.identity.ReceiptID,
+	}
 }
 
 func (a *GeneratedCandidateAuthority) prepareCandidateCommand(args []string) (runtimeprocess.CommandRequest, error) {
@@ -324,7 +329,7 @@ func validCandidatePolicyArtifact(pins candidateValidationPins, component deploy
 }
 
 func validCandidatePolicyReceipt(pins candidateValidationPins, artifact candidateArtifactSnapshot, receipt candidateIntentSnapshot) bool {
-	return candidatePolicyUUID(receipt.id) && receipt.creatorJobID == pins.claim.JobID() &&
+	return candidatePolicyUUID(receipt.id) && receipt.creatorJobID == pins.jobID() &&
 		receipt.creatorWorkerAttempt > 0 && receipt.configurationRevisionID == pins.configurationRevisionID &&
 		receipt.configurationRevisionNumber == pins.configurationRevisionNumber &&
 		receipt.imageArtifactID == artifact.id && receipt.imageArtifactAttempt == artifact.attemptNumber &&

@@ -364,7 +364,7 @@ func TestGatewayV2LANGrantDurabilityOrReleaseUncertaintyReturnsNoReceipt(t *test
 			}
 			return gatewayTopologyUnknownOrDrift
 		}
-		if recoverErr := manager.Recover(context.Background()); !IsCode(recoverErr, DiagnosticRouteUnresolved) {
+		if recoverErr := exerciseCommittedV2RecoveryCore(manager, context.Background()); !IsCode(recoverErr, DiagnosticRouteUnresolved) {
 			t.Fatalf("generic recovery err=%v, want unresolved activation marker", recoverErr)
 		}
 		afterRecover, _, loadErr := store.loadBoundUpgrade(journal.OperationID)
@@ -547,7 +547,7 @@ func TestGatewayV2LANGrantRestartRecoveryRollsBackProposedAndMixedTo404State(t *
 			manager.gatewayMixedRestartObserver = func(context.Context, routeState, gatewayV2RouteState, gatewayV2RouteState, gatewayMigrationJournal) bool {
 				return topology == "mixed"
 			}
-			if err := manager.Recover(context.Background()); err != nil {
+			if err := exerciseCommittedV2RecoveryCore(manager, context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			recovered, _, err := store.loadBoundUpgrade(journal.OperationID)

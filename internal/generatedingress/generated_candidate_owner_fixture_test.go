@@ -35,15 +35,22 @@ func newCandidateOwnerFixture(t *testing.T) *candidateOwnerFixture {
 
 func newCandidateOwnerFixtureWithValidation(t *testing.T, validation *candidateValidationFixture) *candidateOwnerFixture {
 	t.Helper()
-	if validation == nil || validation.migration == nil {
-		t.Fatal("candidate owner fixture requires prepared validation authority")
-	}
 	options := GeneratedCandidateProcessOptions{
 		DockerExecutable: filepath.Join(t.TempDir(), "docker"), DockerConfigDirectory: t.TempDir(),
 		WorkingDirectory: t.TempDir(), CommandTimeout: time.Minute, HealthTimeout: time.Minute,
 		HealthPollInterval: 100 * time.Millisecond, OutputLimit: 16 << 10,
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20,
 		LogSize: "1m", LogFiles: 2, ReplacementDiskBytes: 128 << 20,
+	}
+	return newCandidateOwnerFixtureWithValidationAndOptions(t, validation, options)
+}
+
+func newCandidateOwnerFixtureWithValidationAndOptions(t *testing.T, validation *candidateValidationFixture,
+	options GeneratedCandidateProcessOptions,
+) *candidateOwnerFixture {
+	t.Helper()
+	if validation == nil || validation.migration == nil {
+		t.Fatal("candidate owner fixture requires prepared validation authority")
 	}
 	source := &candidateOwnerCapacitySource{value: generatedcapacity.Snapshot{
 		MemoryAvailableBytes: uint64(options.MemoryBytes), DiskAvailableBytes: options.ReplacementDiskBytes,
@@ -143,7 +150,7 @@ func (f *candidateOwnerFixture) reserve(t *testing.T) GeneratedReplacementReserv
 	t.Helper()
 	reservation, err := f.authority.ReserveReplacement(f.validation.migration.guarded.context, GeneratedReplacementRequest(f.validation.request))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("reserve candidate replacement: %v", err)
 	}
 	return reservation
 }
@@ -152,7 +159,7 @@ func (f *candidateOwnerFixture) pin(t *testing.T, reservation GeneratedReplaceme
 	t.Helper()
 	execution, err := f.authority.PinCandidates(f.validation.migration.guarded.context, f.validation.request, reservation)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("pin candidate execution: %v", err)
 	}
 	return execution
 }
@@ -161,7 +168,7 @@ func (f *candidateOwnerFixture) beginCreate(t *testing.T, execution *GeneratedCa
 	t.Helper()
 	invocation, err := execution.BeginCreate("api")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("begin candidate create: %v", err)
 	}
 	return invocation
 }
@@ -381,13 +388,8 @@ func candidateOwnerPhysicalInspection(physical candidateOwnerPhysical) generated
 	if receiptID == "" {
 		receiptID = policy.identity.ReceiptID
 	}
-	labels := map[string]string{
-		"io.rig.managed": "generated-runtime", "io.rig.application": policy.identity.AppID,
-		"io.rig.release": policy.identity.ReleaseID, "io.rig.deployment": policy.identity.DeploymentID,
-		"io.rig.artifact": policy.identity.ArtifactID, "io.rig.plan": policy.identity.DeploymentPlanRevisionID,
-		"io.rig.component": policy.identity.Component, "io.rig.role": policy.identity.Role,
-		"io.rig.slot": policy.identity.Slot, generatedcontainer.ReceiptLabel: receiptID,
-	}
+	policy.identity.ReceiptID = receiptID
+	labels := candidatePolicyContainerLabels(policy)
 	tmpfs := map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=" + strconv.FormatInt(policy.limits.TmpfsBytes, 10)}
 	if policy.identity.Technology == "nextjs" {
 		tmpfs[policy.identity.WorkingDirectory+"/.next/cache"] = "rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=" + strconv.FormatInt(generatedcontainer.NextCacheTmpfsBytes, 10)

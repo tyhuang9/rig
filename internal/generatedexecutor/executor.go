@@ -39,11 +39,48 @@ type Executor struct {
 	state         runtimeState
 	runtime       runtimeEngine
 	authorization AuthorizationGate
-	routes        generatedruntime.RouteSwitcher
+	routes        routeController
 	migrations    generatedruntime.MigrationRunner
 	pinMigration  func(context.Context, deployments.GeneratedMigrationRequest) (generatedMigrationExecution, error)
 	options       Options
 	waitDrain     func(context.Context, time.Duration) error
+}
+
+// routeController is the package-private lifecycle boundary used after the
+// original candidate execution has proved the complete route roster. The
+// exported constructor always installs generatedRouteController; callers
+// cannot supply an alternate route writer or a proof callback.
+type routeController interface {
+	activate(context.Context, *generatedingress.GeneratedCandidateExecution,
+		generatedruntime.RouteSwitchRequest, generatedruntimestate.Deployment,
+	) (generatedruntimestate.Deployment, error)
+	attestPublished(context.Context, deploymentexecution.Claim, string) error
+}
+
+type generatedRouteController struct {
+	authority *generatedingress.GeneratedRouteAuthority
+}
+
+func (c generatedRouteController) activate(ctx context.Context,
+	execution *generatedingress.GeneratedCandidateExecution,
+	request generatedruntime.RouteSwitchRequest,
+	_ generatedruntimestate.Deployment,
+) (generatedruntimestate.Deployment, error) {
+	if c.authority == nil {
+		return generatedruntimestate.Deployment{}, errors.New("generated route authority is unavailable")
+	}
+	pinned, err := c.authority.Pin(ctx, execution, request)
+	if err != nil {
+		return generatedruntimestate.Deployment{}, err
+	}
+	return pinned.Activate(ctx)
+}
+
+func (c generatedRouteController) attestPublished(ctx context.Context, claim deploymentexecution.Claim, deploymentID string) error {
+	if c.authority == nil {
+		return errors.New("generated route authority is unavailable")
+	}
+	return c.authority.AttestPublished(ctx, claim, deploymentID)
 }
 
 func NewExecutor(
@@ -57,7 +94,29 @@ func NewExecutor(
 	state runtimeState,
 	runtime runtimeEngine,
 	authorization AuthorizationGate,
-	routes generatedruntime.RouteSwitcher,
+	routes *generatedingress.GeneratedRouteAuthority,
+	migrations generatedruntime.MigrationRunner,
+	options Options,
+) (*Executor, error) {
+	if routes == nil {
+		return nil, errors.New("generated executor route authority is required")
+	}
+	return newExecutor(applications, releases, configuration, deploymentRepository, plans, compiler,
+		artifacts, state, runtime, authorization, generatedRouteController{authority: routes}, migrations, options)
+}
+
+func newExecutor(
+	applications applicationReader,
+	releases releaseResolver,
+	configuration configurationExporter,
+	deploymentRepository deploymentStore,
+	plans planReader,
+	compiler imageCompiler,
+	artifacts artifactStore,
+	state runtimeState,
+	runtime runtimeEngine,
+	authorization AuthorizationGate,
+	routes routeController,
 	migrations generatedruntime.MigrationRunner,
 	options Options,
 ) (*Executor, error) {
@@ -137,6 +196,7 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		return waitingFor(jobs.PauseMigrationApprovalRequired), nil
 	}
 	if errors.Is(err, generatedruntimestate.ErrDeploymentInProgress) {
+		e.observeRoutePause(ctx, routePauseStageRuntimeBegin, routePauseCauseDeploymentInProgress)
 		return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 	}
 	if err != nil {
@@ -150,7 +210,12 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		// completing its deployment and job rows. Only finish the same pinned
 		// deployment while its durable active head still names this candidate.
 		head, headErr := e.state.Active(ctx, deployment.AppID)
-		if headErr != nil || head.DeploymentID != deployment.ID || head.ReleaseID != deployment.ReleaseID || head.Slot != runtimeDeployment.CandidateSlot {
+		if headErr != nil {
+			e.observeRoutePauseError(ctx, routePauseStageRuntimeSuccessHead, headErr)
+			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
+		}
+		if head.DeploymentID != deployment.ID || head.ReleaseID != deployment.ReleaseID || head.Slot != runtimeDeployment.CandidateSlot {
+			e.observeRoutePause(ctx, routePauseStageRuntimeSuccessHead, routePauseCauseActiveHeadMismatch)
 			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 		}
 		if deployment.Status != deployments.Succeeded {
@@ -330,22 +395,31 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			if observeErr != nil {
 				return jobs.ExecutionResult{}, generatedAuthorizationRefusal(ctx, observeErr)
 			}
-			advanced, _, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidates)
+			advanced, switchErr := e.switchRoute(ctx, resolved, runtimeDeployment, candidateExecution, candidates)
 			if switchErr != nil {
 				// FinishHealth irreversibly closed inactive cleanup before route
 				// publication. Route failures always preserve these candidates.
+				e.observeRoutePauseError(ctx, routePauseStageRouteSwitch, switchErr)
 				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			runtimeDeployment = advanced
 
 		case generatedruntimestate.PhaseDraining:
+			if err = e.routes.attestPublished(ctx, claim, deployment.ID); err != nil {
+				// A durable receipt resolves the activation write, but retry still
+				// needs a fresh physical route proof before cleanup or success.
+				e.observeRoutePauseError(ctx, routePauseStageRouteSwitch, err)
+				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
+			}
 			if err = e.drainPrevious(ctx, resolved, runtimeDeployment); err != nil {
 				// The new slot is already active. Keep the deployment and job
 				// nonterminal so retry or restart recovery can finish old-slot cleanup.
+				e.observeRoutePauseError(ctx, routePauseStagePreviousRetirement, err)
 				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			advanced, advanceErr := e.state.Advance(ctx, deployment.AppID, deployment.ID, generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, "")
 			if advanceErr != nil {
+				e.observeRoutePauseError(ctx, routePauseStageRuntimeSuccessAdvance, advanceErr)
 				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 			}
 			runtimeDeployment = advanced

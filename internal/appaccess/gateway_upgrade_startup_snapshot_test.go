@@ -57,7 +57,7 @@ func TestGatewayUpgradeStartupSnapshotPreparedClaim(t *testing.T) {
 
 func TestGatewayUpgradeStartupSnapshotCommittedAuthorityRequiresCurrentNativeEvidence(t *testing.T) {
 	t.Run("native approver demoted", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		if _, err := fixture.repository.GatewayUpgradeStartupSnapshot(context.Background()); err != nil {
 			t.Fatalf("native committed baseline: %v", err)
 		}
@@ -70,7 +70,7 @@ func TestGatewayUpgradeStartupSnapshotCommittedAuthorityRequiresCurrentNativeEvi
 	})
 
 	t.Run("unexplained profile head", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		for _, trigger := range []string{
 			"lan_gateway_profile_upgrade_claim_pin_insert",
 			"lan_gateway_profile_upgrade_claim_pin_head",
@@ -125,7 +125,7 @@ func TestGatewayUpgradeStartupSnapshotCommittedAuthorityRequiresCurrentNativeEvi
 	})
 
 	t.Run("mixed current committed and prepared claims", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		if _, err := fixture.db.Exec(`DROP INDEX lan_gateway_upgrade_claims_blocking_singleton`); err != nil {
 			t.Fatal(err)
 		}

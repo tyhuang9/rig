@@ -8,9 +8,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
-	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -93,31 +94,23 @@ func (s *liveRuntimeSession) Start(t *testing.T, spec generatedingress.LiveRunti
 
 func (s *liveRuntimeSession) WaitHealthyAndHandoff() error { return s.value.WaitHealthyAndHandoff() }
 func (s *liveRuntimeSession) RejectObservedFailure() error { return s.value.RejectObservedFailure() }
-func (s *liveRuntimeSession) RoutePublished(slot generatedruntime.Slot, endpoints []generatedroute.RouteEndpoint) error {
-	return s.value.RoutePublished(slot, endpoints)
+func (s *liveRuntimeSession) ActivateRoute(routes *generatedingress.GeneratedRouteAuthority,
+	request generatedroute.RouteSwitchRequest,
+) error {
+	return s.value.ActivateRoute(routes, request)
 }
 func (s *liveRuntimeSession) PublishedHistory(ctx context.Context, db *sql.DB) (generatedruntimestate.ActiveHead, error) {
 	return s.value.PublishedHistory(ctx, db)
 }
 func (s *liveRuntimeSession) Close() { s.value.Close() }
 
-type candidateEnvironmentStager struct {
-	value generatedingress.GeneratedCandidateEnvironmentStager
+func (liveRuntimeAdapter) NewAuthority(t *testing.T, db *sql.DB, workingDirectory string,
+	plans *deploymentplans.Store, configuration *appconfig.Store,
+) generatedingress.LiveRuntimeTestAuthority {
+	return &liveRuntimeAuthority{value: liveauthority.NewWithStores(t, db, workingDirectory, plans, configuration)}
 }
 
-func (s candidateEnvironmentStager) Stage(operationID string, attempt int, contents []byte) (generatedruntime.EnvironmentLease, error) {
-	return s.value.StageGeneratedCandidate(operationID, attempt, contents)
-}
-
-func (s candidateEnvironmentStager) StageGeneratedCandidate(operationID string, attempt int, contents []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
-	return s.value.StageGeneratedCandidate(operationID, attempt, contents)
-}
-
-func (liveRuntimeAdapter) NewAuthority(t *testing.T, db *sql.DB, workingDirectory string) generatedingress.LiveRuntimeTestAuthority {
-	return &liveRuntimeAuthority{value: liveauthority.New(t, db, workingDirectory)}
-}
-
-func (liveRuntimeAdapter) NewEngine(runner runtimeprocess.CommandRunner, environment generatedingress.GeneratedCandidateEnvironmentStager, capacity generatedcapacity.Source, repository *deployments.Repository, options generatedingress.LiveRuntimeTestEngineOptions) (generatedingress.LiveRuntimeTestEngine, error) {
+func (liveRuntimeAdapter) NewEngine(runner runtimeprocess.CommandRunner, environment generatedingress.GeneratedCandidateEnvironmentStager, candidates *generatedingress.GeneratedCandidateAuthority, options generatedingress.LiveRuntimeTestEngineOptions) (generatedingress.LiveRuntimeTestEngine, error) {
 	if environment == nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
@@ -125,7 +118,7 @@ func (liveRuntimeAdapter) NewEngine(runner runtimeprocess.CommandRunner, environ
 	if environmentValue.Kind() != reflect.Pointer || environmentValue.IsNil() {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
-	value, err := generatedruntime.NewEngine(runner, &candidateEnvironmentStager{value: environment}, capacity, repository, generatedruntime.EngineOptions{
+	value, err := generatedruntime.NewEngine(runner, environment, candidates, generatedruntime.EngineOptions{
 		DockerExecutable: options.DockerExecutable, DockerEndpoint: options.DockerEndpoint,
 		DockerConfigDirectory: options.DockerConfigDirectory, WorkingDirectory: options.WorkingDirectory,
 		CommandTimeout: options.CommandTimeout, HealthTimeout: options.HealthTimeout,

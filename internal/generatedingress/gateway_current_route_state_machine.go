@@ -4,10 +4,56 @@ import (
 	"context"
 	"math"
 	"reflect"
+	"strconv"
+	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/generatedroute"
 )
+
+// selectGatewayCurrentObservationLocked selects the exact current rebind under
+// the short lock-acquisition budget. Pending, LAN-recovery and crossed
+// SQL/protected states remain handled refusals and cannot fall through to an
+// older route format.
+func (m *Manager) selectGatewayCurrentObservationLocked(ctx context.Context, appID string) (
+	gatewayCurrentRouteState, bool, error,
+) {
+	selection, _, handled, err := m.gatewayCurrentSelectedStateLocked(ctx)
+	if err != nil || !handled {
+		return gatewayCurrentRouteState{}, handled, err
+	}
+	if selection.State == nil {
+		return gatewayCurrentRouteState{}, true, gatewayCurrentRouteOperationError(ctx)
+	}
+	want := cloneGatewayCurrentOperationState(*selection.State)
+	if _, exists := want.Apps[appID]; !exists {
+		return gatewayCurrentRouteState{}, true, &Error{Code: DiagnosticRouteInvalid}
+	}
+	return want, true, nil
+}
+
+// attestGatewayCurrentObservationLocked uses the caller-capped extended
+// observation budget after selection. attestGatewayCurrentStateLocked repeats
+// the complete selection both before and after the physical proof while the
+// same Manager and OS locks remain held.
+func (m *Manager) attestGatewayCurrentObservationLocked(ctx context.Context,
+	want gatewayCurrentRouteState, appID string,
+) (Observation, error) {
+	attestation, err := m.attestGatewayCurrentStateLocked(ctx, want)
+	if err != nil || attestation.Outcome != gatewayCurrentPhysicalStableServing ||
+		!reflect.DeepEqual(attestation.State, want) {
+		return Observation{}, gatewayCurrentRouteOperationError(ctx)
+	}
+	app, exists := want.Apps[appID]
+	if !exists {
+		return Observation{}, &Error{Code: DiagnosticRouteInvalid}
+	}
+	return Observation{
+		URL:  "http://" + appID + ".rig.localhost:" + strconv.FormatUint(uint64(m.options.HostPort), 10),
+		Slot: app.Route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...),
+		ObservedAt: time.Now().UTC(),
+	}, nil
+}
 
 // gatewayCurrentSelectedStateLocked returns the current rebind generation
 // only when SQL selection is stable and no newer rebind claim is active. The

@@ -166,9 +166,9 @@ func TestRebindFenceBlocksNormalGatewayEffects(t *testing.T) {
 			before := len(runner.commands)
 			var err error
 			if method == "switch" {
-				err = manager.Switch(context.Background(), switchRequest(runner))
+				err = exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 			} else {
-				err = manager.Provision(context.Background())
+				err = exerciseLegacyV1EnsureGatewayCore(manager, context.Background())
 			}
 			if !IsCode(err, DiagnosticRouteUnresolved) || len(runner.commands) != before {
 				t.Fatalf("err=%v Docker commands=%d", err, len(runner.commands)-before)
@@ -224,9 +224,11 @@ func TestIndependentManagersDoNoGatewayWorkWhileAnotherHoldsTheLock(t *testing.T
 		name string
 		run  func(context.Context) error
 	}{
-		{name: "provision", run: second.Provision},
+		{name: "provision", run: func(ctx context.Context) error {
+			return exerciseLegacyV1EnsureGatewayCore(second, ctx)
+		}},
 		{name: "switch", run: func(ctx context.Context) error {
-			return second.Switch(ctx, switchRequest(runner))
+			return exerciseManagerSwitch(second, ctx, switchRequest(runner))
 		}},
 		{name: "observation", run: func(ctx context.Context) error {
 			return second.WithObservation(ctx, runner.appID, func(context.Context, Observation) error {
@@ -270,7 +272,7 @@ func TestSwitchReleaseFailurePreservesLiveCandidate(t *testing.T) {
 	}
 	t.Cleanup(func() { managerAcquireGatewayOSLock = original })
 
-	err := manager.Switch(context.Background(), switchRequest(runner))
+	err := exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 	if !IsCode(err, DiagnosticRouteUnresolved) || !testRouteCandidateMayBeLive(err) {
 		t.Fatalf("switch error=%v candidateMayBeLive=%t", err, testRouteCandidateMayBeLive(err))
 	}

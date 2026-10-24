@@ -80,7 +80,7 @@ func TestLegacyV1FenceChecksMarkerAfterGatewayLockContention(t *testing.T) {
 
 	result := make(chan error, 1)
 	go func() {
-		result <- second.Switch(context.Background(), switchRequest(runner))
+		result <- exerciseManagerSwitch(second, context.Background(), switchRequest(runner))
 	}()
 	select {
 	case <-entered:
@@ -108,16 +108,13 @@ func TestLegacyV1FenceChecksMarkerAfterGatewayLockContention(t *testing.T) {
 	}
 }
 
-func TestLegacyV1FenceAllowsLegacyPathsWithoutMarkers(t *testing.T) {
+func TestLegacyV1FenceAllowsPrivateRouteAndReadPathsWithoutMarkers(t *testing.T) {
 	manager, runner := newManagerFixture(t, false)
 	ctx := context.Background()
-	if err := manager.Switch(ctx, switchRequest(runner)); err != nil {
+	if err := exerciseManagerSwitch(manager, ctx, switchRequest(runner)); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.Provision(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.Recover(ctx); err != nil {
+	if err := exerciseLegacyV1FenceCore(manager, ctx); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := manager.Observe(ctx, runner.appID); err != nil {
@@ -152,10 +149,11 @@ func assertLegacyV1Blocked(t *testing.T, manager *Manager, runner *ingressRunner
 		run              func() error
 	}{
 		{name: "switch", candidateMayLive: true, run: func() error {
-			return manager.Switch(context.Background(), switchRequest(runner))
+			return exerciseManagerSwitch(manager, context.Background(), switchRequest(runner))
 		}},
-		{name: "provision", run: func() error { return manager.Provision(context.Background()) }},
-		{name: "recover", run: func() error { return manager.Recover(context.Background()) }},
+		{name: "legacy format fence", run: func() error {
+			return exerciseLegacyV1FenceCore(manager, context.Background())
+		}},
 		{name: "observe", run: func() error {
 			_, err := manager.Observe(context.Background(), runner.appID)
 			return err
@@ -192,6 +190,63 @@ func assertLegacyV1Blocked(t *testing.T, manager *Manager, runner *ingressRunner
 	}
 	if capacitySnapshot != (generatedcapacity.Snapshot{}) {
 		t.Fatalf("blocked capacity snapshot = %+v", capacitySnapshot)
+	}
+}
+
+// These public methods always refuse. Private primitive tests above preserve
+// format and physical-state semantics; they do not grant ordinary Managers
+// domain construction, recovery or generated route authority.
+func TestOrdinaryManagerMutatorsRefuseEveryShapeBeforeGatewayWork(t *testing.T) {
+	for _, committed := range []bool{false, true} {
+		name := "legacy"
+		if committed {
+			name = "committed v2"
+		}
+		t.Run(name, func(t *testing.T) {
+			manager, runner := newManagerFixture(t, false)
+			if committed {
+				installCommittedV2Pair(t, manager)
+			}
+			copiedValue := reflect.New(reflect.TypeOf(manager).Elem())
+			copiedValue.Elem().Set(reflect.ValueOf(manager).Elem())
+			copied := copiedValue.Interface().(*Manager)
+			shapes := []struct {
+				name    string
+				manager *Manager
+			}{
+				{name: "nil"},
+				{name: "zero", manager: &Manager{}},
+				{name: "constructed", manager: manager},
+				{name: "copied", manager: copied},
+			}
+			original := managerAcquireGatewayOSLock
+			lockCalls := 0
+			managerAcquireGatewayOSLock = func(context.Context, *stateStore) (func() error, error) {
+				lockCalls++
+				return nil, &Error{Code: DiagnosticRouteUnresolved}
+			}
+			t.Cleanup(func() { managerAcquireGatewayOSLock = original })
+			before := len(runner.commands)
+			for _, shape := range shapes {
+				t.Run(shape.name, func(t *testing.T) {
+					for _, ctx := range []context.Context{context.Background(), nil} {
+						results := []error{
+							shape.manager.Switch(ctx, switchRequest(runner)),
+							shape.manager.Provision(ctx),
+							shape.manager.Recover(ctx),
+						}
+						for index, err := range results {
+							if !IsCode(err, DiagnosticValidationFailed) || testRouteCandidateMayBeLive(err) {
+								t.Fatalf("ordinary mutator %d error=%v candidate may be live=%t", index, err, testRouteCandidateMayBeLive(err))
+							}
+						}
+					}
+				})
+			}
+			if lockCalls != 0 || len(runner.commands) != before {
+				t.Fatalf("refused ordinary mutation acquired gateway lock %d times or issued %d commands", lockCalls, len(runner.commands)-before)
+			}
+		})
 	}
 }
 

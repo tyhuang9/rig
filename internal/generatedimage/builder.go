@@ -2,8 +2,6 @@ package generatedimage
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,29 +15,30 @@ import (
 
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedbuilder"
 	"github.com/hostd/hostd/internal/pathsecurity"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
 
 const (
-	builderIdentityFilename       = "builder-identity-v2.json"
-	legacyBuilderIdentityFilename = "builder-identity.json"
+	builderIdentityFilename       = generatedbuilder.IdentityFilename
+	legacyBuilderIdentityFilename = generatedbuilder.LegacyIdentityFilename
 	dockerConfigDirectory         = "docker-config"
 	buildxConfigDirectory         = "buildx-config"
-	buildkitImage                 = "moby/buildkit@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8"
-	buildkitStatePath             = "/var/lib/buildkit"
+	buildkitImage                 = generatedbuilder.ImageReference
+	buildkitStatePath             = generatedbuilder.StatePath
 	buildkitRemoteScheme          = "docker-container://"
 	buildxBuilderListFormat       = "json"
-	defaultStateQuotaBytes        = int64(2 << 30)
-	minimumStateQuotaBytes        = int64(512 << 20)
-	maximumStateQuotaBytes        = int64(16 << 30)
-	buildkitPIDsLimit             = int64(512)
-	buildkitMemoryHeadroom        = int64(1 << 30)
+	defaultStateQuotaBytes        = generatedbuilder.DefaultStateQuotaBytes
+	minimumStateQuotaBytes        = generatedbuilder.MinimumStateQuotaBytes
+	maximumStateQuotaBytes        = generatedbuilder.MaximumStateQuotaBytes
+	buildkitPIDsLimit             = generatedbuilder.PIDsLimit
+	buildkitMemoryHeadroom        = generatedbuilder.MemoryHeadroom
 
 	defaultBuilderPrepareTimeout = 2 * time.Minute
 	defaultBuilderOutputLimit    = 64 << 10
-	builderStateSchema           = 2
+	builderStateSchema           = generatedbuilder.StateSchema
 )
 
 // BuilderErrorCode is a durable, non-secret outcome of preparing the
@@ -111,21 +110,9 @@ type BuilderSession struct {
 
 func (s BuilderSession) Environment() []string { return append([]string(nil), s.environment...) }
 
-type builderIdentity struct {
-	Schema      int    `json:"schema"`
-	BuilderName string `json:"builderName"`
-	NodeName    string `json:"nodeName"`
-	NetworkName string `json:"networkName"`
-}
+type builderIdentity = generatedbuilder.Identity
 
-type dockerNetwork struct {
-	Name     string            `json:"Name"`
-	Driver   string            `json:"Driver"`
-	Scope    string            `json:"Scope"`
-	Internal bool              `json:"Internal"`
-	Labels   map[string]string `json:"Labels"`
-	Options  map[string]string `json:"Options"`
-}
+type dockerNetwork = generatedbuilder.Network
 
 type buildxBuilder struct {
 	Name   string       `json:"Name"`
@@ -148,64 +135,9 @@ type buildxNode struct {
 	Endpoint string `json:"Endpoint"`
 }
 
-type dockerMount struct {
-	Type        string `json:"Type"`
-	Source      string `json:"Source"`
-	Destination string `json:"Destination"`
-	Mode        string `json:"Mode"`
-	RW          bool   `json:"RW"`
-	Propagation string `json:"Propagation"`
-}
-
-type dockerConfiguredMount struct {
-	Type         string `json:"Type"`
-	Source       string `json:"Source"`
-	Target       string `json:"Target"`
-	ReadOnly     bool   `json:"ReadOnly"`
-	TmpfsOptions *struct {
-		SizeBytes int64 `json:"SizeBytes"`
-		Mode      int64 `json:"Mode"`
-	} `json:"TmpfsOptions"`
-}
-
-type buildkitContainer struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	Image string `json:"Image"`
-	State struct {
-		Running    bool `json:"Running"`
-		Paused     bool `json:"Paused"`
-		Restarting bool `json:"Restarting"`
-	} `json:"State"`
-	Config struct {
-		Image  string            `json:"Image"`
-		Cmd    []string          `json:"Cmd"`
-		Labels map[string]string `json:"Labels"`
-	} `json:"Config"`
-	HostConfig struct {
-		Memory       int64                      `json:"Memory"`
-		MemorySwap   int64                      `json:"MemorySwap"`
-		CPUPeriod    int64                      `json:"CpuPeriod"`
-		CPUQuota     int64                      `json:"CpuQuota"`
-		PidsLimit    int64                      `json:"PidsLimit"`
-		NetworkMode  string                     `json:"NetworkMode"`
-		Privileged   bool                       `json:"Privileged"`
-		Binds        []string                   `json:"Binds"`
-		Mounts       []dockerConfiguredMount    `json:"Mounts"`
-		PortBindings map[string]json.RawMessage `json:"PortBindings"`
-		LogConfig    struct {
-			Type   string            `json:"Type"`
-			Config map[string]string `json:"Config"`
-		} `json:"LogConfig"`
-		RestartPolicy struct {
-			Name string `json:"Name"`
-		} `json:"RestartPolicy"`
-	} `json:"HostConfig"`
-	NetworkSettings struct {
-		Networks map[string]json.RawMessage `json:"Networks"`
-	} `json:"NetworkSettings"`
-	Mounts []dockerMount `json:"Mounts"`
-}
+type dockerMount = generatedbuilder.Mount
+type dockerConfiguredMount = generatedbuilder.ConfiguredMount
+type buildkitContainer = generatedbuilder.Container
 
 // BuilderManager provisions and validates one durable Buildx builder. The
 // mutex makes initialization idempotent for concurrent compile requests in a
@@ -391,7 +323,7 @@ func (m *BuilderManager) loadOrCreateIdentity() (builderIdentity, error) {
 		if createErr != nil {
 			return builderIdentity{}, &BuilderError{Code: BuilderFilesystemInvalid}
 		}
-		encoded, marshalErr := json.Marshal(identity)
+		encoded, marshalErr := generatedbuilder.EncodeIdentity(identity)
 		if marshalErr != nil {
 			return builderIdentity{}, &BuilderError{Code: BuilderFilesystemInvalid}
 		}
@@ -406,39 +338,19 @@ func (m *BuilderManager) loadOrCreateIdentity() (builderIdentity, error) {
 		return builderIdentity{}, &BuilderError{Code: BuilderFilesystemInvalid}
 	}
 	defer clear(body)
-	var identity builderIdentity
-	if json.Unmarshal(body, &identity) != nil || !validBuilderIdentity(identity) {
+	identity, decodeErr := generatedbuilder.DecodeIdentity(body)
+	if decodeErr != nil {
 		return builderIdentity{}, &BuilderError{Code: BuilderDriftDetected}
 	}
 	return identity, nil
 }
 
 func newBuilderIdentity() (builderIdentity, error) {
-	random := make([]byte, 12)
-	if _, err := rand.Read(random); err != nil {
-		return builderIdentity{}, err
-	}
-	suffix := hex.EncodeToString(random)
-	return builderIdentity{
-		Schema: builderStateSchema, BuilderName: "rig-buildkit-" + suffix,
-		NodeName: "rig-node-" + suffix, NetworkName: "rig-buildnet-" + suffix,
-	}, nil
+	return generatedbuilder.NewIdentity()
 }
 
 func validBuilderIdentity(identity builderIdentity) bool {
-	return identity.Schema == builderStateSchema && validControllerName(identity.BuilderName, "rig-buildkit-") && validControllerName(identity.NodeName, "rig-node-") && validControllerName(identity.NetworkName, "rig-buildnet-")
-}
-
-func validControllerName(value, prefix string) bool {
-	if len(value) < len(prefix)+24 || len(value) > 63 || !strings.HasPrefix(value, prefix) {
-		return false
-	}
-	for _, character := range value {
-		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
-			return false
-		}
-	}
-	return true
+	return generatedbuilder.ValidIdentity(identity)
 }
 
 func (m *BuilderManager) ensureNetwork(ctx context.Context, authority *deployments.GeneratedImageCommandExecution, identity builderIdentity, env []string) error {
@@ -503,7 +415,7 @@ func (m *BuilderManager) inspectNetwork(ctx context.Context, name string, env []
 }
 
 func matchesNetwork(network dockerNetwork, identity builderIdentity) bool {
-	return network.Name == identity.NetworkName && network.Driver == "bridge" && network.Scope == "local" && !network.Internal && network.Options["com.docker.network.bridge.enable_icc"] == "false" && network.Labels["rig.controller"] == "generated-builder" && network.Labels["rig.builder"] == identity.BuilderName && network.Labels["rig.network"] == identity.NetworkName
+	return generatedbuilder.MatchesNetwork(network, identity)
 }
 
 func (m *BuilderManager) ensureBuilder(ctx context.Context, authority *deployments.GeneratedImageCommandExecution, identity builderIdentity, env []string) error {
@@ -704,20 +616,15 @@ func (m *BuilderManager) inspectBuildkitContainer(ctx context.Context, identity 
 }
 
 func buildkitContainerName(identity builderIdentity) string {
-	return "rig-buildkitd-" + strings.TrimPrefix(identity.NodeName, "rig-node-")
+	return generatedbuilder.ContainerName(identity)
 }
 
 func buildkitMemoryLimit(quotaBytes int64) int64 {
-	return quotaBytes + buildkitMemoryHeadroom
+	return generatedbuilder.MemoryLimit(quotaBytes)
 }
 
 func buildkitCommand(quotaBytes int64) []string {
-	return []string{
-		"--oci-worker-net", "bridge",
-		"--oci-worker-gc",
-		"--oci-worker-gc-keepstorage=" + fmt.Sprintf("%d", quotaBytes/(2*1_000_000)),
-		"--oci-max-parallelism=1",
-	}
+	return generatedbuilder.Command(quotaBytes)
 }
 
 func matchesBuildkitContainer(container buildkitContainer, identity builderIdentity, quotaBytes int64) bool {
@@ -725,46 +632,11 @@ func matchesBuildkitContainer(container buildkitContainer, identity builderIdent
 }
 
 func matchesBuildkitContainerConfiguration(container buildkitContainer, identity builderIdentity, quotaBytes int64) bool {
-	wantLabels := map[string]string{
-		"rig.controller":  "generated-builder",
-		"rig.builder":     identity.BuilderName,
-		"rig.network":     identity.NetworkName,
-		"rig.quota.bytes": fmt.Sprintf("%d", quotaBytes),
-	}
-	if !lowerHex(container.ID, 64) || container.Name != "/"+buildkitContainerName(identity) || !validImageContentID(container.Image) || container.Config.Image != buildkitImage || !equalStringSlices(container.Config.Cmd, buildkitCommand(quotaBytes)) {
-		return false
-	}
-	for key, value := range wantLabels {
-		if container.Config.Labels[key] != value {
-			return false
-		}
-	}
-	if container.HostConfig.Memory != buildkitMemoryLimit(quotaBytes) || container.HostConfig.MemorySwap != buildkitMemoryLimit(quotaBytes) || container.HostConfig.CPUPeriod != 100000 || container.HostConfig.CPUQuota != 100000 || container.HostConfig.PidsLimit != buildkitPIDsLimit || !container.HostConfig.Privileged || container.HostConfig.NetworkMode != identity.NetworkName || len(container.HostConfig.Binds) != 0 || len(container.HostConfig.PortBindings) != 0 || container.HostConfig.RestartPolicy.Name != "unless-stopped" || container.HostConfig.LogConfig.Type != "json-file" || len(container.HostConfig.LogConfig.Config) != 2 || container.HostConfig.LogConfig.Config["max-size"] != "10m" || container.HostConfig.LogConfig.Config["max-file"] != "1" || len(container.NetworkSettings.Networks) != 1 {
-		return false
-	}
-	_, connected := container.NetworkSettings.Networks[identity.NetworkName]
-	if !connected || len(container.HostConfig.Mounts) != 1 || len(container.Mounts) != 1 {
-		return false
-	}
-	configured := container.HostConfig.Mounts[0]
-	active := container.Mounts[0]
-	return configured.Type == "tmpfs" && configured.Source == "" && configured.Target == buildkitStatePath && !configured.ReadOnly && configured.TmpfsOptions != nil && configured.TmpfsOptions.SizeBytes == quotaBytes && configured.TmpfsOptions.Mode == 0o700 && active.Type == "tmpfs" && active.Source == "" && active.Destination == buildkitStatePath && active.RW && active.Mode == "" && active.Propagation == ""
+	return generatedbuilder.MatchesContainerConfiguration(container, identity, quotaBytes)
 }
 
 func buildkitContainerReady(container buildkitContainer) bool {
-	return container.State.Running && !container.State.Paused && !container.State.Restarting
-}
-
-func equalStringSlices(left, right []string) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
+	return generatedbuilder.ContainerReady(container)
 }
 
 func (m *BuilderManager) findBuilder(ctx context.Context, name string, env []string) (buildxBuilder, bool, error) {

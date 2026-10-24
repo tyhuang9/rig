@@ -10,7 +10,7 @@ import (
 // Re-sign the malformed snapshots below so validation must reject the actual
 // cross-binding or policy contradiction rather than only stale digest bytes.
 func TestGatewayRebindReconcileReviewValidationBindsCanonicalSnapshot(t *testing.T) {
-	fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+	fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 	snapshot := gatewayRebindAuthorizationSnapshot(t, fixture)
 	baseline, err := BuildGatewayRebindReconcileReview(snapshot,
 		gatewayRebindA0TrustedSnapshot(claim), testAdministrator)
@@ -83,7 +83,7 @@ func TestGatewayRebindReconcileReviewValidationBindsCanonicalSnapshot(t *testing
 }
 
 func TestGatewayRebindReconcileReviewValidationPreservesFixedPolicy(t *testing.T) {
-	fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+	fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 	snapshot := gatewayRebindAuthorizationSnapshot(t, fixture)
 	trusted := gatewayRebindA0TrustedSnapshot(claim)
 	trusted.Protected.Presence = GatewayRebindProtectedEvidenceCheckpointTerminal

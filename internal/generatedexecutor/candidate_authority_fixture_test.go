@@ -17,9 +17,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
-	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/apps"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -35,6 +33,7 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 // sealedExecutorFixture is the only successful candidate test harness in this
@@ -62,6 +61,7 @@ type sealedExecutorFixture struct {
 	releases          *fakeReleases
 
 	repository    *deployments.Repository
+	domain        *generatedingress.GeneratedDomain
 	deployments   *sealedDeploymentStore
 	stateStore    *generatedruntimestate.Repository
 	state         *sealedRuntimeState
@@ -74,7 +74,7 @@ type sealedExecutorFixture struct {
 	reporter      *fakeReporter
 	runner        *sealedCandidateRunner
 	environment   *sealedCandidateEnvironment
-	capacity      *scriptedCapacitySource
+	capacity      *generateddomain.Runner
 	executor      *Executor
 }
 
@@ -109,12 +109,27 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 	if len(components) == 0 {
 		t.Fatal("candidate fixture needs a component")
 	}
-	dataRoot := t.TempDir()
-	db, err := database.Open(dataRoot)
+	dataRoot := generateddomain.NewRetainedRoot(t)
+	prepareExecutorDomainDatabase(t, dataRoot)
+	runner := newSealedCandidateRunner(t)
+	environment := &sealedCandidateEnvironment{root: filepath.Join(dataRoot, "candidate-environments")}
+	if err := os.Mkdir(environment.root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	engineOptions := generatedruntime.EngineOptions{
+		DockerExecutable: filepath.Join(dataRoot, "docker"), DockerConfigDirectory: directories.DockerConfigDirectory,
+		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Minute,
+		HealthTimeout: time.Minute, HealthPollInterval: 100 * time.Millisecond, OutputLimit: 16 << 10,
+		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20, LogSize: "1m", LogFiles: 2},
+		ReplacementDiskBytes: 128 << 20,
+	}
+	domainFixture := newExecutorDomainFixture(t, dataRoot, runner, environment, engineOptions)
+	db, bindings, plans, configurations := domainFixture.db, domainFixture.bindings, domainFixture.plans, domainFixture.configuration
+	repository := domainFixture.repository
 
 	actorID, machineID := uuid.NewString(), uuid.NewString()
 	now := time.Now().UTC()
@@ -145,10 +160,6 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 		for _, field := range componentFields {
 			provenance = append(provenance, deploymentplans.FieldProvenance{Field: "components." + component.Name + "." + field, Origin: deploymentplans.ProvenanceInferred, Confidence: 100, Evidence: []string{"package.json"}})
 		}
-	}
-	plans, err := deploymentplans.New(db, dataRoot)
-	if err != nil {
-		t.Fatal(err)
 	}
 	planValue := deploymentplans.Plan{
 		Strategy:   deploymentplans.StrategyGeneratedNode,
@@ -182,10 +193,6 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	configurations, err := appconfig.New(db, dataRoot)
-	if err != nil {
-		t.Fatal(err)
 	}
 	secret := "candidate-runtime-secret"
 	targets := make([]appconfig.ComponentTarget, 0, len(components))
@@ -238,14 +245,6 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,attempt,requested_by,input_json,created_at,updated_at) VALUES(?,'deploy','application',?,'queued','queued',0,?,?,?,?)`, jobID, app.ID, actorID, string(input), stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
-	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(db))
-	if err != nil {
-		t.Fatal(err)
-	}
-	bindings, err := deploymentbinding.New(db, validator)
-	if err != nil {
-		t.Fatal(err)
-	}
 	tx, err := db.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -266,18 +265,6 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 		t.Fatal(err)
 	}
 
-	positive, err := applifecycle.NewPositiveFenceValidator(applifecycle.New(db))
-	if err != nil {
-		t.Fatal(err)
-	}
-	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
 	scope, releaseScope, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
 	if err != nil {
 		t.Fatal(err)
@@ -288,24 +275,6 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 		}
 	})
 	guarded := deploymenteffects.WithScope(context.Background(), scope)
-
-	dockerConfig := filepath.Join(dataRoot, "docker-config")
-	if err := os.Mkdir(dockerConfig, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	runner := newSealedCandidateRunner(t)
-	environment := &sealedCandidateEnvironment{root: filepath.Join(dataRoot, "candidate-environments")}
-	if err := os.Mkdir(environment.root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	migrationOptions := deployments.GeneratedMigrationProcessOptions{
-		DockerExecutable: filepath.Join(dataRoot, "docker"), DockerConfigDirectory: dockerConfig,
-		WorkingDirectory: directories.WorkingDirectory, Timeout: time.Minute, OutputLimit: 16 << 10,
-	}
-	repository, err := deployments.NewWithExecutionGuardAndGeneratedMigration(db, guard, plans, configurations, environment, runner, migrationOptions)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	artifactStore := generatedimage.NewArtifactRepository(db)
 	artifacts := make([]generatedimage.Artifact, 0, len(components))
@@ -326,15 +295,9 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 	}
 	artifact := artifacts[0]
 
-	capacity := &scriptedCapacitySource{}
-	capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 512 << 20, DiskAvailableBytes: 512 << 20})
-	engine, err := generatedruntime.NewEngine(runner, environment, capacity, repository, generatedruntime.EngineOptions{
-		DockerExecutable: filepath.Join(dataRoot, "docker"), DockerConfigDirectory: dockerConfig,
-		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Minute,
-		HealthTimeout: time.Minute, HealthPollInterval: 100 * time.Millisecond, OutputLimit: 16 << 10,
-		Limits:               generatedruntime.ContainerLimits{MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 64, TmpfsBytes: 8 << 20, LogSize: "1m", LogFiles: 2},
-		ReplacementDiskBytes: 128 << 20,
-	})
+	capacity := domainFixture.process
+	capacity.SetCapacity(512<<20, 512<<20)
+	engine, err := generatedruntime.NewEngine(domainFixture.process, environment, domainFixture.domain.Candidates(), engineOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,14 +312,14 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 	authorization := &sealedAuthorizationGate{delegate: authorizationGate}
 	events := []string{}
 	compiler := &fakeCompiler{events: &events, artifacts: artifacts, repository: repository, release: release, plan: plan}
-	routes := &fakeRoutes{events: &events}
+	routes := &fakeRoutes{events: &events, delegate: generatedRouteController{authority: domainFixture.domain.Routes()}}
 	migrations := &fakeMigrations{events: &events}
 	if migration {
 		migrations.delegate = &executorMigrationRunner{repository: repository}
 	}
 	configurationView := &sealedConfigurationExporter{store: configurations}
 	releaseView := &fakeReleases{release: release}
-	executor, err := NewExecutor(applications, releaseView, configurationView, deploymentStore, plans,
+	executor, err := newExecutor(applications, releaseView, configurationView, deploymentStore, plans,
 		compiler, artifactStore, state, runtime, authorization, routes, migrations, Options{DrainPeriod: time.Millisecond, CleanupTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -367,7 +330,7 @@ func newSealedExecutorFixtureWithComponentsAndMigration(t *testing.T, components
 		plan: plan, configuration: configuration, configurationView: configurationView, release: release, artifact: artifact, artifacts: artifacts,
 		artifactStore: artifactStore, bindings: bindings,
 		plans: plans, configurations: configurations, releases: releaseView,
-		repository: repository, deployments: deploymentStore, stateStore: stateStore, state: state,
+		repository: repository, domain: domainFixture.domain, deployments: deploymentStore, stateStore: stateStore, state: state,
 		engine: engine, runtime: runtime, authorization: authorization, compiler: compiler,
 		routes: routes, migrations: migrations, reporter: &fakeReporter{}, runner: runner,
 		environment: environment, capacity: capacity, executor: executor,
@@ -795,14 +758,12 @@ func (s *sealedDeploymentStore) PinGeneratedMigration(ctx context.Context, reque
 }
 
 type sealedRuntimeState struct {
-	repository            *generatedruntimestate.Repository
-	beginErr              error
-	getErr                error
-	failSwitchActive      bool
-	failAdvanceToDraining bool
-	advanceErrTo          generatedruntimestate.Phase
-	advanceErr            error
-	activeOverride        *generatedruntimestate.ActiveHead
+	repository     *generatedruntimestate.Repository
+	beginErr       error
+	getErr         error
+	advanceErrTo   generatedruntimestate.Phase
+	advanceErr     error
+	activeOverride *generatedruntimestate.ActiveHead
 }
 
 func (s *sealedRuntimeState) Begin(ctx context.Context, input generatedruntimestate.BeginInput) (generatedruntimestate.Deployment, bool, error) {
@@ -824,9 +785,6 @@ func (s *sealedRuntimeState) Active(ctx context.Context, appID string) (generate
 	return s.repository.Active(ctx, appID)
 }
 func (s *sealedRuntimeState) Advance(ctx context.Context, appID, deploymentID string, expected, next generatedruntimestate.Phase, diagnostic generatedruntimestate.DiagnosticCode) (generatedruntimestate.Deployment, error) {
-	if next == generatedruntimestate.PhaseDraining && s.failAdvanceToDraining {
-		return generatedruntimestate.Deployment{}, generatedruntimestate.ErrInvalidTransition
-	}
 	if next == s.advanceErrTo && s.advanceErr != nil {
 		return generatedruntimestate.Deployment{}, s.advanceErr
 	}
@@ -837,12 +795,6 @@ func (s *sealedRuntimeState) AdvanceComponent(ctx context.Context, appID, deploy
 }
 func (s *sealedRuntimeState) FailComponent(ctx context.Context, appID, deploymentID, component string, expected generatedruntimestate.ComponentState, diagnostic generatedruntimestate.DiagnosticCode) (generatedruntimestate.Component, error) {
 	return s.repository.FailComponent(ctx, appID, deploymentID, component, expected, diagnostic)
-}
-func (s *sealedRuntimeState) SwitchActive(ctx context.Context, appID, deploymentID string, generation int64) (generatedruntimestate.ActiveHead, bool, error) {
-	if s.failSwitchActive {
-		return generatedruntimestate.ActiveHead{}, false, generatedruntimestate.ErrConflict
-	}
-	return s.repository.SwitchActive(ctx, appID, deploymentID, generation)
 }
 
 type sealedRuntimeEngine struct {

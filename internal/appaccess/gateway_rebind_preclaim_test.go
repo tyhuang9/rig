@@ -19,7 +19,7 @@ func gatewayRebindPreclaimProposalFor(fixture gatewayRebindFixture) GatewayRebin
 }
 
 func TestGatewayRebindPreclaimSnapshotValidatesUnpersistedProposal(t *testing.T) {
-	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	proposal := gatewayRebindPreclaimProposalFor(fixture)
 	first, err := fixture.repository.GatewayRebindPreclaimSnapshot(context.Background(), proposal)
 	if err != nil {
@@ -150,7 +150,7 @@ func TestGatewayRebindPreclaimSnapshotRejectsBadProposalAndStoredDrift(t *testin
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+			fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 			proposal := gatewayRebindPreclaimProposalFor(fixture)
 			test.mutate(t, &fixture, &proposal)
 			if _, err := fixture.repository.GatewayRebindPreclaimSnapshot(context.Background(), proposal); err == nil {
@@ -181,7 +181,7 @@ func refreshGatewayRebindPreclaimProposalDigests(t *testing.T, proposal *Gateway
 }
 
 func TestGatewayRebindPreclaimSnapshotCancellationAndNilRepository(t *testing.T) {
-	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if _, err := fixture.repository.GatewayRebindPreclaimSnapshot(ctx, gatewayRebindPreclaimProposalFor(fixture)); !errors.Is(err, context.Canceled) {

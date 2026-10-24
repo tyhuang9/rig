@@ -11,13 +11,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deploymentplans"
@@ -28,6 +28,7 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/databasefixture"
 )
 
 // candidateTestRepository exposes only the concrete test database alongside
@@ -35,8 +36,10 @@ import (
 // sealed GeneratedOwnerStores bundle.
 type candidateTestRepository struct {
 	*deployments.Repository
-	db     *sql.DB
-	stores *deployments.GeneratedOwnerStores
+	db        *sql.DB
+	stores    *deployments.GeneratedOwnerStores
+	mu        sync.Mutex
+	authority *GeneratedCandidateAuthority
 }
 
 func (r *candidateTestRepository) GeneratedCandidateAuthority(
@@ -48,22 +51,30 @@ func (r *candidateTestRepository) GeneratedCandidateAuthority(
 	if r == nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
-	return NewGeneratedCandidateAuthority(r.stores, process, environment, budget, options)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.authority != nil {
+		if r.authority.process != process || r.authority.environment != environment ||
+			r.authority.budget != budget || r.authority.options != options {
+			return nil, deploymentexecution.ErrInvalidConfiguration
+		}
+		return r.authority, nil
+	}
+	authority, err := newGeneratedCandidateAuthorityConcrete(r.stores, process, environment, budget, options)
+	if err != nil {
+		return nil, err
+	}
+	r.authority = authority
+	return authority, nil
 }
 
 func (r *candidateTestRepository) candidateAuthority() *GeneratedCandidateAuthority {
-	if r == nil || r.stores == nil || r.stores.Repository() == nil {
+	if r == nil {
 		return nil
 	}
-	generatedCandidateAuthorityRegistries.Lock()
-	registry := generatedCandidateAuthorityRegistries.values[r.stores.Repository()]
-	generatedCandidateAuthorityRegistries.Unlock()
-	if registry == nil {
-		return nil
-	}
-	registry.mu.Lock()
-	defer registry.mu.Unlock()
-	return registry.authority
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.authority
 }
 
 type candidateTestGuarded struct {
@@ -84,13 +95,17 @@ type candidateMigrationRequestFixture struct {
 }
 
 type generatedMigrationFixture struct {
-	repository    *candidateTestRepository
-	configuration *appconfig.Store
-	guarded       *candidateTestGuarded
-	request       candidateMigrationRequestFixture
-	plan          deploymentplans.Plan
-	claim         deploymentexecution.Claim
-	binding       deploymentbinding.Binding
+	repository     *candidateTestRepository
+	bindings       *deploymentbinding.Repository
+	jobService     *jobs.Service
+	plans          *deploymentplans.Store
+	configuration  *appconfig.Store
+	guarded        *candidateTestGuarded
+	releaseEffects func() error
+	request        candidateMigrationRequestFixture
+	plan           deploymentplans.Plan
+	claim          deploymentexecution.Claim
+	binding        deploymentbinding.Binding
 }
 
 func newGeneratedMigrationFixture(t *testing.T) *generatedMigrationFixture {
@@ -101,7 +116,7 @@ func newGeneratedMigrationFixture(t *testing.T) *generatedMigrationFixture {
 func newGeneratedMigrationFixtureWithComponents(t *testing.T, planComponentNames, runtimeComponentNames []string) *generatedMigrationFixture {
 	t.Helper()
 	dataRoot := filepath.Join(t.TempDir(), "state")
-	db, err := database.Open(dataRoot)
+	db, err := databasefixture.Open(dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,20 +129,6 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if db == nil {
 		t.Fatal("generated migration fixture requires a database")
 	}
-	actorID := uuid.NewString()
-	appID := uuid.NewString()
-	machineID := uuid.NewString()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, "owner", "hash", now, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,?,'local','ready','test','test','test','test',?,?)`, machineID, "local", now, now); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?, 'draft',?,?)`, appID, appID, appID, machineID, now, now); err != nil {
-		t.Fatal(err)
-	}
-
 	lifecycle := applifecycle.New(db)
 	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
 	if err != nil {
@@ -153,17 +154,6 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := release(); err != nil {
-			t.Errorf("release deployment effects scope: %v", err)
-		}
-	})
-	guarded := &candidateTestGuarded{context: deploymenteffects.WithScope(context.Background(), scope), appID: appID, actorID: actorID}
-
 	plans, err := deploymentplans.New(db, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -172,14 +162,143 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if err != nil {
 		t.Fatal(err)
 	}
+	repository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores, err := repository.GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, bindings, repository, stores, plans,
+		configuration, directories.WorkingDirectory, planComponentNames, runtimeComponentNames)
+}
+
+func newGeneratedMigrationFixtureOnDomainWithComponents(t *testing.T, identity generatedDomainIdentityFixture,
+	planComponentNames, runtimeComponentNames []string, explicitPlan ...deploymentplans.Plan,
+) *generatedMigrationFixture {
+	t.Helper()
+	if identity.stores == nil || !identity.stores.ConfiguredForDomain(identity.dataRoot,
+		identity.options.WorkingDirectory) {
+		t.Fatal("generated migration domain fixture requires exact sealed stores")
+	}
+	db := identity.stores.Database()
+	lifecycle := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobService, err := jobs.NewWithDeploymentBindings(db, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, identity.options.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := deploymentplans.New(db, identity.dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := appconfig.New(db, identity.dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores, err := repository.GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stores.ConfiguredForDomain(identity.dataRoot, identity.options.WorkingDirectory) {
+		t.Fatal("generated migration fixture did not retain exact domain provenance")
+	}
+	return newGeneratedMigrationFixtureWithDependenciesAndImages(t, db, jobService, bindings, repository,
+		stores, plans, configuration,
+		identity.options.WorkingDirectory, planComponentNames, runtimeComponentNames, nil, explicitPlan...)
+}
+
+func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobService *jobs.Service,
+	bindings *deploymentbinding.Repository,
+	repository *deployments.Repository, stores *deployments.GeneratedOwnerStores,
+	plans *deploymentplans.Store, configuration *appconfig.Store, workingDirectory string,
+	planComponentNames, runtimeComponentNames []string, explicitPlan ...deploymentplans.Plan,
+) *generatedMigrationFixture {
+	return newGeneratedMigrationFixtureWithDependenciesAndImages(t, db, jobService, bindings, repository, stores,
+		plans, configuration, workingDirectory, planComponentNames, runtimeComponentNames, nil, explicitPlan...)
+}
+
+func newGeneratedMigrationFixtureWithDependenciesAndImages(t *testing.T, db *sql.DB,
+	jobService *jobs.Service, bindings *deploymentbinding.Repository,
+	repository *deployments.Repository, stores *deployments.GeneratedOwnerStores,
+	plans *deploymentplans.Store, configuration *appconfig.Store, workingDirectory string,
+	planComponentNames, runtimeComponentNames []string, imageContentIDs map[string]string,
+	explicitPlan ...deploymentplans.Plan,
+) *generatedMigrationFixture {
+	t.Helper()
+	if db == nil || jobService == nil || bindings == nil || repository == nil || stores == nil || plans == nil ||
+		configuration == nil || workingDirectory == "" {
+		t.Fatal("generated migration fixture dependencies are incomplete")
+	}
+	if len(imageContentIDs) != 0 {
+		if len(imageContentIDs) != len(runtimeComponentNames) {
+			t.Fatal("explicit generated migration image roster is incomplete")
+		}
+		for _, name := range runtimeComponentNames {
+			imageID, exists := imageContentIDs[name]
+			if !exists || !generatedDomainCanonicalDockerID(imageID, true) {
+				t.Fatal("explicit generated migration image identity is invalid")
+			}
+		}
+	}
+	actorID := uuid.NewString()
+	appID := uuid.NewString()
+	machineID := uuid.NewString()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, actorID, "owner-"+actorID, "hash", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO machines(id,name,mode,status,os,architecture,hostname,agent_version,created_at,updated_at) VALUES(?,?,'local','ready','test','test','test','test',?,?)`, machineID, "local", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,active_machine_id,status,created_at,updated_at) VALUES(?,?,?,?, 'draft',?,?)`, appID, appID, appID, machineID, now, now); err != nil {
+		t.Fatal(err)
+	}
+
+	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), workingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	releaseEffects := func() error {
+		if released {
+			return nil
+		}
+		released = true
+		return release()
+	}
+	t.Cleanup(func() {
+		if err := releaseEffects(); err != nil {
+			t.Errorf("release deployment effects scope: %v", err)
+		}
+	})
+	guarded := &candidateTestGuarded{context: deploymenteffects.WithScope(context.Background(), scope), appID: appID, actorID: actorID}
 	fields := []string{"role", "rootDirectory", "packageManager", "installBehavior", "installDirectory", "nodeVersion", "runCommand", "internalPort", "healthProbe"}
 	components := make([]deploymentplans.Component, 0, len(planComponentNames))
 	provenance := make([]deploymentplans.FieldProvenance, 0, len(planComponentNames)*len(fields))
-	configurationComponents := make([]appconfig.ComponentTarget, 0, len(planComponentNames))
 	for _, name := range planComponentNames {
 		root := "apps/" + name
 		components = append(components, deploymentplans.Component{Name: name, Role: "server", RootDirectory: root, PackageManager: "npm", InstallBehavior: "npm ci", InstallDirectory: root, NodeVersion: "24", RunCommand: "npm start", InternalPort: 3000, HealthProbe: "/health"})
-		configurationComponents = append(configurationComponents, appconfig.ComponentTarget{Name: name, Role: "server"})
 		for _, field := range fields {
 			provenance = append(provenance, deploymentplans.FieldProvenance{Field: "components." + name + "." + field, Origin: deploymentplans.ProvenanceInferred, Confidence: 100, Evidence: []string{"package.json"}})
 		}
@@ -191,6 +310,16 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 		Components:      components,
 		FieldProvenance: provenance,
 		Migration:       &deploymentplans.Migration{ComponentName: "api", RootDirectory: "apps/api", Command: "npm run migrate -- --locked", EnvironmentKeys: []string{"DATABASE_URL"}, EvidenceDigest: strings.Repeat("b", 64), Approval: deploymentplans.MigrationApproval{Status: deploymentplans.MigrationApprovalPending}},
+	}
+	if len(explicitPlan) > 1 {
+		t.Fatal("generated migration fixture accepts one explicit plan")
+	}
+	if len(explicitPlan) == 1 {
+		plan = explicitPlan[0]
+	}
+	configurationComponents := make([]appconfig.ComponentTarget, len(plan.Components))
+	for index, component := range plan.Components {
+		configurationComponents[index] = appconfig.ComponentTarget{Name: component.Name, Role: component.Role}
 	}
 	revision, err := plans.Replace(context.Background(), appID, actorID, deploymentplans.ReplaceInput{Plan: plan})
 	if err != nil {
@@ -223,14 +352,6 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,configuration_revision_id,configuration_revision_number,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'github',7,?,'ready',?,?,?,?,?)`, releaseID, appID, now, strings.Repeat("c", 64), workspace, configurationRevision.RevisionID, configurationRevision.RevisionNumber, revision.ID, revision.RevisionNumber); err != nil {
 		t.Fatal(err)
 	}
-	repository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stores, err := repository.GeneratedOwnerStores()
-	if err != nil {
-		t.Fatal(err)
-	}
 	testRepository := &candidateTestRepository{Repository: repository, db: db, stores: stores}
 	deployment, _, err := repository.GetOrCreateByJob(context.Background(), appID, created.Job.ID, "current")
 	if err != nil {
@@ -258,8 +379,18 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 	}
 	artifactID := ""
 	buildDigest := strings.Repeat("d", 64)
-	imageID := "sha256:" + strings.Repeat("e", 64)
-	for _, name := range runtimeComponentNames {
+	for index, name := range runtimeComponentNames {
+		imageDigit := "e"
+		if len(explicitPlan) == 1 {
+			imageDigit = fmt.Sprintf("%x", 14+index)
+			if len(imageDigit) != 1 {
+				t.Fatal("explicit generated migration plan supports at most two component images")
+			}
+		}
+		imageID := "sha256:" + strings.Repeat(imageDigit, 64)
+		if len(imageContentIDs) != 0 {
+			imageID = imageContentIDs[name]
+		}
 		componentArtifactID := uuid.NewString()
 		if _, err := db.Exec(`INSERT INTO generated_image_artifacts(id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,'test-compiler',?,3,?,'ready',?,?,?)`, componentArtifactID, releaseID, revision.ID, revision.RevisionNumber, name, buildDigest, imageID, now, now, now); err != nil {
 			t.Fatal(err)
@@ -278,7 +409,9 @@ func newGeneratedMigrationFixtureOnDatabaseWithComponents(t *testing.T, db *sql.
 		t.Fatal(err)
 	}
 	return &generatedMigrationFixture{
-		repository: testRepository, configuration: configuration, guarded: guarded, plan: plan, claim: claim, binding: created.Binding,
+		repository: testRepository, bindings: bindings, jobService: jobService,
+		plans: plans, configuration: configuration, guarded: guarded,
+		releaseEffects: releaseEffects, plan: plan, claim: claim, binding: created.Binding,
 		request: candidateMigrationRequestFixture{
 			DeploymentID: deployment.ID, ReleaseID: releaseID,
 			ConfigurationRevisionID: configurationRevision.RevisionID, ConfigurationRevisionNumber: configurationRevision.RevisionNumber,

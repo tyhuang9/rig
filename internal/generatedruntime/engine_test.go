@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -16,14 +15,16 @@ import (
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedcontainer"
 	"github.com/hostd/hostd/internal/generatedingress"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 const (
-	testImageID     = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testImageID     = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	testContainerID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
@@ -95,7 +96,7 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 	spec.RunCommand = command
 	limits := ContainerLimits{MemoryBytes: 384 << 20, MilliCPUs: 750, PIDs: 192, TmpfsBytes: 32 << 20, LogSize: "5m", LogFiles: 2}
 	var program *runtimeCandidateProgram
-	session := newRuntimeCandidateSession(t, spec, limits, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	session := newRuntimeCandidateSession(t, spec, limits, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		return program.run(request)
 	})
 	spec = session.authority.spec
@@ -156,7 +157,7 @@ func TestGeneratedRuntimeCandidateLifecycleUsesExactHardenedDockerArguments(t *t
 }
 
 func TestGeneratedRuntimeRejectsImageLabelDriftBeforeDockerMutation(t *testing.T) {
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	program.image = func(image imageInspection) imageInspection {
 		image.Labels["io.rig.application"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 		return image
@@ -171,7 +172,7 @@ func TestGeneratedRuntimeRejectsImageLabelDriftBeforeDockerMutation(t *testing.T
 }
 
 func TestGeneratedRuntimeRejectsImageComponentDriftBeforeDockerMutation(t *testing.T) {
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	program.image = func(image imageInspection) imageInspection {
 		image.Labels["io.rig.component"] = "other-component"
 		return image
@@ -186,7 +187,7 @@ func TestGeneratedRuntimeRejectsImageComponentDriftBeforeDockerMutation(t *testi
 }
 
 func TestGeneratedRuntimeRejectsImageRoleDriftBeforeDockerMutation(t *testing.T) {
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	program.image = func(image imageInspection) imageInspection {
 		image.Labels["io.rig.role"] = RoleStatic
 		return image
@@ -205,7 +206,7 @@ func TestGeneratedRuntimeOmitsEnvironmentFileWhenConfigurationIsEmpty(t *testing
 	spec.Environment = nil
 	spec.EnvironmentOperationID = ""
 	spec.EnvironmentOperationAttempt = 0
-	session, _, invocation := newPreparedRuntimeCandidate(t, spec, defaultLimits(), nil)
+	session, _, invocation := newPreparedRuntimeCandidate(t, spec, defaultLimits(), fixedDomainCapacity{})
 	if _, err := session.execution.CreateAndRecord(invocation); err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +223,7 @@ func TestGeneratedRuntimeStagesEnvironmentFileForExplicitEmptyPublicValue(t *tes
 		Sensitivity: appconfig.SensitivityPublic,
 		Value:       &empty,
 	}}
-	session, _, invocation := newPreparedRuntimeCandidateWithConfiguration(t, candidateSpec(), defaultLimits(), nil, entries)
+	session, _, invocation := newPreparedRuntimeCandidateWithConfiguration(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{}, entries)
 	if _, err := session.execution.CreateAndRecord(invocation); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +238,9 @@ func TestGeneratedRuntimeStagesEnvironmentFileForExplicitEmptyPublicValue(t *tes
 }
 
 func TestGeneratedRuntimeRejectsCapacityBeforeDockerMutation(t *testing.T) {
-	session := newRuntimeCandidateSession(t, candidateSpec(), defaultLimits(), fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 1, DiskAvailableBytes: 1}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	spec := candidateSpec()
+	spec.ActiveSlot = ""
+	session := newRuntimeCandidateSession(t, spec, defaultLimits(), fixedDomainCapacity{memory: 1, disk: 1}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		t.Fatalf("capacity rejection reached Docker: %#v", request.Args)
 		return runtimeRequestResult{}
 	})
@@ -248,13 +251,20 @@ func TestGeneratedRuntimeRejectsCapacityBeforeDockerMutation(t *testing.T) {
 	if len(session.runner.requests) != 0 {
 		t.Fatalf("capacity rejection reached Docker: %d requests", len(session.runner.requests))
 	}
+	for _, command := range []string{"container create", "container start", "container rm", "network create"} {
+		if countRuntimeRequests(session.runner.requests, command) != 0 {
+			t.Fatalf("shared-domain capacity rejection reached %s", command)
+		}
+	}
 }
 
 func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
 	limits := defaultLimits()
 	limits.LogSize = "50m"
 	limits.LogFiles = 10
-	session := newRuntimeCandidateSession(t, candidateSpec(), limits, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 550 << 20}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	spec := candidateSpec()
+	spec.ActiveSlot = ""
+	session := newRuntimeCandidateSession(t, spec, limits, fixedDomainCapacity{memory: 4 << 30, disk: 550 << 20}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		t.Fatalf("under-reserved replacement reached Docker: %#v", request.Args)
 		return runtimeRequestResult{}
 	})
@@ -267,13 +277,13 @@ func TestGeneratedRuntimeDerivesDiskAdmissionFromMaximumLogs(t *testing.T) {
 }
 
 func TestGeneratedRuntimeRequiresTwoLocalLogFiles(t *testing.T) {
-	root := t.TempDir()
-	config := filepath.Join(root, "docker-config")
-	if err := os.Mkdir(config, 0o700); err != nil {
+	root := generateddomain.NewRetainedRoot(t)
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
+	if err != nil {
 		t.Fatal(err)
 	}
 	options := EngineOptions{
-		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
+		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
 		CommandTimeout: time.Second, HealthTimeout: time.Second, HealthPollInterval: 100 * time.Millisecond,
 		OutputLimit: 1024, Limits: defaultLimits(), ReplacementDiskBytes: 1 << 30,
 	}
@@ -293,20 +303,14 @@ func TestGeneratedRuntimeRequiresTwoLocalLogFiles(t *testing.T) {
 		}
 	}
 
-	engine, err := NewEngine(
-		&runtimeFakeRunner{run: func(runtimeprocess.CommandRequest) runtimeRequestResult { return runtimeRequestResult{} }},
-		&runtimeFakeEnvironment{path: filepath.Join(root, "runtime.env")},
-		fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}},
-		newConfiguredRuntimeDeployments(t, root),
-		EngineOptions{
-			DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: config, WorkingDirectory: root,
-			CommandTimeout: time.Second, HealthTimeout: time.Second, HealthPollInterval: 100 * time.Millisecond,
-			OutputLimit: 1024, ReplacementDiskBytes: 1 << 30,
-		},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
+	runner := &runtimeFakeRunner{run: func(runtimeprocess.CommandRequest) runtimeRequestResult { return runtimeRequestResult{} }}
+	environment := &runtimeFakeEnvironment{path: filepath.Join(root, "runtime.env")}
+	fixture := newRuntimeDomainFixture(t, root, runner, environment, EngineOptions{
+		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
+		CommandTimeout: time.Second, HealthTimeout: time.Second, HealthPollInterval: 100 * time.Millisecond,
+		OutputLimit: 1024, ReplacementDiskBytes: 1 << 30,
+	}, generateddomain.Options{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30})
+	engine := fixture.engine
 	if engine.options.Limits.LogFiles != 3 {
 		t.Fatalf("default log files = %d, want 3", engine.options.Limits.LogFiles)
 	}
@@ -402,7 +406,7 @@ func TestGeneratedRuntimeRejectsUnsafeNextCacheRootAndTechnology(t *testing.T) {
 }
 
 func TestGeneratedRuntimeCreatedCandidateAllowsUnavailableNetworkUntilHealthCheck(t *testing.T) {
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	if _, err := session.execution.CreateAndRecord(invocation); err != nil {
 		t.Fatalf("created candidate rejected before runtime state materialized: %v", err)
 	}
@@ -457,7 +461,7 @@ func TestGeneratedRuntimeStopAndRemoveAllowsUnrealizedCreatedCandidate(t *testin
 }
 
 func TestGeneratedRuntimeStopAndRemoveRefusesReceiptOwnedCandidateBeforeDocker(t *testing.T) {
-	session, _, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, _, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	candidate := candidateForSpec(session.authority.spec)
 	if candidate.ContainerName != containerName(session.authority.spec.AppID, session.authority.spec.ComponentName, SlotGreen) || invocation.Identity().ReceiptID == "" {
 		t.Fatalf("test setup did not create a receipt-bound candidate: %+v", candidate)
@@ -547,7 +551,7 @@ func TestGeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork(t *test
 }
 
 func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testing.T) {
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	program.inspect = func(inspection generatedcontainer.Inspection) generatedcontainer.Inspection {
 		inspection.Privileged = true
 		return inspection
@@ -567,7 +571,7 @@ func TestGeneratedRuntimeCleansContainerThatFailsHardeningVerification(t *testin
 }
 
 func TestGeneratedRuntimeReconcilesAmbiguousCreateByDeterministicName(t *testing.T) {
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	program.create = func() runtimeRequestResult { return runtimeRequestResult{err: context.DeadlineExceeded} }
 	_, err := session.execution.CreateAndRecord(invocation)
 	if !IsCode(err, DiagnosticRuntimeTimeout) {
@@ -586,8 +590,10 @@ func TestGeneratedRuntimeReconcilesAmbiguousCreateByDeterministicName(t *testing
 
 func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t *testing.T) {
 	limits := defaultLimits()
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), limits,
-		fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: uint64(limits.MemoryBytes), DiskAvailableBytes: 1 << 30}})
+	spec := candidateSpec()
+	spec.ActiveSlot = ""
+	session, program, invocation := newPreparedRuntimeCandidate(t, spec, limits,
+		fixedDomainCapacity{memory: uint64(limits.MemoryBytes), disk: 1 << 30})
 	program.create = func() runtimeRequestResult { return runtimeRequestResult{err: context.DeadlineExceeded} }
 	program.inspect = func(inspection generatedcontainer.Inspection) generatedcontainer.Inspection {
 		inspection.Labels["io.rig.deployment"] = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -600,13 +606,13 @@ func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t
 	if err := session.execution.RemoveInactive(invocation); !IsCode(err, DiagnosticCandidateHardeningFailed) {
 		t.Fatalf("unproved ownership cleanup was accepted: %v", err)
 	}
-	competing, acquireErr := session.engine.capacity.acquire(session.authority.context, capacityRequest{
-		memory: uint64(limits.MemoryBytes), disk: session.engine.options.ReplacementDiskBytes,
-	})
+	competing, acquireErr := session.engine.candidates.ReserveRetainedCapacity(session.authority.context,
+		"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1)
 	if competing != nil {
-		competing.Release()
+		_ = session.engine.candidates.ReleaseRetainedCapacity(
+			"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", competing)
 	}
-	if !IsCode(acquireErr, DiagnosticInsufficientReplacementSpace) {
+	if !errors.Is(acquireErr, generatedcapacity.ErrInsufficientCapacity) {
 		t.Fatalf("unresolved candidate released admission to a competing replacement: %v", acquireErr)
 	}
 	for _, request := range session.runner.requests {
@@ -617,7 +623,7 @@ func TestGeneratedRuntimeFailsClosedWhenAmbiguousCreateOwnershipCannotBeProved(t
 }
 
 func TestGeneratedRuntimeReconcilesAmbiguousStart(t *testing.T) {
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	if _, err := session.execution.CreateAndRecord(invocation); err != nil {
 		t.Fatal(err)
 	}
@@ -648,7 +654,7 @@ func TestGeneratedRuntimeHealthWaitFailsClosed(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+			session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 			if _, err := session.execution.CreateAndRecord(invocation); err != nil {
 				t.Fatal(err)
 			}
@@ -678,7 +684,7 @@ func TestGeneratedRuntimeHealthWaitFailsClosed(t *testing.T) {
 }
 
 func TestGeneratedRuntimeRefusesNetworkOwnershipDrift(t *testing.T) {
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	program.network = func(network networkInspection) networkInspection {
 		network.Labels["io.rig.managed"] = "somebody-else"
 		return network
@@ -694,7 +700,7 @@ func TestGeneratedRuntimeRefusesNetworkOwnershipDrift(t *testing.T) {
 
 func TestGeneratedRuntimeErrorsNeverIncludeDockerOutput(t *testing.T) {
 	secret := "super-secret-docker-output"
-	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, program, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	program.image = func(image imageInspection) imageInspection {
 		return image
 	}
@@ -708,7 +714,7 @@ func TestGeneratedRuntimeErrorsNeverIncludeDockerOutput(t *testing.T) {
 }
 
 func TestGeneratedRuntimeRejectsUnavailableProtectedConfiguration(t *testing.T) {
-	session, _, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), nil)
+	session, _, invocation := newPreparedRuntimeCandidate(t, candidateSpec(), defaultLimits(), fixedDomainCapacity{})
 	session.environment.stageError = errors.New("stager unavailable")
 	if _, err := session.execution.CreateAndRecord(invocation); !IsCode(err, DiagnosticConfigurationUnavailable) {
 		t.Fatalf("expected protected configuration failure, got %v", err)
@@ -1070,16 +1076,15 @@ func containsEnvironmentValue(environment []string, value string) bool {
 
 func newRuntimeTestEngine(t *testing.T, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, CandidateSpec, context.Context) {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runner := &runtimeFakeRunner{run: run}
-	authority := newRuntimeNetworkAuthority(t, directories.WorkingDirectory, candidateSpec())
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "env")}, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, authority.repository, EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return engine, runner, authority.spec, authority.context
+	environment := &runtimeFakeEnvironment{path: filepath.Join(root, "env")}
+	options := EngineOptions{DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second}
+	fixture := newRuntimeDomainFixture(t, root, runner, environment, options, generateddomain.Options{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30})
+	authority := newRuntimeNetworkAuthority(t, fixture, candidateSpec())
+	return fixture.engine, runner, authority.spec, authority.context
 }

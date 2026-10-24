@@ -32,6 +32,7 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
@@ -39,6 +40,7 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
@@ -54,6 +56,9 @@ const (
 // transport journey with a single normal Notes API backed by the reviewed TLS
 // PostgreSQL fixture. It requires a disposable Linux Docker daemon.
 func TestLiveControllerLANDatabaseJourney(t *testing.T) {
+	if liveColdRuntimeRestartChildRequested(t, "RIG_RUN_LIVE_LAN_DATABASE") {
+		return
+	}
 	if os.Getenv("RIG_RUN_LIVE_LAN_DATABASE") != "1" {
 		t.Fatal("set RIG_RUN_LIVE_LAN_DATABASE=1 on a disposable Linux Docker host")
 	}
@@ -70,7 +75,7 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	lanTwoAppDockerPreflight(t, ctx, docker)
 	lanDatabaseDockerPreflight(t, ctx, docker)
 
-	root := t.TempDir()
+	root := newLiveColdRuntimeFixtureRoot(t)
 	dataRoot := filepath.Join(root, "controller")
 	if err := os.Mkdir(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -95,7 +100,21 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 		t.Fatal("stage immutable fixture source:", err)
 	}
 
-	db, err := database.Open(dataRoot)
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal("prepare LAN database controller directories:", err)
+	}
+	ownerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire LAN database controller owner:", err)
+	}
+	ownerLeaseClosed := false
+	defer func() {
+		if !ownerLeaseClosed {
+			_ = ownerLease.Close()
+		}
+	}()
+	db, err := database.OpenForGeneratedDomain(ctx, dataRoot, ownerLease)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,17 +161,28 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	settings := config.Defaults()
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
-	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
+	dependencies := runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &runtimeprocess.ExecRunner{}})
+	}
+	runner := &runtimeprocess.ExecRunner{}
+	options := runtimeCompositionOptions{
+		dockerExecutable: docker,
+		runner:           runner,
+		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
+	}
+	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, settings, dependencies, options)
+	if err != nil {
+		t.Fatal("construct LAN database generated domain:", err)
+	}
+	dependencies.generated = generated
+	composition, err := prepareRuntimeComposition(ctx, settings, dependencies, options)
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
 	}
 	access := appaccess.New(db)
 	grantTrace := &lanTwoAppGrantTrace{Manager: composition.ingress}
-	composition.ingress.TraceGatewayV2LANGrantForLiveDocker(grantTrace.recordDriver)
 	t.Cleanup(func() { grantTrace.logFailure(t) })
 	api := httptest.NewServer((&controller.Server{
 		Auth: authService, Apps: appStore, Jobs: jobStore, Machines: machineStore, Sources: sources,
@@ -395,73 +425,14 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 		t.Fatal("close controller database for reopen")
 	}
 	dbClosed = true
-
-	reopenedDB, err := database.Open(dataRoot)
-	if err != nil {
-		t.Fatal("reopen controller database:", err)
+	if err := ownerLease.Close(); err != nil {
+		t.Fatal("release controller owner before cold restart:", err)
 	}
-	defer reopenedDB.Close()
-	reopenedApps := apps.New(reopenedDB)
-	reopenedJobs, reopenedBindings, err := newDeploymentJobService(reopenedDB)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedConfiguration, err := appconfig.New(reopenedDB, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedPlans, err := deploymentplans.New(reopenedDB, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedSources := sourceconnections.NewService(sourceconnections.NewRepository(reopenedDB), provider, sourceconnections.NewFileCredentialStore(dataRoot), "fixture-app", time.Now)
-	reopenedSnapshots, err := releasesnapshot.New(reopenedDB, reopenedSources, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedDeployments := deployments.New(reopenedDB)
-	reopenedEffectsWorkingDirectory, reopenedScopedAdmission := liveDeploymentExecutionFixture(t, reopenedDB, dataRoot)
-	reopenedComposition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
-		db: reopenedDB, applications: reopenedApps, snapshots: reopenedSnapshots, configuration: reopenedConfiguration,
-		deployments: reopenedDeployments, plans: reopenedPlans, bindings: reopenedBindings,
-		effectsWorkingDirectory: reopenedEffectsWorkingDirectory,
-	}, runtimeCompositionOptions{dockerExecutable: docker, runner: &runtimeprocess.ExecRunner{}})
-	if err != nil {
-		t.Fatal("reopen production runtime:", err)
-	}
-	reopenedAccess := appaccess.New(reopenedDB)
-	reopenedGrantTrace := &lanTwoAppGrantTrace{Manager: reopenedComposition.ingress}
-	reopenedComposition.ingress.TraceGatewayV2LANGrantForLiveDocker(reopenedGrantTrace.recordDriver)
-	t.Cleanup(func() { reopenedGrantTrace.logFailure(t) })
-	reopenedAPI := httptest.NewServer((&controller.Server{
-		Auth: auth.New(reopenedDB), Apps: reopenedApps, Jobs: reopenedJobs, Machines: machines.New(reopenedDB), Sources: reopenedSources,
-		Configuration: reopenedConfiguration, Deployments: reopenedDeployments, DeploymentPlans: reopenedPlans,
-		GeneratedIngress: reopenedComposition.ingress, GeneratedRuntimeState: reopenedComposition.state,
-		GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot,
-		GatewayProfiles: reopenedAccess, GatewayUpgrades: reopenedAccess, GatewayUpgradeRuntime: reopenedComposition.ingress,
-		AppAccess: reopenedAccess, AppGrants: reopenedAccess, LANGrantRuntime: reopenedGrantTrace,
-		AppDisables: reopenedAccess, LANDisableRuntime: reopenedComposition.ingress,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}).Handler())
-	defer reopenedAPI.Close()
-	reopenedWorkerContext, stopReopenedWorker := context.WithCancel(ctx)
-	reopenedDone, err := prepareRuntimeWorker(reopenedWorkerContext, runtimeRecovery{
-		recoverState: reopenedJobs.RecoverRuntimeContext,
-	}, reopenedComposition.executor, func(workerContext context.Context, executor jobs.Executor) error {
-		return reopenedJobs.RunWorkerWithScopedAdmission(workerContext, executor, reopenedScopedAdmission)
-	}, func(error) {})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		stopReopenedWorker()
-		select {
-		case <-reopenedDone:
-		case <-time.After(10 * time.Second):
-			t.Error("reopened deployment worker did not stop")
-		}
-	}()
-	request.base = reopenedAPI.URL
+	ownerLeaseClosed = true
+	cold := startLiveColdRuntimeRestartChild(t, ctx, "TestLiveControllerLANDatabaseJourney", liveColdRuntimeRestartManifest{
+		Mode: liveColdRuntimeLAN, DataRoot: dataRoot, Source: source, Docker: docker,
+	})
+	request.base = cold.url
 	reopenedURL := lanDatabaseAttestedURL(t, &request, application.id, selected.IPv4, port)
 	if reopenedURL != routeURL {
 		t.Fatal("fresh controller reopen did not recover the committed LAN URL")
@@ -473,6 +444,7 @@ func TestLiveControllerLANDatabaseJourney(t *testing.T) {
 	lanDatabaseAssertScopedContainers(t, ctx, docker, application.id, network.Name, gateway, dbURL, caBase64, sentinel)
 	lanDatabaseAssertFrontendSecretsAbsent(t, ctx, reopenedURL, "lan-database-v2", dbURL, caBase64, sentinel)
 	lanDatabaseAssertNote(t, ctx, reopenedURL, note)
+	cold.stop()
 	t.Logf("M3 LAN database journey: app=%s initial-deployment=%s replacement-deployment=%s database-container=%s database-volume=%s LAN=%s note-id=%s", application.id, application.deploymentID, replacementDeploymentID, fixtureIdentity.postgresContainerID, fixtureIdentity.postgresVolumeName, reopenedURL, note.ID)
 }
 

@@ -1,13 +1,345 @@
 package generatedingress
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/database"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
+
+const (
+	liveGatewayRebindStoppedStageReplayEnvironment = "RIG_TEST_STOPPED_STAGE_REPLAY_CHILD"
+	liveGatewayRebindStoppedStageReplayTest        = "TestLiveGatewayRebindStoppedStageContainerReplayChild"
+	liveGatewayRebindStoppedStageReplayPurpose     = "hostd/test/generated-ingress/stopped-stage-replay/v1"
+	liveGatewayRebindStoppedStageReplayMarker      = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_OK:sequence=6:no-create"
+	liveGatewayRebindStoppedStageFailurePrefix     = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_FAILED:"
+	liveGatewayRebindStoppedStageManifestLimit     = 8 << 10
+	liveGatewayRebindStoppedStageOutputLimit       = 64 << 10
+)
+
+type liveGatewayRebindStoppedStageReplayManifest struct {
+	Version               int    `json:"version"`
+	Purpose               string `json:"purpose"`
+	FixtureRoot           string `json:"fixtureRoot"`
+	ControlDirectory      string `json:"controlDirectory"`
+	DataRoot              string `json:"dataRoot"`
+	WorkingDirectory      string `json:"workingDirectory"`
+	DockerExecutable      string `json:"dockerExecutable"`
+	DockerConfigDirectory string `json:"dockerConfigDirectory"`
+	OperationID           string `json:"operationId"`
+	HostPort              uint16 `json:"hostPort"`
+}
+
+type liveGatewayRebindStoppedStageReplayDriver struct {
+	managerGatewayRebindStageContainerDriver
+	createCalls int
+}
+
+type liveGatewayRebindStoppedStageOutputCapture struct {
+	mu       sync.Mutex
+	body     []byte
+	overflow bool
+}
+
+func (c *liveGatewayRebindStoppedStageOutputCapture) Write(body []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	remaining := liveGatewayRebindStoppedStageOutputLimit - len(c.body)
+	if remaining > 0 {
+		count := len(body)
+		if count > remaining {
+			count = remaining
+		}
+		c.body = append(c.body, body[:count]...)
+	}
+	if len(body) > remaining {
+		c.overflow = true
+	}
+	return len(body), nil
+}
+
+func (c *liveGatewayRebindStoppedStageOutputCapture) result() ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]byte(nil), c.body...), c.overflow
+}
+
+func (d *liveGatewayRebindStoppedStageReplayDriver) create(context.Context,
+	gatewayRebindProtectedIntent, gatewayRebindStageIntent,
+) (string, error) {
+	d.createCalls++
+	return "", errors.New("stopped-stage replay attempted container creation")
+}
+
+func liveGatewayRebindStoppedStageExactDirectory(path string) bool {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path ||
+		(runtime.GOOS != "windows" && securetemp.ValidatePrivateDirectory(path) != nil) {
+		return false
+	}
+	info, err := os.Lstat(path)
+	return err == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 &&
+		!generatedIngressPathIsReparsePoint(path)
+}
+
+func validLiveGatewayRebindStoppedStageReplayManifest(value liveGatewayRebindStoppedStageReplayManifest,
+	manifestPath, expectedDocker string,
+) bool {
+	if value.Version != 1 || value.Purpose != liveGatewayRebindStoppedStageReplayPurpose ||
+		!validCanonicalUUID(value.OperationID) || value.HostPort == 0 ||
+		manifestPath == "" || !filepath.IsAbs(manifestPath) || filepath.Clean(manifestPath) != manifestPath ||
+		filepath.Base(manifestPath) != "manifest.json" || filepath.Dir(manifestPath) != value.ControlDirectory ||
+		value.DockerExecutable == "" || value.DockerExecutable != expectedDocker ||
+		!filepath.IsAbs(expectedDocker) || filepath.Clean(expectedDocker) != expectedDocker {
+		return false
+	}
+	if filepath.Dir(value.ControlDirectory) != value.FixtureRoot ||
+		!strings.HasPrefix(filepath.Base(value.ControlDirectory), "stopped-stage-replay-") ||
+		value.DataRoot != filepath.Join(value.FixtureRoot, "ingress-state") {
+		return false
+	}
+	runtimeRoot := filepath.Join(value.DataRoot, "runtime")
+	builderRoot := filepath.Join(runtimeRoot, "generated-builder")
+	if value.WorkingDirectory != filepath.Join(builderRoot, "controller-working") ||
+		value.DockerConfigDirectory != filepath.Join(builderRoot, "controller-docker-config") {
+		return false
+	}
+	for _, directory := range []string{
+		value.FixtureRoot, value.ControlDirectory, value.DataRoot, runtimeRoot, builderRoot,
+		value.WorkingDirectory, value.DockerConfigDirectory,
+	} {
+		if !liveGatewayRebindStoppedStageExactDirectory(directory) {
+			return false
+		}
+	}
+	dockerInfo, err := os.Stat(expectedDocker)
+	return err == nil && dockerInfo.Mode().IsRegular()
+}
+
+func rejectLiveGatewayRebindStoppedStageManifestKeys(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return errors.New("stopped-stage replay manifest is not an object")
+	}
+	expected := map[string]struct{}{
+		"version": {}, "purpose": {}, "fixtureRoot": {}, "controlDirectory": {}, "dataRoot": {},
+		"workingDirectory": {}, "dockerExecutable": {}, "dockerConfigDirectory": {},
+		"operationId": {}, "hostPort": {},
+	}
+	seen := make(map[string]struct{}, len(expected))
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return errors.New("stopped-stage replay manifest key is invalid")
+		}
+		if _, ok := expected[key]; !ok {
+			return errors.New("stopped-stage replay manifest key is unknown")
+		}
+		if _, ok := seen[key]; ok {
+			return errors.New("stopped-stage replay manifest key is duplicated")
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return errors.New("stopped-stage replay manifest value is invalid")
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') || len(seen) != len(expected) {
+		return errors.New("stopped-stage replay manifest object is incomplete")
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("stopped-stage replay manifest has trailing input")
+	}
+	return nil
+}
+
+func writeLiveGatewayRebindStoppedStageManifestFile(path string, body []byte) error {
+	if len(body) == 0 || len(body) > liveGatewayRebindStoppedStageManifestLimit {
+		return errors.New("stopped-stage replay manifest body is invalid")
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return errors.New("create stopped-stage replay manifest")
+	}
+	written, writeErr := file.Write(body)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil || written != len(body) {
+		return errors.New("write stopped-stage replay manifest")
+	}
+	return nil
+}
+
+func writeLiveGatewayRebindStoppedStageReplayManifest(value liveGatewayRebindStoppedStageReplayManifest,
+	expectedDocker string,
+) (string, error) {
+	path := filepath.Join(value.ControlDirectory, "manifest.json")
+	if !validLiveGatewayRebindStoppedStageReplayManifest(value, path, expectedDocker) {
+		return "", errors.New("stopped-stage replay manifest is invalid")
+	}
+	body, err := json.Marshal(value)
+	if err != nil || rejectLiveGatewayRebindStoppedStageManifestKeys(body) != nil {
+		return "", errors.New("encode stopped-stage replay manifest")
+	}
+	if err := writeLiveGatewayRebindStoppedStageManifestFile(path, body); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func readLiveGatewayRebindStoppedStageReplayManifest(path, expectedDocker string) (
+	liveGatewayRebindStoppedStageReplayManifest, error,
+) {
+	var value liveGatewayRebindStoppedStageReplayManifest
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path ||
+		filepath.Base(path) != "manifest.json" {
+		return value, errors.New("stopped-stage replay manifest path is invalid")
+	}
+	directory := filepath.Dir(path)
+	if !liveGatewayRebindStoppedStageExactDirectory(directory) {
+		return value, errors.New("stopped-stage replay control directory is invalid")
+	}
+	directoryInfo, err := os.Lstat(directory)
+	if err != nil {
+		return value, errors.New("stopped-stage replay control directory is unavailable")
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil || !pathInfo.Mode().IsRegular() || pathInfo.Mode()&os.ModeSymlink != 0 ||
+		generatedIngressPathIsReparsePoint(path) ||
+		(runtime.GOOS != "windows" && pathInfo.Mode().Perm()&0o077 != 0) {
+		return value, errors.New("stopped-stage replay manifest file is invalid")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return value, errors.New("stopped-stage replay manifest cannot be opened")
+	}
+	openedInfo, statErr := file.Stat()
+	if statErr != nil || !os.SameFile(pathInfo, openedInfo) {
+		_ = file.Close()
+		return value, errors.New("stopped-stage replay manifest identity changed")
+	}
+	body, readErr := io.ReadAll(io.LimitReader(file, liveGatewayRebindStoppedStageManifestLimit+1))
+	closeErr := file.Close()
+	currentInfo, currentErr := os.Lstat(path)
+	currentDirectoryInfo, directoryErr := os.Lstat(directory)
+	if readErr != nil || closeErr != nil || len(body) == 0 || len(body) > liveGatewayRebindStoppedStageManifestLimit ||
+		currentErr != nil || !os.SameFile(pathInfo, currentInfo) || directoryErr != nil ||
+		!os.SameFile(directoryInfo, currentDirectoryInfo) || rejectLiveGatewayRebindStoppedStageManifestKeys(body) != nil {
+		return value, errors.New("stopped-stage replay manifest read is invalid")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&value) != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+		!validLiveGatewayRebindStoppedStageReplayManifest(value, path, expectedDocker) {
+		return liveGatewayRebindStoppedStageReplayManifest{}, errors.New("stopped-stage replay manifest is invalid")
+	}
+	return value, nil
+}
+
+func liveGatewayRebindStoppedStageChildEnvironment(manifest string) []string {
+	values := make([]string, 0, len(os.Environ())+1)
+	for _, value := range os.Environ() {
+		key, _, _ := strings.Cut(value, "=")
+		if key != liveGatewayRebindStoppedStageReplayEnvironment {
+			values = append(values, value)
+		}
+	}
+	if manifest != "" {
+		values = append(values, liveGatewayRebindStoppedStageReplayEnvironment+"="+manifest)
+	}
+	return values
+}
+
+func liveGatewayRebindStoppedStageChildCompleted(output []byte) bool {
+	if len(output) == 0 || len(output) > liveGatewayRebindStoppedStageOutputLimit {
+		return false
+	}
+	lines := bytes.Split(output, []byte{'\n'})
+	if len(lines) > 64 {
+		return false
+	}
+	markerCount := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(string(line))
+		if trimmed == liveGatewayRebindStoppedStageReplayMarker {
+			markerCount++
+		} else if strings.Contains(trimmed, "GATEWAY_REBIND_STOPPED_STAGE_REPLAY") {
+			return false
+		}
+	}
+	return markerCount == 1 &&
+		bytes.Contains(output, []byte("--- PASS: "+liveGatewayRebindStoppedStageReplayTest+" ")) &&
+		!bytes.Contains(output, []byte("--- FAIL:")) && !bytes.Contains(output, []byte("--- SKIP:"))
+}
+
+func liveGatewayRebindStoppedStageChildFailure(output []byte) string {
+	if len(output) == 0 || len(output) > liveGatewayRebindStoppedStageOutputLimit {
+		return "unknown"
+	}
+	lines := bytes.Split(output, []byte{'\n'})
+	if len(lines) > 64 {
+		return "unknown"
+	}
+	known := map[string]struct{}{
+		"environment": {}, "manifest": {}, "database": {}, "manager": {}, "source": {},
+		"replay": {}, "create": {}, "history": {}, "physical": {}, "receipt": {},
+	}
+	result := ""
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(string(line))
+		stage, found := strings.CutPrefix(trimmed, liveGatewayRebindStoppedStageFailurePrefix)
+		if !found {
+			continue
+		}
+		if _, ok := known[stage]; !ok {
+			return "unknown"
+		}
+		if result != "" {
+			return "ambiguous"
+		}
+		result = stage
+	}
+	if result == "" {
+		return "unknown"
+	}
+	return result
+}
+
+func failLiveGatewayRebindStoppedStageChild(t *testing.T, stage, message string) {
+	t.Helper()
+	fmt.Fprintln(os.Stderr, liveGatewayRebindStoppedStageFailurePrefix+stage)
+	t.Fatal(message)
+}
+
+func readLiveGatewayRebindStoppedStageProgressBytes(history gatewayRebindProtectedIntentHistory) ([][]byte, error) {
+	result := make([][]byte, len(history.Progress))
+	for index, progress := range history.Progress {
+		body, err := os.ReadFile(progress.Store.path)
+		if err != nil {
+			return nil, errors.New("read stopped-stage protected progress")
+		}
+		result[index] = body
+	}
+	return result, nil
+}
 
 func equalGatewayRebindStageContainerSnapshot(intent gatewayRebindProtectedIntent,
 	stage gatewayRebindStageIntent, binding *gatewayRebindStageContainerBinding,
@@ -20,6 +352,342 @@ func equalGatewayRebindStageContainerSnapshot(intent gatewayRebindProtectedInten
 	physical.StageContainer.Mounts = canonicalGatewayRebindTypedMounts(physical.StageContainer.Mounts)
 	replayed.StageContainer.Mounts = canonicalGatewayRebindTypedMounts(replayed.StageContainer.Mounts)
 	return reflect.DeepEqual(physical, replayed)
+}
+
+func runLiveGatewayRebindStoppedStageReplayChild(t *testing.T, fixture *liveGatewayV2Fixture,
+	intent gatewayRebindProtectedIntent,
+) {
+	t.Helper()
+	control, err := os.MkdirTemp(fixture.root, "stopped-stage-replay-")
+	if err != nil || os.Chmod(control, 0o700) != nil {
+		t.Fatal("create private stopped-stage replay control directory")
+	}
+	value := liveGatewayRebindStoppedStageReplayManifest{
+		Version: 1, Purpose: liveGatewayRebindStoppedStageReplayPurpose,
+		FixtureRoot: fixture.root, ControlDirectory: control,
+		DataRoot: fixture.stateRoot, WorkingDirectory: fixture.ingress.options.WorkingDirectory,
+		DockerExecutable: fixture.docker, DockerConfigDirectory: fixture.dockerConfig,
+		OperationID: intent.OperationID, HostPort: fixture.ingress.options.HostPort,
+	}
+	manifest, err := writeLiveGatewayRebindStoppedStageReplayManifest(value, fixture.docker)
+	if err != nil {
+		t.Fatal("write private stopped-stage replay manifest")
+	}
+	command := exec.CommandContext(fixture.ctx, os.Args[0],
+		"-test.run=^"+liveGatewayRebindStoppedStageReplayTest+"$", "-test.count=1", "-test.v", "-test.timeout=10m")
+	command.Env = liveGatewayRebindStoppedStageChildEnvironment(manifest)
+	capture := &liveGatewayRebindStoppedStageOutputCapture{}
+	command.Stdout, command.Stderr = capture, capture
+	runErr := command.Run()
+	output, overflow := capture.result()
+	if runErr != nil || overflow || !liveGatewayRebindStoppedStageChildCompleted(output) {
+		t.Fatalf("fresh-process stopped-stage replay did not complete its exact closed protocol: stage=%s",
+			liveGatewayRebindStoppedStageChildFailure(output))
+	}
+}
+
+func TestLiveGatewayRebindStoppedStageContainerReplayChild(t *testing.T) {
+	path := os.Getenv(liveGatewayRebindStoppedStageReplayEnvironment)
+	if path == "" {
+		t.Skip("stopped-stage replay child requires a parent-owned manifest")
+	}
+	if os.Getenv("RIG_RUN_LIVE_GATEWAY_V2") != "1" || runtime.GOOS != "linux" ||
+		os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
+		failLiveGatewayRebindStoppedStageChild(t, "environment",
+			"stopped-stage replay child requires explicit local Linux Docker permission")
+	}
+	docker, err := exec.LookPath("docker")
+	if err == nil {
+		docker, err = filepath.Abs(docker)
+	}
+	value, manifestErr := readLiveGatewayRebindStoppedStageReplayManifest(path, docker)
+	if err != nil || manifestErr != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "manifest", "read exact private stopped-stage replay manifest")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	db, err := database.Open(value.DataRoot)
+	if err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "database", "open real SQLite for stopped-stage replay")
+	}
+	databaseOpen := true
+	defer func() {
+		if databaseOpen {
+			_ = db.Close()
+		}
+	}()
+	repository := appaccess.New(db)
+	runner := &runtimeprocess.ExecRunner{}
+	manager, err := New(runner, Options{
+		DataRoot: value.DataRoot, WorkingDirectory: value.WorkingDirectory,
+		DockerExecutable: value.DockerExecutable, DockerConfigDirectory: value.DockerConfigDirectory,
+		HostPort: value.HostPort, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
+		OutputLimit: liveDockerOutputLimit, RebindFenceCheck: repository.CheckGatewayRebindFence,
+		RebindCurrentStateRepository: repository,
+	})
+	if err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "manager", "construct fresh-process stopped-stage replay manager")
+	}
+	before, err := manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	if err != nil || len(before.Intents) != 1 || len(before.Progress) != 6 ||
+		before.Intents[0].Intent.OperationID != value.OperationID ||
+		before.Progress[5].Record.OperationID != value.OperationID || before.Progress[5].Record.Sequence != 6 ||
+		before.Progress[5].Record.Stage == nil || before.Progress[5].Record.Stage.StageContainer == nil {
+		failLiveGatewayRebindStoppedStageChild(t, "source",
+			"stopped-stage replay child did not select the exact sequence-six source")
+	}
+	beforeBytes, err := readLiveGatewayRebindStoppedStageProgressBytes(before)
+	if err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "history",
+			"read stopped-stage replay protected history bytes")
+	}
+	intent := before.Intents[0].Intent
+	stage := *before.Progress[5].Record.Stage
+	binding := stage.StageContainer
+	driver := &liveGatewayRebindStoppedStageReplayDriver{
+		managerGatewayRebindStageContainerDriver: managerGatewayRebindStageContainerDriver{manager: manager},
+	}
+	reads := liveGatewayRebindStageProductionReads(manager)
+	if err := manager.stageGatewayRebindSuccessorContainerWithDriver(ctx, repository, reads,
+		manager.inspectGatewayRebindDocker, driver, time.Now().UTC(), nil); err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "replay",
+			"production stopped-stage replay refused the exact sequence-six source")
+	}
+	if driver.createCalls != 0 {
+		failLiveGatewayRebindStoppedStageChild(t, "create",
+			"sequence-six stopped-stage replay dispatched a container create")
+	}
+	after, err := manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	afterBytes, bytesErr := readLiveGatewayRebindStoppedStageProgressBytes(after)
+	if err != nil || bytesErr != nil || !reflect.DeepEqual(before, after) ||
+		!reflect.DeepEqual(beforeBytes, afterBytes) {
+		failLiveGatewayRebindStoppedStageChild(t, "history",
+			"fresh-process stopped-stage replay changed protected history")
+	}
+	physical, err := driver.inspect(ctx, intent)
+	if err != nil || !validGatewayRebindStageContainerObservation(intent, stage, physical, binding) ||
+		!validOwnedNameSet(physical.OwnedContainers, intent.Intent.Identity.StageContainer) {
+		failLiveGatewayRebindStoppedStageChild(t, "physical",
+			"fresh-process stopped-stage replay did not retain exact physical proof")
+	}
+	delta, err := readGatewayRebindStageContainerPhysicalObservation(ctx, reads, driver, intent, stage, binding)
+	if err != nil || delta.StageContainer == nil || *delta.StageContainer != *binding {
+		failLiveGatewayRebindStoppedStageChild(t, "receipt",
+			"fresh-process stopped-stage replay did not retain its exact physical receipt")
+	}
+	if err := db.Close(); err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "database", "close stopped-stage replay database")
+	}
+	databaseOpen = false
+	fmt.Println(liveGatewayRebindStoppedStageReplayMarker)
+}
+
+func newLiveGatewayRebindStoppedStageManifestFixture(t *testing.T) (
+	liveGatewayRebindStoppedStageReplayManifest, string,
+) {
+	t.Helper()
+	root := newLiveGatewayV2FixtureRoot(t)
+	dataRoot := filepath.Join(root, "ingress-state")
+	if err := os.Mkdir(dataRoot, 0o700); err != nil {
+		t.Fatal("create stopped-stage protocol data root")
+	}
+	builder, err := securetemp.NewGeneratedBuilderDirectory(dataRoot)
+	if err != nil {
+		t.Fatal("create stopped-stage protocol builder root")
+	}
+	dockerConfig, err := builder.EnsureDirectory("controller-docker-config")
+	if err != nil {
+		t.Fatal("create stopped-stage protocol Docker config")
+	}
+	working, err := builder.EnsureDirectory("controller-working")
+	if err != nil {
+		t.Fatal("create stopped-stage protocol working directory")
+	}
+	docker := filepath.Join(root, "docker")
+	if err := os.WriteFile(docker, []byte("fixture"), 0o700); err != nil {
+		t.Fatal("create stopped-stage protocol Docker executable")
+	}
+	control, err := os.MkdirTemp(root, "stopped-stage-replay-")
+	if err != nil || os.Chmod(control, 0o700) != nil {
+		t.Fatal("create stopped-stage protocol control directory")
+	}
+	return liveGatewayRebindStoppedStageReplayManifest{
+		Version: 1, Purpose: liveGatewayRebindStoppedStageReplayPurpose,
+		FixtureRoot: root, ControlDirectory: control, DataRoot: dataRoot,
+		WorkingDirectory: working, DockerExecutable: docker, DockerConfigDirectory: dockerConfig,
+		OperationID: "d3333333-3333-4333-8333-333333333333", HostPort: 23456,
+	}, docker
+}
+
+func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
+	t.Run("exact private manifest", func(t *testing.T) {
+		value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
+		path := filepath.Join(value.ControlDirectory, "manifest.json")
+		if value.Version != 1 || value.Purpose != liveGatewayRebindStoppedStageReplayPurpose ||
+			!validCanonicalUUID(value.OperationID) || value.HostPort == 0 || !filepath.IsAbs(docker) {
+			t.Fatal("exact stopped-stage replay scalar fixture is invalid")
+		}
+		for index, directory := range []string{
+			value.FixtureRoot, value.ControlDirectory, value.DataRoot,
+			filepath.Join(value.DataRoot, "runtime"), filepath.Join(value.DataRoot, "runtime", "generated-builder"),
+			value.WorkingDirectory, value.DockerConfigDirectory,
+		} {
+			if !liveGatewayRebindStoppedStageExactDirectory(directory) {
+				t.Fatalf("exact stopped-stage replay directory %d is invalid", index)
+			}
+		}
+		var err error
+		path, err = writeLiveGatewayRebindStoppedStageReplayManifest(value, docker)
+		got, readErr := readLiveGatewayRebindStoppedStageReplayManifest(path, docker)
+		if err != nil || readErr != nil || got != value {
+			t.Fatalf("exact stopped-stage replay manifest did not round trip: write=%v read=%v", err, readErr)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{name: "unknown field", mutate: func(body []byte) []byte {
+			return bytes.Replace(body, []byte(`"hostPort":23456}`), []byte(`"hostPort":23456,"unknown":true}`), 1)
+		}},
+		{name: "duplicate field", mutate: func(body []byte) []byte {
+			return bytes.Replace(body, []byte(`"version":1`), []byte(`"version":1,"version":1`), 1)
+		}},
+		{name: "case folded field", mutate: func(body []byte) []byte {
+			return bytes.Replace(body, []byte(`"version":1`), []byte(`"Version":1`), 1)
+		}},
+		{name: "wrong field type", mutate: func(body []byte) []byte {
+			return bytes.Replace(body, []byte(`"hostPort":23456`), []byte(`"hostPort":"23456"`), 1)
+		}},
+		{name: "trailing input", mutate: func(body []byte) []byte { return append(body, []byte(` {}`)...) }},
+		{name: "malformed input", mutate: func([]byte) []byte { return []byte(`{"version":`) }},
+		{name: "oversized input", mutate: func([]byte) []byte {
+			return bytes.Repeat([]byte{'x'}, liveGatewayRebindStoppedStageManifestLimit+1)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
+			body, err := json.Marshal(value)
+			path := filepath.Join(value.ControlDirectory, "manifest.json")
+			candidate := test.mutate(body)
+			writeErr := writeLiveGatewayRebindStoppedStageManifestFile(path, candidate)
+			if test.name == "oversized input" {
+				writeErr = os.WriteFile(path, candidate, 0o600)
+			}
+			if err != nil || writeErr != nil {
+				t.Fatal("write invalid stopped-stage replay manifest fixture")
+			}
+			if _, err := readLiveGatewayRebindStoppedStageReplayManifest(path, docker); err == nil {
+				t.Fatal("invalid stopped-stage replay manifest was accepted")
+			}
+		})
+	}
+
+	t.Run("crossed data root", func(t *testing.T) {
+		value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
+		value.DataRoot = t.TempDir()
+		body, err := json.Marshal(value)
+		path := filepath.Join(value.ControlDirectory, "manifest.json")
+		if err != nil || writeLiveGatewayRebindStoppedStageManifestFile(path, body) != nil {
+			t.Fatal("write crossed stopped-stage replay manifest fixture")
+		}
+		if _, err := readLiveGatewayRebindStoppedStageReplayManifest(path, docker); err == nil {
+			t.Fatal("crossed stopped-stage replay manifest was accepted")
+		}
+	})
+
+	if runtime.GOOS != "windows" {
+		t.Run("broad fixture root is refused without repair", func(t *testing.T) {
+			value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
+			if err := os.Chmod(value.FixtureRoot, 0o755); err != nil {
+				t.Fatal("broaden stopped-stage replay fixture root")
+			}
+			path := filepath.Join(value.ControlDirectory, "manifest.json")
+			if _, err := writeLiveGatewayRebindStoppedStageReplayManifest(value, docker); err == nil {
+				t.Fatal("broad stopped-stage replay fixture root was accepted")
+			}
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				t.Fatal("refused stopped-stage replay manifest was created")
+			}
+			info, err := os.Stat(value.FixtureRoot)
+			if err != nil || info.Mode().Perm() != 0o755 {
+				t.Fatal("stopped-stage replay manifest writer repaired a broad fixture root")
+			}
+		})
+
+		t.Run("broad control directory is refused without repair", func(t *testing.T) {
+			value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
+			path, err := writeLiveGatewayRebindStoppedStageReplayManifest(value, docker)
+			if err != nil || os.Chmod(value.ControlDirectory, 0o755) != nil {
+				t.Fatal("broaden stopped-stage replay control directory")
+			}
+			if _, err := readLiveGatewayRebindStoppedStageReplayManifest(path, docker); err == nil {
+				t.Fatal("broad stopped-stage replay control directory was accepted")
+			}
+			info, err := os.Stat(value.ControlDirectory)
+			if err != nil || info.Mode().Perm() != 0o755 {
+				t.Fatal("stopped-stage replay manifest reader repaired a broad control directory")
+			}
+		})
+	}
+
+	pass := "=== RUN   " + liveGatewayRebindStoppedStageReplayTest + "\n" +
+		liveGatewayRebindStoppedStageReplayMarker + "\n--- PASS: " +
+		liveGatewayRebindStoppedStageReplayTest + " (0.01s)\nPASS\n"
+	for _, test := range []struct {
+		name   string
+		output []byte
+		want   bool
+	}{
+		{name: "exact", output: []byte(pass), want: true},
+		{name: "missing marker", output: []byte(strings.Replace(pass, liveGatewayRebindStoppedStageReplayMarker+"\n", "", 1))},
+		{name: "duplicate marker", output: []byte(strings.Replace(pass, liveGatewayRebindStoppedStageReplayMarker+"\n", liveGatewayRebindStoppedStageReplayMarker+"\n"+liveGatewayRebindStoppedStageReplayMarker+"\n", 1))},
+		{name: "tainted marker", output: []byte(strings.Replace(pass, liveGatewayRebindStoppedStageReplayMarker, liveGatewayRebindStoppedStageReplayMarker+":private", 1))},
+		{name: "skip", output: []byte(strings.Replace(pass, "--- PASS:", "--- SKIP:", 1))},
+		{name: "fail", output: []byte(strings.Replace(pass, "--- PASS:", "--- FAIL:", 1))},
+		{name: "failure token", output: []byte(strings.Replace(pass, liveGatewayRebindStoppedStageReplayMarker,
+			liveGatewayRebindStoppedStageFailurePrefix+"manifest", 1))},
+		{name: "oversized", output: bytes.Repeat([]byte{'x'}, liveGatewayRebindStoppedStageOutputLimit+1)},
+	} {
+		t.Run("marker "+test.name, func(t *testing.T) {
+			if got := liveGatewayRebindStoppedStageChildCompleted(test.output); got != test.want {
+				t.Fatalf("closed stopped-stage replay marker accepted=%t want=%t", got, test.want)
+			}
+		})
+	}
+	for _, test := range []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{name: "exact", output: liveGatewayRebindStoppedStageFailurePrefix + "manifest\n", want: "manifest"},
+		{name: "crossed", output: liveGatewayRebindStoppedStageFailurePrefix + "manifest\n" +
+			liveGatewayRebindStoppedStageFailurePrefix + "database\n", want: "ambiguous"},
+		{name: "tainted", output: liveGatewayRebindStoppedStageFailurePrefix + "manifest:private\n", want: "unknown"},
+		{name: "malformed", output: liveGatewayRebindStoppedStageFailurePrefix + "private\n", want: "unknown"},
+		{name: "absent", output: "private\n", want: "unknown"},
+	} {
+		t.Run("failure "+test.name, func(t *testing.T) {
+			if got := liveGatewayRebindStoppedStageChildFailure([]byte(test.output)); got != test.want {
+				t.Fatalf("closed stopped-stage replay failure=%q want=%q", got, test.want)
+			}
+		})
+	}
+	t.Run("capture refuses overflow", func(t *testing.T) {
+		capture := &liveGatewayRebindStoppedStageOutputCapture{}
+		first := bytes.Repeat([]byte{'x'}, liveGatewayRebindStoppedStageOutputLimit)
+		if written, err := capture.Write(first); err != nil || written != len(first) {
+			t.Fatal("bounded stopped-stage child capture refused in-bound output")
+		}
+		if written, err := capture.Write([]byte{'x'}); err != nil || written != 1 {
+			t.Fatal("bounded stopped-stage child capture did not consume overflow")
+		}
+		body, overflow := capture.result()
+		if !overflow || len(body) != liveGatewayRebindStoppedStageOutputLimit {
+			t.Fatal("bounded stopped-stage child capture did not retain a closed overflow state")
+		}
+	})
 }
 
 // TestLiveGatewayRebindSuccessorStoppedStageContainer proves that the fourth
@@ -249,38 +917,31 @@ func TestLiveGatewayRebindSuccessorStoppedStageContainer(t *testing.T) {
 		t.Fatal("stopped-container creation changed the successor host topology or volume receipts")
 	}
 
-	restarted, err := New(fixture.runner, fixture.ingress.options)
-	if err != nil {
-		t.Fatal("restart generated ingress manager before stopped-container replay")
-	}
-	restartReads := liveGatewayRebindStageProductionReads(restarted)
-	if err := restarted.stageGatewayRebindSuccessorContainer(fixture.ctx, repository, restartReads,
-		restarted.inspectGatewayRebindDocker, baseTime.Add(6*time.Nanosecond), nil); err != nil {
-		failLiveIngress(t, "replay live rebind stopped successor container", err)
-	}
-	replayedHistory, err := restarted.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	runLiveGatewayRebindStoppedStageReplayChild(t, fixture, intent)
+	restartReads := liveGatewayRebindStageProductionReads(fixture.ingress)
+	replayedHistory, err := fixture.ingress.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil || !reflect.DeepEqual(boundHistory, replayedHistory) ||
 		!reflect.DeepEqual(boundBytes, liveGatewayRebindProgressBytes(t, replayedHistory)) {
 		t.Fatal("live stopped-container replay changed protected records or bytes")
 	}
-	replayedDriver := managerGatewayRebindStageContainerDriver{manager: restarted}
+	replayedDriver := managerGatewayRebindStageContainerDriver{manager: fixture.ingress}
 	replayed, err := replayedDriver.inspect(fixture.ctx, intent)
 	if err != nil {
-		t.Fatal("fresh-manager stopped-container replay inspection failed")
+		t.Fatal("fresh-process stopped-container replay inspection failed")
 	}
 	if !equalGatewayRebindStageContainerSnapshot(intent, *bound.Stage, containerBinding, physical, replayed) {
-		t.Fatal("fresh-manager stopped-container replay physical snapshot changed")
+		t.Fatal("fresh-process stopped-container replay physical snapshot changed")
 	}
 	if !validGatewayRebindStageContainerObservation(intent, *bound.Stage, replayed, containerBinding) {
-		t.Fatal("fresh-manager stopped-container replay exact binding proof failed")
+		t.Fatal("fresh-process stopped-container replay exact binding proof failed")
 	}
 	if !validOwnedNameSet(replayed.OwnedContainers, intent.Intent.Identity.StageContainer) {
-		t.Fatal("fresh-manager stopped-container replay owned-container census changed")
+		t.Fatal("fresh-process stopped-container replay owned-container census changed")
 	}
 	replayedDelta, err := readGatewayRebindStageContainerPhysicalObservation(
 		fixture.ctx, restartReads, replayedDriver, intent, *bound.Stage, containerBinding)
 	if err != nil || !reflect.DeepEqual(createdDelta, replayedDelta) {
-		t.Fatal("fresh-manager replay changed the stopped-container physical observation")
+		t.Fatal("fresh-process replay changed the stopped-container physical observation")
 	}
 
 	afterPrepared, err := repository.GatewayRebindStartupSnapshot(fixture.ctx)

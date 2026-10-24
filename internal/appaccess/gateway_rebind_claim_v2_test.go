@@ -25,7 +25,7 @@ func TestClaimGatewayRebindV2BindsCompleteRuntimeHeadsAtAdmission(t *testing.T) 
 			_ string, _ generatedruntimestate.ActiveHead,
 		) {
 			appID := addApps(t, fixture.db, 1)[0]
-			seedGatewayRebindActiveRuntime(t, fixture.db, appID)
+			seedHistoricalGatewayRebindActiveRuntime(t, fixture.db, appID)
 		}},
 		{name: "delete loopback head", mutate: func(t *testing.T, fixture gatewayRebindFixture,
 			loopbackID string, _ generatedruntimestate.ActiveHead,
@@ -37,15 +37,15 @@ func TestClaimGatewayRebindV2BindsCompleteRuntimeHeadsAtAdmission(t *testing.T) 
 		{name: "replace loopback head", mutate: func(t *testing.T, fixture gatewayRebindFixture,
 			_ string, loopbackHead generatedruntimestate.ActiveHead,
 		) {
-			redeployRuntimeHeadForRebindTest(t, fixture.db, loopbackHead)
+			redeployHistoricalRuntimeHeadForRebindTest(t, fixture.db, loopbackHead)
 		}},
 		{name: "equivalent timestamp zone", proposalTimeEquivalent: true},
 		{name: "wrong signed loopback timestamp", proposalTimeDrift: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+			fixture := newHistoricalGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 			loopbackID := addApps(t, fixture.db, 1)[0]
-			loopback := seedGatewayRebindActiveRuntime(t, fixture.db, loopbackID)
+			loopback := seedHistoricalGatewayRebindActiveRuntime(t, fixture.db, loopbackID)
 			finishGatewayRebindFixtureWork(t, fixture.db)
 			proposal := gatewayRebindV2ProposalForFixture(t, fixture)
 			before := append([]GatewayRebindRuntimeHead(nil), proposal.RuntimeHeads...)
@@ -69,6 +69,8 @@ func TestClaimGatewayRebindV2BindsCompleteRuntimeHeadsAtAdmission(t *testing.T) 
 				test.mutate(t, fixture, loopbackID, loopback)
 				finishGatewayRebindFixtureWork(t, fixture.db)
 			}
+			// Historical mutation completes before current-schema admission.
+			upgradeHistoricalGatewayDatabase(t, fixture.db)
 			after, err := fixture.repository.GatewayRebindRuntimeHeads(context.Background())
 			if err != nil {
 				t.Fatal(err)
@@ -172,6 +174,16 @@ func TestGatewayRebindRuntimeHeadHistoryIsSealedAndValidated(t *testing.T) {
 		head := proposal.RuntimeHeads[0]
 		if _, err := fixture.db.Exec(`UPDATE generated_runtime_active_heads
 			SET generation=generation WHERE app_id=?`, head.AppID); err == nil ||
+			!strings.Contains(err.Error(), "generated runtime active head requires an exact activation receipt") {
+			t.Fatalf("active receipt guard=%v", err)
+		}
+		// This disposable negative fixture removes only the newer activation
+		// guard so the independently retained rebind fence remains observable.
+		if _, err := fixture.db.Exec(`DROP TRIGGER generated_runtime_active_head_activation_guard`); err != nil {
+			t.Fatal("drop active-head activation guard:", err)
+		}
+		if _, err := fixture.db.Exec(`UPDATE generated_runtime_active_heads
+			SET generation=generation WHERE app_id=?`, head.AppID); err == nil ||
 			!strings.Contains(err.Error(), "rebind fence is active") {
 			t.Fatalf("active live-head mutation=%v", err)
 		}
@@ -218,9 +230,10 @@ func TestGatewayRebindRuntimeHeadHistoryIsSealedAndValidated(t *testing.T) {
 	})
 
 	t.Run("unsorted retained heads fail recovery", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newHistoricalGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		loopbackID := addApps(t, fixture.db, 1)[0]
-		seedGatewayRebindActiveRuntime(t, fixture.db, loopbackID)
+		seedHistoricalGatewayRebindActiveRuntime(t, fixture.db, loopbackID)
+		upgradeHistoricalGatewayDatabase(t, fixture.db)
 		finishGatewayRebindFixtureWork(t, fixture.db)
 		proposal := gatewayRebindV2ProposalForFixture(t, fixture)
 		claim, created, err := fixture.repository.ClaimGatewayRebindV2(context.Background(), proposal)
@@ -271,7 +284,7 @@ func TestGatewayRebindRuntimeHeadHistoryIsSealedAndValidated(t *testing.T) {
 }
 
 func TestClaimGatewayRebindV2PersistsExactPreparedClaimAndRoster(t *testing.T) {
-	fixture := newGatewayRebindFixtureOnDBWithClaimAndReleaseID(t, appAccessDB(t), false, false,
+	fixture := newGatewayRebindFixtureOnDBWithClaimAndReleaseID(t, historicalAppAccessDB(t), false, false,
 		rebindTestSnapshotReleaseID)
 	finishGatewayRebindFixtureWork(t, fixture.db)
 	proposal := gatewayRebindV2ProposalForFixture(t, fixture)
@@ -318,7 +331,7 @@ func TestClaimGatewayRebindV2PersistsExactPreparedClaimAndRoster(t *testing.T) {
 }
 
 func TestClaimGatewayRebindV2ReservesGenerationAcrossRollback(t *testing.T) {
-	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	finishGatewayRebindFixtureWork(t, fixture.db)
 	first := gatewayRebindV2ProposalForFixture(t, fixture)
 	first.Spec.Predecessor.Lineage.ProtectedGeneration = 0
@@ -397,7 +410,7 @@ func reissueGatewayRebindV2Proposal(t *testing.T, base GatewayRebindPreclaimProp
 
 func TestClaimGatewayRebindV2RejectsIncompleteAndStaleRosterAtomically(t *testing.T) {
 	t.Run("incomplete", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		finishGatewayRebindFixtureWork(t, fixture.db)
 		proposal := gatewayRebindV2ProposalForFixture(t, fixture)
 		proposal.Roster = nil
@@ -411,7 +424,7 @@ func TestClaimGatewayRebindV2RejectsIncompleteAndStaleRosterAtomically(t *testin
 	})
 
 	t.Run("stale runtime head", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		finishGatewayRebindFixtureWork(t, fixture.db)
 		proposal := gatewayRebindV2ProposalForFixture(t, fixture)
 		proposal.Roster[0].RouteGeneration++
@@ -499,7 +512,7 @@ func gatewayRebindV2ProposalForFixture(t *testing.T,
 }
 
 func TestValidateGatewayRebindClaimV2ForProposalRequiresCanonicalRequestDigests(t *testing.T) {
-	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	finishGatewayRebindFixtureWork(t, fixture.db)
 	proposal := gatewayRebindV2ProposalForFixture(t, fixture)
 	claim, created, err := fixture.repository.ClaimGatewayRebindV2(context.Background(), proposal)

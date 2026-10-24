@@ -7,8 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
-	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
@@ -127,7 +128,7 @@ type LiveRuntimeTestSession interface {
 	Start(*testing.T, LiveRuntimeTestCandidateSpec) (LiveRuntimeTestCandidate, error)
 	WaitHealthyAndHandoff() error
 	RejectObservedFailure() error
-	RoutePublished(generatedidentity.Slot, []generatedroute.RouteEndpoint) error
+	ActivateRoute(*GeneratedRouteAuthority, generatedroute.RouteSwitchRequest) error
 	PublishedHistory(context.Context, *sql.DB) (generatedruntimestate.ActiveHead, error)
 	Close()
 }
@@ -136,8 +137,8 @@ type LiveRuntimeTestSession interface {
 // binary. The external test package supplies the real generatedruntime and
 // liveauthority objects without creating a production dependency cycle.
 type LiveRuntimeTestAdapter interface {
-	NewAuthority(*testing.T, *sql.DB, string) LiveRuntimeTestAuthority
-	NewEngine(runtimeprocess.CommandRunner, GeneratedCandidateEnvironmentStager, generatedcapacity.Source, *deployments.Repository, LiveRuntimeTestEngineOptions) (LiveRuntimeTestEngine, error)
+	NewAuthority(*testing.T, *sql.DB, string, *deploymentplans.Store, *appconfig.Store) LiveRuntimeTestAuthority
+	NewEngine(runtimeprocess.CommandRunner, GeneratedCandidateEnvironmentStager, *GeneratedCandidateAuthority, LiveRuntimeTestEngineOptions) (LiveRuntimeTestEngine, error)
 	IsCode(error, string) bool
 	ErrorCode(error) (string, bool)
 	NewError(string) error
@@ -180,13 +181,17 @@ type liveRuntimeEngineOptions = LiveRuntimeTestEngineOptions
 type liveRuntimeEngine = LiveRuntimeTestEngine
 type liveRuntimeSession = LiveRuntimeTestSession
 
-func newLiveRuntimeEngine(runner runtimeprocess.CommandRunner, environment GeneratedCandidateEnvironmentStager, capacity generatedcapacity.Source, repository *deployments.Repository, options liveRuntimeEngineOptions) (liveRuntimeEngine, error) {
-	return registeredLiveRuntimeTestAdapter().NewEngine(runner, environment, capacity, repository, options)
+func newLiveRuntimeEngine(runner runtimeprocess.CommandRunner, environment GeneratedCandidateEnvironmentStager,
+	candidates *GeneratedCandidateAuthority, options liveRuntimeEngineOptions,
+) (liveRuntimeEngine, error) {
+	return registeredLiveRuntimeTestAdapter().NewEngine(runner, environment, candidates, options)
 }
 
-func newLiveRuntimeAuthority(t *testing.T, db *sql.DB, workingDirectory string) LiveRuntimeTestAuthority {
+func newLiveRuntimeAuthority(t *testing.T, db *sql.DB, workingDirectory string,
+	plans *deploymentplans.Store, configuration *appconfig.Store,
+) LiveRuntimeTestAuthority {
 	t.Helper()
-	return registeredLiveRuntimeTestAdapter().NewAuthority(t, db, workingDirectory)
+	return registeredLiveRuntimeTestAdapter().NewAuthority(t, db, workingDirectory, plans, configuration)
 }
 
 func liveRuntimeIsCode(err error, code string) bool {

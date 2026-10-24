@@ -192,14 +192,8 @@ func liveCrossStoreAdmissionChildInput(value liveCrossStoreAdmissionChild) (gate
 func TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery(t *testing.T) {
 	f := newLiveGatewayRebindSourceFixture(t, liveGatewayRebindCrossStoreEnvironment)
 	fixture := f.fixture
-	options := fixture.ingress.options
-	options.RebindFenceCheck = f.repository.CheckGatewayRebindFence
-	options.RebindCurrentStateRepository = f.repository
-	manager, err := New(fixture.runner, options)
-	if err != nil {
-		t.Fatal("open source manager with real SQL authority")
-	}
-	fixture.ingress = manager
+	manager := fixture.ingress
+	options := manager.options
 	inspection, err := manager.InspectGatewayRebindProposal(fixture.ctx, f.repository, GatewayRebindProposalInput{
 		OperationID: f.proposal.Spec.OperationID, SuccessorProfileRevisionID: f.proposal.Spec.SuccessorProfileRevisionID,
 		SuccessorProfileRevisionNumber: f.proposal.Spec.SuccessorProfileRevisionNumber,

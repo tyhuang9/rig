@@ -325,7 +325,7 @@ func TestGatewayCurrentProtectedSelectionV2(t *testing.T) {
 		app := baseline.Apps[appID]
 		request := generatedroute.RouteSwitchRequest{AppID: appID, ToSlot: app.Route.Slot,
 			Endpoints: append([]generatedroute.RouteEndpoint(nil), app.Route.Endpoints...)}
-		if err := fixture.manager.Switch(context.Background(), request); err == nil {
+		if err := exerciseManagerSwitch(fixture.manager, context.Background(), request); err == nil {
 			t.Fatal("ordinary route entry accepted a current V2 sidecar")
 		}
 		if store, _, _, committed, err := fixture.manager.committedV2Locked(context.Background()); err == nil || store != nil || committed {

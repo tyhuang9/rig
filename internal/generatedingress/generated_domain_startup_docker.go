@@ -104,6 +104,56 @@ type generatedDomainDockerCensusBudget struct {
 	bytes   int
 }
 
+// Startup observations use a private projection instead of decoding Docker's
+// full inspect payload. Docker may add fields to MountPoint, EndpointSettings,
+// and NetworkResource without changing the fields that form Rig's ownership
+// proof. Projecting the exact consumed fields keeps strict JSON decoding useful
+// while preventing unrelated Docker API growth from changing that proof.
+const (
+	generatedDomainStartupMountsProjection = `[{{range $index, $mount := .Mounts}}{{if $index}},{{end}}` +
+		`{"Type":{{json $mount.Type}},"Name":{{json $mount.Name}},"Destination":{{json $mount.Destination}},"RW":{{json $mount.RW}}}{{end}}]`
+	generatedDomainStartupNetworkAttachmentsProjection = `{{if .NetworkSettings}}{ ` +
+		`{{$networkFirst := true}}{{range $name, $network := .NetworkSettings.Networks}}` +
+		`{{if not $networkFirst}},{{end}}{{$networkFirst = false}}{{json $name}}:` +
+		`{"Aliases":{{json $network.Aliases}},"IPAddress":{{json $network.IPAddress}},` +
+		`"GwPriority":{{json $network.GwPriority}},"IPv6Gateway":{{json $network.IPv6Gateway}}}{{end}}` +
+		`}{{else}}null{{end}}`
+	generatedDomainStartupConfiguredNetworksProjection = `{{if .NetworkSettings}}{ ` +
+		`{{$configuredFirst := true}}{{range $name, $network := .NetworkSettings.Networks}}` +
+		`{{if not $configuredFirst}},{{end}}{{$configuredFirst = false}}{{json $name}}:{"IPAMConfig":` +
+		`{{if $network.IPAMConfig}}{"IPv4Address":{{json $network.IPAMConfig.IPv4Address}},` +
+		`"IPv6Address":{{json $network.IPAMConfig.IPv6Address}}}{{else}}null{{end}},` +
+		`"NetworkID":{{json $network.NetworkID}},"EndpointID":{{json $network.EndpointID}},` +
+		`"IPAddress":{{json $network.IPAddress}},"GwPriority":{{json $network.GwPriority}},` +
+		`"IPv6Gateway":{{json $network.IPv6Gateway}}}{{end}}}{{else}}null{{end}}`
+	generatedDomainStartupContainerInspectFormat = `{"id":{{json .ID}},"name":{{json .Name}},` +
+		`"image":{{json .Image}},"labels":{{json .Config.Labels}},"hostname":{{json .Config.Hostname}},` +
+		`"user":{{json .Config.User}},"env":{{json .Config.Env}},"entrypoint":{{json .Config.Entrypoint}},` +
+		`"cmd":{{json .Config.Cmd}},"readOnly":{{json .HostConfig.ReadonlyRootfs}},` +
+		`"privileged":{{json .HostConfig.Privileged}},"capAdd":{{json .HostConfig.CapAdd}},` +
+		`"capDrop":{{json .HostConfig.CapDrop}},"securityOpt":{{json .HostConfig.SecurityOpt}},` +
+		`"binds":{{json .HostConfig.Binds}},"mounts":` + generatedDomainStartupMountsProjection + `,` +
+		`"tmpfs":{{json .HostConfig.Tmpfs}},"memory":{{json .HostConfig.Memory}},` +
+		`"memorySwap":{{json .HostConfig.MemorySwap}},"nanoCpus":{{json .HostConfig.NanoCPUs}},` +
+		`"pidsLimit":{{json .HostConfig.PidsLimit}},"logType":{{json .HostConfig.LogConfig.Type}},` +
+		`"logConfig":{{json .HostConfig.LogConfig.Config}},"restart":{{json .HostConfig.RestartPolicy.Name}},` +
+		`"networkMode":{{json .HostConfig.NetworkMode}},"ulimits":{{json .HostConfig.Ulimits}},` +
+		`"running":{{json .State.Running}},"restarting":{{json .State.Restarting}},` +
+		`"portBindings":{{json .HostConfig.PortBindings}},"networks":` +
+		generatedDomainStartupNetworkAttachmentsProjection + `,"paused":{{json .State.Paused}},` +
+		`"dead":{{json .State.Dead}},"restartCount":{{json .RestartCount}},"effectivePortBindings":` +
+		`{{if .NetworkSettings}}{{json .NetworkSettings.Ports}}{{else}}null{{end}},"configuredNetworks":` +
+		generatedDomainStartupConfiguredNetworksProjection + `}`
+	generatedDomainStartupNetworkInspectFormat = `{"Id":{{json .ID}},"Name":{{json .Name}},` +
+		`"Driver":{{json .Driver}},"Scope":{{json .Scope}},"Internal":{{json .Internal}},` +
+		`"Options":{{json .Options}},"IPAM":{"Config":[{{range $index, $config := .IPAM.Config}}` +
+		`{{if $index}},{{end}}{"Subnet":{{json $config.Subnet}},"Gateway":{{json $config.Gateway}}}{{end}}]},` +
+		`"Labels":{{json .Labels}},"Containers":{ ` +
+		`{{$containerFirst := true}}{{range $id, $container := .Containers}}` +
+		`{{if not $containerFirst}},{{end}}{{$containerFirst = false}}{{json $id}}:` +
+		`{"Name":{{json $container.Name}},"IPv4Address":{{json $container.IPv4Address}}}{{end}}}}`
+)
+
 func (b *generatedDomainDockerCensusBudget) charge(body []byte, entries int) error {
 	if b == nil || entries < 0 || len(body) > generatedDomainStartupMaximumBytes-b.bytes ||
 		entries > generatedDomainStartupMaximumEntries-b.entries {
@@ -175,7 +225,9 @@ func newGeneratedDomainStartupReader(runner runtimeprocess.CommandRunner, option
 
 func readGeneratedDomainDockerStartup(ctx context.Context, reader *generatedDomainStartupReader) (generatedDomainDockerStartupSnapshot, error) {
 	if ctx == nil || reader == nil || !generatedCandidatePointerIdentity(reader.runner) || reader.daemonID == "" {
-		return generatedDomainDockerStartupSnapshot{}, errors.New("generated domain Docker startup input is invalid")
+		return generatedDomainDockerStartupSnapshot{}, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonInput,
+			errors.New("generated domain Docker startup input is invalid"))
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -184,29 +236,39 @@ func readGeneratedDomainDockerStartup(ctx context.Context, reader *generatedDoma
 	firstDaemon, err := inspectGeneratedDockerDaemonIdentity(ctx, reader.runner, reader.options.DockerExecutable,
 		reader.environment, generatedDomainStartupCommandTimeout(reader.options, time.Until(deadline)))
 	if err != nil || firstDaemon != reader.daemonID {
-		return generatedDomainDockerStartupSnapshot{}, errors.New("generated domain Docker daemon changed")
+		return generatedDomainDockerStartupSnapshot{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerDaemon, err,
+			errors.New("generated domain Docker daemon changed"))
 	}
 	first, inventories, err := reader.readDockerCensus(ctx, deadline)
 	if err != nil {
-		return generatedDomainDockerStartupSnapshot{}, err
+		return generatedDomainDockerStartupSnapshot{}, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerCensus, err)
 	}
 	second, confirmedInventories, err := reader.readDockerCensus(ctx, deadline)
 	if err != nil || !reflect.DeepEqual(inventories, confirmedInventories) || !sameGeneratedDomainDockerStartup(first, second) {
-		return generatedDomainDockerStartupSnapshot{}, errors.New("generated domain Docker census changed")
+		return generatedDomainDockerStartupSnapshot{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerCensus, err,
+			errors.New("generated domain Docker census changed"))
 	}
 	lastDaemon, err := inspectGeneratedDockerDaemonIdentity(ctx, reader.runner, reader.options.DockerExecutable,
 		reader.environment, generatedDomainStartupCommandTimeout(reader.options, time.Until(deadline)))
 	if err != nil || lastDaemon != firstDaemon {
-		return generatedDomainDockerStartupSnapshot{}, errors.New("generated domain Docker daemon changed")
+		return generatedDomainDockerStartupSnapshot{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerDaemon, err,
+			errors.New("generated domain Docker daemon changed"))
 	}
 	second.daemonID = lastDaemon
 	firstGateway, err := reader.attestGateway(ctx, deadline, second)
 	if err != nil {
-		return generatedDomainDockerStartupSnapshot{}, err
+		return generatedDomainDockerStartupSnapshot{}, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerAttestation, err)
 	}
 	secondGateway, err := reader.attestGateway(ctx, deadline, second)
 	if err != nil || firstGateway != secondGateway {
-		return generatedDomainDockerStartupSnapshot{}, errors.New("generated domain gateway attestation changed")
+		return generatedDomainDockerStartupSnapshot{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerAttestation, err,
+			errors.New("generated domain gateway attestation changed"))
 	}
 	second.gateway = secondGateway
 	if reader.recovery.kind != generatedDomainRecoveryDockerNone {
@@ -665,28 +727,28 @@ func (r *generatedDomainStartupReader) attestGateway(ctx context.Context, deadli
 		return generatedDomainGatewayAttestation{}, nil
 	}
 	if r.recovery.kind == generatedDomainRecoveryDockerNone {
-		if !generatedDomainExpectedDockerObjects(snapshot.objects, expected) {
-			return generatedDomainGatewayAttestation{}, errors.New("generated domain gateway namespace is not exact")
-		}
 		applicationRoutes, valid := generatedDomainGatewayApplicationRoutes(expected)
 		if !valid {
 			return generatedDomainGatewayAttestation{}, errors.New("generated domain gateway expectation is invalid")
 		}
 		if applicationRoutes {
 			// The final classifier derives cold accounting independently from
-			// the sealed SQL and Docker snapshots. Once the complete passive
-			// census proves the exact namespace, do not dispatch admin or route
-			// traffic into an app-bearing gateway that cannot be Stable.
+			// the sealed SQL and complete passive Docker census before any
+			// publication. Do not dispatch admin or route traffic into an
+			// app-bearing gateway that cannot be Stable.
 			return generatedDomainGatewayAttestation{}, nil
+		}
+		if !generatedDomainExpectedDockerObjects(snapshot.objects, expected) {
+			return generatedDomainGatewayAttestation{}, errors.New("generated domain gateway namespace is not exact")
 		}
 	}
 	switch expected.kind {
 	case generatedDomainGatewayNativeV1:
-		return r.attestNativeV1(ctx, deadline, snapshot, expected)
+		return r.attestNativeV1(ctx, deadline, snapshot, expected, false)
 	case generatedDomainGatewayNativeV2:
-		return r.attestNativeV2(ctx, deadline, snapshot, expected)
+		return r.attestNativeV2(ctx, deadline, snapshot, expected, false)
 	case generatedDomainGatewayCurrentV1, generatedDomainGatewayCurrentV2:
-		return r.attestCurrent(ctx, deadline, snapshot, expected)
+		return r.attestCurrent(ctx, deadline, snapshot, expected, false)
 	default:
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain gateway expectation is invalid")
 	}
@@ -755,15 +817,19 @@ func generatedDomainObjectByName(snapshot generatedDomainDockerStartupSnapshot, 
 func (r *generatedDomainStartupReader) readDetailedContainer(ctx context.Context, deadline time.Time,
 	id string,
 ) (caddyInspection, gatewayContainerRuntime, error) {
-	body, err := r.runRead(ctx, deadline, "container", "inspect", "--format", gatewayContainerInspectFormat, id)
+	body, err := r.runRead(ctx, deadline, "container", "inspect", "--format",
+		generatedDomainStartupContainerInspectFormat, id)
 	if err != nil {
-		return caddyInspection{}, gatewayContainerRuntime{}, err
+		return caddyInspection{}, gatewayContainerRuntime{}, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerContainer, err)
 	}
 	defer clear(body)
 	var value gatewayContainerInspection
 	if decodeGeneratedDomainStrictJSON(body, &value) != nil ||
 		!generatedDomainCanonicalDockerID(value.ID, false) || value.ID != id {
-		return caddyInspection{}, gatewayContainerRuntime{}, errors.New("generated domain gateway container inspection is invalid")
+		return caddyInspection{}, gatewayContainerRuntime{}, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerContainer,
+			errors.New("generated domain gateway container inspection is invalid"))
 	}
 	return value.caddyInspection, value.gatewayContainerRuntime, nil
 }
@@ -773,37 +839,39 @@ func (r *generatedDomainStartupReader) readDetailedVolume(ctx context.Context, d
 ) (volumeInspection, gatewayV1VolumeIdentity, error) {
 	body, err := r.runRead(ctx, deadline, "volume", "inspect", "--format", generatedDomainVolumeInspectFormat, name)
 	if err != nil {
-		return volumeInspection{}, gatewayV1VolumeIdentity{}, err
+		return volumeInspection{}, gatewayV1VolumeIdentity{}, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerVolume, err)
 	}
 	defer clear(body)
 	var value gatewayVolumeIdentityInspection
 	if decodeGeneratedDomainStrictJSON(body, &value) != nil || value.Name != name {
-		return volumeInspection{}, gatewayV1VolumeIdentity{}, errors.New("generated domain gateway volume inspection is invalid")
+		return volumeInspection{}, gatewayV1VolumeIdentity{}, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerVolume,
+			errors.New("generated domain gateway volume inspection is invalid"))
 	}
 	return volumeInspection{Name: value.Name, Driver: value.Driver, Scope: value.Scope,
-			Options: value.Options, Labels: value.Labels}, gatewayV1VolumeIdentity{Mountpoint: value.Mountpoint,
-			CreatedAt: value.CreatedAt}, nil
+		Options: value.Options, Labels: value.Labels}, gatewayV1VolumeIdentity{Mountpoint: value.Mountpoint,
+		CreatedAt: value.CreatedAt}, nil
 }
 
 func (r *generatedDomainStartupReader) readDetailedNetwork(ctx context.Context, deadline time.Time,
 	id string,
 ) (caddyNetworkInspection, string, error) {
-	body, err := r.runRead(ctx, deadline, "network", "inspect", "--format", "json", id)
+	body, err := r.runRead(ctx, deadline, "network", "inspect", "--format",
+		generatedDomainStartupNetworkInspectFormat, id)
 	if err != nil {
-		return caddyNetworkInspection{}, "", err
+		return caddyNetworkInspection{}, "", generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerNetwork, err)
 	}
 	defer clear(body)
-	if rejectGeneratedDomainDuplicateJSONKeys(body) != nil {
-		return caddyNetworkInspection{}, "", errors.New("generated domain gateway network inspection is invalid")
+	var value gatewayNetworkIdentityInspection
+	if decodeGeneratedDomainStrictJSON(body, &value) != nil ||
+		!generatedDomainCanonicalDockerID(value.ID, false) || value.ID != id {
+		return caddyNetworkInspection{}, "", generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerNetwork,
+			errors.New("generated domain gateway network inspection is invalid"))
 	}
-	var values []gatewayNetworkIdentityInspection
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&values) != nil || decoder.Decode(&struct{}{}) != io.EOF || len(values) != 1 ||
-		!generatedDomainCanonicalDockerID(values[0].ID, false) || values[0].ID != id {
-		return caddyNetworkInspection{}, "", errors.New("generated domain gateway network inspection is invalid")
-	}
-	return values[0].caddy(), normalizeID(values[0].ID), nil
+	return value.caddy(), normalizeID(value.ID), nil
 }
 
 func (r *generatedDomainStartupReader) attestRecovery(ctx context.Context, deadline time.Time,
@@ -1193,23 +1261,30 @@ func (r *generatedDomainStartupReader) readRestartConfig(ctx context.Context, de
 ) ([]byte, error) {
 	body, err := r.runRead(ctx, deadline, "container", "cp", containerID+":/config/"+filename, "-")
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerRestartConfig, err)
 	}
 	defer clear(body)
 	reader := tar.NewReader(bytes.NewReader(body))
 	header, err := reader.Next()
 	if err != nil || header == nil || header.Typeflag != tar.TypeReg || header.Size <= 0 ||
 		header.Size > gatewayV2MaxConfigBytes || strings.TrimPrefix(header.Name, "./") != filename {
-		return nil, errors.New("generated domain gateway restart config archive is invalid")
+		return nil, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerRestartConfig,
+			errors.New("generated domain gateway restart config archive is invalid"))
 	}
 	config, err := io.ReadAll(io.LimitReader(reader, gatewayV2MaxConfigBytes+1))
 	if err != nil || int64(len(config)) != header.Size || !json.Valid(config) {
 		clear(config)
-		return nil, errors.New("generated domain gateway restart config is invalid")
+		return nil, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerRestartConfig,
+			errors.New("generated domain gateway restart config is invalid"))
 	}
 	if _, err := reader.Next(); err != io.EOF {
 		clear(config)
-		return nil, errors.New("generated domain gateway restart config archive has extra entries")
+		return nil, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerRestartConfig,
+			errors.New("generated domain gateway restart config archive has extra entries"))
 	}
 	return config, nil
 }
@@ -1222,7 +1297,9 @@ func (r *generatedDomainStartupReader) readLiveConfig(ctx context.Context, deadl
 		"--max-time", "10", "http://127.0.0.1:2019/config/")
 	if err != nil || len(body) == 0 || len(body) > gatewayV2MaxConfigBytes || !json.Valid(body) {
 		clear(body)
-		return nil, errors.New("generated domain gateway live config is invalid")
+		return nil, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerLiveConfig, err,
+			errors.New("generated domain gateway live config is invalid"))
 	}
 	return body, nil
 }
@@ -1232,7 +1309,9 @@ func (r *generatedDomainStartupReader) proveGatewayStaticResponse(ctx context.Co
 ) error {
 	if !generatedDomainCanonicalDockerID(containerID, false) || net.ParseIP(address) == nil || port == 0 ||
 		!validName(host, 253) || !validSHA256(token) {
-		return errors.New("generated domain gateway challenge input is invalid")
+		return generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerStaticResponse,
+			errors.New("generated domain gateway challenge input is invalid"))
 	}
 	body, err := r.runRead(ctx, deadline, "container", "exec", containerID,
 		"curl", "--disable", "--silent", "--show-error", "--output", "-", "--write-out", "\n%{http_code}",
@@ -1241,15 +1320,18 @@ func (r *generatedDomainStartupReader) proveGatewayStaticResponse(ctx context.Co
 		"http://"+net.JoinHostPort(address, strconv.FormatUint(uint64(port), 10))+gatewayV2ChallengePathPrefix+token)
 	defer clear(body)
 	if err != nil || string(body) != expectedBody+"\n404" {
-		return errors.New("generated domain gateway static response is invalid")
+		return generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerStaticResponse, err,
+			errors.New("generated domain gateway static response is invalid"))
 	}
 	return nil
 }
 
 func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
-	if expected.nativeV1 == nil || len(expected.nativeV1.Active) != 0 {
+	if expected.nativeV1 == nil || !allowApplicationRoutes && len(expected.nativeV1.Active) != 0 {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 gateway is unsupported")
 	}
 	containerObject, containerFound := generatedDomainObjectByName(snapshot, "container", caddyContainerName)
@@ -1260,49 +1342,70 @@ func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadl
 	}
 	image, err := r.readPinnedImage(ctx, deadline, "")
 	if err != nil {
-		return generatedDomainGatewayAttestation{}, err
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerConstructionDiagnostic(
+			generatedDomainConstructionReasonDockerImage, err)
 	}
 	container, runtime, err := r.readDetailedContainer(ctx, deadline, containerObject.id)
 	if err != nil || !container.Running || container.Restarting || !validGatewayContainerRuntime(runtime, true) ||
 		!gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, container.PortBindings) ||
 		!validCaddyInspection(container, image.ID, r.options.HostPort) {
-		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 container is invalid")
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerContainer, err,
+			errors.New("generated domain native V1 container is invalid"))
 	}
 	volume, _, err := r.readDetailedVolume(ctx, deadline, volumeObject.name)
 	if err != nil || volume.Name != caddyVolumeName || volume.Driver != "local" || volume.Scope != "local" ||
 		len(volume.Options) != 0 || !validGeneratedDomainNativeV1VolumeLabels(volume.Labels) {
-		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 volume is invalid")
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerVolume, err,
+			errors.New("generated domain native V1 volume is invalid"))
 	}
 	network, networkID, err := r.readDetailedNetwork(ctx, deadline, networkObject.id)
 	listenIP, valid := caddyIngressAddress(network, container.ID)
 	if err != nil || networkID != normalizeID(networkObject.id) || !valid {
-		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 network is invalid")
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerNetwork, err,
+			errors.New("generated domain native V1 network is invalid"))
 	}
 	wanted, err := buildCaddyConfig(expected.nativeV1.Active,
 		net.JoinHostPort(listenIP, strconv.FormatUint(uint64(gatewayV2ContainerPort), 10)))
 	if err != nil {
-		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 config is invalid")
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerAttestation, err,
+			errors.New("generated domain native V1 config is invalid"))
 	}
 	defer clear(wanted)
 	restart, err := r.readRestartConfig(ctx, deadline, container.ID, gatewayV2ActiveConfigFile)
 	if err != nil || !sameCaddyConfig(wanted, restart) {
 		clear(restart)
-		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 restart config is invalid")
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerRestartConfig, err,
+			errors.New("generated domain native V1 restart config is invalid"))
 	}
 	defer clear(restart)
 	live, err := r.readLiveConfig(ctx, deadline, container.ID)
 	if err != nil || !sameCaddyConfig(wanted, live) {
 		clear(live)
-		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 live config is invalid")
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerLiveConfig, err,
+			errors.New("generated domain native V1 live config is invalid"))
 	}
 	defer clear(live)
 	token, err := canonicalDigest(struct {
 		Version int    `json:"version"`
 		State   string `json:"state"`
 	}{1, expected.stateDigest})
-	if err != nil || r.proveGatewayStaticResponse(ctx, deadline, container.ID, listenIP,
-		gatewayV2ContainerPort, "wrong.invalid", token, "") != nil {
-		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 static response is invalid")
+	if err != nil {
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerStaticResponse, err,
+			errors.New("generated domain native V1 static response is invalid"))
+	}
+	staticErr := r.proveGatewayStaticResponse(ctx, deadline, container.ID, listenIP,
+		gatewayV2ContainerPort, "wrong.invalid", token, "")
+	if staticErr != nil {
+		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
+			generatedDomainConstructionReasonDockerStaticResponse, staticErr,
+			errors.New("generated domain native V1 static response is invalid"))
 	}
 	return generatedDomainGatewayAttestation{kind: generatedDomainGatewayNativeV1,
 		stateDigest: expected.stateDigest, exact: true}, nil
@@ -1310,8 +1413,9 @@ func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadl
 
 func (r *generatedDomainStartupReader) attestNativeV2(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
-	if expected.nativeV2 == nil || expected.journal == nil || len(expected.nativeV2.Apps) != 0 ||
+	if expected.nativeV2 == nil || expected.journal == nil || !allowApplicationRoutes && len(expected.nativeV2.Apps) != 0 ||
 		expected.journal.Phase != gatewayPhaseCommitted {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V2 gateway is unsupported")
 	}
@@ -1386,9 +1490,10 @@ func (r *generatedDomainStartupReader) attestNativeV2(ctx context.Context, deadl
 
 func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
 	if expected.currentV2 != nil && expected.currentV2.Lineage.Kind == appaccess.GatewayRebindSourceGatewayUpgrade {
-		return r.attestCurrentV2Upgrade(ctx, deadline, snapshot, expected)
+		return r.attestCurrentV2Upgrade(ctx, deadline, snapshot, expected, allowApplicationRoutes)
 	}
 	if expected.terminal == nil {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway terminal is unavailable")
@@ -1403,7 +1508,7 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 	var err error
 	if expected.currentV1 != nil {
 		state := *expected.currentV1
-		if len(state.Apps) != 0 {
+		if !allowApplicationRoutes && len(state.Apps) != 0 {
 			return generatedDomainGatewayAttestation{}, errors.New("generated domain current V1 gateway has application routes")
 		}
 		lineage, profile, networkPlan, identity = state.Lineage, state.Profile, state.Network, state.Identity
@@ -1411,7 +1516,7 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 		token, _ = gatewayCurrentPhysicalProbeToken(state)
 	} else if expected.currentV2 != nil {
 		state := *expected.currentV2
-		if len(state.Apps) != 0 {
+		if !allowApplicationRoutes && len(state.Apps) != 0 {
 			return generatedDomainGatewayAttestation{}, errors.New("generated domain current V2 gateway has application routes")
 		}
 		lineage, profile, networkPlan, identity = state.Lineage, state.Profile, state.Network, state.Identity
@@ -1488,10 +1593,12 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 
 func (r *generatedDomainStartupReader) attestCurrentV2Upgrade(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
 	if !generatedDomainCurrentV2UpgradeExpectationValid(expected) || expected.currentV2 == nil ||
-		expected.nativeV2 == nil || expected.journal == nil || len(expected.currentV2.Apps) != 0 ||
-		len(expected.nativeV2.Apps) != 0 || expected.journal.Phase != gatewayPhaseCommitted {
+		expected.nativeV2 == nil || expected.journal == nil ||
+		!allowApplicationRoutes && (len(expected.currentV2.Apps) != 0 || len(expected.nativeV2.Apps) != 0) ||
+		expected.journal.Phase != gatewayPhaseCommitted {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current V2 upgrade gateway is unsupported")
 	}
 	current, source, journal := *expected.currentV2, *expected.nativeV2, *expected.journal

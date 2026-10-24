@@ -6,7 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"github.com/hostd/hostd/internal/generatedingress"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -22,6 +22,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
@@ -304,17 +305,14 @@ func (f *fakeArtifacts) MarkUnavailable(_ context.Context, id string) (generated
 }
 
 type fakeRuntimeState struct {
-	deployment            generatedruntimestate.Deployment
-	previous              map[string]generatedruntimestate.Deployment
-	active                generatedruntimestate.ActiveHead
-	beginErr              error
-	getErr                error
-	migrationRequired     bool
-	switchCalls           int
-	failSwitchActive      bool
-	failAdvanceToDraining bool
-	advanceErrTo          generatedruntimestate.Phase
-	advanceErr            error
+	deployment        generatedruntimestate.Deployment
+	previous          map[string]generatedruntimestate.Deployment
+	active            generatedruntimestate.ActiveHead
+	beginErr          error
+	getErr            error
+	migrationRequired bool
+	advanceErrTo      generatedruntimestate.Phase
+	advanceErr        error
 }
 
 func (f *fakeRuntimeState) Begin(_ context.Context, input generatedruntimestate.BeginInput) (generatedruntimestate.Deployment, bool, error) {
@@ -358,9 +356,6 @@ func (f *fakeRuntimeState) Active(context.Context, string) (generatedruntimestat
 	return f.active, nil
 }
 func (f *fakeRuntimeState) Advance(_ context.Context, _, _ string, _, next generatedruntimestate.Phase, diagnostic generatedruntimestate.DiagnosticCode) (generatedruntimestate.Deployment, error) {
-	if next == generatedruntimestate.PhaseDraining && f.failAdvanceToDraining {
-		return f.deployment, generatedruntimestate.ErrInvalidTransition
-	}
 	if next == f.advanceErrTo && f.advanceErr != nil {
 		return generatedruntimestate.Deployment{}, f.advanceErr
 	}
@@ -404,17 +399,6 @@ func (f *fakeRuntimeState) AdvanceComponent(_ context.Context, _, deploymentID, 
 }
 func (f *fakeRuntimeState) FailComponent(context.Context, string, string, string, generatedruntimestate.ComponentState, generatedruntimestate.DiagnosticCode) (generatedruntimestate.Component, error) {
 	return generatedruntimestate.Component{}, nil
-}
-func (f *fakeRuntimeState) SwitchActive(context.Context, string, string, int64) (generatedruntimestate.ActiveHead, bool, error) {
-	f.switchCalls++
-	if f.failSwitchActive {
-		return generatedruntimestate.ActiveHead{}, false, generatedruntimestate.ErrConflict
-	}
-	f.active = generatedruntimestate.ActiveHead{AppID: f.deployment.AppID, DeploymentID: f.deployment.DeploymentID, ReleaseID: f.deployment.ReleaseID, Slot: f.deployment.CandidateSlot, Generation: f.active.Generation + 1}
-	for index := range f.deployment.Components {
-		f.deployment.Components[index].State = generatedruntimestate.ComponentActive
-	}
-	return f.active, true, nil
 }
 func (f *fakeRuntimeState) component(name string) *generatedruntimestate.Component {
 	for index := range f.deployment.Components {
@@ -519,20 +503,72 @@ func (f *fakeAuthorization) Authorize(ctx context.Context, request Authorization
 }
 
 type fakeRoutes struct {
-	events   *[]string
-	requests []generatedruntime.RouteSwitchRequest
-	err      error
-	errs     []error
+	events          *[]string
+	requests        []generatedruntime.RouteSwitchRequest
+	inputs          []generatedruntimestate.Deployment
+	delegate        routeController
+	lastErr         error
+	err             error
+	errs            []error
+	postActivateErr error
+	delegateCalls   int
+	attestErr       error
+	attestCalls     int
+}
+
+func (f *fakeRoutes) attestPublished(ctx context.Context, claim deploymentexecution.Claim, deploymentID string) error {
+	f.attestCalls++
+	if f.attestErr != nil {
+		return f.attestErr
+	}
+	if f.delegate != nil {
+		return f.delegate.attestPublished(ctx, claim, deploymentID)
+	}
+	return nil
 }
 
 func (f *fakeRoutes) Switch(_ context.Context, request generatedruntime.RouteSwitchRequest) error {
 	*f.events = append(*f.events, "route")
 	call := len(f.requests)
 	f.requests = append(f.requests, request)
-	if call < len(f.errs) {
+	if call < len(f.errs) && f.errs[call] != nil {
 		return f.errs[call]
 	}
 	return f.err
+}
+
+func (f *fakeRoutes) activate(ctx context.Context, execution *generatedingress.GeneratedCandidateExecution,
+	request generatedruntime.RouteSwitchRequest, current generatedruntimestate.Deployment,
+) (generatedruntimestate.Deployment, error) {
+	f.inputs = append(f.inputs, current)
+	call := len(f.requests)
+	if call < len(f.errs) && f.errs[call] != nil {
+		*f.events = append(*f.events, "route")
+		f.requests = append(f.requests, request)
+		return generatedruntimestate.Deployment{}, f.errs[call]
+	}
+	if f.err != nil {
+		*f.events = append(*f.events, "route")
+		f.requests = append(f.requests, request)
+		return generatedruntimestate.Deployment{}, f.err
+	}
+	if f.delegate != nil {
+		*f.events = append(*f.events, "route")
+		f.requests = append(f.requests, request)
+		f.delegateCalls++
+		updated, err := f.delegate.activate(ctx, execution, request, current)
+		f.lastErr = err
+		if err == nil && f.postActivateErr != nil {
+			err, f.postActivateErr = f.postActivateErr, nil
+			f.lastErr = err
+		}
+		return updated, err
+	}
+	if err := f.Switch(context.Background(), request); err != nil {
+		return generatedruntimestate.Deployment{}, err
+	}
+	current.Phase = generatedruntimestate.PhaseDraining
+	return current, nil
 }
 
 type candidateMayBeLiveRouteError struct{}
@@ -645,7 +681,7 @@ func newExecutorFixture(t *testing.T, migration bool) *executorFixture {
 	if authority != nil {
 		migrations.delegate = authority.runner
 	}
-	executor, err := NewExecutor(
+	executor, err := newExecutor(
 		&fakeApplications{app: apps.Application{ID: testAppID, Source: apps.Source{Type: apps.SourceLocal, Path: `C:\source`}}},
 		&fakeReleases{release: release}, configuration, deploymentsFake,
 		planReader, compiler, artifacts, state, runtime, authorization, routes, migrations, Options{},
@@ -1257,7 +1293,7 @@ func TestGeneratedExecutorRetainsWholeAggregateAfterSecondHiddenNetworkRefusal(t
 	web.RunCommand = projectanalysis.ManagedStaticCommand(web.StaticOutputDirectory, int(web.InternalPort))
 	web.InstallDirectory = web.RootDirectory
 	fixture := newSealedExecutorFixtureWithComponents(t, []deploymentplans.Component{api, web})
-	fixture.capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 256 << 20, DiskAvailableBytes: 256 << 20})
+	fixture.capacity.SetCapacity(256<<20, 256<<20)
 	fixture.runner.createErrs = []error{nil, runtimeprocess.ErrTerminationFailed}
 
 	result, err := fixture.execute()
@@ -1288,7 +1324,11 @@ func generatedNetworkBoundaryTestError() error {
 
 func TestGeneratedExecutorPassesAcceptedTechnologyToRuntime(t *testing.T) {
 	for _, technology := range []string{"", "node", "nextjs"} {
-		t.Run(technology, func(t *testing.T) {
+		name := technology
+		if name == "" {
+			name = "unversioned"
+		}
+		t.Run(name, func(t *testing.T) {
 			fixture := newSealedExecutorFixtureWithTechnology(t, technology)
 			result, err := fixture.execute()
 			if err != nil || result.CompletionCode != "deployment_completed" {
@@ -1422,7 +1462,7 @@ func TestGeneratedExecutorRetainsCandidateCapacityOnImageRefusalWithPriorCandida
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newSealedExecutorFixture(t)
-			fixture.capacity.Set(generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 128 << 20, DiskAvailableBytes: 128 << 20})
+			fixture.capacity.SetCapacity(128<<20, 128<<20)
 			checkCompetitor := fixture.capacityCompetitor(t)
 			fixture.seedCandidate(t, test.seed)
 			fixture.runner.mu.Lock()
@@ -1587,11 +1627,12 @@ func TestGeneratedExecutorCleansCandidateWhenActiveCASRollbackSucceeds(t *testin
 		t.Fatal(err)
 	}
 	oldDeploymentID := fixture.deployment(t).ID
-	oldContainerID := fixture.runtimeDeployment(t).Components[0].ContainerID
+	oldComponent := fixture.runtimeDeployment(t).Components[0]
 	fixture.nextDeployment(t)
 	fixture.routes.requests = nil
-	fixture.state.failSwitchActive = true
-	fixture.routes.errs = []error{nil, nil}
+	fixture.routes.delegateCalls = 0
+	reloadsBefore := fixture.capacity.ReloadCalls()
+	installGeneratedExecutorActivationHeadFault(t, fixture, "executor rollback succeeds")
 
 	result, err := fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
@@ -1607,14 +1648,21 @@ func TestGeneratedExecutorCleansCandidateWhenActiveCASRollbackSucceeds(t *testin
 	if runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
 		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 	}
-	if len(fixture.routes.requests) != 2 || len(fixture.routes.requests[1].Endpoints) != 1 || fixture.routes.requests[1].Endpoints[0].ContainerID != oldContainerID {
-		t.Fatalf("route requests=%+v", fixture.routes.requests)
+	if reloads := fixture.capacity.ReloadCalls() - reloadsBefore; fixture.routes.delegateCalls != 1 || reloads != 4 {
+		t.Fatalf("real activation/restore calls=%d reload delta=%d", fixture.routes.delegateCalls, reloads)
+	}
+	observation, observationErr := fixture.domain.Gateway().Observe(context.Background(), fixture.app.ID)
+	if observationErr != nil || len(observation.Endpoints) != 1 || observation.Endpoints[0].ContainerID != oldComponent.ContainerID {
+		t.Fatalf("restored predecessor observation=%+v error=%v", observation, observationErr)
+	}
+	if count := generatedExecutorActivationReceiptCount(t, fixture); count != 1 {
+		t.Fatalf("rolled-back activation receipt count=%d", count)
 	}
 }
 
 func TestGeneratedExecutorPreservesFirstSlotWhenActiveCASFails(t *testing.T) {
 	fixture := newSealedExecutorFixture(t)
-	fixture.state.failSwitchActive = true
+	installGeneratedExecutorActivationHeadFault(t, fixture, "executor first rollback")
 
 	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
@@ -1630,8 +1678,11 @@ func TestGeneratedExecutorPreservesFirstSlotWhenActiveCASFails(t *testing.T) {
 	if runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
 		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 	}
-	if len(fixture.routes.requests) != 1 || fixture.routes.requests[0].ToSlot != generatedruntime.SlotBlue {
+	if len(fixture.routes.requests) != 1 || fixture.routes.requests[0].ToSlot != generatedruntime.SlotBlue || fixture.routes.delegateCalls != 1 {
 		t.Fatalf("route requests=%+v", fixture.routes.requests)
+	}
+	if count := generatedExecutorActivationReceiptCount(t, fixture); count != 0 {
+		t.Fatalf("first rolled-back activation receipt count=%d", count)
 	}
 }
 
@@ -1644,8 +1695,9 @@ func TestGeneratedExecutorPreservesBothSlotsWhenActiveCASRollbackFails(t *testin
 	oldContainerID := fixture.runtimeDeployment(t).Components[0].ContainerID
 	fixture.nextDeployment(t)
 	fixture.routes.requests = nil
-	fixture.state.failSwitchActive = true
-	fixture.routes.errs = []error{nil, errors.New("rollback route unavailable")}
+	fixture.routes.delegateCalls = 0
+	installGeneratedExecutorActivationHeadFault(t, fixture, "executor rollback unavailable")
+	fixture.capacity.SetReloadErrors(nil, nil, errors.New("rollback route unavailable"))
 
 	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
@@ -1665,14 +1717,22 @@ func TestGeneratedExecutorPreservesBothSlotsWhenActiveCASRollbackFails(t *testin
 	if previousErr != nil || len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentActive || previous.Components[0].ContainerID != oldContainerID {
 		t.Fatalf("previous slot was not preserved: %+v", previous)
 	}
-	if len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotBlue {
-		t.Fatalf("route requests=%+v", fixture.routes.requests)
+	if fixture.routes.delegateCalls != 1 || fixture.capacity.ReloadCalls() != 3 {
+		t.Fatalf("real activation/failed restore calls=%d reloads=%d", fixture.routes.delegateCalls, fixture.capacity.ReloadCalls())
+	}
+	successor := fixture.runtimeDeployment(t).Components[0]
+	observation, observationErr := fixture.domain.Gateway().Observe(context.Background(), fixture.app.ID)
+	if observationErr != nil || observation.Slot != generatedruntime.SlotGreen || len(observation.Endpoints) != 1 || observation.Endpoints[0].ContainerID != successor.ContainerID {
+		t.Fatalf("failed restore observation=%+v error=%v", observation, observationErr)
+	}
+	if count := generatedExecutorActivationReceiptCount(t, fixture); count != 1 {
+		t.Fatalf("ambiguous activation receipt count=%d", count)
 	}
 }
 
 func TestGeneratedExecutorNeverCleansNewSlotAfterActiveCAS(t *testing.T) {
 	fixture := newSealedExecutorFixture(t)
-	fixture.state.failAdvanceToDraining = true
+	fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
 	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
@@ -1681,49 +1741,262 @@ func TestGeneratedExecutorNeverCleansNewSlotAfterActiveCAS(t *testing.T) {
 	if active.DeploymentID != fixture.deployment(t).ID || fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
 		t.Fatalf("active=%+v candidate cleanup=%d docker stops=%d", active, fixture.runtime.stopCalls, fixture.runner.stopCalls)
 	}
-	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
 		t.Fatalf("durable phase=%s", runtimeDeployment.Phase)
 	}
 	if deployment := fixture.deployment(t); deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
 		t.Fatalf("main deployment became terminal: %+v", deployment)
 	}
+	if count := generatedExecutorActivationReceiptCount(t, fixture); count != 1 {
+		t.Fatalf("durable activation receipt count=%d", count)
+	}
 }
 
-func TestGeneratedExecutorReattestsRouteBeforeResumingAfterActiveCAS(t *testing.T) {
+func installGeneratedExecutorActivationHeadFault(t *testing.T, fixture *sealedExecutorFixture, marker string) {
+	t.Helper()
+	if _, err := fixture.db.Exec(`CREATE TRIGGER generated_executor_activation_head_fault
+		BEFORE UPDATE ON generated_runtime_active_heads BEGIN SELECT RAISE(ABORT, '` + marker + `'); END`); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func generatedExecutorActivationReceiptCount(t *testing.T, fixture *sealedExecutorFixture) int {
+	t.Helper()
+	var count int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM generated_route_activations`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func TestGeneratedExecutorResumesDurablePostActivationWithoutRepublishingRoute(t *testing.T) {
 	fixture := newSealedExecutorFixture(t)
-	fixture.state.failAdvanceToDraining = true
+	fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
 
 	result, err := fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || len(fixture.routes.requests) != 1 {
 		t.Fatalf("first result=%+v err=%v routes=%+v", result, err, fixture.routes.requests)
 	}
+	// A scheduler retry has a fresh worker attempt, while the durable route
+	// receipt remains bound to the original activation attempt.
+	binding, err := fixture.bindings.Read(context.Background(), fixture.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.db.Exec(`UPDATE jobs SET attempt=2,updated_at=? WHERE id=?`,
+		time.Now().UTC().Format(time.RFC3339Nano), fixture.job.ID); err != nil {
+		t.Fatal(err)
+	}
+	fixture.job.Attempt = 2
+	fixture.claim, err = deploymentexecution.NewClaim(binding, fixture.job.ID, fixture.app.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	fixture.state.failAdvanceToDraining = false
 	result, err = fixture.execute()
 	if err != nil || result.CompletionCode != "deployment_completed" {
 		t.Fatalf("retry result=%+v err=%v", result, err)
 	}
-	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 2 || fixture.routes.requests[1].ToSlot != generatedruntime.SlotBlue || runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded {
+	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 1 || fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 || runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded {
 		t.Fatalf("routes=%+v runtime=%+v", fixture.routes.requests, runtimeDeployment)
+	}
+	var receiptAttempt int
+	if err := fixture.db.QueryRow(`SELECT creator_worker_attempt FROM generated_route_activations`).Scan(&receiptAttempt); err != nil || receiptAttempt != 1 {
+		t.Fatalf("durable receipt creator attempt=%d err=%v", receiptAttempt, err)
 	}
 }
 
-func TestGeneratedExecutorDoesNotDrainWhenRouteReattestationFails(t *testing.T) {
+func TestGeneratedExecutorRefusesDurablePostActivationWhenPublishedRouteDrifts(t *testing.T) {
 	fixture := newSealedExecutorFixture(t)
-	fixture.state.failAdvanceToDraining = true
-	fixture.routes.errs = []error{nil, errors.New("route reattestation unavailable")}
+	fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
+
+	result, err := fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("initial result=%+v err=%v", result, err)
+	}
+	reloads := fixture.capacity.ReloadCalls()
+	drift := filepath.Join(t.TempDir(), "drift.json")
+	if err := os.WriteFile(drift, []byte(`{"apps":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, request := range [][]string{
+		{"container", "cp", drift, "rig-generated-caddy-v1:/config/drift.json"},
+		{"container", "exec", "rig-generated-caddy-v1", "caddy", "reload", "--config", "/config/drift.json"},
+	} {
+		if _, err := fixture.capacity.Run(context.Background(), runtimeprocess.CommandRequest{Args: request}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err = fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("retry result=%+v err=%v", result, err)
+	}
+	runtimeDeployment := fixture.runtimeDeployment(t)
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 ||
+		fixture.capacity.ReloadCalls() != reloads+1 || fixture.runtime.stopCalls != 0 ||
+		fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
+		generatedExecutorActivationReceiptCount(t, fixture) != 1 {
+		t.Fatalf("runtime=%+v delegate=%d attest=%d reloads=%d/%d stops=%d/%d removals=%d",
+			runtimeDeployment, fixture.routes.delegateCalls, fixture.routes.attestCalls,
+			fixture.capacity.ReloadCalls(), reloads, fixture.runtime.stopCalls,
+			fixture.runner.stopCalls, fixture.runner.removeCalls)
+	}
+	if deployment := fixture.deployment(t); deployment.Status == deployments.Succeeded {
+		t.Fatalf("drifted deployment completed: %+v", deployment)
+	}
+}
+
+func TestGeneratedExecutorDurablePostActivationRejectsFutureWorkerClaim(t *testing.T) {
+	fixture := newSealedExecutorFixture(t)
+	fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
+	result, err := fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("initial result=%+v err=%v", result, err)
+	}
+	binding, err := fixture.bindings.Read(context.Background(), fixture.job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.job.Attempt = 2
+	fixture.claim, err = deploymentexecution.NewClaim(binding, fixture.job.ID, fixture.app.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err = fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("future worker claim result=%+v err=%v", result, err)
+	}
+	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 ||
+		fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
+		generatedExecutorActivationReceiptCount(t, fixture) != 1 {
+		t.Fatalf("runtime=%+v delegate=%d attest=%d stops=%d/%d removals=%d receipts=%d",
+			runtimeDeployment, fixture.routes.delegateCalls, fixture.routes.attestCalls,
+			fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls,
+			generatedExecutorActivationReceiptCount(t, fixture))
+	}
+}
+
+func TestGeneratedExecutorDurablePostActivationRejectsStaleWorkerClaim(t *testing.T) {
+	fixture := newSealedExecutorFixture(t)
+	fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
+	result, err := fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("initial result=%+v err=%v", result, err)
+	}
+	if _, err := fixture.db.Exec(`UPDATE jobs SET attempt=2,updated_at=? WHERE id=?`,
+		time.Now().UTC().Format(time.RFC3339Nano), fixture.job.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err = fixture.execute()
+	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("stale worker claim result=%+v err=%v", result, err)
+	}
+	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 ||
+		fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
+		generatedExecutorActivationReceiptCount(t, fixture) != 1 {
+		t.Fatalf("runtime=%+v delegate=%d attest=%d stops=%d/%d removals=%d receipts=%d",
+			runtimeDeployment, fixture.routes.delegateCalls, fixture.routes.attestCalls,
+			fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls,
+			generatedExecutorActivationReceiptCount(t, fixture))
+	}
+}
+
+func TestGeneratedExecutorDurablePostActivationRejectsCrossedReceiptLineage(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *sealedExecutorFixture)
+	}{
+		{name: "zero creator attempt", mutate: func(t *testing.T, fixture *sealedExecutorFixture) {
+			if _, err := fixture.db.Exec(`PRAGMA ignore_check_constraints=ON`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.db.Exec(`UPDATE generated_route_activations SET creator_worker_attempt=0`); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "future creator attempt", mutate: func(t *testing.T, fixture *sealedExecutorFixture) {
+			if _, err := fixture.db.Exec(`UPDATE generated_route_activations SET creator_worker_attempt=2`); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "crossed creator job", mutate: func(t *testing.T, fixture *sealedExecutorFixture) {
+			crossedJobID := uuid.NewString()
+			stamp := time.Now().UTC().Format(time.RFC3339Nano)
+			if _, err := fixture.db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,attempt,
+				requested_by,input_json,created_at,updated_at)
+				VALUES(?,'deploy','application',?,'running','running',1,?,'{}',?,?)`,
+				crossedJobID, uuid.NewString(), fixture.actorID, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.db.Exec(`UPDATE generated_route_activations SET creator_job_id=?`, crossedJobID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newSealedExecutorFixture(t)
+			fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
+			result, err := fixture.execute()
+			if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+				t.Fatalf("initial result=%+v err=%v", result, err)
+			}
+			if _, err := fixture.db.Exec(`DROP TRIGGER generated_route_activation_immutable`); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, fixture)
+
+			result, err = fixture.execute()
+			if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+				t.Fatalf("crossed lineage result=%+v err=%v", result, err)
+			}
+			if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+				fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 ||
+				fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
+				generatedExecutorActivationReceiptCount(t, fixture) != 1 {
+				t.Fatalf("runtime=%+v delegate=%d attest=%d stops=%d/%d removals=%d receipts=%d",
+					runtimeDeployment, fixture.routes.delegateCalls, fixture.routes.attestCalls,
+					fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls,
+					generatedExecutorActivationReceiptCount(t, fixture))
+			}
+			if deployment := fixture.deployment(t); deployment.Status == deployments.Succeeded {
+				t.Fatalf("crossed lineage deployment completed: %+v", deployment)
+			}
+		})
+	}
+}
+
+func TestGeneratedExecutorDoesNotRetirePredecessorWhenReceiptOwnedStopRefuses(t *testing.T) {
+	fixture := newSealedExecutorFixture(t)
+	if _, err := fixture.execute(); err != nil {
+		t.Fatal(err)
+	}
+	oldDeploymentID := fixture.deployment(t).ID
+	fixture.nextDeployment(t)
+	fixture.routes.requests = nil
+	fixture.routes.delegateCalls = 0
+	fixture.routes.postActivateErr = errors.New("route activation acknowledgement unavailable")
 
 	result, err := fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("first result=%+v err=%v", result, err)
 	}
-	fixture.state.failAdvanceToDraining = false
+	fixture.runtime.stopErrs = []error{errors.New("route-owned predecessor retirement unavailable")}
 	result, err = fixture.execute()
 	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("retry result=%+v err=%v", result, err)
 	}
-	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 2 || fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute {
+	if runtimeDeployment := fixture.runtimeDeployment(t); len(fixture.routes.requests) != 1 || fixture.routes.delegateCalls != 1 || fixture.runtime.stopCalls != 1 || fixture.runner.stopCalls != 0 || runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
 		t.Fatalf("routes=%+v stopped=%d docker stops=%d runtime=%+v", fixture.routes.requests, fixture.runtime.stopCalls, fixture.runner.stopCalls, runtimeDeployment)
+	}
+	if previous, getErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); getErr != nil || previous.Components[0].State != generatedruntimestate.ComponentDraining {
+		t.Fatalf("predecessor ownership changed: deployment=%+v error=%v", previous, getErr)
 	}
 }
 

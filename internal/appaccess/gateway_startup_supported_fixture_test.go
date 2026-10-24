@@ -15,17 +15,14 @@ import (
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
-// This is the SQL contract of the supported live fixture, not a replacement
-// for its controller and Docker coverage. Canonical application, plan, release
-// and deployment prerequisites follow the established appaccess test fixture;
-// all gateway, grant and generated-runtime transitions use their repositories.
+// This is the SQL read contract for supported fixture identities across an
+// upgrade and reopen; controller and Docker coverage remain separate. Serving
+// history is created under schema 041, then upgraded before current gateway and
+// grant operations. An upgrade must preserve history without minting authority.
 func TestHostingGatewayStartupSnapshotAcceptsSupportedFixtureCombinedStateAfterReopen(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
-	setupDB, err := database.Open(root)
-	if err != nil {
-		t.Fatal(err)
-	}
+	setupDB := openSupportedFixtureHistoricalDatabase(t, root)
 	setupOpen := true
 	t.Cleanup(func() {
 		if setupOpen {
@@ -45,6 +42,19 @@ func TestHostingGatewayStartupSnapshotAcceptsSupportedFixtureCombinedStateAfterR
 			Slot: head.Slot, Generation: head.Generation, UpdatedAt: head.UpdatedAt,
 		})
 		wantComponents = append(wantComponents, components...)
+	}
+	if err := database.Migrate(setupDB); err != nil {
+		t.Fatalf("upgrade supported fixture history: %v", err)
+	}
+	var activationCount, receiptHeads int
+	if err := setupDB.QueryRow(`SELECT COUNT(*) FROM generated_route_activations`).Scan(&activationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := setupDB.QueryRow(`SELECT COUNT(*) FROM generated_runtime_active_heads WHERE activation_receipt_id IS NOT NULL`).Scan(&receiptHeads); err != nil {
+		t.Fatal(err)
+	}
+	if activationCount != 0 || receiptHeads != 0 {
+		t.Fatalf("historical upgrade minted activation authority: receipts=%d heads=%d", activationCount, receiptHeads)
 	}
 	sort.Slice(wantHeads, func(i, j int) bool { return wantHeads[i].AppID < wantHeads[j].AppID })
 	sort.Slice(wantComponents, func(i, j int) bool {
@@ -290,7 +300,6 @@ func seedSupportedFixtureRuntime(t *testing.T, db *sql.DB, appID string) (
 	generatedruntimestate.ActiveHead, []GatewayStartupRuntimeComponent,
 ) {
 	t.Helper()
-	ctx := context.Background()
 	// releasesnapshot.MaterializeLocal and releasesnapshot.Materialize produce
 	// 16 random bytes encoded as 32 lowercase hexadecimal release IDs.
 	planID, releaseID := uuid.NewString(), supportedFixtureDigest(appID + "-release-id")[:32]
@@ -326,15 +335,14 @@ func seedSupportedFixtureRuntime(t *testing.T, db *sql.DB, appID string) (
 		t.Fatal(err)
 	}
 
-	runtime := generatedruntimestate.New(db)
-	value, created, err := runtime.Begin(ctx, generatedruntimestate.BeginInput{
-		DeploymentID: deploymentID, AppID: appID, ReleaseID: releaseID,
-		DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1,
-		ComponentNames: []string{"api", "frontend"},
-	})
-	if err != nil || !created {
-		t.Fatalf("begin supported runtime for %s: created=%t error=%v", appID, created, err)
+	if _, err := db.Exec(`INSERT INTO generated_runtime_deployments(
+		deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,
+		candidate_slot,phase,migration_state,created_at,updated_at
+	) VALUES(?,?,?,?,1,'blue','preflight','not_required',?,?)`,
+		deploymentID, appID, releaseID, planID, stamp, stamp); err != nil {
+		t.Fatal(err)
 	}
+	components := make([]GatewayStartupRuntimeComponent, 0, 2)
 	for _, component := range []string{"api", "frontend"} {
 		artifactID := uuid.NewString()
 		if _, err := db.Exec(`INSERT INTO generated_image_artifacts(
@@ -348,48 +356,52 @@ func seedSupportedFixtureRuntime(t *testing.T, db *sql.DB, appID string) (
 		}
 		containerName := "rig-supported-" + strings.ReplaceAll(appID, "-", "")[:12] + "-" + component
 		containerID := supportedFixtureDigest(appID + "-" + component + "-container")
-		if _, err := runtime.SetImageReady(ctx, appID, deploymentID, component, artifactID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := runtime.SetContainerStarting(ctx, appID, deploymentID, component, containerName); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := runtime.SetContainerRunning(ctx, appID, deploymentID, component, containerID); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := runtime.AdvanceComponent(ctx, appID, deploymentID, component,
-			generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, next := range []generatedruntimestate.Phase{
-		generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate,
-		generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute,
-	} {
-		value, err = runtime.Advance(ctx, appID, deploymentID, value.Phase, next, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	head, changed, err := runtime.SwitchActive(ctx, appID, deploymentID, 0)
-	if err != nil || !changed {
-		t.Fatalf("switch supported runtime head for %s: changed=%t error=%v", appID, changed, err)
-	}
-	components := make([]GatewayStartupRuntimeComponent, 0, 2)
-	for _, name := range []string{"api", "frontend"} {
-		component, err := runtime.Component(ctx, appID, deploymentID, name)
-		if err != nil {
-			t.Fatal(err)
+		for index, statement := range []struct {
+			query string
+			args  []any
+		}{
+			{`INSERT INTO generated_runtime_components(
+				deployment_id,component_name,slot,state,created_at,updated_at
+			) VALUES(?,?,'blue','pending',?,?)`, []any{deploymentID, component, stamp, stamp}},
+			{`UPDATE generated_runtime_components SET state='image_ready',image_artifact_id=?,updated_at=?
+				WHERE deployment_id=? AND component_name=?`, []any{artifactID, stamp, deploymentID, component}},
+			{`UPDATE generated_runtime_components SET state='starting',container_name=?,updated_at=?
+				WHERE deployment_id=? AND component_name=?`, []any{containerName, stamp, deploymentID, component}},
+			{`UPDATE generated_runtime_components SET state='running',container_id=?,updated_at=?
+				WHERE deployment_id=? AND component_name=?`, []any{containerID, stamp, deploymentID, component}},
+			{`UPDATE generated_runtime_components SET state='healthy',updated_at=?
+				WHERE deployment_id=? AND component_name=?`, []any{stamp, deploymentID, component}},
+		} {
+			if _, err := db.Exec(statement.query, statement.args...); err != nil {
+				t.Fatalf("seed historical component %s statement %d: %v", component, index+1, err)
+			}
 		}
 		components = append(components, GatewayStartupRuntimeComponent{
 			AppID: appID, DeploymentID: deploymentID, ReleaseID: releaseID,
-			Name: component.Name, Slot: component.Slot, ImageArtifactID: component.ImageArtifactID,
-			ContainerName: component.ContainerName, ContainerID: component.ContainerID,
-			State: string(component.State), DiagnosticCode: string(component.DiagnosticCode),
-			CreatedAt: component.CreatedAt, UpdatedAt: component.UpdatedAt, FinishedAt: component.FinishedAt,
+			Name: component, Slot: "blue", ImageArtifactID: artifactID,
+			ContainerName: containerName, ContainerID: containerID,
+			State: "active", CreatedAt: testNow, UpdatedAt: testNow,
 		})
 	}
-	return head, components
+	for _, next := range []string{"building", "starting_candidate", "waiting_health", "switching_route"} {
+		if _, err := db.Exec(`UPDATE generated_runtime_deployments SET phase=?,updated_at=? WHERE deployment_id=?`,
+			next, stamp, deploymentID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`UPDATE generated_runtime_active_heads
+		SET deployment_id=?,release_id=?,slot='blue',generation=1,updated_at=? WHERE app_id=?`,
+		deploymentID, releaseID, stamp, appID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE generated_runtime_components SET state='active',updated_at=? WHERE deployment_id=?`,
+		stamp, deploymentID); err != nil {
+		t.Fatal(err)
+	}
+	return generatedruntimestate.ActiveHead{
+		AppID: appID, DeploymentID: deploymentID, ReleaseID: releaseID,
+		Slot: "blue", Generation: 1, UpdatedAt: testNow,
+	}, components
 }
 
 type supportedFixtureAuthority struct {
@@ -503,4 +515,11 @@ func assertSupportedFixtureHasNoRebindClaims(t *testing.T, db *sql.DB) {
 func supportedFixtureDigest(value string) string {
 	digest := sha256.Sum256([]byte(value))
 	return fmt.Sprintf("%x", digest)
+}
+
+// openSupportedFixtureHistoricalDatabase retains the old serving-history schema
+// only during setup. The caller must migrate before its current read contract.
+func openSupportedFixtureHistoricalDatabase(t *testing.T, root string) *sql.DB {
+	t.Helper()
+	return openHistoricalGatewayDatabase(t, root)
 }

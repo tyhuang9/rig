@@ -265,6 +265,9 @@ func TestInspectGatewayRebindPreclaimSuccessorPreflightRejectsDrift(t *testing.T
 					if _, err := f.db.Exec(`DROP TRIGGER generated_runtime_active_head_valid_update`); err != nil {
 						t.Fatal(err)
 					}
+					if _, err := f.db.Exec(`DROP TRIGGER generated_runtime_active_head_activation_guard`); err != nil {
+						t.Fatal(err)
+					}
 					if _, err := f.db.Exec(`UPDATE generated_runtime_active_heads SET generation=generation+1 WHERE app_id=?`, f.proposal.Roster[0].AppID); err != nil {
 						t.Fatal(err)
 					}

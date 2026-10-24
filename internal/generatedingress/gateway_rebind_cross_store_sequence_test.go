@@ -8,12 +8,11 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/generatedidentity"
-	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
+	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 )
 
 // These sequences use real SQLite transitions and protected records. Only
@@ -224,9 +223,16 @@ func TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy(t *test
 	redeployed, err := selection.Store.load()
 	if err != nil || redeployed.Revision != selection.State.Revision+2 || redeployed.Pending != nil ||
 		redeployed.Apps[entry.AppID].Route.Slot != generatedidentity.Slot(head.Slot) ||
-		!reflect.DeepEqual(redeployed.Apps[entry.AppID].LAN, selection.State.Apps[entry.AppID].LAN) ||
-		physical.applyCalls != 1 || physical.attestCalls != 1 || physical.restoreCalls+physical.stopCalls != 0 {
-		t.Fatalf("ordinary redeploy did not preserve transferred binding: %v", err)
+		!reflect.DeepEqual(redeployed.Apps[entry.AppID].LAN, selection.State.Apps[entry.AppID].LAN) {
+		t.Fatalf("ordinary redeploy did not preserve exact head and transferred binding: state=%#v error=%v", redeployed, err)
+	}
+	// The explicit predecessor observation, Pin observation, pre-activation
+	// observation, state-machine proof and post-switch observation each attest
+	// the same selected current authority. Only the state-machine apply mutates.
+	if physical.applyCalls != 1 || physical.attestCalls != 5 ||
+		physical.restoreCalls != 0 || physical.stopCalls != 0 {
+		t.Fatalf("ordinary redeploy physical sequence: apply=%d attest=%d restore=%d stop=%d",
+			physical.applyCalls, physical.attestCalls, physical.restoreCalls, physical.stopCalls)
 	}
 	files, err := readGatewayHistorySnapshotMode(f.manager.store, true)
 	if err != nil {
@@ -271,15 +277,18 @@ func TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy(t *test
 	gatewayRebindSequenceRequireRetainedFiles(t, f.manager, files)
 }
 
-// Create the usual job/deployment envelope, then exercise the real runtime
-// repository and public ingress Switch path. Docker start/health/publication
-// are simulated by fixture data and the explicitly injected physical driver.
+// Create the usual job/deployment envelope, then exercise the real candidate
+// and sealed route authorities. Docker start/health/publication are simulated
+// by fixture data and the explicitly injected physical driver.
 func gatewayRebindSequenceRedeploy(t *testing.T, f gatewayRebindPredecessorFixture,
 	state gatewayCurrentRouteState, entry appaccess.GatewayRebindRosterEntryV2,
 ) generatedruntimestate.ActiveHead {
 	t.Helper()
 	ctx := context.Background()
-	release, err := gatewayRebindAcquireDeploymentEffects(ctx, f.manager.options.WorkingDirectory)
+	if f.migration == nil || f.migration.jobService == nil {
+		t.Fatal("redeploy requires the canonical predecessor migration family")
+	}
+	scope, release, err := deploymenteffects.AcquireScoped(ctx, f.manager.options.WorkingDirectory)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,76 +299,67 @@ func gatewayRebindSequenceRedeploy(t *testing.T, f gatewayRebindPredecessorFixtu
 	}()
 	runtime := generatedruntimestate.New(f.db)
 	previous, err := runtime.Get(ctx, entry.AppID, entry.ServingDeploymentID)
-	if err != nil || len(previous.Components) != 1 {
+	if err != nil || len(previous.Components) != 1 || previous.Phase != generatedruntimestate.PhaseSucceeded {
 		t.Fatalf("previous runtime: %v", err)
 	}
-	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded} {
-		previous, err = runtime.Advance(ctx, entry.AppID, previous.DeploymentID, previous.Phase, next, "")
-		if err != nil {
-			t.Fatal(err)
-		}
+	f.migration.guarded.context = deploymenteffects.WithScope(ctx, scope)
+	successor := newGeneratedRouteSuccessorMigration(t, f.migration, f.migration.jobService)
+	authority := f.migration.repository.candidateAuthority()
+	if authority == nil {
+		t.Fatal("redeploy requires the original generated candidate authority")
 	}
-	jobID, deploymentID := "85858585-8585-4585-8585-858585858585", "86868686-8686-4686-8686-868686868686"
-	stamp := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := f.db.ExecContext(ctx, `INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,created_at,updated_at)
-		VALUES(?,'deploy','application',?,'running','running',?,?,?)`, jobID, entry.AppID,
-		gatewayRebindTestAdministrator, stamp, stamp); err != nil {
-		t.Fatal(err)
+	candidateRunner, ok := authority.process.(*generatedRouteCandidateRunner)
+	if !ok || candidateRunner.delegate == nil {
+		t.Fatal("redeploy requires the original generated candidate authority family")
 	}
-	if _, err := f.db.ExecContext(ctx, `INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,
-		provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number)
-		VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,?)`, deploymentID, entry.AppID, previous.ReleaseID, jobID,
-		previous.DeploymentPlanRevisionID, previous.DeploymentPlanRevisionNumber); err != nil {
-		t.Fatal(err)
+	candidateRunner.delegate.containerID = strings.Repeat("5", 64)
+	owner := &candidateOwnerFixture{validation: newGeneratedRouteSuccessorValidation(t, successor),
+		authority: authority, runner: candidateRunner.delegate}
+	execution, identity := prepareGeneratedRouteSequentialCandidate(t, owner)
+	defer execution.Leave()
+	routeRunner, ok := f.manager.runner.(*generatedRoutePredecessorRunner)
+	if !ok {
+		t.Fatal("redeploy requires the canonical route observation runner")
 	}
-	value, created, err := runtime.Begin(ctx, generatedruntimestate.BeginInput{AppID: entry.AppID, DeploymentID: deploymentID,
-		ReleaseID: previous.ReleaseID, DeploymentPlanRevisionID: previous.DeploymentPlanRevisionID,
-		DeploymentPlanRevisionNumber: previous.DeploymentPlanRevisionNumber, ComponentNames: []string{"api"}})
-	if err != nil || !created {
-		t.Fatalf("begin redeploy: created=%t error=%v", created, err)
+	routeRunner.endpoints[identity.ContainerID] = generatedRouteEndpointSnapshot{appID: entry.AppID,
+		endpoint: generatedRouteEndpoint(identity), slot: generatedidentity.Slot(identity.Slot)}
+	routeRunner.slot = generatedidentity.Slot(identity.Slot)
+	// This SQL/protected-state sequence deliberately simulates physical Docker
+	// effects. Keep the current-V2 topology attestation aligned with that
+	// bounded driver while the sealed route operation performs its own exact
+	// runtime-head, roster and protected-route checks.
+	originalTopologyObserver := f.manager.gatewayTopologyObserver
+	f.manager.gatewayTopologyObserver = func(context.Context, routeState, gatewayV2RouteState,
+		gatewayMigrationJournal,
+	) gatewayObservedTopology {
+		return gatewayTopologyExactFinalV2
 	}
-	if _, err := runtime.SetImageReady(ctx, entry.AppID, deploymentID, "api", previous.Components[0].ImageArtifactID); err != nil {
-		t.Fatal(err)
+	defer func() { f.manager.gatewayTopologyObserver = originalTopologyObserver }()
+	observed, err := f.manager.Observe(successor.guarded.context, entry.AppID)
+	if err != nil || observed.Slot != generatedidentity.Slot(entry.ServingSlot) {
+		t.Fatalf("observe bounded predecessor before redeploy: observation=%#v error=%v", observed, err)
 	}
-	if _, err := runtime.SetContainerStarting(ctx, entry.AppID, deploymentID, "api", "rig-rebind-api-green"); err != nil {
-		t.Fatal(err)
+	routes, err := newGeneratedRouteAuthority(f.manager, owner.authority, owner.authority.stores)
+	if err != nil {
+		t.Fatalf("construct redeploy route authority: %v", err)
 	}
-	if _, err := runtime.SetContainerRunning(ctx, entry.AppID, deploymentID, "api", strings.Repeat("5", 64)); err != nil {
-		t.Fatal(err)
+	request := generatedRouteRequest(entry.AppID, identity)
+	request.FromSlot = generatedidentity.Slot(entry.ServingSlot)
+	activation, err := routes.Pin(successor.guarded.context, execution, request)
+	if err != nil {
+		t.Fatalf("pin redeploy route: %v", err)
 	}
-	if _, err := runtime.AdvanceComponent(ctx, entry.AppID, deploymentID, "api",
-		generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatal(err)
+	if _, err := activation.Activate(successor.guarded.context); err != nil {
+		t.Fatalf("activate redeploy route: %v", err)
 	}
-	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate,
-		generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute} {
-		value, err = runtime.Advance(ctx, entry.AppID, deploymentID, value.Phase, next, "")
-		if err != nil {
-			t.Fatal(err)
-		}
+	head, err := runtime.Active(ctx, entry.AppID)
+	if err != nil || head.Generation != entry.RouteGeneration+1 || head.Slot != string(request.ToSlot) {
+		t.Fatalf("read activated redeploy route: head=%#v error=%v", head, err)
 	}
-	request := routeOperationSwitchRequest(t, entry.AppID, state.Apps[entry.AppID].Route)
-	request.Endpoints = []generatedroute.RouteEndpoint{endpoint("api", "server", "rebind-app-network", "rebind-app-green", 3000, '5')}
-	if err := f.manager.Switch(ctx, request); err != nil {
-		t.Fatalf("ordinary ingress switch: %v", err)
-	}
-	head, changed, err := runtime.SwitchActive(ctx, entry.AppID, deploymentID, entry.RouteGeneration)
-	if err != nil || !changed || head.Generation != entry.RouteGeneration+1 || head.Slot != string(request.ToSlot) {
-		t.Fatalf("runtime head switch: changed=%t error=%v", changed, err)
-	}
-	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded} {
-		value, err = runtime.Advance(ctx, entry.AppID, deploymentID, value.Phase, next, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := f.db.ExecContext(ctx, `UPDATE deployments SET status='succeeded',finished_at=? WHERE id=?`, stamp, deploymentID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.db.ExecContext(ctx, `UPDATE jobs SET status='succeeded',phase='completed',updated_at=?,finished_at=? WHERE id=?`,
-		stamp, stamp, jobID); err != nil {
-		t.Fatal(err)
-	}
+	// This sequence verifies current-route SQL/protected lineage and retains no
+	// lifecycle operation. Complete only the route candidate's runtime,
+	// deployment and job state, matching the original fixture boundary.
+	completeGeneratedRouteSequentialCandidateState(t, owner, head)
 	return head
 }
 

@@ -11,7 +11,7 @@ import (
 )
 
 func TestGatewayRebindReconcileAuthorizationA0BindsPreviewAndAudit(t *testing.T) {
-	fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+	fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 	snapshot := gatewayRebindAuthorizationSnapshot(t, fixture)
 	trusted := gatewayRebindA0TrustedSnapshot(claim)
 	preview, err := BuildGatewayRebindReconcileReview(snapshot, trusted, testAdministrator)
@@ -83,7 +83,7 @@ func TestGatewayRebindReconcileAuthorizationA0BindsPreviewAndAudit(t *testing.T)
 }
 
 func TestGatewayRebindCheckpointTerminalRecoveryPolicy(t *testing.T) {
-	fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+	fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 	snapshot := gatewayRebindAuthorizationSnapshot(t, fixture)
 	receipt := strings.Repeat("7", 64)
 	trusted := gatewayRebindA0TrustedSnapshot(claim)
@@ -368,7 +368,7 @@ func TestGatewayRebindReconcileAuthorizationRejectsWithoutAudit(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+			fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 			snapshot := gatewayRebindAuthorizationSnapshot(t, fixture)
 			trusted := gatewayRebindA0TrustedSnapshot(claim)
 			preview, err := BuildGatewayRebindReconcileReview(snapshot, trusted, testAdministrator)
@@ -389,7 +389,7 @@ func TestGatewayRebindReconcileAuthorizationRejectsWithoutAudit(t *testing.T) {
 
 func TestGatewayRebindReconcileReviewDerivesFixedPolicyAndRejectsContradictions(t *testing.T) {
 	t.Run("prepared evidence decides and fixed directions", func(t *testing.T) {
-		fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+		fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 		snapshot := gatewayRebindAuthorizationSnapshot(t, fixture)
 		base := gatewayRebindA0TrustedSnapshot(claim)
 		for _, test := range []struct {
@@ -415,7 +415,7 @@ func TestGatewayRebindReconcileReviewDerivesFixedPolicyAndRejectsContradictions(
 	})
 
 	t.Run("retained commit requires exact protected decision", func(t *testing.T) {
-		fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+		fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 		receipt := strings.Repeat("9", 64)
 		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(),
 			gatewayRebindProofForClaimV2(t, claim, GatewayRebindPrepared, 1,
@@ -448,7 +448,7 @@ func TestGatewayRebindReconcileReviewDerivesFixedPolicyAndRejectsContradictions(
 	})
 
 	t.Run("retained abort cannot be overridden from unresolved", func(t *testing.T) {
-		fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+		fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 		receipt := strings.Repeat("7", 64)
 		proof := gatewayRebindProofForClaimV2(t, claim, GatewayRebindPrepared, 1,
 			GatewayRebindUnresolved, receipt, nil)
@@ -471,7 +471,7 @@ func TestGatewayRebindReconcileReviewDerivesFixedPolicyAndRejectsContradictions(
 	})
 
 	t.Run("database commit is forward only and rejects abort", func(t *testing.T) {
-		fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+		fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 		receipt := strings.Repeat("6", 64)
 		if _, err := fixture.repository.ApplyGatewayRebindTransition(context.Background(),
 			gatewayRebindProofForClaimV2(t, claim, GatewayRebindPrepared, 1,
@@ -555,7 +555,7 @@ func TestGatewayRebindReconcileReviewDerivesFixedPolicyAndRejectsContradictions(
 	})
 
 	t.Run("terminal claim has no active recovery authorization", func(t *testing.T) {
-		fixture, claim := gatewayRebindDistinctApprovalFixture(t, appAccessDB(t))
+		fixture, claim := gatewayRebindDistinctApprovalFixture(t, historicalAppAccessDB(t))
 		receipt := strings.Repeat("3", 64)
 		proof := gatewayRebindProofForClaimV2(t, claim, GatewayRebindPrepared, 1,
 			GatewayRebindRolledBack, receipt, nil)

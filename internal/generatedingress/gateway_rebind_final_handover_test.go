@@ -566,13 +566,20 @@ func TestGatewayRebindFinalHandoverCancellationAfterPredecessorStopRequiresFresh
 
 func TestGatewayRebindFinalHandoverFreshLoopbackHeadDriftPreventsAllEffects(t *testing.T) {
 	fixture, fake := installGatewayRebindFinalHandoverFixture(t)
-	for _, trigger := range []string{"lan_gateway_rebind_fence_runtime_head_update", "generated_runtime_active_head_valid_update"} {
+	if fixture.predecessor.loopback == nil || fixture.predecessor.loopback.migration == nil {
+		t.Fatal("fresh loopback drift fixture lacks authentic migration provenance")
+	}
+	loopbackID := fixture.predecessor.loopback.migration.guarded.appID
+	for _, trigger := range []string{
+		"lan_gateway_rebind_fence_runtime_head_update", "generated_runtime_active_head_valid_update",
+		"generated_runtime_active_head_activation_guard",
+	} {
 		if _, err := fixture.predecessor.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
 			t.Fatal(err)
 		}
 	}
 	checkpoint := func() {
-		result, err := fixture.predecessor.db.Exec(`UPDATE generated_runtime_active_heads SET generation=generation+1,updated_at=? WHERE app_id=?`, gatewayRebindProgressTimestamp(40).Format(time.RFC3339Nano), "ffffffff-ffff-4fff-8fff-ffffffffffff")
+		result, err := fixture.predecessor.db.Exec(`UPDATE generated_runtime_active_heads SET generation=generation+1,updated_at=? WHERE app_id=?`, gatewayRebindProgressTimestamp(40).Format(time.RFC3339Nano), loopbackID)
 		if err != nil {
 			t.Fatal(err)
 		}

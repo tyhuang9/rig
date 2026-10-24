@@ -261,7 +261,7 @@ func TestMigrationFailureTransactionCannotAdvancePreparation(t *testing.T) {
 	_ = tx.Rollback()
 }
 
-func TestComponentLifecycleAndActiveHeadCAS(t *testing.T) {
+func TestComponentLifecycleRejectsLegacyActiveHeadWrite(t *testing.T) {
 	fixture := newFixture(t, []string{"api"}, false, false)
 	value, _, err := fixture.repository.Begin(context.Background(), fixture.beginInput([]string{"api"}))
 	if err != nil {
@@ -293,21 +293,41 @@ func TestComponentLifecycleAndActiveHeadCAS(t *testing.T) {
 	value = advance(t, fixture.repository, value, PhaseWaitingHealth)
 	value = advance(t, fixture.repository, value, PhaseSwitchingRoute)
 
-	head, switched, err := fixture.repository.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0)
-	if err != nil || !switched || head.DeploymentID != fixture.deploymentID || head.Slot != "blue" || head.Generation != 1 {
-		t.Fatalf("active switch = %#v switched=%t err=%v", head, switched, err)
+	// The current schema requires a sealed domain activation receipt. This
+	// legacy writer cannot promote a healthy component by itself; successful
+	// activation and replay are exercised by the generated route authority tests.
+	beforeHead, err := fixture.repository.Active(context.Background(), fixture.appID)
+	if err != nil || beforeHead.Generation != 0 || beforeHead.DeploymentID != "" || beforeHead.ActivationReceiptID != "" {
+		t.Fatalf("initial active head = %#v err=%v", beforeHead, err)
 	}
-	component, err = fixture.repository.Component(context.Background(), fixture.appID, fixture.deploymentID, "api")
-	if err != nil || component.State != ComponentActive {
-		t.Fatalf("active component = %#v err=%v", component, err)
+	beforeComponent := component
+	for attempt := 0; attempt < 2; attempt++ {
+		head, switched, err := fixture.repository.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0)
+		if err == nil || !strings.Contains(err.Error(), "generated runtime active head requires an exact activation receipt") ||
+			switched || head != (ActiveHead{}) {
+			t.Fatalf("legacy active switch attempt %d = %#v switched=%t err=%v", attempt, head, switched, err)
+		}
+		afterHead, err := fixture.repository.Active(context.Background(), fixture.appID)
+		if err != nil || afterHead != beforeHead {
+			t.Fatalf("refused active switch changed head = %#v err=%v", afterHead, err)
+		}
+		afterComponent, err := fixture.repository.Component(context.Background(), fixture.appID, fixture.deploymentID, "api")
+		if err != nil || afterComponent != beforeComponent {
+			t.Fatalf("refused active switch changed healthy component = %#v err=%v", afterComponent, err)
+		}
+		afterDeployment, err := fixture.repository.Get(context.Background(), fixture.appID, fixture.deploymentID)
+		if err != nil || afterDeployment.Phase != PhaseSwitchingRoute {
+			t.Fatalf("refused active switch changed deployment phase = %#v err=%v", afterDeployment, err)
+		}
+		var receipts int
+		if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM generated_route_activations WHERE app_id=?`, fixture.appID).Scan(&receipts); err != nil || receipts != 0 {
+			t.Fatalf("refused active switch wrote %d receipts: %v", receipts, err)
+		}
 	}
-	if _, err := fixture.repository.AdvanceComponent(context.Background(), fixture.appID, fixture.deploymentID, "api", ComponentActive, ComponentDraining); err == nil {
-		t.Fatal("currently routed component began draining")
+	if _, err := fixture.repository.AdvanceComponent(context.Background(), fixture.appID, fixture.deploymentID, "api", ComponentHealthy, ComponentDraining); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("unactivated healthy component began draining: %v", err)
 	}
-	if replay, switched, err := fixture.repository.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0); err != nil || switched || replay.Generation != 1 {
-		t.Fatalf("active switch replay = %#v switched=%t err=%v", replay, switched, err)
-	}
-	if _, _, err := fixture.repository.SwitchActive(context.Background(), fixture.appID, uuid.NewString(), 0); !errors.Is(err, ErrConflict) {
+	if _, _, err := fixture.repository.SwitchActive(context.Background(), fixture.appID, uuid.NewString(), 1); !errors.Is(err, ErrConflict) {
 		t.Fatalf("stale active generation = %v", err)
 	}
 }

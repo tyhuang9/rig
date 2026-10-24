@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"github.com/hostd/hostd/internal/generatedingress"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,12 +14,21 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/applifecycle"
+	"github.com/hostd/hostd/internal/controllerowner"
+	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 type compilerAttestorRunner struct {
@@ -41,12 +49,6 @@ func (*unusedCompilerEnvironment) Stage(string, int, []byte) (generatedruntime.E
 
 func (*unusedCompilerEnvironment) StageGeneratedCandidate(string, int, []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
 	return nil, errors.New("compiler attestor test unexpectedly staged candidate environment")
-}
-
-type compilerAttestorCapacity struct{}
-
-func (compilerAttestorCapacity) Snapshot(context.Context) (generatedruntime.CapacitySnapshot, error) {
-	return generatedruntime.CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
 }
 
 func TestCompilerCanonicalAttestorControlsBoundedReplacement(t *testing.T) {
@@ -120,7 +122,7 @@ func TestCompilerCanonicalAttestorControlsBoundedReplacement(t *testing.T) {
 					}
 					return compilerImageObservation(t, &fixture, contentID), nil
 				}
-				fixture.compiler.validator = newCompilerAttestorEngine(t, fixture.authority.repository, runner)
+				fixture.compiler.validator = newCompilerAttestorEngine(t, runner)
 			}
 
 			artifact, err := fixture.compile(ctx)
@@ -293,7 +295,7 @@ func TestCompilerImageReadyResumeRequiresFreshExactPhysicalEvidence(t *testing.T
 				}
 				return compilerImageObservation(t, &fixture, observed), nil
 			}
-			fixture.compiler.validator = newCompilerAttestorEngine(t, fixture.authority.repository, runner)
+			fixture.compiler.validator = newCompilerAttestorEngine(t, runner)
 
 			artifact, err := fixture.compile(context.Background())
 			persisted, persistedErr := NewArtifactRepository(fixture.authority.db).Get(context.Background(), ready.ID)
@@ -685,12 +687,86 @@ func compilerImageObservation(t *testing.T, fixture *compilerFixture, observedCo
 	return runtimeprocess.CommandResult{Stdout: body}
 }
 
-func newCompilerAttestorEngine(t *testing.T, repository *deployments.Repository, runner runtimeprocess.CommandRunner) *generatedruntime.Engine {
+// The image attestor is read-only; its domain starts empty before the supplied
+// runner provides image observations. Compiler authorization and artifact
+// persistence remain in each test's separate compiler fixture.
+func newCompilerAttestorEngine(t *testing.T, runner runtimeprocess.CommandRunner) *generatedruntime.Engine {
 	t.Helper()
-	root := t.TempDir()
-	engine, err := generatedruntime.NewEngine(runner, &unusedCompilerEnvironment{}, compilerAttestorCapacity{}, repository, generatedruntime.EngineOptions{
-		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: t.TempDir(), WorkingDirectory: root, CommandTimeout: time.Minute,
+	root := generateddomain.NewRetainedRoot(t)
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := controllerowner.Acquire(context.Background(), directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	db, err := database.OpenForGeneratedDomain(context.Background(), root, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	lifecycle := applifecycle.New(db)
+	validator, err := applifecycle.NewDeploymentBindingValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	positive, err := applifecycle.NewPositiveFenceValidator(lifecycle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := deploymentexecution.NewGuard(db, bindings, positive, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := deploymentplans.New(db, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := appconfig.New(db, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository, err := deployments.NewWithExecutionGuardAndGeneratedCandidates(db, guard, plans, configuration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stores, err := repository.GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := generateddomain.NewRunner(generateddomain.Options{Fallback: runner})
+	environment := &unusedCompilerEnvironment{}
+	options := generatedruntime.EngineOptions{
+		DockerExecutable:      filepath.Join(root, "docker.exe"),
+		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
+		CommandTimeout: time.Minute, HealthTimeout: 2 * time.Minute,
+		HealthPollInterval: time.Second, OutputLimit: 64 << 10,
+		Limits: generatedruntime.ContainerLimits{
+			MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256,
+			TmpfsBytes: 64 << 20, LogSize: "10m", LogFiles: 3,
+		},
+		ReplacementDiskBytes: 256 << 20,
+	}
+	domain, err := generatedingress.NewGeneratedDomain(context.Background(), stores, process, environment, generatedingress.GeneratedDomainOptions{
+		DataRoot: root, DockerExecutable: options.DockerExecutable,
+		DockerConfigDirectory: options.DockerConfigDirectory, WorkingDirectory: options.WorkingDirectory,
+		CommandTimeout: options.CommandTimeout, PullTimeout: 5 * time.Minute,
+		HealthTimeout: options.HealthTimeout, HealthPollInterval: options.HealthPollInterval,
+		OutputLimit: options.OutputLimit, MemoryBytes: options.Limits.MemoryBytes,
+		MilliCPUs: options.Limits.MilliCPUs, PIDs: options.Limits.PIDs,
+		TmpfsBytes: options.Limits.TmpfsBytes, LogSize: options.Limits.LogSize,
+		LogFiles: options.Limits.LogFiles, ReplacementDiskBytes: options.ReplacementDiskBytes,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := generatedruntime.NewEngine(process, environment, domain.Candidates(), options)
 	if err != nil {
 		t.Fatal(err)
 	}

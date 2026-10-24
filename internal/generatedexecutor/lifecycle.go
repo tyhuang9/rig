@@ -281,88 +281,66 @@ func (e *Executor) candidateFailure(ctx context.Context, execution *generateding
 	return errors.Join(executionError(code), cause)
 }
 
-func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment, candidates map[string]generatedruntime.Candidate) (generatedruntimestate.Deployment, bool, error) {
-	head, err := e.state.Active(ctx, resolved.deployment.AppID)
-	if err != nil {
-		return runtimeDeployment, false, staticError("active head unavailable")
-	}
-	if head.DeploymentID == resolved.deployment.ID {
-		request := generatedruntime.RouteSwitchRequest{
-			AppID: resolved.deployment.AppID, FromSlot: generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot),
-			ToSlot: generatedruntime.Slot(runtimeDeployment.CandidateSlot), DrainPeriod: e.options.DrainPeriod,
-			Endpoints: routeEndpoints(resolved.plan, candidates),
-		}
-		if err = e.routes.Switch(ctx, request); err != nil {
-			// The durable active head already names this candidate. Never clean it
-			// up merely because reattesting or reinstalling its route failed.
-			return runtimeDeployment, true, newRouteSwitchError(err, "route reconciliation failed")
-		}
-		updated, advanceErr := e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
-		return updated, true, advanceErr
-	}
-	if head.DeploymentID != runtimeDeployment.PreviousActiveDeploymentID || head.Slot != runtimeDeployment.PreviousActiveSlot {
-		return runtimeDeployment, false, staticError("active head changed")
-	}
+func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
+	runtimeDeployment generatedruntimestate.Deployment, candidateExecution *generatedingress.GeneratedCandidateExecution,
+	candidates map[string]generatedruntime.Candidate,
+) (generatedruntimestate.Deployment, error) {
 	request := generatedruntime.RouteSwitchRequest{
 		AppID: resolved.deployment.AppID, FromSlot: generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot),
 		ToSlot: generatedruntime.Slot(runtimeDeployment.CandidateSlot), DrainPeriod: e.options.DrainPeriod,
 		Endpoints: routeEndpoints(resolved.plan, candidates),
 	}
-	if err = e.routes.Switch(ctx, request); err != nil {
-		return runtimeDeployment, generatedruntime.RouteCandidateMayBeLive(err), newRouteSwitchError(err, "route switch failed")
-	}
-	if _, _, err = e.state.SwitchActive(ctx, resolved.deployment.AppID, resolved.deployment.ID, head.Generation); err != nil {
-		if runtimeDeployment.PreviousActiveDeploymentID == "" {
-			// A first deployment has no previous route to restore. The candidate
-			// route was already committed, so preserve it until reconciliation can
-			// prove and persist the serving state.
-			return runtimeDeployment, true, staticError("active head compare-and-swap failed")
-		}
-		rollback, cancel := context.WithTimeout(context.WithoutCancel(ctx), e.options.CleanupTimeout)
-		restoreErr := e.restorePreviousRoute(rollback, resolved, runtimeDeployment)
-		cancel()
-		if restoreErr != nil {
-			// The route already switched to the candidate, and restoring the
-			// previous route was not proven successful. Preserve both slots and
-			// require reconciliation rather than deleting a possibly live target.
-			return runtimeDeployment, true, staticError("active head compare-and-swap failed")
-		}
-		return runtimeDeployment, false, staticError("active head compare-and-swap failed")
-	}
-	updated, err := e.state.Advance(ctx, resolved.deployment.AppID, resolved.deployment.ID, generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
+	updated, err := e.routes.activate(ctx, candidateExecution, request, runtimeDeployment)
 	if err != nil {
-		return runtimeDeployment, true, staticError("persist draining phase")
+		return runtimeDeployment, newRouteSwitchError(err, "route activation failed")
 	}
-	if runtimeDeployment.PreviousActiveDeploymentID != "" {
-		previous, getErr := e.state.Get(ctx, resolved.deployment.AppID, runtimeDeployment.PreviousActiveDeploymentID)
-		if getErr != nil {
-			return updated, true, staticError("previous deployment unavailable")
-		}
-		for _, component := range previous.Components {
-			if component.State == generatedruntimestate.ComponentActive {
-				if _, err = e.state.AdvanceComponent(ctx, resolved.deployment.AppID, previous.DeploymentID, component.Name, generatedruntimestate.ComponentActive, generatedruntimestate.ComponentDraining); err != nil {
-					return updated, true, staticError("persist previous draining component")
-				}
-			}
-		}
+	if updated.DeploymentID != runtimeDeployment.DeploymentID || updated.AppID != runtimeDeployment.AppID ||
+		updated.Phase != generatedruntimestate.PhaseDraining {
+		return runtimeDeployment, staticError("route activation returned invalid runtime state")
 	}
-	return updated, true, nil
+	return updated, nil
 }
 
-// routeSwitchError preserves only the safe, typed ingress readiness outcome.
-// It intentionally excludes the underlying ingress error because a route
-// switcher owns Docker command output and endpoint data.
+// routeSwitchError preserves only the closed pause cause derived at the
+// sealed route adapter. It intentionally excludes and does not unwrap the
+// underlying route error because that owner may carry Docker output or
+// endpoint data.
 type routeSwitchError struct {
-	label                  string
-	gatewayReadinessFailed bool
+	label string
+	cause routePauseCause
 }
 
 func (e routeSwitchError) Error() string { return "generated executor: " + e.label }
 
-func (e routeSwitchError) GatewayReadinessFailed() bool { return e.gatewayReadinessFailed }
+func (e routeSwitchError) GatewayReadinessFailed() bool {
+	return e.cause == routePauseCauseGatewayReadinessFailed
+}
+
+func (e routeSwitchError) routePauseCause() routePauseCause { return e.cause }
 
 func newRouteSwitchError(err error, label string) error {
-	return routeSwitchError{label: label, gatewayReadinessFailed: generatedruntime.RouteGatewayReadinessFailed(err)}
+	return routeSwitchError{label: label, cause: classifyRouteSwitchCause(err)}
+}
+
+func classifyRouteSwitchCause(err error) routePauseCause {
+	switch {
+	case generatedruntime.RouteGatewayReadinessFailed(err):
+		return routePauseCauseGatewayReadinessFailed
+	case errors.Is(err, context.Canceled):
+		return routePauseCauseCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return routePauseCauseDeadlineExceeded
+	case errors.Is(err, generatedruntimestate.ErrNotFound):
+		return routePauseCauseStateNotFound
+	case errors.Is(err, generatedruntimestate.ErrInvalidState):
+		return routePauseCauseInvalidState
+	case errors.Is(err, generatedruntimestate.ErrInvalidTransition):
+		return routePauseCauseInvalidTransition
+	case errors.Is(err, generatedruntimestate.ErrConflict):
+		return routePauseCauseStateConflict
+	default:
+		return routePauseCauseUnknown
+	}
 }
 
 func routeEndpoints(plan deploymentplans.DeploymentPlanRevision, candidates map[string]generatedruntime.Candidate) []generatedruntime.RouteEndpoint {
@@ -384,24 +362,6 @@ func routeEndpoints(plan deploymentplans.DeploymentPlanRevision, candidates map[
 		})
 	}
 	return result
-}
-
-func (e *Executor) restorePreviousRoute(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment) error {
-	if runtimeDeployment.PreviousActiveDeploymentID == "" {
-		return nil
-	}
-	previous, plan, artifacts, err := e.previousResources(ctx, resolved.deployment.AppID, runtimeDeployment.PreviousActiveDeploymentID)
-	if err != nil {
-		return err
-	}
-	candidates, err := reconstructPreviousCandidates(resolved.deployment.AppID, previous, plan, artifacts)
-	if err != nil {
-		return err
-	}
-	return e.routes.Switch(ctx, generatedruntime.RouteSwitchRequest{
-		AppID: resolved.deployment.AppID, FromSlot: generatedruntime.Slot(runtimeDeployment.CandidateSlot),
-		ToSlot: generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot), Endpoints: routeEndpoints(plan, candidates),
-	})
 }
 
 func (e *Executor) drainPrevious(ctx context.Context, resolved resolvedDeployment, runtimeDeployment generatedruntimestate.Deployment) error {

@@ -31,7 +31,8 @@ func newCandidatePolicyFixture(t *testing.T) candidatePolicyFixture {
 	network := newGeneratedMigrationFixture(t)
 	artifactID := uuid.NewString()
 	pins := candidateValidationPins{
-		claim: network.claim, deploymentID: network.request.DeploymentID,
+		claim: network.claim, identity: candidateValidationIdentity{applicationID: network.claim.ApplicationID(),
+			jobID: network.claim.JobID(), attempt: network.claim.Attempt()}, deploymentID: network.request.DeploymentID,
 		releaseID:                    network.request.ReleaseID,
 		configurationRevisionID:      network.request.ConfigurationRevisionID,
 		configurationRevisionNumber:  network.request.ConfigurationRevisionNumber,
@@ -158,11 +159,15 @@ func TestCandidatePolicyCreateArgumentsMatchHardenedRuntimeAndOptionalEnvironmen
 		t.Fatalf("create arguments mismatch\n got: %#v\nwant: %#v", withoutEnvironment, wantWithoutEnvironment)
 	}
 	labels := candidatePolicyLabels(withoutEnvironment)
-	if labels[generatedcontainer.ReceiptLabel] != fixture.receipt.id || len(labels) != 10 {
+	if labels[generatedcontainer.ReceiptLabel] != fixture.receipt.id ||
+		labels["io.rig.definition"] != policy.buildDefinitionDigest || len(labels) != 11 {
 		t.Fatalf("candidate labels = %#v", labels)
 	}
 	if candidatePolicyCountArgument(withoutEnvironment, "--label", generatedcontainer.ReceiptLabel+"="+fixture.receipt.id) != 1 {
 		t.Fatalf("receipt label multiplicity in %#v", withoutEnvironment)
+	}
+	if candidatePolicyCountArgument(withoutEnvironment, "--label", "io.rig.definition="+policy.buildDefinitionDigest) != 1 {
+		t.Fatal("definition label multiplicity")
 	}
 
 	first, _ := policy.createArgs("")
@@ -351,6 +356,7 @@ func candidatePolicyExpectedCreateArguments(policy candidatePolicy) []string {
 		"--label", "io.rig.artifact=" + policy.identity.ArtifactID,
 		"--label", generatedcontainer.ReceiptLabel + "=" + policy.identity.ReceiptID,
 		"--label", "io.rig.component=" + policy.identity.Component,
+		"--label", "io.rig.definition=" + policy.buildDefinitionDigest,
 		"--label", "io.rig.deployment=" + policy.identity.DeploymentID,
 		"--label", "io.rig.managed=generated-runtime",
 		"--label", "io.rig.plan=" + policy.identity.DeploymentPlanRevisionID,

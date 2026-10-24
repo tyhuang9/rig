@@ -30,13 +30,15 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/appconfig"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
-	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
@@ -54,54 +56,71 @@ func (*liveEnvironmentStager) StageGeneratedCandidate(string, int, []byte) (Gene
 	return nil, errors.New("live lifecycle test does not stage configuration")
 }
 
-type liveCapacitySource struct{}
-
-func (liveCapacitySource) Snapshot(context.Context) (generatedcapacity.Snapshot, error) {
-	return generatedcapacity.Snapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 8 << 30}, nil
-}
-
-func liveGatewayAccessRepository(t *testing.T, dataRoot string) *appaccess.Repository {
-	t.Helper()
-	db, err := database.Open(dataRoot)
-	if err != nil {
-		t.Fatal("open live gateway controller database")
-	}
-	t.Cleanup(func() {
-		if err := db.Close(); err != nil {
-			t.Error("close live gateway controller database")
-		}
-	})
-	return appaccess.New(db)
-}
-
 // The shared fixture uses the real protected stores and candidate owner. It
 // never manufactures successful container history after Docker execution.
 type liveGeneratedAuthority struct {
 	LiveRuntimeTestAuthority
 	repository       *deployments.Repository
+	domain           *GeneratedDomain
 	db               *sql.DB
 	workingDirectory string
 	sessions         map[string]liveRuntimeSession
 }
 
-func liveGeneratedDeployments(t *testing.T, workingDirectory string) *liveGeneratedAuthority {
+func liveGeneratedDeployments(t *testing.T, ctx context.Context, dataRoot string,
+	runner runtimeprocess.CommandRunner, hostPort uint16, options liveRuntimeEngineOptions,
+) (*liveGeneratedAuthority, liveRuntimeEngine) {
 	t.Helper()
-	db, err := database.Open(t.TempDir())
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil || directories.WorkingDirectory != options.WorkingDirectory ||
+		directories.DockerConfigDirectory != options.DockerConfigDirectory {
+		t.Fatal("live generated authority requires canonical controller directories")
+	}
+	lease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatal("acquire live generated controller lease:", err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	db, err := database.OpenForGeneratedDomain(ctx, dataRoot, lease)
+	if err != nil {
+		t.Fatal("open proven live generated database:", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	return liveGeneratedDeploymentsWithDatabase(t, db, workingDirectory)
-}
-
-func liveGeneratedDeploymentsWithDatabase(t *testing.T, db *sql.DB, workingDirectory string) *liveGeneratedAuthority {
-	t.Helper()
-	if db == nil {
-		t.Fatal("live generated authority requires a database")
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal("create live generated plan store:", err)
 	}
-	authority := newLiveRuntimeAuthority(t, db, workingDirectory)
+	configuration, err := appconfig.New(db, dataRoot)
+	if err != nil {
+		t.Fatal("create live generated configuration store:", err)
+	}
+	authority := newLiveRuntimeAuthority(t, db, directories.WorkingDirectory, plans, configuration)
+	stores, err := authority.Repository().GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal("bind live generated owner stores:", err)
+	}
+	environment := &liveEnvironmentStager{}
+	domain, err := NewGeneratedDomain(ctx, stores, runner, environment, GeneratedDomainOptions{
+		DockerExecutable: options.DockerExecutable, DockerEndpoint: options.DockerEndpoint,
+		DockerConfigDirectory: options.DockerConfigDirectory, WorkingDirectory: options.WorkingDirectory,
+		DataRoot: dataRoot, HostPort: hostPort, CommandTimeout: options.CommandTimeout,
+		PullTimeout: 5 * time.Minute, HealthTimeout: options.HealthTimeout,
+		HealthPollInterval: options.HealthPollInterval, OutputLimit: options.OutputLimit,
+		MemoryBytes: options.Limits.MemoryBytes, MilliCPUs: options.Limits.MilliCPUs,
+		PIDs: options.Limits.PIDs, TmpfsBytes: options.Limits.TmpfsBytes,
+		LogSize: options.Limits.LogSize, LogFiles: options.Limits.LogFiles,
+		ReplacementDiskBytes: options.ReplacementDiskBytes,
+	})
+	if err != nil {
+		t.Fatal("construct live generated domain:", err)
+	}
+	engine, err := newLiveRuntimeEngine(runner, environment, domain.Candidates(), options)
+	if err != nil {
+		t.Fatal("create live generated runtime:", err)
+	}
 	return &liveGeneratedAuthority{LiveRuntimeTestAuthority: authority, repository: authority.Repository(),
-		db: db, workingDirectory: workingDirectory, sessions: make(map[string]liveRuntimeSession)}
+		domain: domain, db: db, workingDirectory: directories.WorkingDirectory,
+		sessions: make(map[string]liveRuntimeSession)}, engine
 }
 
 func (a *liveGeneratedAuthority) bindCandidate(t *testing.T, ctx context.Context, spec liveRuntimeCandidateSpec) (context.Context, liveRuntimeCandidateSpec) {
@@ -109,20 +128,15 @@ func (a *liveGeneratedAuthority) bindCandidate(t *testing.T, ctx context.Context
 	return ctx, a.BindNetwork(t, ctx, spec)
 }
 
-func (a *liveGeneratedAuthority) published(t *testing.T, ctx context.Context, ingress *Manager, candidate liveRuntimeCandidate) {
+func (a *liveGeneratedAuthority) activate(t *testing.T, candidate liveRuntimeCandidate,
+	request generatedroute.RouteSwitchRequest,
+) error {
 	t.Helper()
 	session := a.sessions[candidate.DeploymentID]
 	if session == nil {
 		t.Fatal("missing original candidate session")
 	}
-	observation, err := ingress.Observe(ctx, candidate.AppID)
-	if err != nil {
-		t.Fatal("observe exact published candidate route")
-	}
-	if err := session.RoutePublished(observation.Slot, observation.Endpoints); err != nil {
-		t.Fatal("record exact published candidate route:", err)
-	}
-	session.Close()
+	return session.ActivateRoute(a.domain.Routes(), request)
 }
 
 func (a *liveGeneratedAuthority) publishedHistory(ctx context.Context, db *sql.DB,
@@ -185,14 +199,15 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		t.Fatal("resolve docker executable")
 	}
 	root := t.TempDir()
-	dockerConfig := filepath.Join(root, "docker-config")
-	working := filepath.Join(root, "working")
 	state := filepath.Join(root, "ingress-state")
-	for _, directory := range []string{dockerConfig, working, state} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal("create live lifecycle directory")
-		}
+	if err := os.Mkdir(state, 0o700); err != nil {
+		t.Fatal("create live lifecycle controller state root:", err)
 	}
+	directories, err := runtimedocker.PrepareControllerDirectories(state)
+	if err != nil {
+		t.Fatal("prepare live lifecycle controller directories:", err)
+	}
+	dockerConfig, working := directories.DockerConfigDirectory, directories.WorkingDirectory
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
@@ -218,26 +233,13 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
-	authority := liveGeneratedDeployments(t, working)
-	engine, err := newLiveRuntimeEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
+	engineOptions := liveRuntimeEngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
-	})
-	if err != nil {
-		t.Fatal("create generated runtime")
 	}
-	accessRepository := liveGatewayAccessRepository(t, state)
-	ingress, err := New(runner, Options{
-		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
-		DataRoot: state, HostPort: hostPort, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
-		OutputLimit:                  liveDockerOutputLimit,
-		RebindFenceCheck:             accessRepository.CheckGatewayRebindFence,
-		RebindCurrentStateRepository: accessRepository,
-	})
-	if err != nil {
-		t.Fatal("create generated ingress")
-	}
+	authority, engine := liveGeneratedDeployments(t, ctx, state, runner, hostPort, engineOptions)
+	ingress := authority.domain.Gateway()
 
 	blueSpec := liveCandidateSpec("blue", appID, planID)
 	blueSpec = authority.PrepareCandidate(t, ctx, blueSpec)
@@ -252,11 +254,10 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	blueRoute := generatedroute.RouteSwitchRequest{
 		AppID: appID, ToSlot: blue.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(blue)},
 	}
-	if err := ingress.Switch(ctx, blueRoute); err != nil {
+	if err := authority.activate(t, blue, blueRoute); err != nil {
 		failLiveIngress(t, "route first slot", err)
 	}
 	assertLiveResponse(t, hostPort, appID, "/", "blue")
-	authority.published(t, ctx, ingress, blue)
 
 	// Caddy is attached to every private application network. A qualified
 	// network alias must keep identical component/slot aliases isolated.
@@ -273,12 +274,11 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	otherRoute := generatedroute.RouteSwitchRequest{
 		AppID: otherAppID, ToSlot: other.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(other)},
 	}
-	if err := ingress.Switch(ctx, otherRoute); err != nil {
+	if err := authority.activate(t, other, otherRoute); err != nil {
 		failLiveIngress(t, "route other application", err)
 	}
 	assertLiveOneShot(t, ctx, hostPort, appID, "/", "blue", "first application changed while routing other application")
 	assertLiveOneShot(t, ctx, hostPort, otherAppID, "/", "other", "other application did not serve through its private network")
-	authority.published(t, ctx, ingress, other)
 	assertLiveHTTPResponseProbeControl(t, ctx, runner, docker, working, dockerConfig, blue)
 	externalTLS := newLiveExternalTLSFixture(t)
 	defer externalTLS.Close(t)
@@ -335,7 +335,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		AppID: appID, FromSlot: blue.Slot, ToSlot: green.Slot,
 		Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(green)}, DrainPeriod: time.Second,
 	}
-	if err := ingress.Switch(ctx, greenRoute); err != nil {
+	if err := authority.activate(t, green, greenRoute); err != nil {
 		failLiveIngress(t, "switch to replacement slot", err)
 	}
 	assertLiveOneShot(t, ctx, hostPort, appID, "/", "green", "replacement slot did not serve after route switch")
@@ -357,7 +357,6 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	assertLiveOneShot(t, ctx, hostPort, appID, "/", "green", "replacement slot did not remain active")
 	assertLiveOneShot(t, ctx, hostPort, otherAppID, "/", "other", "other application did not remain isolated")
 	assertLiveApplicationNetworkIsolation(t, ctx, runner, docker, working, dockerConfig, ingress, green, other, hostPort, appID, "green", otherAppID, "other", externalTLS)
-	authority.published(t, ctx, ingress, green)
 }
 
 func liveCandidateSpec(version, appID, planID string) liveRuntimeCandidateSpec {

@@ -350,18 +350,16 @@ func TestRecoveryPreservesReviewedCapacityPausesAtSafeContinuationPoints(t *test
 func TestRecoveryRejectsCapacityPauseOutsideSafeContinuation(t *testing.T) {
 	for _, test := range []struct {
 		name           string
+		activation     bool
 		prepare        func(*testing.T, *recoveryFixture)
 		pause          string
 		migration      bool
 		migrationState string
 	}{
 		{name: "preflight", migrationState: "not_required", prepare: func(_ *testing.T, _ *recoveryFixture) {}, pause: "insufficient_replacement_capacity"},
-		{name: "draining", prepare: func(t *testing.T, fixture *recoveryFixture) {
+		{name: "draining", activation: true, prepare: func(t *testing.T, fixture *recoveryFixture) {
 			fixture.toSwitching(t)
-			if _, switched, err := fixture.state.SwitchActive(context.Background(), fixture.appID, fixture.deploymentID, 0); err != nil || !switched {
-				t.Fatalf("switch active: switched=%t err=%v", switched, err)
-			}
-			fixture.advance(t, generatedruntimestate.PhaseDraining)
+			fixture.activate(t)
 		}, pause: "insufficient_replacement_capacity", migrationState: "not_required"},
 		{name: "mismatched disposition", migrationState: "not_required", prepare: func(t *testing.T, fixture *recoveryFixture) { fixture.advance(t, generatedruntimestate.PhaseBuilding) }, pause: "route_reconciliation_required"},
 		{name: "migration running", prepare: func(t *testing.T, fixture *recoveryFixture) {
@@ -374,7 +372,12 @@ func TestRecoveryRejectsCapacityPauseOutsideSafeContinuation(t *testing.T) {
 		}, pause: "insufficient_replacement_capacity", migration: true, migrationState: "failed"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fixture := newRecoveryFixtureWithReviewedCurrent(t, test.migration, true)
+			var fixture *recoveryFixture
+			if test.activation {
+				fixture = newRecoveryActivationFixture(t, true)
+			} else {
+				fixture = newRecoveryFixtureWithReviewedCurrent(t, test.migration, true)
+			}
 			test.prepare(t, fixture)
 			setCapacityPause(t, fixture, test.pause)
 			fixture.recover(t, fixture.now)

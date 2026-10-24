@@ -2,11 +2,14 @@ package generatedingress
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/database"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 )
@@ -25,8 +28,17 @@ func TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes(t *testing.T) {
 	defer release()
 	// Construction must not acquire another lease. A second fixture for the
 	// same controller directory used to deadlock here before any Docker work.
-	authority := liveGeneratedDeployments(t, directories.WorkingDirectory)
-	_ = liveGeneratedDeployments(t, directories.WorkingDirectory)
+	newAuthority := func() *liveGeneratedAuthority {
+		root := t.TempDir()
+		db, openErr := database.Open(root)
+		if openErr != nil {
+			t.Fatal(openErr)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return liveCandidateFixtureAuthority(t, db, root, directories.WorkingDirectory)
+	}
+	authority := newAuthority()
+	_ = newAuthority()
 	scoped := deploymenteffects.WithScope(ctx, scope)
 	spec := liveCandidateSpec("blue", uuid.NewString(), uuid.NewString())
 	spec = authority.PrepareCandidate(t, ctx, spec)
@@ -77,7 +89,7 @@ func TestLiveGeneratedAuthorityUsesCallerDatabaseAcrossSequentialBindings(t *tes
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	authority := liveGeneratedDeploymentsWithDatabase(t, db, directories.WorkingDirectory)
+	authority := liveCandidateFixtureAuthority(t, db, root, directories.WorkingDirectory)
 	ctx := context.Background()
 
 	var bound []liveRuntimeCandidateSpec
@@ -141,4 +153,19 @@ func TestLiveGeneratedAuthorityUsesCallerDatabaseAcrossSequentialBindings(t *tes
 	if _, err := authority.publishedHistory(ctx, foreign, candidate); err == nil {
 		t.Fatal("foreign database unexpectedly validated")
 	}
+}
+
+func liveCandidateFixtureAuthority(t *testing.T, db *sql.DB, dataRoot, workingDirectory string) *liveGeneratedAuthority {
+	t.Helper()
+	plans, err := deploymentplans.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := appconfig.New(db, dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority := newLiveRuntimeAuthority(t, db, workingDirectory, plans, configuration)
+	return &liveGeneratedAuthority{LiveRuntimeTestAuthority: authority, repository: authority.Repository(),
+		db: db, workingDirectory: workingDirectory, sessions: make(map[string]liveRuntimeSession)}
 }

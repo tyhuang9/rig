@@ -51,7 +51,7 @@ func TestGatewayRebindLiveHarnessUsesSupportedDaemonAssembly(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"database.Open(dataRoot)", "prepareRuntimeComposition(", "liveHostdRebindDeployLocal(",
+		"database.OpenForGeneratedDomain(", "prepareRuntimeCompositionForTest(", "liveHostdRebindDeployLocal(",
 		"SourcePath: source",
 		"lanTwoAppGrant(", "runtimeprocess.ExecRunner{}", "fixture.cleanup(t)",
 	} {

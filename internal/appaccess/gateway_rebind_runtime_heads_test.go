@@ -16,17 +16,14 @@ import (
 const rebindTestSnapshotReleaseID = "0123456789abcdef0123456789abcdef"
 
 func TestGatewayRebindRuntimeHeadsIncludesCompleteSortedLANAndLoopbackHeads(t *testing.T) {
-	fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+	fixture := newHistoricalGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 	ctx := context.Background()
-	lanHead, err := generatedruntimestate.New(fixture.db).Active(ctx, fixture.entry.AppID)
-	if err != nil {
-		t.Fatal(err)
-	}
+	lanHead := historicalRuntimeHeadForRebindTest(t, fixture.db, fixture.entry.AppID)
 	want := []GatewayRebindRuntimeHead{runtimeHeadForRebindTest(lanHead)}
 	apps := addApps(t, fixture.db, 2)
 	sort.Sort(sort.Reverse(sort.StringSlice(apps)))
 	for _, appID := range apps {
-		want = append(want, runtimeHeadForRebindTest(seedGatewayRebindActiveRuntime(t, fixture.db, appID)))
+		want = append(want, runtimeHeadForRebindTest(seedHistoricalGatewayRebindActiveRuntime(t, fixture.db, appID)))
 		var grants int
 		if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM lan_app_access_grant_claims WHERE app_id=?`, appID).Scan(&grants); err != nil {
 			t.Fatal(err)
@@ -37,6 +34,7 @@ func TestGatewayRebindRuntimeHeadsIncludesCompleteSortedLANAndLoopbackHeads(t *t
 	}
 	sort.Slice(want, func(i, j int) bool { return want[i].AppID < want[j].AppID })
 
+	upgradeHistoricalGatewayDatabase(t, fixture.db)
 	got, err := fixture.repository.GatewayRebindRuntimeHeads(ctx)
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("complete sorted heads = %#v, want %#v, error=%v", got, want, err)
@@ -52,9 +50,10 @@ func TestGatewayRebindRuntimeHeadsAcceptsCanonicalReleaseIDForms(t *testing.T) {
 		{name: "snapshot hex", releaseID: rebindTestSnapshotReleaseID},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			db := appAccessDB(t)
+			db := historicalAppAccessDB(t)
 			appID := addApps(t, db, 1)[0]
-			active := seedGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, test.releaseID)
+			active := seedHistoricalGatewayRebindActiveRuntimeWithReleaseID(t, db, appID, test.releaseID)
+			upgradeHistoricalGatewayDatabase(t, db)
 			got, err := testRepository(db).GatewayRebindRuntimeHeads(context.Background())
 			want := []GatewayRebindRuntimeHead{runtimeHeadForRebindTest(active)}
 			if err != nil || !reflect.DeepEqual(got, want) || got[0].ReleaseID != test.releaseID {
@@ -65,18 +64,19 @@ func TestGatewayRebindRuntimeHeadsAcceptsCanonicalReleaseIDForms(t *testing.T) {
 }
 
 func TestGatewayRebindRuntimeHeadsOmitsInactiveAndArchivedApplications(t *testing.T) {
-	db := appAccessDB(t)
+	db := historicalAppAccessDB(t)
 	repository := testRepository(db)
 	ctx := context.Background()
-	if got, err := repository.GatewayRebindRuntimeHeads(ctx); err != nil || len(got) != 0 {
+	if got, err := testRepository(appAccessDB(t)).GatewayRebindRuntimeHeads(ctx); err != nil || len(got) != 0 {
 		t.Fatalf("fresh database heads = %#v, error=%v", got, err)
 	}
 	apps := addApps(t, db, 3)
-	want := runtimeHeadForRebindTest(seedGatewayRebindActiveRuntime(t, db, apps[0]))
-	archivedHead := seedGatewayRebindActiveRuntime(t, db, apps[1])
+	want := runtimeHeadForRebindTest(seedHistoricalGatewayRebindActiveRuntime(t, db, apps[0]))
+	archivedHead := seedHistoricalGatewayRebindActiveRuntime(t, db, apps[1])
 	if _, err := db.Exec(`UPDATE applications SET archived_at=? WHERE id=?`, formatTime(testNow), apps[1]); err != nil {
 		t.Fatal(err)
 	}
+	upgradeHistoricalGatewayDatabase(t, db)
 	// The third application's schema-created generation-zero row is a legitimate
 	// inactive head, with no deployment, release, slot, or update timestamp.
 	inactive, err := generatedruntimestate.New(db).Active(ctx, apps[2])
@@ -95,12 +95,15 @@ func TestGatewayRebindRuntimeHeadsOmitsInactiveAndArchivedApplications(t *testin
 }
 
 func TestGatewayRebindRuntimeHeadsReadsAreIndependentAndDoNotMutateState(t *testing.T) {
-	db := appAccessDB(t)
+	fixture := newGeneratedDomainRuntimeFixture(t)
+	t.Cleanup(fixture.Close)
+	db := fixture.Database()
+	addUsers(t, db)
 	repository := testRepository(db)
 	ctx := context.Background()
 	apps := addApps(t, db, 2)
 	sort.Strings(apps)
-	firstHead := seedGatewayRebindActiveRuntime(t, db, apps[0])
+	firstHead, _ := fixture.Activate(t, GeneratedDomainRuntimeSeed{AppID: apps[0]})
 	before := runtimeHeadReadChanges(t, db)
 	first, err := repository.GatewayRebindRuntimeHeads(ctx)
 	if err != nil || !reflect.DeepEqual(first, []GatewayRebindRuntimeHead{runtimeHeadForRebindTest(firstHead)}) {
@@ -110,7 +113,7 @@ func TestGatewayRebindRuntimeHeadsReadsAreIndependentAndDoNotMutateState(t *test
 		t.Fatalf("read changed SQLite rows: before=%d after=%d", before, after)
 	}
 
-	secondHead := seedGatewayRebindActiveRuntime(t, db, apps[1])
+	secondHead, _ := fixture.Activate(t, GeneratedDomainRuntimeSeed{AppID: apps[1]})
 	want := []GatewayRebindRuntimeHead{runtimeHeadForRebindTest(firstHead), runtimeHeadForRebindTest(secondHead)}
 	before = runtimeHeadReadChanges(t, db)
 	second, err := repository.GatewayRebindRuntimeHeads(ctx)
@@ -130,7 +133,7 @@ func TestGatewayRebindRuntimeHeadsReadsAreIndependentAndDoNotMutateState(t *test
 		t.Fatalf("snapshot reads changed SQLite rows: before=%d after=%d", before, after)
 	}
 
-	replacement := redeployRuntimeHeadForRebindTest(t, db, firstHead)
+	replacement, _ := fixture.Activate(t, GeneratedDomainRuntimeSeed{AppID: firstHead.AppID, ReleaseID: firstHead.ReleaseID})
 	want[0] = runtimeHeadForRebindTest(replacement)
 	before = runtimeHeadReadChanges(t, db)
 	fourth, err := repository.GatewayRebindRuntimeHeads(ctx)
@@ -196,16 +199,18 @@ func TestGatewayRebindRuntimeHeadsRejectsCorruptStoredHeadsWithoutPartialResults
 		{name: "missing release", queries: []string{`UPDATE generated_runtime_active_heads SET release_id='ffffffff-ffff-4fff-8fff-ffffffffffff' WHERE app_id=?`}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			db := appAccessDB(t)
+			db := historicalAppAccessDB(t)
 			apps := addApps(t, db, 2)
 			sort.Strings(apps)
 			for _, appID := range apps {
-				seedGatewayRebindActiveRuntime(t, db, appID)
+				seedHistoricalGatewayRebindActiveRuntime(t, db, appID)
 			}
+			upgradeHistoricalGatewayDatabase(t, db)
 			// Corruption is confined to this disposable database. Disable write
 			// guards only while constructing states that the read must reject.
 			for _, statement := range []string{
 				`DROP TRIGGER generated_runtime_active_head_valid_update`,
+				`DROP TRIGGER generated_runtime_active_head_activation_guard`,
 				`PRAGMA foreign_keys=OFF`,
 				`PRAGMA ignore_check_constraints=ON`,
 			} {
@@ -267,12 +272,15 @@ func TestGatewayRebindRuntimeHeadsRejectsCrossedDeploymentReleaseAndSlot(t *test
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			db := appAccessDB(t)
+			db := historicalAppAccessDB(t)
 			apps := addApps(t, db, 2)
-			first := seedGatewayRebindActiveRuntime(t, db, apps[0])
-			second := seedGatewayRebindActiveRuntime(t, db, apps[1])
+			first := seedHistoricalGatewayRebindActiveRuntime(t, db, apps[0])
+			second := seedHistoricalGatewayRebindActiveRuntime(t, db, apps[1])
+			upgradeHistoricalGatewayDatabase(t, db)
+			// Construct deliberately corrupt current rows for the read-refusal contract.
 			for _, statement := range []string{
 				`DROP TRIGGER generated_runtime_active_head_valid_update`,
+				`DROP TRIGGER generated_runtime_active_head_activation_guard`,
 				`PRAGMA foreign_keys=OFF`,
 			} {
 				if _, err := db.Exec(statement); err != nil {
@@ -307,21 +315,24 @@ func runtimeHeadReadChanges(t *testing.T, db *sql.DB) int64 {
 	return count
 }
 
-func redeployRuntimeHeadForRebindTest(t *testing.T, db *sql.DB, previous generatedruntimestate.ActiveHead) generatedruntimestate.ActiveHead {
+func redeployHistoricalRuntimeHeadForRebindTest(t *testing.T, db *sql.DB, previous generatedruntimestate.ActiveHead) generatedruntimestate.ActiveHead {
 	t.Helper()
-	ctx := context.Background()
-	runtime := generatedruntimestate.New(db)
-	oldDeployment, err := runtime.Advance(ctx, previous.AppID, previous.DeploymentID,
-		generatedruntimestate.PhaseSwitchingRoute, generatedruntimestate.PhaseDraining, "")
-	if err != nil {
+	assertHistoricalGatewaySchema(t, db)
+	var planID, artifactID string
+	var planNumber int64
+	if err := db.QueryRow(`SELECT d.deployment_plan_revision_id,d.deployment_plan_revision_number,c.image_artifact_id
+		FROM generated_runtime_deployments d JOIN generated_runtime_components c ON c.deployment_id=d.deployment_id
+		WHERE d.deployment_id=? AND c.component_name='api'`, previous.DeploymentID).Scan(&planID, &planNumber, &artifactID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.Advance(ctx, previous.AppID, previous.DeploymentID,
-		generatedruntimestate.PhaseDraining, generatedruntimestate.PhaseSucceeded, ""); err != nil {
+	stamp := formatTime(testNow)
+	if _, err := db.Exec(`UPDATE generated_runtime_deployments SET phase='draining',updated_at=? WHERE deployment_id=?`, stamp, previous.DeploymentID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE generated_runtime_deployments SET phase='succeeded',updated_at=?,finished_at=? WHERE deployment_id=?`, stamp, stamp, previous.DeploymentID); err != nil {
 		t.Fatal(err)
 	}
 	deploymentID, jobID := uuid.NewString(), uuid.NewString()
-	stamp := formatTime(testNow)
 	if _, err := db.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',updated_at=?,finished_at=?
 		WHERE id=(SELECT job_id FROM deployments WHERE id=?)`, stamp, stamp, previous.DeploymentID); err != nil {
 		t.Fatal(err)
@@ -333,43 +344,22 @@ func redeployRuntimeHeadForRebindTest(t *testing.T, db *sql.DB, previous generat
 	if _, err := db.Exec(`INSERT INTO deployments(
 		id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,
 		deployment_plan_revision_id,deployment_plan_revision_number
-	) VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,?)`, deploymentID, previous.AppID,
-		previous.ReleaseID, jobID, oldDeployment.DeploymentPlanRevisionID, oldDeployment.DeploymentPlanRevisionNumber); err != nil {
+	) VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,?)`, deploymentID, previous.AppID, previous.ReleaseID, jobID, planID, planNumber); err != nil {
 		t.Fatal(err)
 	}
-	value, _, err := runtime.Begin(ctx, generatedruntimestate.BeginInput{
-		DeploymentID: deploymentID, AppID: previous.AppID, ReleaseID: previous.ReleaseID,
-		DeploymentPlanRevisionID:     oldDeployment.DeploymentPlanRevisionID,
-		DeploymentPlanRevisionNumber: oldDeployment.DeploymentPlanRevisionNumber, ComponentNames: []string{"api"},
-	})
-	if err != nil {
+	slot := "green"
+	if previous.Slot == slot {
+		slot = "blue"
+	}
+	if _, err := db.Exec(`INSERT INTO generated_runtime_deployments(
+		deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,
+		candidate_slot,previous_active_deployment_id,previous_active_slot,phase,migration_state,created_at,updated_at
+	) VALUES(?,?,?,?,?,?,?,?,'preflight','not_required',?,?)`, deploymentID, previous.AppID, previous.ReleaseID,
+		planID, planNumber, slot, previous.DeploymentID, previous.Slot, stamp, stamp); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runtime.SetImageReady(ctx, previous.AppID, deploymentID, "api", oldDeployment.Components[0].ImageArtifactID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetContainerStarting(ctx, previous.AppID, deploymentID, "api", "rig-rebind-replacement-api"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.SetContainerRunning(ctx, previous.AppID, deploymentID, "api", strings.Repeat("4", 64)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtime.AdvanceComponent(ctx, previous.AppID, deploymentID, "api",
-		generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatal(err)
-	}
-	for _, next := range []generatedruntimestate.Phase{
-		generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate,
-		generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute,
-	} {
-		value, err = runtime.Advance(ctx, previous.AppID, deploymentID, value.Phase, next, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	head, changed, err := runtime.SwitchActive(ctx, previous.AppID, deploymentID, previous.Generation)
-	if err != nil || !changed || head.DeploymentID == previous.DeploymentID || head.Slot == previous.Slot || head.Generation != previous.Generation+1 {
-		t.Fatalf("replacement active head=%#v changed=%t error=%v", head, changed, err)
-	}
-	return head
+	return activateHistoricalGatewayComponent(t, db, generatedruntimestate.ActiveHead{
+		AppID: previous.AppID, DeploymentID: deploymentID, ReleaseID: previous.ReleaseID,
+		Slot: slot, Generation: previous.Generation + 1,
+	}, artifactID, "rig-rebind-replacement-api", strings.Repeat("4", 64))
 }

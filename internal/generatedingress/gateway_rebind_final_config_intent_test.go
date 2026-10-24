@@ -454,6 +454,7 @@ func TestGatewayRebindFinalConfigIntentRejectsLoopbackRuntimeHeadCheckpointDrift
 	fixture, fake, reads, loopbackID := installGatewayRebindFinalConfigLoopbackServingProgress(t)
 	for _, trigger := range []string{
 		"lan_gateway_rebind_fence_runtime_head_update", "generated_runtime_active_head_valid_update",
+		"generated_runtime_active_head_activation_guard",
 	} {
 		if _, err := fixture.predecessor.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
 			t.Fatal(err)
@@ -551,56 +552,19 @@ func installGatewayRebindFinalConfigLoopbackServingProgress(t *testing.T) (gatew
 	*gatewayRebindStageStartFake, gatewayRebindSuccessorPreflightReads, string,
 ) {
 	t.Helper()
-	fixture := newGatewayRebindEffectBoundaryFixture(t)
-	loopbackID := "ffffffff-ffff-4fff-8fff-ffffffffffff"
-	for _, trigger := range []string{
-		"lan_gateway_rebind_fence_runtime_head_insert", "lan_gateway_rebind_fence_runtime_head_update",
-		"lan_gateway_rebind_fence_runtime_head_delete", "lan_gateway_rebind_fence_access_head_insert",
-	} {
-		if _, err := fixture.predecessor.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
-			t.Fatal(err)
-		}
+	fixture := newGatewayRebindEffectBoundaryFixtureWithLoopback(t)
+	if fixture.predecessor.loopback == nil || fixture.predecessor.loopback.migration == nil {
+		t.Fatal("loopback final-config fixture lacks authentic serving runtime")
 	}
-	if _, err := fixture.predecessor.db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
-		VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`,
-		loopbackID, "rebind-loopback-"+loopbackID, "Loopback-only rebind app"); err != nil {
-		t.Fatal(err)
-	}
-	head := seedGatewayRebindPredecessorRuntime(t, fixture.predecessor.db, loopbackID)
-	for _, statement := range []string{
-		`CREATE TRIGGER lan_gateway_rebind_fence_runtime_head_update
-			BEFORE UPDATE ON generated_runtime_active_heads
-			WHEN EXISTS (SELECT 1 FROM lan_gateway_rebind_claims)
-			BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind fence is active'); END`,
-		`CREATE TRIGGER lan_gateway_rebind_fence_runtime_head_insert
-			BEFORE INSERT ON generated_runtime_active_heads
-			WHEN EXISTS (SELECT 1 FROM lan_gateway_rebind_claims)
-			BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind fence is active'); END`,
-		`CREATE TRIGGER lan_gateway_rebind_fence_runtime_head_delete
-			BEFORE DELETE ON generated_runtime_active_heads
-			WHEN EXISTS (SELECT 1 FROM lan_gateway_rebind_claims)
-			BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind fence is active'); END`,
-		`CREATE TRIGGER lan_gateway_rebind_fence_access_head_insert
-			BEFORE INSERT ON lan_app_access_heads
-			WHEN EXISTS (SELECT 1 FROM lan_gateway_rebind_claims)
-			BEGIN SELECT RAISE(ABORT, 'LAN gateway rebind fence is active'); END`,
-	} {
-		if _, err := fixture.predecessor.db.Exec(statement); err != nil {
-			t.Fatal(err)
-		}
-	}
+	migration := fixture.predecessor.loopback.migration
+	loopbackID := migration.guarded.appID
+	head, loopbackEndpoint := fixture.predecessor.loopback.head, fixture.predecessor.loopback.endpoint
 	state := cloneGatewayV2RouteState(fixture.predecessor.state)
-	var source gatewayV2AppRoute
-	for _, app := range state.Apps {
-		source = cloneGatewayV2AppRoute(app)
-		break
+	source, found := state.Apps[loopbackID]
+	if !found || source.LAN != nil || source.Route.Slot != generatedidentity.Slot(head.Slot) ||
+		!reflect.DeepEqual(source.Route.Endpoints, []generatedroute.RouteEndpoint{loopbackEndpoint}) {
+		t.Fatal("loopback final-config fixture lost authentic pre-upgrade route")
 	}
-	source.LAN = nil
-	source.Route.Slot = generatedidentity.Slot(head.Slot)
-	source.Route.Endpoints = []generatedroute.RouteEndpoint{
-		endpoint("api", "server", "rebind-loopback-network", "rebind-loopback-"+head.Slot, 3000, '7'),
-	}
-	state.Apps[loopbackID] = source
 	predecessor := gatewayUpgradeGenerationSelection{
 		Store: fixture.predecessor.store, Generation: fixture.predecessor.store.generation,
 		State: state, Journal: fixture.predecessor.journal, Existing: true,

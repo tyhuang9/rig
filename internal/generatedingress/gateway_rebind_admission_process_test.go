@@ -328,7 +328,7 @@ func TestGatewayRebindAdmissionProcessRecoversCommittedClaim(t *testing.T) {
 	}
 	gatewayRebindAdmissionKillAndReap(t, crashed)
 	appRoute := f.state.Apps[inspection.Roster[0].AppID]
-	err = f.manager.Switch(ctx, generatedroute.RouteSwitchRequest{AppID: inspection.Roster[0].AppID,
+	err = exerciseManagerSwitch(f.manager, ctx, generatedroute.RouteSwitchRequest{AppID: inspection.Roster[0].AppID,
 		ToSlot: appRoute.Route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), appRoute.Route.Endpoints...)})
 	if err == nil || !IsCode(err, DiagnosticRouteUnresolved) {
 		t.Fatalf("ordinary mutation crossed the committed prepared fence: %v", err)
@@ -649,7 +649,7 @@ func gatewayRebindAdmissionProcessMutation(path, mode string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	err = manager.Switch(ctx, manifest.Mutation)
+	err = exerciseManagerSwitch(manager, ctx, manifest.Mutation)
 	if mode == "mutation-blocked" {
 		if err == nil || !IsCode(err, DiagnosticCancelled) || runner.calls.Load() != 0 {
 			return fmt.Errorf("ordinary mutation was not blocked by the claim lock chain: %w", err)

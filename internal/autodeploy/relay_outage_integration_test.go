@@ -7,9 +7,11 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -42,7 +44,8 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	}
 	// Preparing a fresh migrated controller is fixture setup, not part of the
 	// bounded outage/restart journey. Both phases retain a finite budget.
-	setupCtx, cancelSetup := context.WithTimeout(context.Background(), 20*time.Second)
+	setupStarted := time.Now()
+	setupCtx, cancelSetup := context.WithTimeout(context.Background(), relayOutageSetupDeadline)
 	defer cancelSetup()
 	pool, reopenPG := relayOutagePostgres(t, setupCtx, dsn)
 	relay, err := store.New(pool, store.Options{})
@@ -57,7 +60,9 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	now := time.Now().UTC()
 	relayOutageEnrollRelay(t, setupCtx, relay, now, controllerID, keyID, publicKey)
-	relayOutageSeedController(t, setupCtx, db, now, controllerID, keyID, bindingID, publicKey)
+	if err = relayOutageSeedController(setupCtx, db.ExecContext, now, controllerID, keyID, bindingID, publicKey); err != nil {
+		relayOutageFatalSetupFailure(t, setupCtx, relayOutageSetupFailureControllerSeed, err)
+	}
 	controllerRepository := controllerrelay.NewRepository(db)
 	autoRepository := NewRepository(db)
 	status, err := autoRepository.Configure(setupCtx, ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, ExpectedRevision: 0, Enabled: true}, now)
@@ -70,8 +75,11 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	firstFixture := relayOutageFirstRunFixture{stopSupervisor: stopFirst, server: server, handler: handler, done: firstRun}
 	t.Cleanup(func() { firstFixture.Stop(t) })
 	relayOutageWaitInitialSubscriptionSync(t, setupCtx, db, pool, controllerID, status.SubscriptionID, firstSupervisor)
-	firstFixture.Stop(t)
-	if setupCtx.Err() != nil {
+	deadlineDiagnostic, deadlineExceeded := relayOutageStopFirstFixtureAndObserveSetupDeadline(setupCtx, setupStarted, func() {
+		firstFixture.Stop(t)
+	}, time.Now)
+	if deadlineExceeded {
+		t.Log(relayOutageFormatSetupDeadlineDiagnostic(deadlineDiagnostic))
 		t.Fatal("initial relay fixture exceeded setup deadline")
 	}
 	cancelSetup()
@@ -365,6 +373,224 @@ func TestRelayOutageControllerOpenRetriesOnlyTransientSQLiteLocks(t *testing.T) 
 	})
 }
 
+func TestRelayOutageControllerSeedReturnsFirstError(t *testing.T) {
+	at := time.Unix(100, 0).UTC()
+	publicKey := ed25519.PublicKey(bytes.Repeat([]byte{0x41}, ed25519.PublicKeySize))
+
+	t.Run("complete seed", func(t *testing.T) {
+		calls := 0
+		err := relayOutageSeedController(context.Background(), func(context.Context, string, ...any) (sql.Result, error) {
+			calls++
+			return nil, nil
+		}, at, "controller", "key", "binding", publicKey)
+		if err != nil || calls != 7 {
+			t.Fatalf("seed error=%v calls=%d", err, calls)
+		}
+	})
+
+	t.Run("first failure stops seed", func(t *testing.T) {
+		privateErr := errors.New("private controller seed detail")
+		calls := 0
+		err := relayOutageSeedController(context.Background(), func(context.Context, string, ...any) (sql.Result, error) {
+			calls++
+			if calls == 3 {
+				return nil, privateErr
+			}
+			return nil, nil
+		}, at, "controller", "key", "binding", publicKey)
+		if !errors.Is(err, privateErr) || calls != 3 {
+			t.Fatalf("seed error=%v calls=%d", err, calls)
+		}
+	})
+
+	if err := relayOutageSeedController(context.Background(), nil, at, "controller", "key", "binding", publicKey); relayOutageClassifySetupFailure(context.Background(), err) != relayOutageSetupFailureOther {
+		t.Fatalf("nil executor error=%v class=%q", err, relayOutageClassifySetupFailure(context.Background(), err))
+	}
+}
+
+func TestRelayOutageSetupFailureDiagnosticIsClosedAndSanitized(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal("open constraint fixture")
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err = db.Exec(`CREATE TABLE constraint_fixture (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal("create constraint fixture")
+	}
+	if _, err = db.Exec(`INSERT INTO constraint_fixture(id) VALUES(1)`); err != nil {
+		t.Fatal("seed constraint fixture")
+	}
+	_, constraintErr := db.Exec(`INSERT INTO constraint_fixture(id) VALUES(1)`)
+	if constraintErr == nil {
+		t.Fatal("duplicate constraint fixture was accepted")
+	}
+
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	deadlineCtx, cancelDeadline := context.WithDeadline(context.Background(), time.Unix(1, 0))
+	defer cancelDeadline()
+
+	for _, test := range []struct {
+		name  string
+		ctx   context.Context
+		err   error
+		class relayOutageSetupFailureClass
+	}{
+		{name: "direct deadline", ctx: canceledCtx, err: fmt.Errorf("private deadline detail: %w", context.DeadlineExceeded), class: relayOutageSetupFailureDeadline},
+		{name: "direct canceled", ctx: context.Background(), err: fmt.Errorf("private canceled detail: %w", context.Canceled), class: relayOutageSetupFailureCanceled},
+		{name: "constraint", ctx: canceledCtx, err: fmt.Errorf("private constraint detail: %w", constraintErr), class: relayOutageSetupFailureConstraint},
+		{name: "deadline context fallback", ctx: deadlineCtx, err: errors.New("private driver interrupt detail"), class: relayOutageSetupFailureDeadline},
+		{name: "canceled context fallback", ctx: canceledCtx, err: errors.New("private driver interrupt detail"), class: relayOutageSetupFailureCanceled},
+		{name: "other", ctx: context.Background(), err: errors.New("private other detail"), class: relayOutageSetupFailureOther},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			class := relayOutageClassifySetupFailure(test.ctx, test.err)
+			if class != test.class {
+				t.Fatalf("class=%q want=%q", class, test.class)
+			}
+			diagnostic := relayOutageFormatSetupFailureDiagnostic(relayOutageSetupFailureControllerSeed, class)
+			want := fmt.Sprintf("relay_outage_setup_failure phase=controller_seed error_class=%s", test.class)
+			if diagnostic != want || strings.Contains(diagnostic, "private") {
+				t.Fatalf("diagnostic=%q want=%q", diagnostic, want)
+			}
+		})
+	}
+
+	for _, invalid := range []struct {
+		phase relayOutageSetupFailurePhase
+		class relayOutageSetupFailureClass
+	}{
+		{phase: "", class: relayOutageSetupFailureOther},
+		{phase: "relay_enrollment", class: relayOutageSetupFailureOther},
+		{phase: relayOutageSetupFailureControllerSeed, class: ""},
+		{phase: relayOutageSetupFailureControllerSeed, class: "timeout"},
+	} {
+		if diagnostic := relayOutageFormatSetupFailureDiagnostic(invalid.phase, invalid.class); diagnostic != "" {
+			t.Fatalf("invalid phase=%q class=%q diagnostic=%q", invalid.phase, invalid.class, diagnostic)
+		}
+	}
+}
+
+func TestRelayOutageSetupFailureFatalEmitsOnlyClosedProjection(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("locate relay outage diagnostic helper")
+	}
+	command := exec.Command(executable, "-test.run=^TestRelayOutageSetupFailureFatalHelper$", "-test.count=1", "-test.v")
+	command.Env = append(os.Environ(), "RIG_RELAY_OUTAGE_FATAL_HELPER=1")
+	output, runErr := command.CombinedOutput()
+	if runErr == nil {
+		t.Fatal("fatal relay outage diagnostic helper succeeded")
+	}
+	text := string(output)
+	want := "relay_outage_setup_failure phase=controller_seed error_class=canceled"
+	if !strings.Contains(text, want) || strings.Contains(text, "private driver interrupt detail") {
+		t.Fatalf("fatal diagnostic did not retain the closed projection: %q", text)
+	}
+}
+
+func TestRelayOutageSetupFailureFatalHelper(t *testing.T) {
+	if os.Getenv("RIG_RELAY_OUTAGE_FATAL_HELPER") != "1" {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	relayOutageFatalSetupFailure(t, ctx, relayOutageSetupFailureControllerSeed, errors.New("private driver interrupt detail"))
+}
+
+func TestRelayOutageSetupDeadlineObservationStopsFirstFixture(t *testing.T) {
+	started := time.Unix(100, 0)
+
+	t.Run("deadline before first fixture stop", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		times := []time.Time{started.Add(9 * time.Second), started.Add(9 * time.Second), started.Add(12 * time.Second)}
+		next := 0
+		stopped := 0
+		diagnostic, found := relayOutageStopFirstFixtureAndObserveSetupDeadline(ctx, started, func() { stopped++ }, func() time.Time {
+			value := times[next]
+			next++
+			return value
+		})
+		if stopped != 1 || !found || diagnostic.phase != relayOutageSetupDeadlineBeforeFirstFixtureStop || diagnostic.preStopElapsedMS != 9000 || diagnostic.stopElapsedMS != 3000 {
+			t.Fatalf("stopped=%d found=%t diagnostic=%+v", stopped, found, diagnostic)
+		}
+		if got := relayOutageFormatSetupDeadlineDiagnostic(diagnostic); got != "relay_outage_setup_deadline phase=before_first_fixture_stop deadline_exceeded=true pre_stop_elapsed_ms=9000 stop_elapsed_ms=3000" {
+			t.Fatalf("diagnostic=%q", got)
+		}
+	})
+
+	t.Run("deadline during first fixture stop", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		times := []time.Time{started.Add(8 * time.Second), started.Add(8 * time.Second), started.Add(9500 * time.Millisecond)}
+		next := 0
+		stopped := 0
+		diagnostic, found := relayOutageStopFirstFixtureAndObserveSetupDeadline(ctx, started, func() {
+			stopped++
+			cancel()
+		}, func() time.Time {
+			value := times[next]
+			next++
+			return value
+		})
+		if stopped != 1 || !found || diagnostic.phase != relayOutageSetupDeadlineAfterFirstFixtureStop || diagnostic.preStopElapsedMS != 8000 || diagnostic.stopElapsedMS != 1500 {
+			t.Fatalf("stopped=%d found=%t diagnostic=%+v", stopped, found, diagnostic)
+		}
+	})
+
+	t.Run("no deadline expiry emits no record", func(t *testing.T) {
+		times := []time.Time{started.Add(time.Second), started.Add(time.Second), started.Add(2 * time.Second)}
+		next := 0
+		stopped := 0
+		_, found := relayOutageStopFirstFixtureAndObserveSetupDeadline(context.Background(), started, func() { stopped++ }, func() time.Time {
+			value := times[next]
+			next++
+			return value
+		})
+		if stopped != 1 || found {
+			t.Fatalf("stopped=%d found=%t", stopped, found)
+		}
+	})
+}
+
+func TestRelayOutageSetupDeadlineDiagnosticRejectsInvalidValues(t *testing.T) {
+	limit := int64(relayOutageSetupDeadline / time.Millisecond)
+	for _, diagnostic := range []relayOutageSetupDeadlineDiagnostic{
+		{phase: relayOutageSetupDeadlinePhase("unknown"), deadlineExceeded: true},
+		{phase: relayOutageSetupDeadlineBeforeFirstFixtureStop, deadlineExceeded: false},
+		{phase: relayOutageSetupDeadlineBeforeFirstFixtureStop, deadlineExceeded: true, preStopElapsedMS: -1},
+		{phase: relayOutageSetupDeadlineBeforeFirstFixtureStop, deadlineExceeded: true, stopElapsedMS: -1},
+		{phase: relayOutageSetupDeadlineBeforeFirstFixtureStop, deadlineExceeded: true, preStopElapsedMS: limit + 1},
+		{phase: relayOutageSetupDeadlineBeforeFirstFixtureStop, deadlineExceeded: true, stopElapsedMS: limit + 1},
+	} {
+		if got := relayOutageFormatSetupDeadlineDiagnostic(diagnostic); got != "" {
+			t.Fatalf("invalid diagnostic=%+v formatted=%q", diagnostic, got)
+		}
+	}
+}
+
+func TestRelayOutageBoundedElapsedMilliseconds(t *testing.T) {
+	started := time.Unix(100, 0)
+	limit := int64(relayOutageSetupDeadline / time.Millisecond)
+	for _, test := range []struct {
+		name     string
+		finished time.Time
+		want     int64
+	}{
+		{name: "negative is zero", finished: started.Add(-time.Millisecond), want: 0},
+		{name: "sub millisecond is zero", finished: started.Add(999 * time.Microsecond), want: 0},
+		{name: "ordinary duration", finished: started.Add(1234 * time.Millisecond), want: 1234},
+		{name: "over limit is clipped", finished: started.Add(relayOutageSetupDeadline + time.Second), want: limit},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := relayOutageBoundedElapsedMilliseconds(started, test.finished); got != test.want {
+				t.Fatalf("elapsed=%d want=%d", got, test.want)
+			}
+		})
+	}
+}
+
 func relayOutageSQLiteBusyError(t *testing.T) error {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "busy.db")
@@ -403,8 +629,12 @@ func relayOutageSQLiteBusyError(t *testing.T) error {
 	return busyErr
 }
 
-func relayOutageSeedController(t *testing.T, ctx context.Context, db *sql.DB, at time.Time, controllerID, keyID, bindingID string, publicKey ed25519.PublicKey) {
-	t.Helper()
+type relayOutageSeedExec func(context.Context, string, ...any) (sql.Result, error)
+
+func relayOutageSeedController(ctx context.Context, exec relayOutageSeedExec, at time.Time, controllerID, keyID, bindingID string, publicKey ed25519.PublicKey) error {
+	if exec == nil {
+		return errors.New("controller seed executor is unavailable")
+	}
 	stamp := timestamp(at)
 	statements := []struct {
 		query string
@@ -419,10 +649,11 @@ func relayOutageSeedController(t *testing.T, ctx context.Context, db *sql.DB, at
 		{`INSERT INTO relay_installation_bindings(binding_id,owner_user_id,connection_id,controller_id,installation_id,repository_id,state,state_changed_at,created_at,updated_at) VALUES(?,?,?,?,?,?,'authorized',?,?,?)`, []any{bindingID, testOwner, testConnection, controllerID, testInstallation, testRepository, stamp, stamp, stamp}},
 	}
 	for _, statement := range statements {
-		if _, err := db.ExecContext(ctx, statement.query, statement.args...); err != nil {
-			t.Fatal(err)
+		if _, err := exec(ctx, statement.query, statement.args...); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 func relayOutageServer(t *testing.T, relay *store.Store) (*wss.Handler, *httptest.Server) {
@@ -591,11 +822,139 @@ func relayOutageWait(t *testing.T, parent context.Context, label string, ready f
 }
 
 const (
+	relayOutageSetupDeadline          = 20 * time.Second
 	relayOutageInitialSyncTimeout     = 5 * time.Second
 	relayOutageDiagnosticQueryTimeout = 100 * time.Millisecond
 	relayOutageDiagnosticCountLimit   = 1000
 	relayOutageDiagnosticUnavailable  = -1
 )
+
+const relayOutageSetupDeadlineDiagnosticPrefix = "relay_outage_setup_deadline"
+
+const relayOutageSetupFailureDiagnosticPrefix = "relay_outage_setup_failure"
+
+type relayOutageSetupFailurePhase string
+
+const relayOutageSetupFailureControllerSeed relayOutageSetupFailurePhase = "controller_seed"
+
+type relayOutageSetupFailureClass string
+
+const (
+	relayOutageSetupFailureDeadline   relayOutageSetupFailureClass = "deadline"
+	relayOutageSetupFailureCanceled   relayOutageSetupFailureClass = "canceled"
+	relayOutageSetupFailureConstraint relayOutageSetupFailureClass = "constraint"
+	relayOutageSetupFailureOther      relayOutageSetupFailureClass = "other"
+)
+
+func relayOutageFatalSetupFailure(t testing.TB, ctx context.Context, phase relayOutageSetupFailurePhase, err error) {
+	t.Helper()
+	diagnostic := relayOutageFormatSetupFailureDiagnostic(phase, relayOutageClassifySetupFailure(ctx, err))
+	if diagnostic == "" {
+		diagnostic = "relay outage setup failed"
+	}
+	t.Fatal(diagnostic)
+}
+
+func relayOutageClassifySetupFailure(ctx context.Context, err error) relayOutageSetupFailureClass {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return relayOutageSetupFailureDeadline
+	case errors.Is(err, context.Canceled):
+		return relayOutageSetupFailureCanceled
+	}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqlite3.SQLITE_CONSTRAINT {
+		return relayOutageSetupFailureConstraint
+	}
+	if ctx != nil {
+		switch ctx.Err() {
+		case context.DeadlineExceeded:
+			return relayOutageSetupFailureDeadline
+		case context.Canceled:
+			return relayOutageSetupFailureCanceled
+		}
+	}
+	return relayOutageSetupFailureOther
+}
+
+func relayOutageFormatSetupFailureDiagnostic(phase relayOutageSetupFailurePhase, class relayOutageSetupFailureClass) string {
+	if phase != relayOutageSetupFailureControllerSeed {
+		return ""
+	}
+	switch class {
+	case relayOutageSetupFailureDeadline, relayOutageSetupFailureCanceled, relayOutageSetupFailureConstraint, relayOutageSetupFailureOther:
+		return fmt.Sprintf("%s phase=%s error_class=%s", relayOutageSetupFailureDiagnosticPrefix, phase, class)
+	default:
+		return ""
+	}
+}
+
+type relayOutageSetupDeadlinePhase string
+
+const (
+	relayOutageSetupDeadlineBeforeFirstFixtureStop relayOutageSetupDeadlinePhase = "before_first_fixture_stop"
+	relayOutageSetupDeadlineAfterFirstFixtureStop  relayOutageSetupDeadlinePhase = "after_first_fixture_stop"
+)
+
+type relayOutageSetupDeadlineDiagnostic struct {
+	phase            relayOutageSetupDeadlinePhase
+	deadlineExceeded bool
+	preStopElapsedMS int64
+	stopElapsedMS    int64
+}
+
+func relayOutageStopFirstFixtureAndObserveSetupDeadline(ctx context.Context, setupStarted time.Time, stop func(), now func() time.Time) (relayOutageSetupDeadlineDiagnostic, bool) {
+	beforeStop := now()
+	deadlineExceededBeforeStop := ctx != nil && ctx.Err() != nil
+	stopStarted := now()
+	stop()
+	stopFinished := now()
+	phase := relayOutageSetupDeadlineAfterFirstFixtureStop
+	if deadlineExceededBeforeStop {
+		phase = relayOutageSetupDeadlineBeforeFirstFixtureStop
+	} else if ctx == nil || ctx.Err() == nil {
+		return relayOutageSetupDeadlineDiagnostic{}, false
+	}
+	return relayOutageSetupDeadlineDiagnostic{
+		phase:            phase,
+		deadlineExceeded: true,
+		preStopElapsedMS: relayOutageBoundedElapsedMilliseconds(setupStarted, beforeStop),
+		stopElapsedMS:    relayOutageBoundedElapsedMilliseconds(stopStarted, stopFinished),
+	}, true
+}
+
+func relayOutageBoundedElapsedMilliseconds(started, finished time.Time) int64 {
+	elapsed := finished.Sub(started)
+	if elapsed <= 0 {
+		return 0
+	}
+	limit := int64(relayOutageSetupDeadline / time.Millisecond)
+	milliseconds := int64(elapsed / time.Millisecond)
+	if milliseconds > limit {
+		return limit
+	}
+	return milliseconds
+}
+
+func relayOutageFormatSetupDeadlineDiagnostic(diagnostic relayOutageSetupDeadlineDiagnostic) string {
+	if !relayOutageKnownSetupDeadlinePhase(diagnostic.phase) || !diagnostic.deadlineExceeded {
+		return ""
+	}
+	limit := int64(relayOutageSetupDeadline / time.Millisecond)
+	if diagnostic.preStopElapsedMS < 0 || diagnostic.preStopElapsedMS > limit || diagnostic.stopElapsedMS < 0 || diagnostic.stopElapsedMS > limit {
+		return ""
+	}
+	return fmt.Sprintf("%s phase=%s deadline_exceeded=%t pre_stop_elapsed_ms=%d stop_elapsed_ms=%d", relayOutageSetupDeadlineDiagnosticPrefix, diagnostic.phase, diagnostic.deadlineExceeded, diagnostic.preStopElapsedMS, diagnostic.stopElapsedMS)
+}
+
+func relayOutageKnownSetupDeadlinePhase(phase relayOutageSetupDeadlinePhase) bool {
+	switch phase {
+	case relayOutageSetupDeadlineBeforeFirstFixtureStop, relayOutageSetupDeadlineAfterFirstFixtureStop:
+		return true
+	default:
+		return false
+	}
+}
 
 type relayOutageFirstRunFixture struct {
 	stopOnce       sync.Once

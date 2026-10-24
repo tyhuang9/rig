@@ -24,11 +24,12 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
-	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/hostnetwork"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
 
 const (
@@ -68,6 +69,27 @@ type liveGatewayV2Fixture struct {
 	source       routeState
 }
 
+func newLiveGatewayV2FixtureRoot(t testing.TB) string {
+	t.Helper()
+	root := t.TempDir()
+	if runtime.GOOS == "windows" {
+		builder, err := securetemp.NewGeneratedBuilderDirectory(root)
+		if err != nil {
+			t.Fatal("create live gateway-v2 fixture namespace")
+		}
+		root, err = builder.EnsureDirectory("gateway-v2-fixture")
+		if err != nil {
+			t.Fatal("create live gateway-v2 fixture root")
+		}
+	} else if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal("protect live gateway-v2 fixture root")
+	}
+	if err := securetemp.ValidatePrivateDirectory(root); err != nil {
+		t.Fatal("validate live gateway-v2 fixture root")
+	}
+	return root
+}
+
 // TestLiveGatewayV2UpgradeCommitAndRestart is the hosted Linux acceptance
 // gate for the production v1-to-v2 coordinator. It deliberately uses one
 // unassigned LAN port so every published LAN response must remain a 404.
@@ -81,11 +103,9 @@ func TestLiveGatewayV2UpgradeCommitAndRestart(t *testing.T) {
 		imageTag:         "rig-generated-gateway-v2-live:commit",
 		applicationReply: "gateway-v2-commit",
 	})
-	trace := liveGatewayV2InstallOperationTrace(fixture)
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
 	if err != nil || result.Outcome != GatewayV2UpgradeCommitted {
-		trace.log(t)
 		liveGatewayV2LogOperationDiagnostic(t, fixture)
 		failLiveIngress(t, "commit gateway-v2 upgrade", err)
 	}
@@ -135,7 +155,6 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 		imageTag:         "rig-generated-gateway-v2-live:conflict",
 		applicationReply: "gateway-v2-conflict",
 	})
-	trace := liveGatewayV2InstallOperationTrace(fixture)
 
 	var conflictID string
 	t.Cleanup(func() {
@@ -147,7 +166,6 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 
 	result, err := fixture.ingress.UpgradeGatewayV2(fixture.ctx, fixture.request, liveGatewayV2Authorizer(t, fixture.request))
 	if err == nil || result.Outcome != GatewayV2UpgradeRolledBack {
-		trace.log(t)
 		liveGatewayV2LogOperationDiagnostic(t, fixture)
 		t.Fatalf("bind-conflict upgrade = %+v, err=%v", result, err)
 	}
@@ -200,15 +218,16 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		t.Fatal("resolve docker executable")
 	}
 
-	root := t.TempDir()
-	dockerConfig := filepath.Join(root, "docker-config")
-	working := filepath.Join(root, "working")
+	root := newLiveGatewayV2FixtureRoot(t)
 	stateRoot := filepath.Join(root, "ingress-state")
-	for _, directory := range []string{dockerConfig, working, stateRoot} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal("create live gateway-v2 directory")
-		}
+	if err := os.Mkdir(stateRoot, 0o700); err != nil {
+		t.Fatal("create live gateway-v2 controller state root:", err)
 	}
+	directories, err := runtimedocker.PrepareControllerDirectories(stateRoot)
+	if err != nil {
+		t.Fatal("prepare live gateway-v2 controller directories:", err)
+	}
+	dockerConfig, working := directories.DockerConfigDirectory, directories.WorkingDirectory
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)
 	t.Cleanup(cancel)
 	runner := &runtimeprocess.ExecRunner{}
@@ -227,30 +246,16 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		MemoryBytes: 128 << 20, MilliCPUs: 500, PIDs: 128,
 		TmpfsBytes: 16 << 20, LogSize: "1m", LogFiles: 2,
 	}
-	db, err := database.Open(stateRoot)
-	if err != nil {
-		t.Fatal("open real live gateway-v2 control database")
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	repository := appaccess.New(db)
-	authority := liveGeneratedDeploymentsWithDatabase(t, db, working)
-	engine, err := newLiveRuntimeEngine(runner, &liveEnvironmentStager{}, liveCapacitySource{}, authority.repository, liveRuntimeEngineOptions{
+	hostPort := freeLoopbackPort(t)
+	engineOptions := liveRuntimeEngineOptions{
 		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
 		CommandTimeout: 45 * time.Second, HealthTimeout: 90 * time.Second, HealthPollInterval: 250 * time.Millisecond,
 		OutputLimit: liveDockerOutputLimit, Limits: limits, ReplacementDiskBytes: 96 << 20,
-	})
-	if err != nil {
-		t.Fatal("create live gateway-v2 runtime")
 	}
-	ingress, err := New(runner, Options{
-		DockerExecutable: docker, DockerConfigDirectory: dockerConfig, WorkingDirectory: working,
-		DataRoot: stateRoot, HostPort: freeLoopbackPort(t), CommandTimeout: 45 * time.Second,
-		PullTimeout: 5 * time.Minute, OutputLimit: liveDockerOutputLimit,
-		RebindFenceCheck: repository.CheckGatewayRebindFence, RebindCurrentStateRepository: repository,
-	})
-	if err != nil {
-		t.Fatal("create live gateway-v2 ingress")
-	}
+	authority, engine := liveGeneratedDeployments(t, ctx, stateRoot, runner, hostPort, engineOptions)
+	db := authority.db
+	repository := appaccess.New(db)
+	ingress := authority.domain.Gateway()
 	fixture := &liveGatewayV2Fixture{
 		ctx: ctx, runner: runner, docker: docker, root: root, dockerConfig: dockerConfig,
 		stateRoot: stateRoot, db: db, repository: repository, authority: authority, engine: engine,
@@ -277,18 +282,25 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	route := generatedroute.RouteSwitchRequest{
 		AppID: spec.appID, ToSlot: candidate.Slot, Endpoints: []generatedroute.RouteEndpoint{liveEndpoint(candidate)},
 	}
-	if err := ingress.Switch(ctx, route); err != nil {
+	if err := authority.activate(t, candidate, route); err != nil {
 		failLiveIngress(t, "install gateway-v2 source route", err)
 	}
 	assertLiveOneShot(t, ctx, ingress.options.HostPort, spec.appID, "/", spec.applicationReply,
 		"gateway-v2 source route did not serve through v1")
-	authority.published(t, ctx, ingress, candidate)
 	fixture.source, err = ingress.store.load()
 	if err != nil || fixture.source.Pending != nil {
 		t.Fatal("load gateway-v2 source state")
 	}
 	fixture.request = liveGatewayV2Request(t, spec, selected, port)
 	liveGatewayV2AssertSourceAttestation(t, fixture)
+	session := authority.sessions[candidate.DeploymentID]
+	if session == nil {
+		t.Fatal("release gateway-v2 source candidate authority: missing original session")
+	}
+	// The source candidate is complete. Retain its immutable history for the
+	// read-only restart checks, but release its effects scope before a later
+	// gateway-v2 stage acquires that scope. The registered cleanup is idempotent.
+	session.Close()
 	return fixture
 }
 

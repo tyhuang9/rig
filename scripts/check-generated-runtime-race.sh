@@ -53,8 +53,38 @@ current_lan_recovery_pattern='^Test(ManagedGatewayCurrentLANRecovery|GatewayCurr
 current_runtime_pattern='^Test(ManagedGatewayCurrent|GatewayCurrent)(Physical|Serving)'
 current_serving_emergency_pattern='^TestGatewayCurrent(Typed|Native|Startup|Terminal)Emergency'
 current_serving_predecessor_pattern='^TestGatewayCurrentPredecessor'
+# The former remainder exhausted its cumulative 32-minute race budget. Keep
+# complete construction, startup, capacity and gateway-operation parent trees
+# in complementary groups; new tests in each family inherit the same split.
+domain_pattern='^TestGeneratedDomain'
+domain_startup_pattern='^TestGeneratedDomain(Startup|ProtectedStartup)'
+domain_stable_pattern='^TestGeneratedDomainStartupClassifiesStableGateway'
+capacity_pattern='^TestGeneratedIngressCapacity'
+gateway_operations_pattern='^Test(Prepare|Observe|Recover|Commit|Retire)Gateway'
 case "$suite" in
+  runtime-packages-core)
+    packages=(
+      ./internal/projectanalysis
+      ./internal/deploymentplans
+      ./internal/generatedimage
+      ./internal/generatedimagestate
+      ./internal/generatedmigration
+      ./internal/generatedruntime
+      ./internal/autodeploy
+    )
+    ;;
+  runtime-packages-executor)
+    packages=(./internal/generatedexecutor)
+    ;;
+  runtime-packages-state)
+    packages=(./internal/generatedruntimestate)
+    ;;
+  runtime-packages-recovery)
+    packages=(./internal/generatedrecovery)
+    ;;
   runtime-packages)
+    # Retain the established all-package selector for direct callers. Hosted
+    # CI uses the four complementary package-only selectors above.
     packages=(
       ./internal/projectanalysis
       ./internal/deploymentplans
@@ -168,9 +198,29 @@ case "$suite" in
     packages=(./internal/generatedingress)
     filter=(-run "$current_pattern" -skip "$current_lan_pattern|$current_runtime_pattern|$current_serving_emergency_pattern|$current_serving_predecessor_pattern")
     ;;
+  domain-construction)
+    packages=(./internal/generatedingress)
+    filter=(-run "$domain_pattern" -skip "$domain_startup_pattern")
+    ;;
+  domain-startup-stable)
+    packages=(./internal/generatedingress)
+    filter=(-run "$domain_stable_pattern")
+    ;;
+  domain-startup)
+    packages=(./internal/generatedingress)
+    filter=(-run "$domain_startup_pattern" -skip "$domain_stable_pattern")
+    ;;
+  ingress-capacity)
+    packages=(./internal/generatedingress)
+    filter=(-run "$capacity_pattern")
+    ;;
+  gateway-operations)
+    packages=(./internal/generatedingress)
+    filter=(-run "$gateway_operations_pattern")
+    ;;
   ingress-remainder)
     packages=(./internal/generatedingress)
-    filter=(-skip "$gateway_v2_pattern|$rebind_pattern|$current_pattern")
+    filter=(-skip "$gateway_v2_pattern|$rebind_pattern|$current_pattern|$domain_pattern|$capacity_pattern|$gateway_operations_pattern")
     ;;
   *) printf 'Unknown race suite: %s\n' "$suite" >&2; exit 1 ;;
 esac

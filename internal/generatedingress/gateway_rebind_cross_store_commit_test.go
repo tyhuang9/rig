@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -311,6 +312,7 @@ func newGatewayRebindCoordinatorFixtureWithPredecessor(t *testing.T, f gatewayRe
 	f.manager.gatewayRebindCommitBarrier = &atomic.Bool{}
 	input := completeGatewayRebindCoordinatorFixture(t, f)
 	template := newGatewayCurrentStateFixture(t)
+	bindGatewayCurrentStateFixtureApplicationNetworks(t, &template, gatewayRebindFixtureDockerObservation(t, f))
 	f.manager.gatewayRebindV2NetworkObserver = func(_ context.Context,
 		claim appaccess.GatewayRebindClaimV2,
 	) (gatewayRebindSuccessorNetworkObservation, error) {
@@ -322,6 +324,33 @@ func newGatewayRebindCoordinatorFixtureWithPredecessor(t *testing.T, f gatewayRe
 	}
 	driver := &gatewayRebindBoundedPhysicalDriver{t: t, template: template}
 	return f, input, driver
+}
+
+func bindGatewayCurrentStateFixtureApplicationNetworks(t *testing.T, template *gatewayCurrentStateFixture,
+	physical gatewayV2DockerObservation,
+) {
+	t.Helper()
+	if template == nil {
+		t.Fatal("application-network fixture template is nil")
+	}
+	if len(physical.ApplicationNetworks) == 0 ||
+		len(physical.ApplicationNetworks) != len(physical.ApplicationNetworkIDs) {
+		t.Fatal("coordinator fixture application-network observation is incomplete")
+	}
+	template.receipt.Resources.ApplicationNetworks = nil
+	for name, id := range physical.ApplicationNetworkIDs {
+		observed, present := physical.ApplicationNetworks[name]
+		normalizedID := normalizeID(id)
+		if !present || observed.Name != name || !validContainerID(normalizedID) {
+			t.Fatalf("coordinator fixture application-network observation is invalid for %q", name)
+		}
+		template.receipt.Resources.ApplicationNetworks = append(template.receipt.Resources.ApplicationNetworks,
+			gatewayRebindHandoverApplicationNetwork{Name: name, ID: normalizedID})
+	}
+	sort.Slice(template.receipt.Resources.ApplicationNetworks, func(i, j int) bool {
+		return template.receipt.Resources.ApplicationNetworks[i].Name <
+			template.receipt.Resources.ApplicationNetworks[j].Name
+	})
 }
 
 func TestGatewayRebindCoordinatorCommitsRealSQLAndProtectedBaseline(t *testing.T) {

@@ -13,13 +13,14 @@ import (
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 func TestRetainedRuntimeStopsWithoutRemovalAndReconcilesLostAcknowledgement(t *testing.T) {
 	target, inspection := retainedRuntimeFixture()
 	inspection.Status, inspection.Running, inspection.Health = "running", true, "healthy"
 	requests := 0
-	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		requests++
 		switch commandKind(request.Args) {
 		case "container inspect":
@@ -58,7 +59,7 @@ func TestRetainedRuntimeAggregateStartCapacityAndReservationSafety(t *testing.T)
 	running.Networks = hardenedInspection(retainedCandidateSpec(), defaultLimits()).Networks
 	state := stopped
 	startError := error(nil)
-	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
 			return runtimeJSON(state)
@@ -91,6 +92,84 @@ func TestRetainedRuntimeAggregateStartCapacityAndReservationSafety(t *testing.T)
 	assertRetainedCommandInventory(t, runner.requests, []string{"container inspect", "network inspect", "container inspect", "network inspect", "container start", "container inspect", "network inspect", "container inspect", "network inspect"})
 }
 
+func TestRetainedRuntimeCapacitySourceCancellationPreservesClosedDiagnostic(t *testing.T) {
+	target, stopped := retainedRuntimeFixture()
+	stopped.Status, stopped.Running, stopped.Networks = "exited", false, nil
+	engine, runner, ctx, _, release := newRetainedRuntimeEngineWithDomainOptions(t,
+		generateddomain.Options{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30, DelegateCapacity: true},
+		func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+			switch commandKind(request.Args) {
+			case "container inspect":
+				return runtimeJSON(stopped)
+			case "network inspect":
+				return runtimeJSON(retainedNetworkInspection(target))
+			case "container exec":
+				return runtimeRequestResult{err: context.Canceled}
+			default:
+				t.Fatalf("unexpected retained capacity request: %#v", request.Args)
+				return runtimeRequestResult{}
+			}
+		})
+	defer release()
+	if _, reservation, err := engine.ObserveAndReserveRetained(ctx,
+		"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", []RetainedTarget{target}); reservation != nil || !IsCode(err, DiagnosticCancelled) {
+		t.Fatalf("retained capacity cancellation: reservation=%T diagnostic=%v", reservation, err)
+	}
+	assertRetainedCommandInventory(t, runner.requests, []string{"container inspect", "network inspect", "container exec"})
+}
+
+func TestRetainedRuntimeReservationCannotCrossEngineOrOperation(t *testing.T) {
+	target, stopped := retainedRuntimeFixture()
+	stopped.Status, stopped.Running, stopped.Networks = "exited", false, nil
+	owner, _, ownerContext, _, releaseOwner := newRetainedRuntimeEngine(t,
+		fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30},
+		func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+			switch commandKind(request.Args) {
+			case "container inspect":
+				return runtimeJSON(stopped)
+			case "network inspect":
+				return runtimeJSON(retainedNetworkInspection(target))
+			default:
+				t.Fatalf("unexpected owner request: %#v", request.Args)
+				return runtimeRequestResult{}
+			}
+		})
+	defer releaseOwner()
+	foreign, foreignRunner, foreignContext, _, releaseForeign := newRetainedRuntimeEngine(t,
+		fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30},
+		func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+			t.Fatalf("foreign reservation reached Docker: %#v", request.Args)
+			return runtimeRequestResult{}
+		})
+	defer releaseForeign()
+
+	const operationID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	_, reservation, err := owner.ObserveAndReserveRetained(ownerContext, operationID, []RetainedTarget{target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := foreign.StartRetained(foreignContext, operationID, target, reservation,
+		func(context.Context) error { return nil }); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("foreign engine start = %v", err)
+	}
+	if err := foreign.ReleaseRetainedReservation(foreignContext, reservation); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("foreign engine release = %v", err)
+	}
+	if err := foreign.ReleaseUnattemptedRetainedReservation(foreignContext, reservation); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("foreign engine unattempted release = %v", err)
+	}
+	if _, err := owner.StartRetained(ownerContext, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", target,
+		reservation, func(context.Context) error { return nil }); !IsCode(err, DiagnosticValidationFailed) {
+		t.Fatalf("crossed operation start = %v", err)
+	}
+	if err := owner.ReleaseUnattemptedRetainedReservation(ownerContext, reservation); err != nil {
+		t.Fatalf("owner release = %v", err)
+	}
+	if len(foreignRunner.requests) != 0 {
+		t.Fatalf("foreign reservation dispatched Docker: %#v", foreignRunner.requests)
+	}
+}
+
 func TestRetainedRuntimeRequiresOwnedNetworkForStoppedAndRunningTargets(t *testing.T) {
 	for _, state := range []RetainedState{RetainedStopped, RetainedRunning} {
 		t.Run(string(state), func(t *testing.T) {
@@ -100,7 +179,7 @@ func TestRetainedRuntimeRequiresOwnedNetworkForStoppedAndRunningTargets(t *testi
 			} else {
 				inspection.Status, inspection.Running, inspection.Health = "running", true, "healthy"
 			}
-			engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+			engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 				switch commandKind(request.Args) {
 				case "container inspect":
 					return runtimeJSON(inspection)
@@ -125,15 +204,23 @@ func TestRetainedRuntimeRequiresOwnedNetworkForStoppedAndRunningTargets(t *testi
 func TestRetainedRuntimeReservesTheWholeStoppedRosterAtomically(t *testing.T) {
 	targetA, stoppedA := retainedRuntimeFixture()
 	stoppedA.Status, stoppedA.Running, stoppedA.Networks = "exited", false, nil
-	targetB, stoppedB := retainedRuntimeFixtureFor("web", strings.Repeat("c", 64))
+	targetB, stoppedB := retainedRuntimeFixtureFor("web", strings.Repeat("f", 64))
 	stoppedB.Status, stoppedB.Running, stoppedB.Networks = "exited", false, nil
-	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 768 << 20, DiskAvailableBytes: 4 << 30}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	inspections := map[string]containerInspection{targetA.ContainerID: stoppedA, targetB.ContainerID: stoppedB}
+	for id, inspection := range inspections {
+		if inspection.ID != id || inspection.Status != "exited" || inspection.Running || inspection.Paused || inspection.Restarting || inspection.Dead {
+			t.Fatalf("stopped retained fixture %s = %#v", id, inspection)
+		}
+	}
+	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 768 << 20, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
-			if request.Args[len(request.Args)-1] == targetB.ContainerID {
-				return runtimeJSON(stoppedB)
+			identity := request.Args[len(request.Args)-1]
+			inspection, ok := inspections[identity]
+			if !ok {
+				t.Fatalf("unexpected retained container identity %q", identity)
 			}
-			return runtimeJSON(stoppedA)
+			return runtimeJSON(inspection)
 		case "network inspect":
 			return runtimeJSON(retainedNetworkInspection(targetA))
 		default:
@@ -151,7 +238,7 @@ func TestRetainedRuntimeReservesTheWholeStoppedRosterAtomically(t *testing.T) {
 func TestRetainedRuntimeCancellationBeforeStartLeavesReservationProvablyUnattempted(t *testing.T) {
 	target, stopped := retainedRuntimeFixture()
 	stopped.Status, stopped.Running, stopped.Networks = "exited", false, nil
-	engine, runner, ctx, scope, release := newRetainedRuntimeEngine(t, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, ctx, scope, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
 			return runtimeJSON(stopped)
@@ -185,7 +272,7 @@ func TestRetainedRuntimeCancellationBeforeStartLeavesReservationProvablyUnattemp
 func TestRetainedRuntimeUnattemptedCleanupSurvivesScopeShutdown(t *testing.T) {
 	target, stopped := retainedRuntimeFixture()
 	stopped.Status, stopped.Running, stopped.Networks = "exited", false, nil
-	engine, _, ctx, _, release := newRetainedRuntimeEngine(t, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 512 << 20, DiskAvailableBytes: 128 << 20}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, _, ctx, _, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 512 << 20, disk: 128 << 20}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
 			return runtimeJSON(stopped)
@@ -248,7 +335,7 @@ func TestRetainedRuntimeReleaseSerializesAgainstConcurrentStart(t *testing.T) {
 			return runtimeRequestResult{}
 		}
 	}
-	engine, ctx, releaseScope := newRetainedRuntimeEngineWithRunner(t, runner, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}})
+	engine, ctx, releaseScope := newRetainedRuntimeEngineWithRunner(t, runner, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30})
 	defer releaseScope()
 	_, reservation, err := engine.ObserveAndReserveRetained(ctx, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", []RetainedTarget{target})
 	if err != nil {
@@ -283,7 +370,7 @@ func TestRetainedRuntimeRefusesUnstableDriftAndRetainsAmbiguousStartCapacity(t *
 	target, stopped := retainedRuntimeFixture()
 	stopped.Status, stopped.Running, stopped.Networks = "exited", false, nil
 	state := stopped
-	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, ctx, _, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
 			return runtimeJSON(state)
@@ -320,7 +407,7 @@ func TestRetainedRuntimeRefusesUnstableDriftAndRetainsAmbiguousStartCapacity(t *
 
 func TestRetainedRuntimeRejectsMissingForeignAndExpiredScopes(t *testing.T) {
 	target, _ := retainedRuntimeFixture()
-	engine, _, ctx, _, release := newRetainedRuntimeEngine(t, fixedCapacitySource{snapshot: CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}}, func(runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, _, ctx, _, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(runtimeprocess.CommandRequest) runtimeRequestResult {
 		t.Fatal("scope refusal reached Docker")
 		return runtimeRequestResult{}
 	})
@@ -350,25 +437,11 @@ func TestRetainedRuntimeRejectsMissingForeignAndExpiredScopes(t *testing.T) {
 	}
 }
 
-type cancellingCapacitySource struct {
-	cancel context.CancelFunc
-	calls  int
-}
-
-func (s *cancellingCapacitySource) Snapshot(context.Context) (CapacitySnapshot, error) {
-	s.calls++
-	if s.calls == 1 {
-		s.cancel()
-	}
-	return CapacitySnapshot{MemoryAvailableBytes: 4 << 30, DiskAvailableBytes: 4 << 30}, nil
-}
-
-func TestRetainedRuntimeCanceledSuccessfulCapacitySnapshotReleasesAdmission(t *testing.T) {
+func TestRetainedRuntimeCancelledCallerReleasesAdmission(t *testing.T) {
 	target, stopped := retainedRuntimeFixture()
 	stopped.Status, stopped.Running, stopped.Networks = "exited", false, nil
 	parent, cancel := context.WithCancel(context.Background())
-	source := &cancellingCapacitySource{cancel: cancel}
-	engine, _, _, scope, release := newRetainedRuntimeEngine(t, source, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
+	engine, runner, _, scope, release := newRetainedRuntimeEngine(t, fixedDomainCapacity{memory: 4 << 30, disk: 4 << 30}, func(request runtimeprocess.CommandRequest) runtimeRequestResult {
 		switch commandKind(request.Args) {
 		case "container inspect":
 			return runtimeJSON(stopped)
@@ -380,9 +453,13 @@ func TestRetainedRuntimeCanceledSuccessfulCapacitySnapshotReleasesAdmission(t *t
 		}
 	})
 	defer release()
+	cancel()
 	cancelledContext := deploymenteffects.WithScope(parent, scope)
 	if _, _, err := engine.ObserveAndReserveRetained(cancelledContext, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", []RetainedTarget{target}); !IsCode(err, DiagnosticCancelled) {
-		t.Fatalf("cancelled successful snapshot error = %v", err)
+		t.Fatalf("cancelled retained admission error = %v", err)
+	}
+	if len(runner.requests) != 0 {
+		t.Fatalf("pre-cancelled retained admission reached Docker: %#v", runner.requests)
 	}
 	freshContext := deploymenteffects.WithScope(context.Background(), scope)
 	_, reservation, err := engine.ObserveAndReserveRetained(freshContext, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", []RetainedTarget{target})
@@ -394,22 +471,26 @@ func TestRetainedRuntimeCanceledSuccessfulCapacitySnapshotReleasesAdmission(t *t
 	}
 }
 
-func newRetainedRuntimeEngine(t *testing.T, capacity CapacitySource, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, context.Context, deploymenteffects.Scope, func() error) {
+func newRetainedRuntimeEngine(t *testing.T, capacity fixedDomainCapacity, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, context.Context, deploymenteffects.Scope, func() error) {
+	return newRetainedRuntimeEngineWithDomainOptions(t, runtimeDomainOptionsForFixedCapacity(capacity), run)
+}
+
+func newRetainedRuntimeEngineWithDomainOptions(t *testing.T, domainOptions generateddomain.Options, run func(runtimeprocess.CommandRequest) runtimeRequestResult) (*Engine, *runtimeFakeRunner, context.Context, deploymenteffects.Scope, func() error) {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	runner := &runtimeFakeRunner{run: run}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "unused.env")}, capacity, newConfiguredRuntimeDeployments(t, directories.WorkingDirectory), EngineOptions{
+	environment := &runtimeFakeEnvironment{path: filepath.Join(root, "unused.env")}
+	options := EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
 		HealthPollInterval: 100 * time.Millisecond, Limits: defaultLimits(), ReplacementDiskBytes: 128 << 20,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
+	fixture := newRuntimeDomainFixture(t, root, runner, environment, options, domainOptions)
+	engine := fixture.engine
 	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
 	if err != nil {
 		t.Fatal(err)
@@ -469,21 +550,21 @@ func (r *synchronizedRetainedRunner) requestCount() int {
 	return len(r.requests)
 }
 
-func newRetainedRuntimeEngineWithRunner(t *testing.T, runner runtimeprocess.CommandRunner, capacity CapacitySource) (*Engine, context.Context, func() error) {
+func newRetainedRuntimeEngineWithRunner(t *testing.T, runner runtimeprocess.CommandRunner, capacity fixedDomainCapacity) (*Engine, context.Context, func() error) {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	engine, err := NewEngine(runner, &runtimeFakeEnvironment{path: filepath.Join(root, "unused.env")}, capacity, newConfiguredRuntimeDeployments(t, directories.WorkingDirectory), EngineOptions{
+	environment := &runtimeFakeEnvironment{path: filepath.Join(root, "unused.env")}
+	options := EngineOptions{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
 		HealthPollInterval: 100 * time.Millisecond, Limits: defaultLimits(), ReplacementDiskBytes: 128 << 20,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
+	fixture := newRuntimeDomainFixture(t, root, runner, environment, options, runtimeDomainOptionsForFixedCapacity(capacity))
+	engine := fixture.engine
 	scope, release, err := deploymenteffects.AcquireScoped(context.Background(), directories.WorkingDirectory)
 	if err != nil {
 		t.Fatal(err)

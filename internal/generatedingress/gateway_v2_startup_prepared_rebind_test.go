@@ -107,12 +107,6 @@ func TestGatewayV2StartupPreparedAbortRetainsOrdinaryRefusalAndAdmitsExactProof(
 	) gatewayObservedTopology {
 		return gatewayTopologyExactFinalV2
 	}
-	if err := fresh.Recover(context.Background()); err != nil {
-		t.Fatalf("recover after prepared native abort: %v", err)
-	}
-	if err := fresh.Provision(context.Background()); err != nil {
-		t.Fatalf("provision after prepared native abort: %v", err)
-	}
 
 	fresh.gatewayV2TransferDriver = &fakeGatewayV2TransferDriver{t: t, manager: fresh,
 		finalExists: true, finalRunning: true, finalConfig: []byte("attested startup config")}
@@ -212,7 +206,7 @@ func TestGatewayV2StartupPreparedRebindRequiresFreshProofAfterRouteRecovery(t *t
 	if err != nil || before.Disposition != GatewayV2StartupNormalV2 {
 		t.Fatalf("pending-route prepared startup=%#v error=%v", before, err)
 	}
-	if err := fixture.manager.Recover(context.Background()); err != nil {
+	if err := exerciseGatewayCurrentRecoveryCore(fixture.manager, context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	current, err := fixture.manager.InspectGatewayRebindCurrent(context.Background(), repository)

@@ -12,11 +12,7 @@ import (
 
 func TestHostingGatewayStartupRebindCensusUsesOneReadTransaction(t *testing.T) {
 	dataRoot := t.TempDir()
-	readerDB, err := database.Open(dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = readerDB.Close() })
+	readerDB := openHistoricalGatewayDatabase(t, dataRoot)
 	addUsers(t, readerDB)
 	f := newGatewayRebindFixtureOnDB(t, readerDB, true)
 	writerDB, err := database.Open(dataRoot)

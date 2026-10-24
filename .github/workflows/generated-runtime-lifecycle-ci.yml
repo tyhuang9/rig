@@ -292,7 +292,10 @@ jobs:
       fail-fast: false
       matrix:
         suite:
-          - runtime-packages
+          - runtime-packages-core
+          - runtime-packages-executor
+          - runtime-packages-state
+          - runtime-packages-recovery
           - gateway-v2
           - rebind-history
           - rebind-startup-runtime
@@ -318,6 +321,11 @@ jobs:
           - current-serving-emergency
           - current-serving-predecessor
           - current-serving
+          - domain-construction
+          - domain-startup-stable
+          - domain-startup
+          - ingress-capacity
+          - gateway-operations
           - ingress-remainder
     steps:
       - name: Check out source

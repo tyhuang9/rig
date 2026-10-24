@@ -23,8 +23,8 @@ type candidateHeadPins struct {
 }
 
 type candidateHeadSnapshot struct {
-	appID, deploymentID, releaseID, slot string
-	generation                           int64
+	appID, deploymentID, releaseID, slot, activationReceiptID string
+	generation                                                int64
 }
 
 type candidateHeadGroup struct {
@@ -107,6 +107,15 @@ func (r *candidateHeadRegistry) bindPredecessor(pins candidateHeadPins, observed
 // SwitchingRoute and the complete Active roster. It never derives a historical
 // predecessor generation or grants positive start/cleanup/transfer authority.
 func (r *candidateHeadRegistry) bindSelf(pins candidateHeadPins, observed candidateHeadSnapshot) (candidateHeadAnchor, error) {
+	return r.bindColdSelf(pins, observed, false)
+}
+
+// bindColdSelf records a read-only current head reconstructed from the sealed
+// startup census. A null receipt is accepted only for an explicitly selected
+// quiescent pre-042 head; it never authorizes a switching or draining replay.
+func (r *candidateHeadRegistry) bindColdSelf(pins candidateHeadPins, observed candidateHeadSnapshot,
+	allowLegacyReceipt bool,
+) (candidateHeadAnchor, error) {
 	if r == nil || r.groups == nil || !validCandidateHeadPins(pins) {
 		return candidateHeadAnchor{}, deploymentexecution.ErrInvalidConfiguration
 	}
@@ -117,7 +126,9 @@ func (r *candidateHeadRegistry) bindSelf(pins candidateHeadPins, observed candid
 		return candidateHeadAnchor{}, err
 	}
 	if observed.appID != pins.appID || observed.deploymentID != pins.deploymentID || observed.releaseID != pins.releaseID ||
-		observed.slot != pins.slot || observed.generation < 1 {
+		observed.slot != pins.slot || observed.generation < 1 ||
+		(observed.activationReceiptID == "" && !allowLegacyReceipt) ||
+		(observed.activationReceiptID != "" && !validCanonicalUUID(observed.activationReceiptID)) {
 		return candidateHeadAnchor{}, deploymentexecution.ErrAuthorityStale
 	}
 	if group.predecessor != nil && (group.predecessor.generation == math.MaxInt64 || observed.generation != group.predecessor.generation+1) {

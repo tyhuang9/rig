@@ -36,6 +36,7 @@ func gatewayRebindCommittedServingFixtureWithApprovals(t *testing.T,
 		prepare(f, &input)
 	}
 	template := newGatewayCurrentStateFixture(t)
+	bindGatewayCurrentStateFixtureApplicationNetworks(t, &template, gatewayRebindFixtureDockerObservation(t, f))
 	f.manager.gatewayRebindV2NetworkObserver = func(_ context.Context, claim appaccess.GatewayRebindClaimV2) (gatewayRebindSuccessorNetworkObservation, error) {
 		value := template.intent.NetworkObservation
 		value.OperationID, value.ClaimRequestDigest, value.ProfileSpecDigest = claim.Spec.OperationID, claim.RequestDigest, claim.ConfigureApproval.SpecDigest

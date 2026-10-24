@@ -6,10 +6,8 @@ package generatedruntime
 import (
 	"context"
 	"errors"
-	"sync"
 
 	"github.com/hostd/hostd/internal/deployments"
-	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedroute"
@@ -186,21 +184,6 @@ type CandidateDescription = generatedidentity.CandidateDescription
 // AppNetworkDescription lets migration and ingress implementations join the
 // exact app-private network without duplicating the naming algorithm.
 type AppNetworkDescription = generatedidentity.AppNetworkDescription
-
-type CapacitySnapshot = generatedcapacity.Snapshot
-
-type CapacitySource = generatedcapacity.Source
-
-type capacityLease struct {
-	once    sync.Once
-	release func()
-}
-
-func (l *capacityLease) Release() {
-	if l != nil {
-		l.once.Do(l.release)
-	}
-}
 
 type EnvironmentLease interface {
 	Path() string

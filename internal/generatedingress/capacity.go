@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hostd/hostd/internal/generatedcapacity"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 // The command is controller-owned and fixed. It executes inside the pinned,
@@ -14,9 +15,9 @@ import (
 // volume, so df measures the Docker data plane rather than Rig's source disk.
 const capacityProbeCommand = `memory=$(awk '/MemAvailable:/ {print $2*1024}' /proc/meminfo); disk=$(df -Pk /config | awk 'NR==2 {print $4*1024}'); printf '%s %s\n' "$memory" "$disk"`
 
-// Snapshot implements generatedcapacity.Source. Provision must have
-// succeeded at startup; this method is intentionally read-only apart from the
-// fixed process executed inside the already-running Caddy container.
+// Snapshot implements generatedcapacity.Source. Canonical domain construction
+// must have established the exact gateway first; this method is intentionally
+// read-only apart from the fixed process executed inside that Caddy container.
 func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedcapacity.Snapshot, resultErr error) {
 	if m == nil || ctx == nil {
 		return generatedcapacity.Snapshot{}, errors.New("generated ingress capacity source is invalid")
@@ -67,8 +68,23 @@ func (m *Manager) Snapshot(ctx context.Context) (snapshot generatedcapacity.Snap
 }
 
 func (m *Manager) snapshotFromContainer(ctx context.Context, container string) (generatedcapacity.Snapshot, error) {
-	result, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", container, "sh", "-c", capacityProbeCommand)
+	result, err := m.runner.Run(ctx, runtimeprocess.CommandRequest{
+		Executable:  m.options.DockerExecutable,
+		Args:        []string{"container", "exec", container, "sh", "-c", capacityProbeCommand},
+		Directory:   m.options.WorkingDirectory,
+		Env:         append([]string(nil), m.dockerEnv...),
+		Timeout:     m.options.CommandTimeout,
+		OutputLimit: m.options.OutputLimit,
+	})
 	if err != nil {
+		clearResult(&result)
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return generatedcapacity.Snapshot{}, &Error{Code: DiagnosticCancelled}
+		}
+		return generatedcapacity.Snapshot{}, errors.New("generated ingress capacity probe failed")
+	}
+	if result.StdoutTruncated || result.StderrTruncated {
+		clearResult(&result)
 		return generatedcapacity.Snapshot{}, errors.New("generated ingress capacity probe failed")
 	}
 	fields := strings.Fields(string(result.Stdout))

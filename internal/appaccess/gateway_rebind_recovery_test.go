@@ -99,7 +99,7 @@ func TestGatewayRebindRecoverySnapshotRepresentsValidatedNoHistoryStates(t *test
 	})
 
 	t.Run("committed upgrade authority", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		snapshot, err := fixture.repository.GatewayRebindRecoverySnapshot(context.Background())
 		if err != nil || len(snapshot.History) != 0 || snapshot.Active != nil ||
 			snapshot.CurrentProfile == nil || snapshot.CurrentProfile.ID != fixture.profile.ID ||

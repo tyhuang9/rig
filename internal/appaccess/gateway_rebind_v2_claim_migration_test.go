@@ -9,7 +9,7 @@ import (
 
 func TestGatewayRebindV2SourceClaimAcceptsUpgradeGenerationAndRejectsCrossKindMixes(t *testing.T) {
 	t.Run("upgrade generation after prior abort", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		if err := insertGatewayRebindSourceClaimForMigrationTest(fixture, 2, 2,
 			GatewayRebindSourceGatewayUpgrade, 7, strings.Repeat("a", 64), "", nil, nil); err != nil {
 			t.Fatalf("insert v2 upgrade generation: %v", err)
@@ -23,7 +23,7 @@ func TestGatewayRebindV2SourceClaimAcceptsUpgradeGenerationAndRejectsCrossKindMi
 	})
 
 	t.Run("legacy format cannot encode rebind predecessor", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		rebindOperationID, receipt := uuid.NewString(), strings.Repeat("b", 64)
 		if err := insertGatewayRebindSourceClaimForMigrationTest(fixture, 1, 1,
 			GatewayRebindSourceGatewayRebind, 0, "", "", &rebindOperationID, &receipt); err == nil {
@@ -32,7 +32,7 @@ func TestGatewayRebindV2SourceClaimAcceptsUpgradeGenerationAndRejectsCrossKindMi
 	})
 
 	t.Run("upgrade kind rejects rebind evidence", func(t *testing.T) {
-		fixture := newGatewayRebindFixtureOnDBWithClaim(t, appAccessDB(t), false, false)
+		fixture := newGatewayRebindFixtureOnDBWithClaim(t, historicalAppAccessDB(t), false, false)
 		if err := insertGatewayRebindSourceClaimForMigrationTest(fixture, 2, 2,
 			GatewayRebindSourceGatewayUpgrade, 7, "", strings.Repeat("c", 64), nil, nil); err == nil {
 			t.Fatal("upgrade source accepted protected rebind intent evidence")

@@ -350,7 +350,7 @@ func (r *generatedDomainBootstrapReceipt) guard(
 		if networkErr != nil || !found || normalizeID(id) != r.networkID ||
 			!validGeneratedDomainBootstrapNetwork(network, r.networkID,
 				r.network.IPAM.Config[0].Subnet, r.network.IPAM.Config[0].Gateway,
-				r.ingressIP, r.containerID != "", r.containerID) {
+				r.ingressIP, r.started, r.containerID) {
 			return nil, errors.New("generated domain bootstrap network receipt changed")
 		}
 	}
@@ -401,13 +401,13 @@ func (r *generatedDomainBootstrapReceipt) matchesSelectedObjects(objects []gener
 	if r.volume.Name != "" {
 		expected["volume\x00"+caddyVolumeName] = generatedDomainDockerObject{kind: "volume", name: caddyVolumeName,
 			labels: r.volume.Labels, data: generatedDomainDockerObjectData{driver: r.volume.Driver,
-				scope: r.volume.Scope, options: r.volume.Options, mountpoint: r.volumeIdentity.Mountpoint,
+				scope: r.volume.Scope, options: cloneStringMap(r.volume.Options), mountpoint: r.volumeIdentity.Mountpoint,
 				createdAt: r.volumeIdentity.CreatedAt}}
 	}
 	if r.networkID != "" {
 		expected["network\x00"+caddyNetworkName] = generatedDomainDockerObject{kind: "network", id: r.networkID,
 			name: caddyNetworkName, labels: r.network.Labels, data: generatedDomainDockerObjectData{
-				driver: r.network.Driver, scope: r.network.Scope, options: r.network.Options}}
+				driver: r.network.Driver, scope: r.network.Scope, options: cloneStringMap(r.network.Options)}}
 	}
 	if r.containerID != "" {
 		expected["container\x00"+caddyContainerName] = generatedDomainDockerObject{kind: "container",
@@ -442,7 +442,7 @@ func validGeneratedDomainBootstrapVolume(value volumeInspection, identity gatewa
 }
 
 func validGeneratedDomainBootstrapNetwork(value caddyNetworkInspection, id, subnet, gateway, ingressIP string,
-	withContainer bool, containerID string,
+	started bool, containerID string,
 ) bool {
 	if !generatedDomainCanonicalDockerID(id, false) || value.Name != caddyNetworkName || value.Driver != "bridge" ||
 		value.Scope != "local" || value.Internal || len(value.Options) != 0 ||
@@ -453,8 +453,14 @@ func validGeneratedDomainBootstrapNetwork(value caddyNetworkInspection, id, subn
 		}) {
 		return false
 	}
-	if !withContainer {
-		return len(value.Containers) == 0
+	if containerID == "" {
+		return !started && len(value.Containers) == 0
+	}
+	// A stopped container has a requested network attachment, but Docker may
+	// expose its network membership only after Start. If membership is already
+	// visible, it must still be the one exact receipt-owned container.
+	if !started && len(value.Containers) == 0 {
+		return true
 	}
 	if len(value.Containers) != 1 {
 		return false
@@ -482,16 +488,18 @@ func validGeneratedDomainBootstrapContainer(value caddyInspection, runtime gatew
 		return false
 	}
 	network := runtime.ConfiguredNetworks[caddyNetworkName]
-	if normalizeID(network.NetworkID) != networkID || network.GwPriority != caddyGatewayPriority ||
+	if network.GwPriority != caddyGatewayPriority ||
 		network.IPv6Gateway != "" || network.IPAMConfig == nil || network.IPAMConfig.IPv4Address != ingressIP ||
 		network.IPAMConfig.IPv6Address != "" {
 		return false
 	}
 	if running {
-		return network.IPAddress == ingressIP &&
+		return normalizeID(network.NetworkID) == networkID && network.IPAddress == ingressIP &&
 			gatewayV2EffectivePortBindingsMatchConfigured(runtime.EffectivePortBindings, value.PortBindings)
 	}
-	return network.IPAddress == "" && !gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)
+	return (network.NetworkID == "" || normalizeID(network.NetworkID) == networkID) &&
+		network.EndpointID == "" && network.IPAddress == "" &&
+		!gatewayV2HasEffectivePortBinding(runtime.EffectivePortBindings)
 }
 
 func generatedDomainBootstrapNetworkCandidate(ctx context.Context, manager *Manager,

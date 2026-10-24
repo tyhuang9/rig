@@ -60,7 +60,23 @@ func (r *generatedDomainRecoveryCensusRunner) Run(ctx context.Context,
 	case reflect.DeepEqual(args, []string{"volume", "ls", "--format", generatedDomainVolumeListFormat}):
 		return generatedDomainRecoveryCensusList(r.objects, "volume"), nil
 	case reflect.DeepEqual(args, []string{"image", "ls", "--all", "--no-trunc", "--quiet"}):
-		return runtimeprocess.CommandResult{Stdout: []byte(r.imageID + "\n")}, nil
+		ids := make([]string, 0, 1+len(r.objects))
+		seen := make(map[string]struct{})
+		if r.imageID != "" {
+			ids = append(ids, r.imageID)
+			seen[r.imageID] = struct{}{}
+		}
+		for _, object := range r.objects {
+			if object.kind != "image" {
+				continue
+			}
+			if _, duplicate := seen[object.id]; duplicate {
+				continue
+			}
+			ids = append(ids, object.id)
+			seen[object.id] = struct{}{}
+		}
+		return runtimeprocess.CommandResult{Stdout: []byte(strings.Join(ids, "\n") + "\n")}, nil
 	case len(args) == 5 && args[1] == "inspect" && args[2] == "--format" &&
 		args[3] == generatedDomainContainerInspectFormat && args[0] == "container":
 		return generatedDomainRecoveryCensusProjection(r.objects, "container", args[4])
@@ -74,6 +90,8 @@ func (r *generatedDomainRecoveryCensusRunner) Run(ctx context.Context,
 		args[4] == r.imageID:
 		return jsonResult(generatedDomainDockerInspectProjection{ID: r.imageID,
 			Labels: map[string]string{}, ContentID: r.imageID}), nil
+	case len(args) == 5 && reflect.DeepEqual(args[:4], []string{"image", "inspect", "--format", generatedDomainImageInspectFormat}):
+		return generatedDomainRecoveryCensusProjection(r.objects, "image", args[4])
 	default:
 		if r.gateway == nil {
 			return runtimeprocess.CommandResult{}, errors.New("unexpected generated-domain recovery command")
@@ -128,7 +146,8 @@ func (r *generatedDomainGatewayAttestationRunner) Run(_ context.Context,
 	switch {
 	case len(args) == 5 && reflect.DeepEqual(args[:4], []string{"image", "inspect", "--format", imageInspectFormat}):
 		return jsonResult(r.image), nil
-	case len(args) == 5 && reflect.DeepEqual(args[:4], []string{"container", "inspect", "--format", gatewayContainerInspectFormat}):
+	case len(args) == 5 && reflect.DeepEqual(args[:4], []string{"container", "inspect", "--format",
+		generatedDomainStartupContainerInspectFormat}):
 		container := r.container
 		if r.containers != nil {
 			var ok bool
@@ -147,7 +166,8 @@ func (r *generatedDomainGatewayAttestationRunner) Run(_ context.Context,
 			return runtimeprocess.CommandResult{}, errors.New("unexpected generated-domain startup volume")
 		}
 		return jsonResult(volume), nil
-	case len(args) == 5 && reflect.DeepEqual(args[:4], []string{"network", "inspect", "--format", "json"}):
+	case len(args) == 5 && reflect.DeepEqual(args[:4], []string{"network", "inspect", "--format",
+		generatedDomainStartupNetworkInspectFormat}):
 		network := r.network
 		if r.networks != nil {
 			var ok bool
@@ -159,7 +179,7 @@ func (r *generatedDomainGatewayAttestationRunner) Run(_ context.Context,
 		if args[4] != network.ID {
 			return runtimeprocess.CommandResult{}, errors.New("unexpected generated-domain startup network")
 		}
-		return jsonResult([]gatewayNetworkIdentityInspection{network}), nil
+		return jsonResult(network), nil
 	case len(args) == 4 && args[0] == "container" && args[1] == "cp" && args[3] == "-":
 		containerID := strings.SplitN(args[2], ":", 2)[0]
 		restart := generatedDomainRestartFixture{name: r.restartName, body: r.restart}
@@ -212,6 +232,278 @@ func generatedDomainGatewayAdminCommand(args []string, containerID string) bool 
 func generatedDomainGatewayChallengeCommand(args []string, containerID string) bool {
 	return len(args) >= 4 && args[0] == "container" && args[1] == "exec" && args[2] == containerID &&
 		strings.Contains(args[len(args)-1], gatewayV2ChallengePathPrefix)
+}
+
+type generatedDomainStartupProjectionRunner struct {
+	containerID   string
+	networkID     string
+	containerBody []byte
+	networkBody   []byte
+	commands      [][]string
+}
+
+func (r *generatedDomainStartupProjectionRunner) Run(_ context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	r.commands = append(r.commands, append([]string(nil), request.Args...))
+	switch {
+	case reflect.DeepEqual(request.Args, []string{"container", "inspect", "--format",
+		generatedDomainStartupContainerInspectFormat, r.containerID}):
+		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), r.containerBody...)}, nil
+	case reflect.DeepEqual(request.Args, []string{"network", "inspect", "--format",
+		generatedDomainStartupNetworkInspectFormat, r.networkID}):
+		return runtimeprocess.CommandResult{Stdout: append([]byte(nil), r.networkBody...)}, nil
+	default:
+		return runtimeprocess.CommandResult{}, errors.New("unexpected generated-domain startup projection command")
+	}
+}
+
+func TestGeneratedDomainStartupDockerInspectProjectsOnlyConsumedFields(t *testing.T) {
+	containerID := strings.Repeat("a", 64)
+	networkID := strings.Repeat("b", 64)
+	networkName := "rig-ingress-projection"
+	containerInput := map[string]any{
+		"ID": containerID, "Name": "/rig-gateway", "Image": "sha256:" + strings.Repeat("c", 64),
+		"Config": map[string]any{
+			"Labels": map[string]string{"io.rig.managed": "generated-ingress"}, "Hostname": "gateway",
+			"User": "1000:1000", "Env": []string{"A=B"}, "Entrypoint": []string{"caddy"}, "Cmd": []string{"run"},
+		},
+		"HostConfig": map[string]any{
+			"ReadonlyRootfs": true, "Privileged": false, "CapAdd": []string{"NET_BIND_SERVICE"},
+			"CapDrop": []string{"ALL"}, "SecurityOpt": []string{"no-new-privileges:true"},
+			"Binds": []string{"rig-config:/config:ro"}, "Tmpfs": map[string]string{"/tmp": "rw,noexec"},
+			"Memory": int64(64 << 20), "MemorySwap": int64(64 << 20), "NanoCPUs": int64(1_000_000_000),
+			"PidsLimit": int64(128), "LogConfig": map[string]any{"Type": "local", "Config": map[string]string{"max-size": "1m"}},
+			"RestartPolicy": map[string]any{"Name": "unless-stopped"}, "NetworkMode": networkName,
+			"Ulimits":      []map[string]any{{"Name": "nofile", "Hard": int64(1024), "Soft": int64(1024)}},
+			"PortBindings": map[string]any{"8080/tcp": []map[string]string{{"HostIP": "127.0.0.1", "HostPort": "8080"}}},
+		},
+		"Mounts": []map[string]any{{
+			"Type": "volume", "Name": "rig-config", "Destination": "/config", "RW": false,
+			"Source": "sensitive-mount-source", "Mode": "z", "Propagation": "rprivate", "Driver": "local",
+		}},
+		"State":        map[string]any{"Running": true, "Restarting": false, "Paused": false, "Dead": false},
+		"RestartCount": 2,
+		"NetworkSettings": map[string]any{
+			"Ports": map[string]any{"8080/tcp": []map[string]string{{"HostIP": "127.0.0.1", "HostPort": "8080"}}},
+			"Networks": map[string]any{networkName: map[string]any{
+				"Aliases": []string{"rig-gateway"}, "IPAddress": "172.30.0.2", "GwPriority": 1,
+				"IPv6Gateway": "", "NetworkID": networkID, "EndpointID": "endpoint-id",
+				"IPAMConfig": map[string]any{"IPv4Address": "172.30.0.2", "IPv6Address": "", "LinkLocalIPs": []string{"sensitive-link-local"}},
+				"MacAddress": "sensitive-mac", "Gateway": "sensitive-gateway", "DNSNames": []string{"sensitive-dns"},
+			}},
+		},
+	}
+	networkInput := map[string]any{
+		"ID": networkID, "Name": networkName, "Driver": "bridge", "Scope": "local", "Internal": false,
+		"Options": map[string]string{"com.docker.network.bridge.name": "rig0"},
+		"IPAM": map[string]any{
+			"Driver": "default", "Options": map[string]string{"sensitive-ipam-option": "hidden"},
+			"Config": []map[string]any{{"Subnet": "172.30.0.0/28", "Gateway": "172.30.0.1",
+				"IPRange": "sensitive-range", "AuxAddress": map[string]string{"sensitive": "172.30.0.3"}}},
+		},
+		"Labels": map[string]string{"io.rig.managed": "generated-ingress-network"},
+		"Containers": map[string]any{containerID: map[string]any{
+			"Name": "rig-gateway", "IPv4Address": "172.30.0.2/28", "EndpointID": "sensitive-endpoint",
+			"MacAddress": "sensitive-network-mac", "IPv6Address": "sensitive-ipv6",
+		}},
+		"Created": "sensitive-created", "EnableIPv4": true, "EnableIPv6": false, "Attachable": false,
+		"Ingress": false, "ConfigOnly": false, "Peers": []string{"sensitive-peer"},
+	}
+	containerBody := []byte(renderIngressInspectTemplate(t, generatedDomainStartupContainerInspectFormat, containerInput))
+	networkBody := []byte(renderIngressInspectTemplate(t, generatedDomainStartupNetworkInspectFormat, networkInput))
+	for _, forbidden := range []string{"sensitive-mount-source", "sensitive-link-local", "sensitive-mac",
+		"sensitive-gateway", "sensitive-dns", "sensitive-ipam-option", "sensitive-range",
+		"sensitive-endpoint", "sensitive-network-mac", "sensitive-ipv6", "sensitive-created", "sensitive-peer"} {
+		if strings.Contains(string(containerBody), forbidden) || strings.Contains(string(networkBody), forbidden) {
+			t.Fatalf("startup projection retained nonconsumed Docker field %q", forbidden)
+		}
+	}
+	runner := &generatedDomainStartupProjectionRunner{containerID: containerID, networkID: networkID,
+		containerBody: containerBody, networkBody: networkBody}
+	reader := &generatedDomainStartupReader{runner: runner, options: generatedDomainOptions{
+		DockerExecutable: `C:\docker.exe`, WorkingDirectory: `C:\work`, CommandTimeout: time.Minute, OutputLimit: 1 << 20}}
+	container, runtime, err := reader.readDetailedContainer(context.Background(), time.Now().Add(time.Minute), containerID)
+	if err != nil || container.ID != containerID || len(container.Mounts) != 1 || container.Mounts[0].Name != "rig-config" ||
+		container.Networks[networkName] == nil || container.Networks[networkName].IPAddress != "172.30.0.2" ||
+		runtime.ConfiguredNetworks[networkName].NetworkID != networkID ||
+		runtime.ConfiguredNetworks[networkName].IPAMConfig == nil ||
+		runtime.ConfiguredNetworks[networkName].IPAMConfig.IPv4Address != "172.30.0.2" {
+		t.Fatalf("projected container = %#v runtime=%#v err=%v", container, runtime, err)
+	}
+	network, gotNetworkID, err := reader.readDetailedNetwork(context.Background(), time.Now().Add(time.Minute), networkID)
+	if err != nil || gotNetworkID != networkID || network.Name != networkName || len(network.IPAM.Config) != 1 ||
+		network.IPAM.Config[0].Subnet != "172.30.0.0/28" || network.Containers[containerID].Name != "rig-gateway" {
+		t.Fatalf("projected network = %#v id=%q err=%v", network, gotNetworkID, err)
+	}
+
+	t.Run("legacy_full_shapes_remain_incompatible_with_strict_startup_readers", func(t *testing.T) {
+		legacyContainer := []byte(renderIngressInspectTemplate(t, gatewayContainerInspectFormat, containerInput))
+		control := &generatedDomainStartupProjectionRunner{containerID: containerID, networkID: networkID,
+			containerBody: legacyContainer, networkBody: networkBody}
+		controlReader := &generatedDomainStartupReader{runner: control, options: reader.options}
+		if _, _, readErr := controlReader.readDetailedContainer(context.Background(), time.Now().Add(time.Minute), containerID); readErr == nil || len(control.commands) != 1 {
+			t.Fatalf("full Docker container shape bypassed the startup projection: commands=%#v err=%v",
+				control.commands, readErr)
+		}
+		legacyNetwork := jsonResult([]any{networkInput}).Stdout
+		control = &generatedDomainStartupProjectionRunner{containerID: containerID, networkID: networkID,
+			containerBody: containerBody, networkBody: legacyNetwork}
+		controlReader = &generatedDomainStartupReader{runner: control, options: reader.options}
+		if _, _, readErr := controlReader.readDetailedNetwork(context.Background(), time.Now().Add(time.Minute), networkID); readErr == nil || len(control.commands) != 1 {
+			t.Fatalf("full Docker network shape bypassed the startup projection: commands=%#v err=%v",
+				control.commands, readErr)
+		}
+	})
+
+	copyMap := func(source map[string]any) map[string]any {
+		result := make(map[string]any, len(source))
+		for key, value := range source {
+			result[key] = value
+		}
+		return result
+	}
+	t.Run("nested_projection_cardinality_and_nulls", func(t *testing.T) {
+		nilInput := copyMap(containerInput)
+		nilInput["Mounts"] = nil
+		nilInput["NetworkSettings"] = nil
+		var nilValue gatewayContainerInspection
+		if err := decodeGeneratedDomainStrictJSON([]byte(renderIngressInspectTemplate(t,
+			generatedDomainStartupContainerInspectFormat, nilInput)), &nilValue); err != nil ||
+			len(nilValue.Mounts) != 0 || nilValue.Networks != nil || nilValue.ConfiguredNetworks != nil ||
+			nilValue.EffectivePortBindings != nil {
+			t.Fatalf("nil nested projection = %#v, %v", nilValue, err)
+		}
+
+		emptyInput := copyMap(containerInput)
+		emptyInput["Mounts"] = []map[string]any{}
+		emptyInput["NetworkSettings"] = map[string]any{"Ports": map[string]any{}, "Networks": map[string]any{}}
+		var emptyValue gatewayContainerInspection
+		if err := decodeGeneratedDomainStrictJSON([]byte(renderIngressInspectTemplate(t,
+			generatedDomainStartupContainerInspectFormat, emptyInput)), &emptyValue); err != nil ||
+			len(emptyValue.Mounts) != 0 || emptyValue.Networks == nil || len(emptyValue.Networks) != 0 ||
+			emptyValue.ConfiguredNetworks == nil || len(emptyValue.ConfiguredNetworks) != 0 ||
+			emptyValue.EffectivePortBindings == nil || len(emptyValue.EffectivePortBindings) != 0 {
+			t.Fatalf("empty nested projection = %#v, %v", emptyValue, err)
+		}
+
+		nilMapsInput := copyMap(containerInput)
+		nilHostConfig := copyMap(containerInput["HostConfig"].(map[string]any))
+		nilHostConfig["Tmpfs"] = nil
+		nilHostConfig["PortBindings"] = nil
+		nilHostConfig["LogConfig"] = map[string]any{"Type": "local", "Config": nil}
+		nilMapsInput["HostConfig"] = nilHostConfig
+		nilMapsInput["NetworkSettings"] = map[string]any{
+			"Ports": nil,
+			"Networks": map[string]any{networkName: map[string]any{
+				"Aliases": nil, "IPAddress": "172.30.0.2", "GwPriority": 1, "IPv6Gateway": "",
+				"NetworkID": networkID, "EndpointID": "", "IPAMConfig": nil,
+			}},
+		}
+		var nilMapsValue gatewayContainerInspection
+		if err := decodeGeneratedDomainStrictJSON([]byte(renderIngressInspectTemplate(t,
+			generatedDomainStartupContainerInspectFormat, nilMapsInput)), &nilMapsValue); err != nil ||
+			nilMapsValue.Tmpfs != nil || nilMapsValue.PortBindings != nil || nilMapsValue.LogConfig != nil ||
+			nilMapsValue.EffectivePortBindings != nil || nilMapsValue.Networks[networkName] == nil ||
+			nilMapsValue.Networks[networkName].Aliases != nil ||
+			nilMapsValue.ConfiguredNetworks[networkName].IPAMConfig != nil {
+			t.Fatalf("nil nested maps projection = %#v, %v", nilMapsValue, err)
+		}
+
+		multipleInput := copyMap(containerInput)
+		multipleInput["Mounts"] = []map[string]any{
+			{"Type": "volume", "Name": "first", "Destination": "/first", "RW": false},
+			{"Type": "tmpfs", "Name": "", "Destination": "/second", "RW": true},
+		}
+		multipleInput["NetworkSettings"] = map[string]any{
+			"Ports": map[string]any{},
+			"Networks": map[string]any{
+				networkName: map[string]any{"Aliases": []string{"first"}, "IPAddress": "172.30.0.2",
+					"GwPriority": 1, "IPv6Gateway": "", "NetworkID": networkID, "EndpointID": "first",
+					"IPAMConfig": map[string]any{"IPv4Address": "172.30.0.2", "IPv6Address": ""}},
+				"rig-second": map[string]any{"Aliases": []string{"second"}, "IPAddress": "172.31.0.2",
+					"GwPriority": 0, "IPv6Gateway": "", "NetworkID": strings.Repeat("d", 64), "EndpointID": "second",
+					"IPAMConfig": nil},
+			},
+		}
+		var multipleValue gatewayContainerInspection
+		if err := decodeGeneratedDomainStrictJSON([]byte(renderIngressInspectTemplate(t,
+			generatedDomainStartupContainerInspectFormat, multipleInput)), &multipleValue); err != nil ||
+			len(multipleValue.Mounts) != 2 || len(multipleValue.Networks) != 2 ||
+			len(multipleValue.ConfiguredNetworks) != 2 || multipleValue.ConfiguredNetworks["rig-second"].IPAMConfig != nil {
+			t.Fatalf("multiple nested container projection = %#v, %v", multipleValue, err)
+		}
+
+		multipleNetwork := copyMap(networkInput)
+		multipleNetwork["IPAM"] = map[string]any{"Config": []map[string]any{
+			{"Subnet": "172.30.0.0/28", "Gateway": "172.30.0.1"},
+			{"Subnet": "172.31.0.0/28", "Gateway": "172.31.0.1"},
+		}}
+		multipleNetwork["Containers"] = map[string]any{
+			containerID:             map[string]any{"Name": "first", "IPv4Address": "172.30.0.2/28"},
+			strings.Repeat("e", 64): map[string]any{"Name": "second", "IPv4Address": "172.30.0.3/28"},
+		}
+		var multipleNetworkValue gatewayNetworkIdentityInspection
+		if err := decodeGeneratedDomainStrictJSON([]byte(renderIngressInspectTemplate(t,
+			generatedDomainStartupNetworkInspectFormat, multipleNetwork)), &multipleNetworkValue); err != nil ||
+			len(multipleNetworkValue.IPAM.Config) != 2 || len(multipleNetworkValue.Containers) != 2 {
+			t.Fatalf("multiple nested network projection = %#v, %v", multipleNetworkValue, err)
+		}
+
+		for name, input := range map[string]map[string]any{
+			"empty": func() map[string]any {
+				value := copyMap(networkInput)
+				value["IPAM"] = map[string]any{"Config": []map[string]any{}}
+				value["Containers"] = map[string]any{}
+				return value
+			}(),
+			"nil": func() map[string]any {
+				value := copyMap(networkInput)
+				value["Options"] = nil
+				value["Labels"] = nil
+				value["IPAM"] = map[string]any{"Config": nil}
+				value["Containers"] = nil
+				return value
+			}(),
+		} {
+			var value gatewayNetworkIdentityInspection
+			if err := decodeGeneratedDomainStrictJSON([]byte(renderIngressInspectTemplate(t,
+				generatedDomainStartupNetworkInspectFormat, input)), &value); err != nil ||
+				len(value.IPAM.Config) != 0 || len(value.Containers) != 0 {
+				t.Fatalf("%s nested network projection = %#v, %v", name, value, err)
+			}
+		}
+	})
+
+	withUnknown := func(body []byte) []byte {
+		return []byte(strings.TrimSuffix(string(body), "}") + `,"unexpected":true}`)
+	}
+	for _, test := range []struct {
+		name string
+		body []byte
+	}{
+		{name: "container_unknown", body: withUnknown(containerBody)},
+		{name: "container_duplicate", body: []byte(`{"id":"` + containerID + `","id":"` + containerID + `"}`)},
+		{name: "network_unknown", body: withUnknown(networkBody)},
+		{name: "network_duplicate", body: []byte(`{"Id":"` + networkID + `","Id":"` + networkID + `"}`)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			control := &generatedDomainStartupProjectionRunner{containerID: containerID, networkID: networkID,
+				containerBody: containerBody, networkBody: networkBody}
+			controlReader := &generatedDomainStartupReader{runner: control, options: reader.options}
+			var readErr error
+			if strings.HasPrefix(test.name, "container_") {
+				control.containerBody = test.body
+				_, _, readErr = controlReader.readDetailedContainer(context.Background(), time.Now().Add(time.Minute), containerID)
+			} else {
+				control.networkBody = test.body
+				_, _, readErr = controlReader.readDetailedNetwork(context.Background(), time.Now().Add(time.Minute), networkID)
+			}
+			if readErr == nil || len(control.commands) != 1 {
+				t.Fatalf("noncanonical projection reached acceptance: commands=%#v err=%v", control.commands, readErr)
+			}
+		})
+	}
 }
 
 func TestGeneratedDomainStartupClassifiesStableGateway(t *testing.T) {
@@ -838,7 +1130,18 @@ func newGeneratedDomainUpgradeFixtureAtPhase(t *testing.T, target gatewayMigrati
 	}
 	identity := newGeneratedDomainIdentityFixture(t)
 	runner := &ingressRunner{files: map[string][]byte{}}
-	manager, err := newManager(runner, Options{
+	if retainedApp {
+		_, _, ingressIP := ingressNetworkCandidate(0)
+		runner.caddyNetworks = map[string]*networkAttachment{caddyNetworkName: {
+			GwPriority: caddyGatewayPriority, IPAddress: ingressIP}}
+		runner.ingressContainers = map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {
+			Name: caddyContainerName, IPv4Address: ingressIP + "/28"}}
+	}
+	constructManager := newManager
+	if retainedApp {
+		constructManager = New
+	}
+	manager, err := constructManager(runner, Options{
 		DockerExecutable:             identity.options.DockerExecutable,
 		DockerEndpoint:               identity.options.DockerEndpoint,
 		DockerConfigDirectory:        identity.options.DockerConfigDirectory,
@@ -880,12 +1183,8 @@ func newGeneratedDomainUpgradeFixtureAtPhase(t *testing.T, target gatewayMigrati
 	source := routeState{Version: stateVersion, Active: map[string]routeRecord{}}
 	var installRetainedLAN func(*gatewayUpgradeStateStore, gatewayMigrationJournal, gatewayV2RouteState) gatewayV2RouteState
 	if retainedApp {
-		appID := uuid.NewString()
-		if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at)
-			VALUES(?,?,?,'draft',datetime('now'),datetime('now'))`, appID,
-			"startup-retained-"+appID, "Startup retained app"); err != nil {
-			t.Fatal(err)
-		}
+		migration := newGeneratedMigrationFixtureOnDomainWithComponents(t, identity, []string{"api"}, []string{"api"})
+		appID := migration.guarded.appID
 		allocation, _, err := repository.ReserveAppAccess(ctx, appaccess.ReserveAppAccessInput{
 			AppID: appID, OperationID: uuid.NewString(), GatewayProfileRevisionID: profile.ID,
 			GatewayProfileRevisionNumber: profile.RevisionNumber,
@@ -927,11 +1226,9 @@ func newGeneratedDomainUpgradeFixtureAtPhase(t *testing.T, target gatewayMigrati
 			}); err != nil {
 			t.Fatal(err)
 		}
-		active := seedGatewayRebindPredecessorRuntime(t, db, appID)
+		active, activeEndpoint := seedGatewayRebindPredecessorRuntime(t, manager, runner, migration)
 		source.Active[appID] = routeRecord{Slot: generatedidentity.Slot(active.Slot),
-			Endpoints: []generatedroute.RouteEndpoint{
-				endpoint("api", "server", "startup-retained-network", "startup-retained-blue", 3000, '4'),
-			}}
+			Endpoints: []generatedroute.RouteEndpoint{activeEndpoint}}
 		installRetainedLAN = func(store *gatewayUpgradeStateStore, journal gatewayMigrationJournal,
 			state gatewayV2RouteState,
 		) gatewayV2RouteState {

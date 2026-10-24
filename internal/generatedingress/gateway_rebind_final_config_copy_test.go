@@ -276,6 +276,7 @@ func TestGatewayRebindFinalConfigCopyRejectsCheckpointRuntimeHeadDrift(t *testin
 	fake := newGatewayRebindFinalConfigCopyFake(t, fixture, stageFake)
 	for _, trigger := range []string{
 		"lan_gateway_rebind_fence_runtime_head_update", "generated_runtime_active_head_valid_update",
+		"generated_runtime_active_head_activation_guard",
 	} {
 		if _, err := fixture.predecessor.db.Exec(`DROP TRIGGER ` + trigger); err != nil {
 			t.Fatal(err)

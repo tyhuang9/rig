@@ -19,7 +19,15 @@ func gatewayRebindProtectedIntentFixture(t *testing.T) (gatewayRebindPredecessor
 	gatewayRebindSuccessorPreflightObservation,
 ) {
 	t.Helper()
-	fixture := newGatewayRebindPredecessorFixture(t)
+	return gatewayRebindProtectedIntentFixtureFromPredecessor(t, newGatewayRebindPredecessorFixture(t))
+}
+
+func gatewayRebindProtectedIntentFixtureFromPredecessor(t *testing.T,
+	fixture gatewayRebindPredecessorFixture,
+) (gatewayRebindPredecessorFixture, appaccess.GatewayRebindStartupSnapshot,
+	gatewayUpgradeGenerationSelection, gatewayRebindSuccessorPreflightObservation,
+) {
+	t.Helper()
 	snapshot, err := fixture.repository.GatewayRebindStartupSnapshot(context.Background())
 	if err != nil {
 		t.Fatal(err)

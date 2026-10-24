@@ -3,13 +3,16 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 )
 
 func TestGatewayCurrentStateMachineBuildsExactDurableTransitions(t *testing.T) {
@@ -127,6 +130,7 @@ func TestGatewayCurrentStateMachineReplaysTransferredGrantWithoutRawProfileRewri
 	}
 	driver := &gatewayCurrentStateMachineDriver{t: t, terminal: terminal}
 	fixture.manager.gatewayCurrentPhysicalDriver = driver
+	admitGatewayCurrentServingManager(t, &fixture, driver)
 	appID, app := routeOperationTransferredApp(t, fixture.baseline)
 	request := gatewayV2LANGrantRequestForBinding(appID, app.LAN.Raw)
 	authorize, leases := allowGatewayV2LANGrant(t, fixture.manager, request, nil)
@@ -187,6 +191,7 @@ func TestGatewayCurrentStateMachineGrantCommitsAndQuarantinesFailedResolution(t 
 	}
 	driver := &gatewayCurrentStateMachineDriver{t: t, terminal: terminal}
 	fixture.manager.gatewayCurrentPhysicalDriver = driver
+	admitGatewayCurrentServingManager(t, &fixture, driver)
 	request := routeOperationNativeGrantRequest(t, baseline, appID)
 	authorize, leases := allowGatewayV2LANGrant(t, fixture.manager, request, nil)
 	result, err := fixture.manager.GrantGatewayV2LAN(context.Background(), request, authorize)
@@ -266,6 +271,7 @@ func TestGatewayCurrentStateMachineGrantActivationFailureRestoresBeforeAndRetain
 	}
 	driver := &gatewayCurrentStateMachineDriver{t: t, terminal: terminal}
 	fixture.manager.gatewayCurrentPhysicalDriver = driver
+	admitGatewayCurrentServingManager(t, &fixture, driver)
 	request := routeOperationNativeGrantRequest(t, baseline, appID)
 	authorize, _ := allowGatewayV2LANGrant(t, fixture.manager, request, func(lease *fakeGatewayV2LANGrantLease) {
 		lease.activateErr = errors.New("ambiguous activate")
@@ -302,6 +308,7 @@ func TestGatewayCurrentStateMachineGrantActivationFailureRestoresBeforeAndRetain
 func TestGatewayCurrentStateMachineGrantReconcilesCanceledAndLostMarkerWrites(t *testing.T) {
 	t.Run("canceled after physical publication", func(t *testing.T) {
 		fixture, driver, request := newGatewayCurrentGrantOperationFixture(t)
+		admitGatewayCurrentServingManager(t, &fixture, driver)
 		ctx, cancel := context.WithCancel(context.Background())
 		driver.afterApply = cancel
 		authorize, _ := allowGatewayV2LANGrant(t, fixture.manager, request, nil)
@@ -316,7 +323,7 @@ func TestGatewayCurrentStateMachineGrantReconcilesCanceledAndLostMarkerWrites(t 
 			t.Fatalf("canceled grant did not restore before with exact R+1 marker: %#v calls=%d/%d/%d",
 				retained, driver.applyCalls, driver.restoreCalls, driver.stopCalls)
 		}
-		if err := fixture.manager.Recover(context.Background()); !IsCode(err, DiagnosticRouteUnresolved) {
+		if err := exerciseGatewayCurrentRecoveryCore(fixture.manager, context.Background()); !IsCode(err, DiagnosticRouteUnresolved) {
 			t.Fatalf("generic recovery cleared request-bound LAN pending state: %v", err)
 		}
 		if after := routeOperationLoad(t, fixture.store); !reflect.DeepEqual(after, retained) {
@@ -347,6 +354,7 @@ func TestGatewayCurrentStateMachineGrantReconcilesCanceledAndLostMarkerWrites(t 
 
 	t.Run("activation marker save acknowledged late", func(t *testing.T) {
 		fixture, driver, request := newGatewayCurrentGrantOperationFixture(t)
+		admitGatewayCurrentServingManager(t, &fixture, driver)
 		repository := fixture.manager.options.RebindCurrentStateRepository.(*routeOperationSnapshotRepository)
 		repository.errorAt = make(map[int]error)
 		driver.afterApply = func() {
@@ -370,6 +378,7 @@ func TestGatewayCurrentStateMachineGrantReconcilesCanceledAndLostMarkerWrites(t 
 
 	t.Run("rollback callback is fenced by a fresh retained marker read", func(t *testing.T) {
 		fixture, driver, request := newGatewayCurrentGrantOperationFixture(t)
+		admitGatewayCurrentServingManager(t, &fixture, driver)
 		ctx, cancel := context.WithCancel(context.Background())
 		driver.afterApply = cancel
 		authorize, _ := allowGatewayV2LANGrant(t, fixture.manager, request, nil)
@@ -406,6 +415,7 @@ func TestGatewayCurrentStateMachineGrantReconcilesCanceledAndLostMarkerWrites(t 
 
 func TestGatewayCurrentStateMachineQuarantinesLostPostCommitProof(t *testing.T) {
 	fixture, driver, request := newGatewayCurrentGrantOperationFixture(t)
+	admitGatewayCurrentServingManager(t, &fixture, driver)
 	authorize, _ := allowGatewayV2LANGrant(t, fixture.manager, request, nil)
 	if _, err := fixture.manager.GrantGatewayV2LAN(context.Background(), request, authorize); err != nil {
 		t.Fatal(err)
@@ -443,6 +453,7 @@ func TestGatewayCurrentStateMachineDisablesTransferredBindingAndRetainsManifest(
 	}
 	driver := &gatewayCurrentStateMachineDriver{t: t, terminal: terminal}
 	fixture.manager.gatewayCurrentPhysicalDriver = driver
+	admitGatewayCurrentServingManager(t, &fixture, driver)
 	appID, app := routeOperationTransferredApp(t, fixture.baseline)
 	request := disableRequestForGrant(t, gatewayV2LANGrantRequestForBinding(appID, app.LAN.Raw))
 	authorize, lease := allowGatewayV2LANDisable(t, fixture.manager, request)
@@ -513,6 +524,7 @@ func TestGatewayCurrentStateMachineDisableRetainsResolutionAndAcknowledgmentFail
 	}
 	driver := &gatewayCurrentStateMachineDriver{t: t, terminal: terminal}
 	fixture.manager.gatewayCurrentPhysicalDriver = driver
+	admitGatewayCurrentServingManager(t, &fixture, driver)
 	appID, app := routeOperationTransferredApp(t, fixture.baseline)
 	request := disableRequestForGrant(t, gatewayV2LANGrantRequestForBinding(appID, app.LAN.Raw))
 	authorize, _ := allowGatewayV2LANDisable(t, fixture.manager, request)
@@ -608,4 +620,38 @@ func newGatewayCurrentGrantOperationFixture(t *testing.T) (
 	driver := &gatewayCurrentStateMachineDriver{t: t, terminal: terminal}
 	fixture.manager.gatewayCurrentPhysicalDriver = driver
 	return fixture, driver, routeOperationNativeGrantRequest(t, baseline, appID)
+}
+
+func admitGatewayCurrentServingManager(t *testing.T, fixture *gatewayCurrentStateFixture, driver gatewayCurrentPhysicalDriver) {
+	t.Helper()
+	previous := fixture.manager
+	controllerRoot := t.TempDir()
+	directories, err := runtimedocker.PrepareControllerDirectories(controllerRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &gatewayCurrentNoCommandRunner{}
+	manager, err := New(runner, Options{
+		DockerExecutable:             filepath.Join(controllerRoot, "docker"),
+		DockerEndpoint:               "",
+		DockerConfigDirectory:        directories.DockerConfigDirectory,
+		WorkingDirectory:             directories.WorkingDirectory,
+		DataRoot:                     fixture.dataRoot,
+		HostPort:                     8080,
+		CommandTimeout:               time.Second,
+		PullTimeout:                  time.Second,
+		OutputLimit:                  1024,
+		RebindFenceCheck:             previous.options.RebindFenceCheck,
+		RebindCurrentStateRepository: previous.options.RebindCurrentStateRepository,
+	})
+	if err != nil {
+		t.Fatalf("admit current serving manager: %v", err)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("current serving manager daemon calls = %d, want 0", runner.calls)
+	}
+	manager.gatewayRebindFailStop = previous.gatewayRebindFailStop
+	manager.gatewayRebindCommitBarrier = previous.gatewayRebindCommitBarrier
+	manager.gatewayCurrentPhysicalDriver = driver
+	fixture.manager = manager
 }

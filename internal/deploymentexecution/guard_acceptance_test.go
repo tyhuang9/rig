@@ -3,23 +3,36 @@ package deploymentexecution_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/appconfig"
 	"github.com/hostd/hostd/internal/applifecycle"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
-	"github.com/hostd/hostd/internal/generatedruntimestate"
+	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/generatedcontainer"
+	"github.com/hostd/hostd/internal/generatedingress"
+	"github.com/hostd/hostd/internal/generatedroute"
+	"github.com/hostd/hostd/internal/generatedruntime"
+	"github.com/hostd/hostd/internal/generatedruntime/liveauthority"
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 func TestGuardPolicyGateAcceptsExactLegacyAndRunningAuthority(t *testing.T) {
@@ -105,6 +118,37 @@ func TestGuardComposeChecksUseSeparateClosedStagePolicies(t *testing.T) {
 			}
 			if test.want != nil && !errors.Is(err, test.want) {
 				t.Fatalf("check error=%v want=%v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestGuardRouteActivationUsesExactWaitingHealthStage(t *testing.T) {
+	for _, test := range []struct {
+		status string
+		want   error
+	}{
+		{status: "waiting_health"},
+		{status: "applying", want: deploymentexecution.ErrStageInvalid},
+		{status: "preparing", want: deploymentexecution.ErrStageInvalid},
+		{status: "succeeded", want: deploymentexecution.ErrStageInvalid},
+	} {
+		t.Run(test.status, func(t *testing.T) {
+			fixture := newExecutionFixture(t, false)
+			fixture.exec(t, `UPDATE deployments SET status=? WHERE id=?`, test.status, fixture.deploymentID)
+			pin, claim, release := fixture.pinWithRelease(t)
+			defer func() { pin.Leave(); _ = release() }()
+			tx, err := fixture.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			err = pin.CheckRouteActivationTx(tx, claim, fixture.deploymentID)
+			if test.want == nil && err != nil {
+				t.Fatalf("route activation check error=%v", err)
+			}
+			if test.want != nil && !errors.Is(err, test.want) {
+				t.Fatalf("route activation check error=%v want=%v", err, test.want)
 			}
 		})
 	}
@@ -650,19 +694,27 @@ func TestGuardPolicyGateUsesCanonicalGlobalPendingStartFence(t *testing.T) {
 }
 
 type executionFixture struct {
-	db           *sql.DB
-	jobs         *jobs.Service
-	lifecycle    *applifecycle.Repository
-	bindings     *deploymentbinding.Repository
-	positive     *applifecycle.PositiveFenceValidator
-	appID        string
-	actorID      string
-	stamp        string
-	job          jobs.Job
-	binding      deploymentbinding.Binding
-	deploymentID string
-	pins         applifecycle.GeneratedLifecyclePinsV1
-	directory    string
+	db            *sql.DB
+	jobs          *jobs.Service
+	lifecycle     *applifecycle.Repository
+	bindings      *deploymentbinding.Repository
+	positive      *applifecycle.PositiveFenceValidator
+	appID         string
+	actorID       string
+	stamp         string
+	job           jobs.Job
+	binding       deploymentbinding.Binding
+	deploymentID  string
+	pins          applifecycle.GeneratedLifecyclePinsV1
+	directory     string
+	dataRoot      string
+	directories   runtimedocker.ControllerDirectories
+	authority     *liveauthority.Authority
+	configuration *appconfig.Store
+	domain        *generatedingress.GeneratedDomain
+	engine        *generatedruntime.Engine
+	runner        *guardActivationRunner
+	containerSeq  uint64
 }
 
 type pendingOtherStart struct {
@@ -711,16 +763,25 @@ func (v *mappingLifecycleValidator) UnresolvedHistoryTx(context.Context, *sql.Tx
 
 func newExecutionFixture(t *testing.T, running bool) *executionFixture {
 	t.Helper()
-	db, err := database.Open(filepath.Join(t.TempDir(), "state"))
+	dataRoot := generateddomain.NewRetainedRoot(t)
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := controllerowner.Acquire(context.Background(), directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Close() })
+	db, err := database.OpenForGeneratedDomain(context.Background(), dataRoot, lease)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	directories, err := runtimedocker.PrepareControllerDirectories(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := &executionFixture{db: db, jobs: jobs.New(db), lifecycle: applifecycle.New(db), appID: uuid.NewString(), actorID: uuid.NewString(), stamp: time.Now().UTC().Format(time.RFC3339Nano), directory: directories.WorkingDirectory}
+	f := &executionFixture{db: db, jobs: jobs.New(db), lifecycle: applifecycle.New(db), appID: uuid.NewString(), actorID: uuid.NewString(), stamp: time.Now().UTC().Format(time.RFC3339Nano), directory: directories.WorkingDirectory, dataRoot: dataRoot, directories: directories}
+	// Establish the one owner before any deployment or lifecycle job is admitted.
+	// Even legacy guard cases can later introduce another running application.
+	f.initializeGeneratedDomain(t)
 	f.exec(t, `INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?,?,?)`, f.actorID, f.actorID, "hash", f.stamp, f.stamp)
 	f.exec(t, `INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'deployed',?,?)`, f.appID, f.appID, f.appID, f.stamp, f.stamp)
 	if running {
@@ -983,52 +1044,114 @@ func (f *executionFixture) completeOperation(t *testing.T, action applifecycle.A
 	return accepted.Operation
 }
 
-func (f *executionFixture) prepareRunningPinsFor(t *testing.T, appID string) applifecycle.GeneratedLifecyclePinsV1 {
+func (f *executionFixture) initializeGeneratedDomain(t *testing.T) {
 	t.Helper()
-	planID, releaseID, deploymentID, deployJobID := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
-	f.exec(t, `INSERT INTO deployment_plan_revisions(id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at) VALUES(?,?,1,?,'generated_node','test','1',?,'local',0,?,?,1,0,'',?,?,'accepted',?,?)`, planID, appID, "apps/"+appID+"/plan.json", strings.Repeat("1", 64), strings.Repeat("2", 64), strings.Repeat("3", 64), f.actorID, f.stamp, f.actorID, f.stamp)
-	f.exec(t, `INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,1)`, releaseID, appID, f.stamp, strings.Repeat("4", 64), strings.Repeat("5", 64), planID)
-	f.exec(t, `INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,input_json,created_at,updated_at) VALUES(?,'deploy','application',?,'running','running',?,'{}',?,?)`, deployJobID, appID, f.actorID, f.stamp, f.stamp)
-	f.exec(t, `INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,1)`, deploymentID, appID, releaseID, deployJobID, planID)
-	runtimeRepository := generatedruntimestate.New(f.db)
-	value, created, err := runtimeRepository.Begin(context.Background(), generatedruntimestate.BeginInput{DeploymentID: deploymentID, AppID: appID, ReleaseID: releaseID, DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, ComponentNames: []string{"api"}})
-	if err != nil || !created {
-		t.Fatalf("runtime begin=%#v created=%t error=%v", value, created, err)
-	}
-	artifactID, containerID, definition, image := uuid.NewString(), strings.Repeat("6", 64), strings.Repeat("7", 64), "sha256:"+strings.Repeat("8", 64)
-	f.exec(t, `INSERT INTO generated_image_artifacts(id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,'test',?,1,?,'ready',?,?,?)`, artifactID, releaseID, planID, 1, "api", definition, image, f.stamp, f.stamp, f.stamp)
-	if _, err := runtimeRepository.SetImageReady(context.Background(), appID, deploymentID, "api", artifactID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtimeRepository.SetContainerStarting(context.Background(), appID, deploymentID, "api", "rig-api-retained"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtimeRepository.SetContainerRunning(context.Background(), appID, deploymentID, "api", containerID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runtimeRepository.AdvanceComponent(context.Background(), appID, deploymentID, "api", generatedruntimestate.ComponentRunning, generatedruntimestate.ComponentHealthy); err != nil {
-		t.Fatal(err)
-	}
-	for _, next := range []generatedruntimestate.Phase{generatedruntimestate.PhaseBuilding, generatedruntimestate.PhaseStartingCandidate, generatedruntimestate.PhaseWaitingHealth, generatedruntimestate.PhaseSwitchingRoute} {
-		value, err = runtimeRepository.Advance(context.Background(), appID, deploymentID, value.Phase, next, "")
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	head, changed, err := runtimeRepository.SwitchActive(context.Background(), appID, deploymentID, 0)
-	if err != nil || !changed {
-		t.Fatalf("active head=%#v changed=%t error=%v", head, changed, err)
-	}
-	value, err = runtimeRepository.Advance(context.Background(), appID, deploymentID, value.Phase, generatedruntimestate.PhaseDraining, "")
+	plans, err := deploymentplans.New(f.db, f.dataRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = runtimeRepository.Advance(context.Background(), appID, deploymentID, value.Phase, generatedruntimestate.PhaseSucceeded, ""); err != nil {
+	configuration, err := appconfig.New(f.db, f.dataRoot)
+	if err != nil {
 		t.Fatal(err)
 	}
-	f.exec(t, `UPDATE deployments SET status='succeeded',started_at=?,finished_at=? WHERE id=?`, f.stamp, f.stamp, deploymentID)
-	f.exec(t, `UPDATE jobs SET status='succeeded',phase='succeeded' WHERE id=?`, deployJobID)
-	return applifecycle.GeneratedLifecyclePinsV1{Version: 1, DeploymentID: deploymentID, ReleaseID: releaseID, Slot: head.Slot, ActiveGeneration: head.Generation, PlanRevision: applifecycle.RevisionRef{ID: planID, Number: 1}, Configuration: applifecycle.ConfigurationRef{PlanRevision: applifecycle.RevisionRef{ID: planID, Number: 1}, RuntimeComponents: []string{"api"}}, BaselineDisposition: applifecycle.BaselineRunning, Components: []applifecycle.RetainedComponent{{Name: "api", Role: "service", Technology: "node", ContainerID: containerID, ContainerName: "rig-api-retained", ArtifactID: artifactID, ImageContentID: image, BuildDefinitionDigest: definition, NetworkName: "rig", NetworkAlias: "api", InternalPort: 8080, WorkingDirectory: "/app", RunCommandDigest: strings.Repeat("9", 64), Limits: applifecycle.RetainedLimits{MemoryBytes: 128 << 20, MemorySwapBytes: 256 << 20, CPUQuota: 50000, CPUPeriod: 100000, PIDsLimit: 128, TmpfsBytes: 16 << 20, LogDriver: "local", LogMaxSize: "10m", LogMaxFiles: 3, HardeningPolicyVersion: "v1"}}}, Route: applifecycle.AppRouteAnchorV1{SelectedLineageKind: "gateway_rebind", SelectedLineageGeneration: 1, SelectedLineageOperationID: uuid.NewString(), SelectedLineageTerminalDigest: strings.Repeat("a", 64), ProtectedFormatVersion: 2, TargetRecordDigest: strings.Repeat("b", 64)}}
+	authority := liveauthority.NewWithStores(t, f.db, f.directories.WorkingDirectory, plans, configuration)
+	stores, err := authority.Repository().GeneratedOwnerStores()
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &guardActivationRunner{absent: guardActivationExitOne(t)}
+	process := generateddomain.NewRunner(generateddomain.Options{
+		Fallback: runner, MemoryAvailableBytes: 8 << 30, DiskAvailableBytes: 8 << 30,
+	})
+	environment := &guardActivationEnvironment{}
+	options := generatedruntime.EngineOptions{
+		DockerExecutable: filepath.Join(f.dataRoot, "docker.exe"), DockerConfigDirectory: f.directories.DockerConfigDirectory,
+		WorkingDirectory: f.directories.WorkingDirectory, CommandTimeout: time.Second, HealthTimeout: time.Second,
+		HealthPollInterval: 100 * time.Millisecond, OutputLimit: 64 << 10, ReplacementDiskBytes: 128 << 20,
+		Limits: generatedruntime.ContainerLimits{MemoryBytes: 512 << 20, MilliCPUs: 1000, PIDs: 256, TmpfsBytes: 64 << 20, LogSize: "10m", LogFiles: 3},
+	}
+	domain, err := generatedingress.NewGeneratedDomain(context.Background(), stores, process, environment, generatedingress.GeneratedDomainOptions{
+		DataRoot: f.dataRoot, DockerExecutable: options.DockerExecutable, DockerConfigDirectory: options.DockerConfigDirectory,
+		WorkingDirectory: options.WorkingDirectory, CommandTimeout: options.CommandTimeout, PullTimeout: 5 * time.Minute,
+		HealthTimeout: options.HealthTimeout, HealthPollInterval: options.HealthPollInterval, OutputLimit: options.OutputLimit,
+		MemoryBytes: options.Limits.MemoryBytes, MilliCPUs: options.Limits.MilliCPUs, PIDs: options.Limits.PIDs,
+		TmpfsBytes: options.Limits.TmpfsBytes, LogSize: options.Limits.LogSize, LogFiles: options.Limits.LogFiles,
+		ReplacementDiskBytes: options.ReplacementDiskBytes,
+	})
+	if err != nil {
+		t.Fatalf("construct guard generated domain: %v", err)
+	}
+	engine, err := generatedruntime.NewEngine(process, environment, domain.Candidates(), options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.authority, f.configuration, f.domain, f.engine, f.runner = authority, configuration, domain, engine, runner
+}
+
+func (f *executionFixture) prepareRunningPinsFor(t *testing.T, appID string) applifecycle.GeneratedLifecyclePinsV1 {
+	t.Helper()
+	spec := f.authority.PrepareCandidate(t, context.Background(), generatedruntime.CandidateSpec{
+		AppID: appID, ReleaseID: uuid.NewString(), ArtifactID: uuid.NewString(), ComponentName: "api",
+		Role: generatedruntime.RoleServer, Technology: "node", RootDirectory: "apps/api", RunCommand: "node server.js",
+		InternalPort: 8080, HealthProbe: "/health", ImageContentID: "sha256:" + strings.Repeat("8", 64),
+		BuildDefinitionDigest: strings.Repeat("7", 64),
+	})
+	session := f.authority.Begin(t, context.Background(), f.engine, spec)
+	defer session.Close()
+	bound := session.BoundSpec()
+	description, err := generatedruntime.DescribeInactiveCandidate(bound.AppID, bound.ComponentName, bound.ActiveSlot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.containerSeq++
+	f.runner.setContainer(guardActivationContainer{
+		spec: bound, description: description, containerID: fmt.Sprintf("%064x", f.containerSeq), status: "absent",
+	})
+	candidate, err := session.Start(t, bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.WaitHealthyAndHandoff(); err != nil {
+		t.Fatal(err)
+	}
+	request := generatedroute.RouteSwitchRequest{
+		AppID: candidate.AppID, ToSlot: candidate.Slot,
+		Endpoints: []generatedroute.RouteEndpoint{{
+			Component: candidate.Component, Role: candidate.Role, ContainerID: candidate.ContainerID,
+			NetworkName: candidate.NetworkName, NetworkAlias: candidate.NetworkAlias, InternalPort: candidate.InternalPort,
+		}},
+	}
+	if err := session.ActivateRoute(f.domain.Routes(), request); err != nil {
+		t.Fatalf("activate guard running fixture: %v", err)
+	}
+	head, err := session.PublishedHistory(context.Background(), f.db)
+	if err != nil || head.DeploymentID != candidate.DeploymentID || head.ActivationReceiptID == "" {
+		t.Fatalf("guard running head=%#v error=%v", head, err)
+	}
+	configurationRevision, err := f.configuration.Get(context.Background(), candidate.AppID)
+	if err != nil || configurationRevision.RevisionID != bound.ConfigurationRevisionID ||
+		configurationRevision.RevisionNumber != bound.ConfigurationRevisionNumber || configurationRevision.FormatVersion != 2 {
+		t.Fatalf("guard running configuration=%#v error=%v", configurationRevision, err)
+	}
+	session.Close()
+	return applifecycle.GeneratedLifecyclePinsV1{
+		Version: 1, DeploymentID: candidate.DeploymentID, ReleaseID: candidate.ReleaseID, Slot: head.Slot, ActiveGeneration: head.Generation,
+		PlanRevision: applifecycle.RevisionRef{ID: candidate.DeploymentPlanRevisionID, Number: bound.DeploymentPlanRevisionNumber},
+		Configuration: applifecycle.ConfigurationRef{RevisionID: bound.ConfigurationRevisionID,
+			RevisionNumber: bound.ConfigurationRevisionNumber, FormatVersion: configurationRevision.FormatVersion,
+			PlanRevision: applifecycle.RevisionRef{ID: candidate.DeploymentPlanRevisionID, Number: bound.DeploymentPlanRevisionNumber}, RuntimeComponents: []string{"api"}},
+		BaselineDisposition: applifecycle.BaselineRunning,
+		Components: []applifecycle.RetainedComponent{{
+			Name: candidate.Component, Role: candidate.Role, Technology: candidate.Technology, ContainerID: candidate.ContainerID, ContainerName: candidate.ContainerName,
+			ArtifactID: candidate.ArtifactID, ImageContentID: candidate.ImageContentID, BuildDefinitionDigest: bound.BuildDefinitionDigest, NetworkName: candidate.NetworkName, NetworkAlias: candidate.NetworkAlias,
+			InternalPort: candidate.InternalPort, WorkingDirectory: candidate.WorkingDirectory, RunCommandDigest: candidate.RunCommandDigest,
+			Limits: applifecycle.RetainedLimits{MemoryBytes: 512 << 20, MemorySwapBytes: 512 << 20, CPUQuota: 100000,
+				CPUPeriod: 100000, PIDsLimit: 256, TmpfsBytes: 64 << 20, LogDriver: "local", LogMaxSize: "10m", LogMaxFiles: 3, HardeningPolicyVersion: "v1"},
+		}},
+		Route: applifecycle.AppRouteAnchorV1{SelectedLineageKind: "gateway_rebind", SelectedLineageGeneration: 1,
+			SelectedLineageOperationID: uuid.NewString(), SelectedLineageTerminalDigest: strings.Repeat("a", 64),
+			ProtectedFormatVersion: 2, TargetRecordDigest: strings.Repeat("b", 64)},
+	}
 }
 
 type executionEffectSpec struct {
@@ -1069,4 +1192,198 @@ func (f *executionFixture) exec(t *testing.T, statement string, args ...any) {
 	if _, err := f.db.Exec(statement, args...); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type guardActivationEnvironment struct{}
+
+func (*guardActivationEnvironment) Stage(string, int, []byte) (generatedruntime.EnvironmentLease, error) {
+	return nil, errors.New("guard activation fixture must not stage environment")
+}
+
+func (*guardActivationEnvironment) StageGeneratedCandidate(string, int, []byte) (generatedingress.GeneratedCandidateEnvironmentLease, error) {
+	return nil, errors.New("guard activation fixture must not stage candidate environment")
+}
+
+type guardActivationRunner struct {
+	mu         sync.Mutex
+	current    *guardActivationContainer
+	containers map[string]*guardActivationContainer
+	networks   map[string]string
+	absent     *exec.ExitError
+	commands   []string
+}
+
+type guardActivationContainer struct {
+	spec        generatedruntime.CandidateSpec
+	description generatedruntime.CandidateDescription
+	containerID string
+	status      string
+	receiptID   string
+}
+
+func (r *guardActivationRunner) setContainer(value guardActivationContainer) {
+	r.mu.Lock()
+	if r.containers == nil {
+		r.containers = make(map[string]*guardActivationContainer)
+	}
+	if r.networks == nil {
+		r.networks = make(map[string]string)
+	}
+	current := &value
+	r.current = current
+	r.containers[value.description.ContainerName] = current
+	r.containers[value.containerID] = current
+	r.networks[value.description.NetworkName] = value.spec.AppID
+	r.mu.Unlock()
+}
+
+func (r *guardActivationRunner) Run(_ context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	args := request.Args
+	if len(args) < 2 {
+		return runtimeprocess.CommandResult{}, errors.New("unexpected guard activation command")
+	}
+	r.commands = append(r.commands, args[0]+" "+args[1])
+	identity := args[len(args)-1]
+	marshal := func(value any) (runtimeprocess.CommandResult, error) {
+		body, err := json.Marshal(value)
+		return runtimeprocess.CommandResult{Stdout: body}, err
+	}
+	switch args[0] + " " + args[1] {
+	case "network inspect":
+		appID := r.networks[identity]
+		if appID == "" {
+			return runtimeprocess.CommandResult{}, errors.New("unexpected guard activation app network")
+		}
+		return marshal(map[string]any{
+			"name": identity, "driver": "bridge", "scope": "local", "internal": false,
+			"labels": map[string]string{"io.rig.managed": generatedruntime.NetworkOwnershipLabelValue, "io.rig.application": appID},
+		})
+	case "image inspect":
+		c := r.current
+		if c == nil {
+			return runtimeprocess.CommandResult{}, errors.New("guard activation candidate is unavailable")
+		}
+		if identity != c.spec.ImageContentID {
+			return runtimeprocess.CommandResult{}, errors.New("unexpected guard activation candidate image")
+		}
+		return marshal(map[string]any{
+			"id": c.spec.ImageContentID, "size": 1, "user": "node", "workingDir": "/workspace",
+			"entrypoint": []string{generatedcontainer.Entrypoint},
+			"labels": map[string]string{
+				"io.rig.managed": "generated-image", "io.rig.application": c.spec.AppID,
+				"io.rig.release": c.spec.ReleaseID, "io.rig.artifact": c.spec.ArtifactID,
+				"io.rig.plan": c.spec.DeploymentPlanRevisionID, "io.rig.component": c.spec.ComponentName,
+				"io.rig.role": c.spec.Role, "io.rig.definition": c.spec.BuildDefinitionDigest,
+			},
+		})
+	case "container inspect":
+		c := r.containers[identity]
+		if c == nil {
+			return runtimeprocess.CommandResult{}, errors.New("unexpected guard activation candidate container")
+		}
+		if c.status == "absent" {
+			return runtimeprocess.CommandResult{Stderr: []byte("Error: No such container: " + identity)}, r.absent
+		}
+		return marshal(c.inspection())
+	case "container create":
+		c := r.current
+		if c == nil {
+			return runtimeprocess.CommandResult{}, errors.New("guard activation candidate is unavailable")
+		}
+		name, receipt := "", ""
+		for index := 0; index+1 < len(args); index++ {
+			if args[index] == "--name" {
+				name = args[index+1]
+			}
+			if args[index] == "--label" && strings.HasPrefix(args[index+1], generatedcontainer.ReceiptLabel+"=") {
+				receipt = strings.TrimPrefix(args[index+1], generatedcontainer.ReceiptLabel+"=")
+			}
+		}
+		if name != c.description.ContainerName || receipt == "" || c.status != "absent" {
+			return runtimeprocess.CommandResult{}, errors.New("unexpected guard activation candidate create")
+		}
+		c.status, c.receiptID = "created", receipt
+		return runtimeprocess.CommandResult{Stdout: []byte(c.containerID + "\n")}, nil
+	case "container start":
+		c := r.containers[identity]
+		if c == nil {
+			return runtimeprocess.CommandResult{}, errors.New("unexpected guard activation candidate start")
+		}
+		if identity != c.containerID || c.status != "created" {
+			return runtimeprocess.CommandResult{}, errors.New("unexpected guard activation candidate start")
+		}
+		c.status = "running"
+		return runtimeprocess.CommandResult{}, nil
+	default:
+		return runtimeprocess.CommandResult{}, errors.New("unexpected guard activation candidate command")
+	}
+}
+
+func (r *guardActivationRunner) commandKinds() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.commands...)
+}
+
+func (c *guardActivationContainer) inspection() generatedcontainer.Inspection {
+	running := c.status == "running"
+	networks := map[string]generatedcontainer.NetworkAttachment(nil)
+	if running {
+		networks = map[string]generatedcontainer.NetworkAttachment{
+			c.description.NetworkName: {Aliases: []string{c.description.NetworkAlias}},
+		}
+	}
+	startedAt := "2026-10-01T00:00:00Z"
+	if c.status == "created" {
+		startedAt = "0001-01-01T00:00:00Z"
+	}
+	return generatedcontainer.Inspection{
+		ID: c.containerID, Name: "/" + c.description.ContainerName, Image: c.spec.ImageContentID,
+		ConfigImage: c.spec.ImageContentID, Entrypoint: []string{generatedcontainer.Entrypoint},
+		Volumes: map[string]json.RawMessage{}, HostMounts: []json.RawMessage{}, Mounts: []generatedcontainer.Mount{}, StartedAt: startedAt,
+		Labels: map[string]string{
+			"io.rig.managed": "generated-runtime", "io.rig.application": c.spec.AppID,
+			"io.rig.release": c.spec.ReleaseID, "io.rig.deployment": c.spec.DeploymentID,
+			"io.rig.artifact": c.spec.ArtifactID, "io.rig.plan": c.spec.DeploymentPlanRevisionID,
+			"io.rig.component": c.spec.ComponentName, "io.rig.role": c.spec.Role,
+			"io.rig.slot": string(c.description.Slot), generatedcontainer.ReceiptLabel: c.receiptID,
+		},
+		User: generatedcontainer.User, WorkingDirectory: "/workspace/apps/api", Command: []string{"/bin/sh", "-lc", c.spec.RunCommand},
+		HealthTest: []string{"CMD-SHELL", generatedcontainer.HealthCommand}, HealthInterval: int64(2 * time.Second),
+		HealthTimeout: int64(2 * time.Second), HealthStartPeriod: int64(5 * time.Second), HealthRetries: 3,
+		Memory: int64(512 << 20), MemorySwap: int64(512 << 20), NanoCPUs: int64(1_000_000_000), PIDs: int64(256),
+		Ulimits: []generatedcontainer.Ulimit{{Name: "nofile", Soft: 1024, Hard: 1024}}, Init: true,
+		NetworkMode: c.description.NetworkName, ReadonlyRootfs: true, CapAdd: []string{}, CapDrop: []string{"ALL"},
+		SecurityOptions: []string{"no-new-privileges:true"}, Binds: []string{}, PortBindings: map[string]json.RawMessage{},
+		Tmpfs: map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=67108864"}, LogType: "local",
+		LogConfig: map[string]string{"max-size": "10m", "max-file": "3"}, Restart: "no",
+		Status: c.status, Running: running, ExitCode: 0,
+		Health: map[bool]string{true: "healthy", false: ""}[running], Networks: networks,
+	}
+}
+
+func TestGuardActivationExitOneHelper(t *testing.T) {
+	if os.Getenv("RIG_TEST_GUARD_ACTIVATION_EXIT") == "1" {
+		os.Exit(1)
+	}
+}
+
+func guardActivationExitOne(t *testing.T) *exec.ExitError {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(ctx, executable, "-test.run=^TestGuardActivationExitOneHelper$")
+	command.Env = append(os.Environ(), "RIG_TEST_GUARD_ACTIVATION_EXIT=1")
+	err = command.Run()
+	exited, ok := err.(*exec.ExitError)
+	if !ok || exited.ProcessState == nil || !exited.ProcessState.Exited() || exited.ProcessState.ExitCode() != 1 {
+		t.Fatalf("expected completed exit one, got %T %v", err, err)
+	}
+	return exited
 }

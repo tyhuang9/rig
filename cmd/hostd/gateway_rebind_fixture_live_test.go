@@ -34,10 +34,10 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
-	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/hostnetwork"
 	"github.com/hostd/hostd/internal/jobs"
@@ -46,6 +46,7 @@ import (
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/sourceconnections"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 func liveDeploymentExecutionFixture(t *testing.T, db *sql.DB, dataRoot string) (string, jobs.ScopedAdmission) {
@@ -72,10 +73,9 @@ func TestLiveRuntimeCompositionAcceptsFixtureRunnerPointers(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeCompositionFixture(t)
 			fixture.configuration.GeneratedRuntime = true
-			composition, err := prepareRuntimeComposition(context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
+			composition, err := prepareRuntimeCompositionForTest(t, context.Background(), fixture.configuration, fixture.dependencies, runtimeCompositionOptions{
 				dockerExecutable: fixture.dockerExecutable,
-				runner:           test.runner,
-				recoverIngress:   func(context.Context, *generatedingress.Manager) error { return nil },
+				runner:           generateddomain.NewRunner(generateddomain.Options{Fallback: test.runner}),
 			})
 			if err != nil {
 				t.Fatalf("compose generated runtime with %s: %v", test.name, err)
@@ -185,7 +185,16 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 		t.Fatal(err)
 	}
 	provider := controllerJourneyNewGitHubProvider(t, source)
-	db, err := database.Open(dataRoot)
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = setupLease.Close() }()
+	db, err := database.OpenForGeneratedDomain(ctx, dataRoot, setupLease)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,7 +242,7 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	settings := config.Defaults()
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
-	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
+	composition, err := prepareRuntimeCompositionForTest(t, ctx, settings, runtimeCompositionDependencies{
 		db: db, applications: applicationStore, snapshots: snapshots, configuration: configurationStore,
 		deployments: deploymentStore, plans: planStore, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
@@ -339,6 +348,9 @@ func newLiveHostdGatewayRebindFixture(t *testing.T) *liveHostdGatewayRebindFixtu
 		t.Fatal("close baseline database before full hostd start:", err)
 	}
 	setupClosed = true
+	if err := setupLease.Close(); err != nil {
+		t.Fatal("release baseline controller lease before full hostd start:", err)
+	}
 	fixture.listen = liveHostdGatewayRebindListenAddress(t)
 	return fixture
 }

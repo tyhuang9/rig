@@ -42,7 +42,7 @@ func (r *generatedReplacementReservationPermit) Release() {
 // Durable risk is attached before policy, head, or phase refusal. Admission
 // never grants permission to run a command or write a candidate result.
 func (a *GeneratedCandidateAuthority) ReserveReplacement(ctx context.Context, request GeneratedReplacementRequest) (GeneratedReplacementReservation, error) {
-	if a == nil || !generatedCandidateRepositoryConfigured(a.stores) || a.ledger == nil || a.heads == nil {
+	if !validGeneratedCandidateAuthority(a) {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
 	pins, err := candidatePinsFromRequest(GeneratedCandidateRequest(request))
@@ -72,10 +72,7 @@ func (a *GeneratedCandidateAuthority) ReserveReplacement(ctx context.Context, re
 		limits: generatedcapacity.Limits{MemoryBytes: uint64(a.options.MemoryBytes), DiskBytes: a.options.ReplacementDiskBytes},
 	})
 	if err != nil {
-		if errors.Is(err, generatedcapacity.ErrInsufficientCapacity) {
-			return nil, candidateFailure("insufficient_replacement_capacity", err)
-		}
-		return nil, candidateFailure("validation_failed", err)
+		return nil, candidateCapacityFailure(ctx, err)
 	}
 	accepted := false
 	defer func() {
@@ -101,9 +98,27 @@ func (a *GeneratedCandidateAuthority) ReserveReplacement(ctx context.Context, re
 	return &generatedReplacementReservationPermit{owner: a, pins: pins, capacity: capacity, baseline: current, anchor: anchor}, nil
 }
 
+func candidateCapacityFailure(ctx context.Context, err error) error {
+	switch {
+	case errors.Is(err, generatedcapacity.ErrInvalidLimits):
+		return candidateFailure("internal_error", err)
+	case errors.Is(err, generatedcapacity.ErrInvalidCount):
+		return candidateFailure("validation_failed", err)
+	case errors.Is(err, generatedcapacity.ErrInsufficientCapacity):
+		return candidateFailure("insufficient_replacement_capacity", err)
+	case IsCode(err, DiagnosticCancelled), errors.Is(err, context.Canceled), ctx != nil && errors.Is(ctx.Err(), context.Canceled):
+		return candidateFailure("cancelled", errors.Join(err, contextError(ctx)))
+	default:
+		// The capacity source is a sealed Manager observation. Deadline and
+		// other source failures retain the historical runtime-unavailable
+		// diagnostic without disclosing process output.
+		return candidateFailure("runtime_unavailable", err)
+	}
+}
+
 func (a *GeneratedCandidateAuthority) RetainReplacementCapacity(value GeneratedReplacementReservation) error {
 	permit, ok := value.(*generatedReplacementReservationPermit)
-	if !ok || permit == nil || a == nil || permit.owner != a || permit.capacity == nil || permit.capacity.ledger != a.ledger {
+	if !ok || permit == nil || !validGeneratedCandidateAuthority(a) || permit.owner != a || permit.capacity == nil || permit.capacity.ledger != a.ledger {
 		return deploymentexecution.ErrIdentityLost
 	}
 	return permit.capacity.retainAll()
@@ -247,7 +262,7 @@ func (p *generatedCandidateInvocationPermit) Identity() GeneratedCandidateInvoca
 
 func (a *GeneratedCandidateAuthority) PinCandidates(ctx context.Context, request GeneratedCandidateRequest, value GeneratedReplacementReservation) (*GeneratedCandidateExecution, error) {
 	permit, ok := value.(*generatedReplacementReservationPermit)
-	if !ok || permit == nil || a == nil || permit.owner != a || permit.capacity == nil || permit.capacity.ledger != a.ledger {
+	if !ok || permit == nil || !validGeneratedCandidateAuthority(a) || permit.owner != a || permit.capacity == nil || permit.capacity.ledger != a.ledger {
 		return nil, deploymentexecution.ErrIdentityLost
 	}
 	pins, err := candidatePinsFromRequest(request)

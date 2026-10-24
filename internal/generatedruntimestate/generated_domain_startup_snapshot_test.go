@@ -4,8 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/database"
 )
 
 func TestGeneratedDomainStartupSnapshotTxTreatsHistoricalApplicationsAsEmpty(t *testing.T) {
@@ -66,6 +73,17 @@ func TestGeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAnd
 	}
 	for _, test := range phaseCases {
 		t.Run("phase "+test.name, func(t *testing.T) {
+			if test.want == PhaseDraining || test.want == PhaseSucceeded {
+				state := newHistoricalStartupServingFixture(t, test.want)
+				got, err := generatedDomainSnapshotForTest(t, state.repository, state.db)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(got.Deployments) != 1 || got.Deployments[0].Phase != test.want {
+					t.Fatalf("historical phase snapshot=%#v", got.Deployments)
+				}
+				return
+			}
 			state := newFixture(t, []string{"api"}, test.migration, test.migration)
 			deployment, created, err := state.repository.Begin(context.Background(), state.beginInput([]string{"api"}))
 			if err != nil || !created {
@@ -138,29 +156,9 @@ func TestGeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAnd
 	}
 
 	t.Run("archived application retains positive serving head", func(t *testing.T) {
-		serving := newCandidateFixture(t, []string{"api"})
-		intent := serving.input("api")
-		serving.commit(t, func(tx *sql.Tx) error {
-			return serving.repository.BeginCandidateTx(context.Background(), tx, intent)
-		})
-		serving.commit(t, func(tx *sql.Tx) error {
-			return serving.repository.RecordCandidateCreatedTx(context.Background(), tx, serving.appID,
-				serving.deploymentID, "api", intent.ReceiptID, intent.ContainerName, serving.containerIDs["api"])
-		})
-		serving.commit(t, func(tx *sql.Tx) error {
-			return serving.repository.FinishCandidateStartingTx(context.Background(), tx, serving.appID, serving.deploymentID)
-		})
-		serving.commit(t, func(tx *sql.Tx) error {
-			return serving.repository.RecordCandidateHealthyTx(context.Background(), tx, serving.appID,
-				serving.deploymentID, "api", intent.ReceiptID, serving.containerIDs["api"])
-		})
-		serving.commit(t, func(tx *sql.Tx) error {
-			return serving.repository.FinishCandidateHealthTx(context.Background(), tx, serving.appID, serving.deploymentID)
-		})
-		head, changed, err := serving.repository.SwitchActive(context.Background(), serving.appID, serving.deploymentID, 0)
-		if err != nil || !changed {
-			t.Fatalf("switch active: changed=%t error=%v", changed, err)
-		}
+		// This head predates activation receipts. Upgrade its real historical
+		// schema, then retain visibility without manufacturing current authority.
+		serving := newHistoricalStartupServingFixture(t, PhaseDraining)
 		if _, err := serving.db.Exec(`UPDATE applications SET archived_at=? WHERE id=?`, timestamp(serving.now), serving.appID); err != nil {
 			t.Fatal(err)
 		}
@@ -169,7 +167,8 @@ func TestGeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAnd
 			t.Fatal(err)
 		}
 		if len(got.ActiveHeads) != 1 || got.ActiveHeads[0].AppID != serving.appID ||
-			got.ActiveHeads[0].DeploymentID != head.DeploymentID || got.ActiveHeads[0].Generation != head.Generation {
+			got.ActiveHeads[0].DeploymentID != serving.deploymentID || got.ActiveHeads[0].Generation != 1 ||
+			got.ActiveHeads[0].ActivationReceiptID != "" {
 			t.Fatalf("archived positive head=%#v", got.ActiveHeads)
 		}
 	})
@@ -268,8 +267,12 @@ func TestGeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPa
 		{name: "updated at", update: `UPDATE generated_runtime_active_heads SET updated_at='' WHERE app_id=?`},
 	}
 	for _, test := range zeroHeadCases {
-		t.Run("generation zero non-null "+test.name, func(t *testing.T) {
+		t.Run("current guard refuses generation zero non-null "+test.name, func(t *testing.T) {
 			fixture := newFixture(t, []string{"api"}, false, false)
+			beforeHead, err := fixture.repository.Active(context.Background(), fixture.appID)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if _, err := fixture.db.Exec(`DROP TRIGGER generated_runtime_active_head_valid_update`); err != nil {
 				t.Fatal(err)
 			}
@@ -277,6 +280,24 @@ func TestGeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPa
 				t.Fatal(err)
 			}
 			if _, err := fixture.db.Exec(`PRAGMA ignore_check_constraints=ON`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.db.Exec(test.update, fixture.appID); err == nil ||
+				!strings.Contains(err.Error(), "generated runtime active head requires an exact activation receipt") {
+				t.Fatalf("obsolete active-head write error = %v", err)
+			}
+			afterHead, err := fixture.repository.Active(context.Background(), fixture.appID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if afterHead != beforeHead {
+				t.Fatalf("refused obsolete active-head write changed state: before=%#v after=%#v", beforeHead, afterHead)
+			}
+			// Preserve the reader's original malformed-state boundary separately
+			// from the current writer guard. This deliberate corruption setup drops
+			// only the 042 activation guard after proving that it refused the same
+			// write; production writers never receive this escape.
+			if _, err := fixture.db.Exec(`DROP TRIGGER generated_runtime_active_head_activation_guard`); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := fixture.db.Exec(test.update, fixture.appID); err != nil {
@@ -415,4 +436,139 @@ func generatedDomainSnapshotForTest(t *testing.T, repository *Repository, db *sq
 		return GeneratedDomainStartupSnapshot{}, err
 	}
 	return snapshot, nil
+}
+
+// newHistoricalStartupServingFixture applies the checked-in schema through 041,
+// writes a serving head permitted by that schema, and upgrades normally. It is
+// deliberately a read-compatibility fixture, not a current activation writer.
+func newHistoricalStartupServingFixture(t *testing.T, phase Phase) fixture {
+	t.Helper()
+	if phase != PhaseDraining && phase != PhaseSucceeded {
+		t.Fatalf("unsupported historical serving phase %q", phase)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "control.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(1)
+	for _, pragma := range []string{"PRAGMA foreign_keys=ON", "PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL", "PRAGMA busy_timeout=5000"} {
+		if _, err := db.Exec(pragma); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_migrations(version TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	migrationDir := filepath.Join("..", "database", "migrations")
+	entries, err := os.ReadDir(migrationDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var applied int
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") || entry.Name() >= "042_" {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(migrationDir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(string(body)); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("historical migration %s: %v", entry.Name(), err)
+		}
+		if _, err := tx.Exec(`INSERT INTO schema_migrations(version,applied_at) VALUES(?,datetime('now'))`, entry.Name()); err != nil {
+			_ = tx.Rollback()
+			t.Fatal(err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		applied++
+	}
+	if applied != 41 {
+		t.Fatalf("historical migration discovery=%d want=41", applied)
+	}
+	f := fixture{db: db, appID: uuid.NewString(), actorID: uuid.NewString(),
+		deploymentID: uuid.NewString(), releaseID: uuid.NewString(), planID: uuid.NewString(),
+		now: time.Date(2026, time.August, 31, 12, 0, 0, 0, time.UTC)}
+	if _, err := db.Exec(`INSERT INTO users(id,username,passphrase_hash,created_at,updated_at) VALUES(?,?,?, ?,?)`, f.actorID, f.actorID, "hash", timestamp(f.now), timestamp(f.now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO applications(id,slug,name,status,created_at,updated_at) VALUES(?,?,?,'draft',?,?)`, f.appID, f.appID, f.appID, timestamp(f.now), timestamp(f.now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployment_plan_revisions(
+		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
+		analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,
+		field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at
+	) VALUES(?,?,1,?,'generated_node','test','1',?,'local',0,?,?,?,8,?,?,?,'accepted',?,?)`,
+		f.planID, f.appID, "apps/"+f.appID+"/deployment-plans/"+f.planID+".secret", strings.Repeat("a", 64),
+		strings.Repeat("b", 64), strings.Repeat("c", 64), 1, "", f.actorID, timestamp(f.now), f.actorID, timestamp(f.now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO releases(id,app_id,status,metadata_json,created_at,source_provider,repository_id,resolved_sha,workspace_state,workspace_tree_sha256,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,'ready','{}',?,'local',0,?,'ready',?,?,1)`, f.releaseID, f.appID, timestamp(f.now), strings.Repeat("b", 64), strings.Repeat("f", 64), f.planID); err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.NewString()
+	if _, err := db.Exec(`INSERT INTO jobs(id,type,resource_type,resource_id,status,phase,requested_by,created_at,updated_at) VALUES(?,'deploy','application',?,'running','running',?,?,?)`, jobID, f.appID, f.actorID, timestamp(f.now), timestamp(f.now)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployments(id,app_id,release_id,job_id,status,configuration_mode,provenance_initialized,runtime_strategy,deployment_plan_revision_id,deployment_plan_revision_number) VALUES(?,?,?,?,'preparing','current',1,'generated_node',?,1)`, f.deploymentID, f.appID, f.releaseID, jobID, f.planID); err != nil {
+		t.Fatal(err)
+	}
+	mustExec := func(query string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(query, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustExec(`INSERT INTO generated_runtime_deployments(
+		deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,
+		candidate_slot,phase,migration_state,created_at,updated_at
+	) VALUES(?,?,?,?,1,'blue','preflight','not_required',?,?)`,
+		f.deploymentID, f.appID, f.releaseID, f.planID, timestamp(f.now), timestamp(f.now))
+	artifactID := seedReadyArtifact(t, f, "api")
+	mustExec(`INSERT INTO generated_runtime_components(
+		deployment_id,component_name,slot,image_artifact_id,container_name,container_id,state,created_at,updated_at
+	) VALUES(?,'api','blue',?,?,?,'healthy',?,?)`,
+		f.deploymentID, artifactID, "rig-historical-api", strings.Repeat("1", 64), timestamp(f.now), timestamp(f.now))
+	for _, next := range []Phase{PhaseBuilding, PhaseStartingCandidate, PhaseWaitingHealth, PhaseSwitchingRoute} {
+		mustExec(`UPDATE generated_runtime_deployments SET phase=?,updated_at=? WHERE deployment_id=?`,
+			next, timestamp(f.now), f.deploymentID)
+	}
+	mustExec(`UPDATE generated_runtime_active_heads
+		SET deployment_id=?,release_id=?,slot='blue',generation=1,updated_at=? WHERE app_id=?`,
+		f.deploymentID, f.releaseID, timestamp(f.now), f.appID)
+	mustExec(`UPDATE generated_runtime_components SET state='active',updated_at=? WHERE deployment_id=?`,
+		timestamp(f.now), f.deploymentID)
+	mustExec(`UPDATE generated_runtime_deployments SET phase='draining',updated_at=? WHERE deployment_id=?`,
+		timestamp(f.now), f.deploymentID)
+	if phase == PhaseSucceeded {
+		mustExec(`UPDATE generated_runtime_deployments SET phase='succeeded',updated_at=?,finished_at=? WHERE deployment_id=?`,
+			timestamp(f.now), timestamp(f.now), f.deploymentID)
+	}
+	if err := database.Migrate(db); err != nil {
+		t.Fatalf("upgrade historical serving head: %v", err)
+	}
+	var activationCount int
+	var receiptID sql.NullString
+	if err := db.QueryRow(`SELECT COUNT(*) FROM generated_route_activations`).Scan(&activationCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT activation_receipt_id FROM generated_runtime_active_heads WHERE app_id=?`, f.appID).Scan(&receiptID); err != nil {
+		t.Fatal(err)
+	}
+	if activationCount != 0 || receiptID.Valid {
+		t.Fatalf("historical upgrade minted activation authority: count=%d receipt=%#v", activationCount, receiptID)
+	}
+	f.repository = New(db)
+	f.repository.now = func() time.Time { return f.now }
+	return f
 }

@@ -39,7 +39,7 @@ type gatewayRebindCompositionRunner struct {
 }
 
 func TestGatewayRebindSupportedConstructorInstallsConcreteDrivers(t *testing.T) {
-	manager, _ := newManagerFixture(t, false)
+	manager, runner := newManagerFixture(t, false)
 	rebind, rebindOK := manager.gatewayRebindCrossStoreDriver.(managerGatewayRebindCrossStoreDriver)
 	current, currentOK := manager.gatewayCurrentPhysicalDriver.(managedGatewayCurrentPhysicalDriver)
 	if !rebindOK || rebind.manager != manager || !currentOK || current.manager() != manager {
@@ -53,8 +53,22 @@ func TestGatewayRebindSupportedConstructorInstallsConcreteDrivers(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if raw.gatewayRebindCrossStoreDriver != nil || raw.gatewayCurrentPhysicalDriver != nil {
-		t.Fatal("incomplete raw construction installed production physical authority")
+	rawRebind, rawRebindOK := raw.gatewayRebindCrossStoreDriver.(managerGatewayRebindCrossStoreDriver)
+	rawCurrent, rawCurrentOK := raw.gatewayCurrentPhysicalDriver.(managedGatewayCurrentPhysicalDriver)
+	if !rawRebindOK || rawRebind.manager != raw || !rawCurrentOK || rawCurrent.manager() != raw {
+		t.Fatalf("raw drivers rebind=%T current=%T", raw.gatewayRebindCrossStoreDriver,
+			raw.gatewayCurrentPhysicalDriver)
+	}
+	if raw.domainView != nil {
+		t.Fatal("incomplete raw construction gained generated-domain authority")
+	}
+	commands := len(runner.commands)
+	if leave, err := raw.enterGeneratedDomainTypedMutation(context.Background()); leave != nil ||
+		!IsCode(err, DiagnosticRouteUnresolved) {
+		t.Fatalf("incomplete raw typed mutation leave=%v err=%v", leave != nil, err)
+	}
+	if len(runner.commands) != commands {
+		t.Fatalf("incomplete raw typed mutation commands=%d, want %d", len(runner.commands), commands)
 	}
 }
 

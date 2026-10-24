@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"github.com/hostd/hostd/internal/generatedingress"
+	"log/slog"
 	"time"
 
 	"github.com/hostd/hostd/internal/appconfig"
@@ -76,7 +77,6 @@ type runtimeState interface {
 	Advance(context.Context, string, string, generatedruntimestate.Phase, generatedruntimestate.Phase, generatedruntimestate.DiagnosticCode) (generatedruntimestate.Deployment, error)
 	AdvanceComponent(context.Context, string, string, string, generatedruntimestate.ComponentState, generatedruntimestate.ComponentState) (generatedruntimestate.Component, error)
 	FailComponent(context.Context, string, string, string, generatedruntimestate.ComponentState, generatedruntimestate.DiagnosticCode) (generatedruntimestate.Component, error)
-	SwitchActive(context.Context, string, string, int64) (generatedruntimestate.ActiveHead, bool, error)
 }
 
 type runtimeEngine interface {
@@ -113,4 +113,7 @@ type AuthorizationGate interface {
 type Options struct {
 	DrainPeriod    time.Duration
 	CleanupTimeout time.Duration
+	// RoutePauseLogger receives only the closed stage and cause observation.
+	// A nil logger disables the observation without changing execution.
+	RoutePauseLogger *slog.Logger
 }

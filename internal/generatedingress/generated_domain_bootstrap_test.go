@@ -43,6 +43,8 @@ type generatedDomainBootstrapTestRunner struct {
 	extra         []generatedDomainDockerObject
 	hook          func(string, int) error
 	hookErr       error
+
+	exposeStoppedNetworkTopology bool
 }
 
 func newGeneratedDomainBootstrapTestRunner(hostPort uint16) *generatedDomainBootstrapTestRunner {
@@ -111,6 +113,10 @@ func (r *generatedDomainBootstrapTestRunner) Run(_ context.Context,
 			(args[4] == r.container.ID || args[4] == caddyContainerName) {
 			return jsonResult(*r.container), nil
 		}
+		if args[3] == generatedDomainStartupContainerInspectFormat && r.container != nil &&
+			(args[4] == r.container.ID || args[4] == caddyContainerName) {
+			return jsonResult(*r.container), nil
+		}
 	}
 	if len(args) == 5 && args[0] == "volume" && args[1] == "inspect" && args[2] == "--format" &&
 		(args[3] == generatedDomainVolumeInspectFormat || args[3] == generatedDomainBootstrapVolumeIdentityFormat) &&
@@ -123,6 +129,10 @@ func (r *generatedDomainBootstrapTestRunner) Run(_ context.Context,
 		}
 		if args[3] == "json" && r.network != nil && (args[4] == r.network.ID || args[4] == caddyNetworkName) {
 			return jsonResult([]gatewayNetworkIdentityInspection{*r.network}), nil
+		}
+		if args[3] == generatedDomainStartupNetworkInspectFormat && r.network != nil &&
+			(args[4] == r.network.ID || args[4] == caddyNetworkName) {
+			return jsonResult(*r.network), nil
 		}
 	}
 	if len(args) >= 2 && args[0] == "volume" && args[1] == "create" {
@@ -158,11 +168,11 @@ func (r *generatedDomainBootstrapTestRunner) Run(_ context.Context,
 		r.container.gatewayContainerRuntime.EffectivePortBindings =
 			gatewayV2IdentityTestPortBindingsCopy(r.container.PortBindings)
 		configured := r.container.ConfiguredNetworks[caddyNetworkName]
-		configured.IPAddress = r.network.IPAM.Config[0].Subnet
-		configured.IPAddress = strings.Split(configured.IPAddress, "/")[0]
-		configured.IPAddress = r.network.Containers[r.container.ID].IPv4Address
-		configured.IPAddress = strings.Split(configured.IPAddress, "/")[0]
+		configured.NetworkID = r.network.ID
+		configured.IPAddress = configured.IPAMConfig.IPv4Address
 		r.container.ConfiguredNetworks[caddyNetworkName] = configured
+		r.network.Containers[r.container.ID] = caddyNetworkContainerInspection{
+			Name: caddyContainerName, IPv4Address: configured.IPAddress + "/28"}
 		if r.loseAck == "start" {
 			return runtimeprocess.CommandResult{}, errors.New("injected lost start acknowledgement")
 		}
@@ -207,7 +217,7 @@ func (r *generatedDomainBootstrapTestRunner) createVolumeLocked(args []string) (
 	}
 	r.effects++
 	r.volume = &gatewayVolumeIdentityInspection{Name: caddyVolumeName, Driver: "local", Scope: "local",
-		Options: map[string]string{}, Labels: map[string]string{
+		Options: nil, Labels: map[string]string{
 			gatewayV2ManagedLabelKey:                 gatewayV2ManagedContainerLabel,
 			gatewayV2IdentityLabelKey:                gatewayV1IdentityVersion,
 			generatedDomainBootstrapVolumeNonceLabel: nonce,
@@ -270,13 +280,17 @@ func (r *generatedDomainBootstrapTestRunner) createContainerLocked(args []string
 		gatewayV2FinalRestartPolicy, "/config/"+gatewayV2ActiveConfigFile)
 	container.Running = false
 	container.Tmpfs = map[string]string{"/data": "rw,noexec,nosuid,nodev,size=67108864"}
+	configured := gatewayV2ConfiguredNetwork{
+		IPAMConfig: &gatewayV2ConfiguredIPAM{IPv4Address: ingressIP}, GwPriority: caddyGatewayPriority}
+	if r.exposeStoppedNetworkTopology {
+		configured.NetworkID = r.network.ID
+	}
 	runtime := gatewayContainerRuntime{EffectivePortBindings: map[string][]map[string]string{},
-		ConfiguredNetworks: map[string]gatewayV2ConfiguredNetwork{caddyNetworkName: {
-			IPAMConfig: &gatewayV2ConfiguredIPAM{IPv4Address: ingressIP}, NetworkID: r.network.ID,
-			GwPriority: caddyGatewayPriority,
-		}}}
+		ConfiguredNetworks: map[string]gatewayV2ConfiguredNetwork{caddyNetworkName: configured}}
 	r.container = &gatewayContainerInspection{caddyInspection: container, gatewayContainerRuntime: runtime}
-	r.network.Containers[id] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: ingressIP + "/28"}
+	if r.exposeStoppedNetworkTopology {
+		r.network.Containers[id] = caddyNetworkContainerInspection{Name: caddyContainerName, IPv4Address: ingressIP + "/28"}
+	}
 	if r.loseAck == "container" {
 		return runtimeprocess.CommandResult{}, errors.New("injected lost container acknowledgement")
 	}
@@ -382,6 +396,24 @@ func TestGeneratedDomainEmptyBootstrapReceipts(t *testing.T) {
 			generatedDomainAssertNoApplicationOrUnownedListenerTraffic(t, commands)
 		})
 	})
+	t.Run("sealed_empty_with_exposed_stopped_network_topology_to_stable", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			identity, runner, environment := newGeneratedDomainEmptyConstructionFixture(t)
+			runner.exposeStoppedNetworkTopology = true
+			result, err := newGeneratedDomainConstruction(context.Background(), identity.stores, runner, environment,
+				identity.options)
+			if err != nil || !validGeneratedDomainConstructionResult(result.reservation, result) {
+				t.Fatalf("sealed empty construction with stopped topology = %#v, %v", result, err)
+			}
+			commands, effects, _, _ := runner.snapshot()
+			if effects != 5 || runner.container == nil || runner.network == nil ||
+				normalizeID(runner.container.ConfiguredNetworks[caddyNetworkName].NetworkID) != runner.network.ID ||
+				len(runner.network.Containers) != 1 {
+				t.Fatalf("bootstrap did not reach exact running topology: effects=%d", effects)
+			}
+			generatedDomainAssertNoApplicationOrUnownedListenerTraffic(t, commands)
+		})
+	})
 	t.Run("existing_name_with_distinct_nonce_is_never_adopted", func(t *testing.T) {
 		generatedDomainConstructionCase(t, func(t *testing.T) {
 			identity, runner, environment := newGeneratedDomainEmptyConstructionFixture(t)
@@ -406,6 +438,196 @@ func TestGeneratedDomainEmptyBootstrapReceipts(t *testing.T) {
 			generatedDomainAssertNoApplicationOrUnownedListenerTraffic(t, commands)
 		})
 	})
+}
+
+func TestGeneratedDomainBootstrapPhaseTopologyValidation(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		exposed bool
+		started bool
+		mutate  func(*gatewayContainerInspection, *gatewayNetworkIdentityInspection)
+	}{
+		{name: "stopped omitted topology", started: false},
+		{name: "stopped exposed topology", exposed: true, started: false},
+		{name: "running exact topology", started: true},
+		{name: "stopped wrong nonempty network id", mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.NetworkID = strings.Repeat("9", 64)
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "stopped crossed configured name", mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			delete(container.ConfiguredNetworks, caddyNetworkName)
+			container.ConfiguredNetworks["crossed"] = configured
+		}},
+		{name: "stopped wrong ipam", mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.IPAMConfig = &gatewayV2ConfiguredIPAM{IPv4Address: "10.255.255.1"}
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "stopped wrong gateway priority", mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.GwPriority++
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "stopped endpoint id", mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.EndpointID = strings.Repeat("8", 64)
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "stopped runtime ip", mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.IPAddress = configured.IPAMConfig.IPv4Address
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "stopped effective binding", mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			container.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(container.PortBindings)
+		}},
+		{name: "stopped crossed network member", exposed: true, mutate: func(container *gatewayContainerInspection, network *gatewayNetworkIdentityInspection) {
+			member := network.Containers[container.ID]
+			delete(network.Containers, container.ID)
+			network.Containers[strings.Repeat("7", 64)] = member
+		}},
+		{name: "stopped extra network member", exposed: true, mutate: func(_ *gatewayContainerInspection, network *gatewayNetworkIdentityInspection) {
+			network.Containers[strings.Repeat("7", 64)] = caddyNetworkContainerInspection{
+				Name: "crossed", IPv4Address: "10.255.255.1/28"}
+		}},
+		{name: "stopped wrong network member name", exposed: true, mutate: func(container *gatewayContainerInspection, network *gatewayNetworkIdentityInspection) {
+			member := network.Containers[container.ID]
+			member.Name = "crossed"
+			network.Containers[container.ID] = member
+		}},
+		{name: "stopped wrong network member ip", exposed: true, mutate: func(container *gatewayContainerInspection, network *gatewayNetworkIdentityInspection) {
+			member := network.Containers[container.ID]
+			member.IPv4Address = "10.255.255.1/28"
+			network.Containers[container.ID] = member
+		}},
+		{name: "running missing network id", started: true, mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.NetworkID = ""
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "running wrong network id", started: true, mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.NetworkID = strings.Repeat("9", 64)
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "running missing network member", started: true, mutate: func(_ *gatewayContainerInspection, network *gatewayNetworkIdentityInspection) {
+			network.Containers = map[string]caddyNetworkContainerInspection{}
+		}},
+		{name: "running crossed network member", started: true, mutate: func(container *gatewayContainerInspection, network *gatewayNetworkIdentityInspection) {
+			member := network.Containers[container.ID]
+			delete(network.Containers, container.ID)
+			network.Containers[strings.Repeat("7", 64)] = member
+		}},
+		{name: "running missing ip", started: true, mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.IPAddress = ""
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "running wrong ip", started: true, mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			configured := container.ConfiguredNetworks[caddyNetworkName]
+			configured.IPAddress = "10.255.255.1"
+			container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "running missing effective binding", started: true, mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			container.EffectivePortBindings = map[string][]map[string]string{}
+		}},
+		{name: "running crossed effective binding", started: true, mutate: func(container *gatewayContainerInspection, _ *gatewayNetworkIdentityInspection) {
+			container.EffectivePortBindings = gatewayV2IdentityTestPortBindingsCopy(container.PortBindings)
+			container.EffectivePortBindings["8080/tcp"][0]["HostPort"] = "1"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runner := generatedDomainBootstrapTopologyFixture(t, test.exposed, test.started)
+			if test.mutate != nil {
+				test.mutate(runner.container, runner.network)
+			}
+			valid := generatedDomainBootstrapTestTopologyValid(runner, test.started)
+			if test.mutate == nil && !valid {
+				t.Fatal("exact bootstrap phase topology was rejected")
+			}
+			if test.mutate != nil && valid {
+				t.Fatal("drifted bootstrap phase topology was accepted")
+			}
+		})
+	}
+}
+
+func TestGeneratedDomainBootstrapPhaseDriftIsSticky(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		effects int
+		mutate  func(*generatedDomainBootstrapTestRunner)
+	}{
+		{name: "stopped configured network identity drift", effects: 3, mutate: func(runner *generatedDomainBootstrapTestRunner) {
+			configured := runner.container.ConfiguredNetworks[caddyNetworkName]
+			configured.NetworkID = strings.Repeat("9", 64)
+			runner.container.ConfiguredNetworks[caddyNetworkName] = configured
+		}},
+		{name: "running crossed network member", effects: 5, mutate: func(runner *generatedDomainBootstrapTestRunner) {
+			member := runner.network.Containers[runner.container.ID]
+			delete(runner.network.Containers, runner.container.ID)
+			runner.network.Containers[strings.Repeat("7", 64)] = member
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				identity, runner, environment := newGeneratedDomainEmptyConstructionFixture(t)
+				drifted := false
+				runner.hook = func(event string, _ int) error {
+					if event == "census" && !drifted && runner.effects == test.effects {
+						drifted = true
+						test.mutate(runner)
+					}
+					return nil
+				}
+				result, err := newGeneratedDomainConstruction(context.Background(), identity.stores, runner,
+					environment, identity.options)
+				commands, effects, _, _ := runner.snapshot()
+				if err == nil || result != nil || !drifted || effects != test.effects || runner.challenges != 0 {
+					t.Fatalf("bootstrap phase drift = %#v, %v; drifted=%t effects=%d challenges=%d",
+						result, err, drifted, effects, runner.challenges)
+				}
+				generatedDomainAssertNoBootstrapRetryOrCleanup(t, commands)
+			})
+		})
+	}
+}
+
+func generatedDomainBootstrapTopologyFixture(t *testing.T, exposeStopped, started bool) *generatedDomainBootstrapTestRunner {
+	t.Helper()
+	runner := newGeneratedDomainBootstrapTestRunner(8080)
+	runner.exposeStoppedNetworkTopology = exposeStopped
+	subnet, gateway, ingressIP := ingressNetworkCandidate(0)
+	if _, err := runner.createNetworkLocked([]string{"network", "create", "--subnet", subnet, "--gateway", gateway, caddyNetworkName}); err != nil {
+		t.Fatal(err)
+	}
+	args, err := caddyCreateArgs(runner.image.ID, ingressIP, runner.hostPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.createContainerLocked(args); err != nil {
+		t.Fatal(err)
+	}
+	if started {
+		if _, err := runner.Run(context.Background(), runtimeprocess.CommandRequest{Args: []string{"container", "start", runner.container.ID}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return runner
+}
+
+func generatedDomainBootstrapTestTopologyValid(runner *generatedDomainBootstrapTestRunner, started bool) bool {
+	subnet := runner.network.IPAM.Config[0].Subnet
+	_, _, ingressIP := ingressNetworkCandidate(0)
+	network := caddyNetworkInspection{Name: runner.network.Name, Driver: runner.network.Driver, Scope: runner.network.Scope,
+		Internal: runner.network.Internal, Options: cloneStringMap(runner.network.Options), IPAM: runner.network.IPAM,
+		Labels: cloneStringMap(runner.network.Labels), Containers: runner.network.Containers}
+	return validGeneratedDomainBootstrapNetwork(network, runner.network.ID, subnet,
+		runner.network.IPAM.Config[0].Gateway, ingressIP, started, runner.container.ID) &&
+		validGeneratedDomainBootstrapContainer(runner.container.caddyInspection, runner.container.gatewayContainerRuntime,
+			runner.container.ID, runner.image.ID, runner.network.ID, ingressIP, runner.hostPort, started)
 }
 
 func TestGeneratedDomainEmptyBootstrapEffectBoundaries(t *testing.T) {
