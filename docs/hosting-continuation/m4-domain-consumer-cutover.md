@@ -17,6 +17,98 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Stopped-stage replay in a genuine child process
+
+Commit `bdfd6a28991597163301abf40382b5e80285d92b` changes only
+`gateway_rebind_stage_container_live_test.go`. The previous fixture called
+`New` a second time while its original generated domain still reserved the
+same root and daemon. The replacement runs the same test binary in a fresh
+process with a pointer `ExecRunner`, the real SQLite repository and the
+original fence/current-state adapters.
+
+The child selects the exact persisted sequence-six intent and invokes the
+production replay with its real inspector. A counting driver refuses container
+creation. Success requires zero creates, unchanged history bytes and exact
+physical proof. The parent retains every history, physical snapshot/census,
+SQL claim, predecessor state/resources, route and request-count assertion.
+Later sequence-nine cleanup is unchanged. Production code is unchanged.
+
+An exclusive private manifest binds the operation and contained fixture paths.
+Both manifest input and child output are bounded. Child capture enforces its
+64 KiB limit while draining output; the completion parser requires the exact
+PASS and single success marker. Failure reporting exposes only a fixed stage,
+never arbitrary child stderr. Review found and corrected an earlier unbounded
+capture and missing failure attribution before the final source freeze.
+
+On 24 October at 03:59:01–03:59:23 UTC, tagged binaries discovered the protocol
+parent, live replay child and live stopped-stage parent on Windows and native
+Linux. Only the protocol parent executed: 24 unique passes on Windows and 25
+on Linux, with no failures or skips. Linux additionally executed the broad
+control-directory refusal. Formatting, tagged vet, canonical generation and
+diff checks passed at 03:59:44–03:59:49. Security review found no remaining
+protocol issue; root verified source, binaries, discovery, raw outcomes and
+static evidence.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `stopped-stage-fresh-process-final-20261024T035901Z/receipt.json` | `3ceef3a0c8f529e1efadde15c4fed2bc4c34e09e144c93546f5f27307f51236d` |
+| `stopped-stage-fresh-process-static-20261024T035943Z/receipt.json` | `8373904abbe0128891e4ec2837990ac8757fa70516f2fe561e03f69cf4c148e1` |
+| `stopped-stage-fresh-process-source-security-review-20261024.md` | `829cfb1eabe7372d1ab2845c852a86146942b9840d53b42c04516a57165c7f39` |
+| `stopped-stage-fresh-process-root-audit-20261024.json` | `8321d2cd8c1f80d0dbce1d665d93c4f8a12766b8fc72ec23f4bff94baa7da4f4` |
+
+The live parent and child are discovery-only locally. Actual Docker replay,
+unchanged physical state and cleanup require hosted execution; protocol
+success is not a Docker acceptance result.
+
+## Hosted progress after the inspect-template repair
+
+Published `94e86e763c39de60073dea8bc9592e7b124bed88` advances both controller
+children past retained-builder inspection to
+`cold_construction/cold_group_attestation`:
+
+- [TLS controller restart](https://github.com/tyhuang9/rig/actions/runs/40059540802/job/120769849546),
+  raw SHA-256 `015b58a30c1cd699372757bd37b8a0763b1bf2144e0dda0d0ca76593ada8955d`.
+- [Process-kill restart](https://github.com/tyhuang9/rig/actions/runs/40059540802/job/120769849358),
+  raw SHA-256 `a74c5103df0afd6774f64541b84f68a8d4ae267708be1919dcd88d1e2083fc8e`.
+
+Before the later restart refusal, the TLS job records healthy frontend/API
+containers, Chromium note creation, and external PostgreSQL outage/recovery
+with application and database containers preserved. Those successful stages
+do not constitute acceptance of the complete controller journey.
+
+The component-group diagnostic still covers image, container, network and
+complete-census checks. Its individual rejecting predicate is unresolved;
+the map does not justify relaxing receipt, identity or ownership checks.
+
+At 04:16:37 UTC on 24 October, the partial snapshot has 19 failures, 30
+successes, 12 running, 80 queued and two skipped. All failures are captured in
+`pr222-94e-fifth-failure-batch-20261024.json`, SHA-256
+`480b7941507cfa5670b91cbee7117bf6a291e39ce6c9a0d85a544586ab7371db`.
+The jobs run synthetic merge `23520432c23b9dcf68983cd2c6f57a84956d6de4`,
+tree `f3654854844beb79dab6cf7e8154affa52d1e948`, identical to that published head.
+
+The [full-hostd diagnostic](https://github.com/tyhuang9/rig/actions/runs/40059540747/job/120769975257)
+still refuses at `startup_observation/docker_attestation` for `a0-sql-claim`.
+Its raw SHA-256 is
+`e47943f2294aef88ac20d9d54362752c4d717a08f7ebcd6c97afadb8bf9ddeba`.
+A source trace identifies an ordering conflict: app-bearing startup checks
+the Docker namespace against gateway-only names before handing the apps to
+complete cold accounting. A regression and repair remain pending; this trace
+alone does not establish the exact first Docker object rejected by the job.
+
+The [Windows rebind-history job](https://github.com/tyhuang9/rig/actions/runs/40059540752/job/120770440286)
+and [Linux race counterpart](https://github.com/tyhuang9/rig/actions/runs/40059540775/job/120770292539)
+fail the same two tests. The constructor test expects nil drivers, although
+the raw manager has coherent drivers without a generated-domain authority.
+The deliberate active-head corruption test encounters the newer exact-receipt
+SQL guard before it reaches the reader refusal under test. The proposed
+test-only corrections must preserve those runtime safeguards. The logs report
+neither a data race nor a timeout. Raw SHA-256 values are respectively
+`a1810b3c783d98411c84ee2cac44e515eca0714e37aebc0d51e5b86337865c2e`
+and `41fda44f181abbb9ae125530136856815a58ee6f93268d21f39b0f10cdaa15ed`.
+
 ## Retained-builder Docker inspect template repair
 
 Commit `c31be537fac54aa23eb56dc20a39fbd5dfcbc792` changes two container-inspect
