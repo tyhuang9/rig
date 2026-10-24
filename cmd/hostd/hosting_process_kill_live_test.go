@@ -362,23 +362,35 @@ const (
 
 	controllerChildStartupDiagnosticMaxBytes   = 8 << 10
 	controllerChildStartupDiagnosticMaxRecords = 32
+	controllerChildConstructionMaxErrors       = 32
 )
 
 // controllerChildStartupFail preserves the existing fixed test failure while
 // adding one private, closed diagnostic record to stderr. Child stdout remains
 // uncaptured because it can contain scoped runtime data.
 func controllerChildStartupFail(t *testing.T, kind controllerChildStartupKind, stage controllerChildStartupStage, message string) {
+	controllerChildStartupFailWithConstruction(t, kind, stage, nil, message)
+}
+
+func controllerChildStartupFailWithConstruction(t *testing.T, kind controllerChildStartupKind,
+	stage controllerChildStartupStage, construction error, message string,
+) {
 	t.Helper()
 	record := struct {
-		Message string `json:"msg"`
-		Kind    string `json:"child_kind"`
-		Stage   string `json:"child_stage"`
-		Result  string `json:"child_result"`
+		Message            string `json:"msg"`
+		Kind               string `json:"child_kind"`
+		Stage              string `json:"child_stage"`
+		Result             string `json:"child_result"`
+		ConstructionStage  string `json:"construction_stage,omitempty"`
+		ConstructionReason string `json:"construction_reason,omitempty"`
 	}{
 		Message: "controller child startup failed",
 		Kind:    string(kind),
 		Stage:   string(stage),
 		Result:  "failed",
+	}
+	if controllerChildStartupConstructionEligible(record.Kind, record.Stage) {
+		record.ConstructionStage, record.ConstructionReason, _ = controllerChildConstructionDiagnostic(construction)
 	}
 	if controllerChildStartupKnownPair(record.Kind, record.Stage) {
 		if encoded, err := json.Marshal(record); err == nil {
@@ -386,6 +398,100 @@ func controllerChildStartupFail(t *testing.T, kind controllerChildStartupKind, s
 		}
 	}
 	t.Fatal(message)
+}
+
+func controllerChildConstructionDiagnostic(err error) (string, string, bool) {
+	if err == nil {
+		return "", "", false
+	}
+	var pending [controllerChildConstructionMaxErrors]error
+	pending[0] = err
+	read, write := 0, 1
+	for read < write {
+		current := pending[read]
+		read++
+		if current == nil {
+			continue
+		}
+		if stage, reason, ok := controllerChildConstructionDiagnosticText(current.Error()); ok {
+			return stage, reason, true
+		}
+		if multiple, ok := current.(interface{ Unwrap() []error }); ok {
+			causes := multiple.Unwrap()
+			if remaining := len(pending) - write; len(causes) > remaining {
+				causes = causes[:remaining]
+			}
+			for _, cause := range causes {
+				if cause != nil && write < len(pending) {
+					pending[write] = cause
+					write++
+				}
+			}
+			continue
+		}
+		if single, ok := current.(interface{ Unwrap() error }); ok && write < len(pending) {
+			pending[write] = single.Unwrap()
+			write++
+		}
+	}
+	return "", "", false
+}
+
+func controllerChildConstructionDiagnosticText(value string) (string, string, bool) {
+	const prefix = "generated domain construction was refused: stage="
+	value, ok := strings.CutPrefix(value, prefix)
+	if !ok {
+		return "", "", false
+	}
+	stage, reason, ok := strings.Cut(value, " reason=")
+	if !ok || !controllerChildConstructionDiagnosticKnownPair(stage, reason) {
+		return "", "", false
+	}
+	return stage, reason, true
+}
+
+func controllerChildConstructionDiagnosticKnownPair(stage, reason string) bool {
+	startupReason := func(value string) bool {
+		switch value {
+		case "input", "physical_identity", "path_identity", "database", "protected_state",
+			"gateway_expectation", "docker_census", "docker_daemon", "docker_attestation",
+			"docker_image", "docker_container", "docker_volume", "docker_network",
+			"docker_restart_config", "docker_live_config", "docker_static_response", "stability":
+			return true
+		default:
+			return false
+		}
+	}
+	finalReason := func(value string) bool {
+		return startupReason(value) || value == "classification" || value == "recovery" ||
+			value == "disposition" || value == "process_latch" || value == "fence"
+	}
+	switch stage {
+	case "startup_observation":
+		return startupReason(reason)
+	case "initial_classification":
+		return reason == "disposition" || reason == "recovery"
+	case "stable_final":
+		return reason == "state_store" || finalReason(reason)
+	case "empty_reclassification":
+		return reason == "classification" || startupReason(reason)
+	case "empty_final_locked", "empty_final_released":
+		return finalReason(reason)
+	case "manifest":
+		return reason == "classification" || reason == "recovery" || reason == "disposition" ||
+			startupReason(reason)
+	case "join":
+		return reason == "manifest"
+	default:
+		return false
+	}
+}
+
+func controllerChildStartupConstructionEligible(kind, stage string) bool {
+	return kind == string(controllerChildStartupControllerRestart) &&
+		stage == string(controllerChildStartupGeneratedDomain) ||
+		kind == string(controllerChildStartupProcessKill) &&
+			stage == string(controllerChildStartupRuntimeComposition)
 }
 
 // The child executes production composition and the durable worker after
@@ -506,8 +612,8 @@ func controllerProcessKillRunChild(t *testing.T) {
 		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
 	})
 	if err != nil {
-		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupRuntimeComposition,
-			"reopen production generated composition")
+		controllerChildStartupFailWithConstruction(t, controllerChildStartupProcessKill,
+			controllerChildStartupRuntimeComposition, err, "reopen production generated composition")
 	}
 	executor := jobs.Executor(composition.executor)
 	if barrier != nil {
@@ -937,36 +1043,41 @@ func controllerChildStartupDiagnosticCode(stderr string) string {
 		} else {
 			limited = nil
 		}
-		if kind, stage, ok := controllerChildStartupDiagnosticRecord(bytes.TrimSpace(line)); ok {
-			return kind + "/" + stage + "/failed"
+		if kind, stage, constructionStage, constructionReason, ok :=
+			controllerChildStartupDiagnosticRecord(bytes.TrimSpace(line)); ok {
+			code := kind + "/" + stage + "/failed"
+			if constructionStage != "" {
+				code += " construction=" + constructionStage + "/" + constructionReason
+			}
+			return code
 		}
 	}
 	return ""
 }
 
-func controllerChildStartupDiagnosticRecord(line []byte) (string, string, bool) {
+func controllerChildStartupDiagnosticRecord(line []byte) (string, string, string, string, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(line))
 	opening, err := decoder.Token()
 	openingDelimiter, isDelimiter := opening.(json.Delim)
 	if err != nil || !isDelimiter || openingDelimiter != '{' {
-		return "", "", false
+		return "", "", "", "", false
 	}
-	var message, kind, stage, result string
-	seen := make(map[string]bool, 4)
+	var message, kind, stage, result, constructionStage, constructionReason string
+	seen := make(map[string]bool, 6)
 	for decoder.More() {
 		keyToken, keyErr := decoder.Token()
 		key, isString := keyToken.(string)
 		if keyErr != nil || !isString || seen[key] {
-			return "", "", false
+			return "", "", "", "", false
 		}
 		seen[key] = true
 		var raw json.RawMessage
 		if decoder.Decode(&raw) != nil {
-			return "", "", false
+			return "", "", "", "", false
 		}
 		value, valid := controllerChildStartupDiagnosticString(raw)
 		if !valid {
-			return "", "", false
+			return "", "", "", "", false
 		}
 		switch key {
 		case "msg":
@@ -977,22 +1088,32 @@ func controllerChildStartupDiagnosticRecord(line []byte) (string, string, bool) 
 			stage = value
 		case "child_result":
 			result = value
+		case "construction_stage":
+			constructionStage = value
+		case "construction_reason":
+			constructionReason = value
 		default:
-			return "", "", false
+			return "", "", "", "", false
 		}
 	}
 	closing, closeErr := decoder.Token()
 	closingDelimiter, isDelimiter := closing.(json.Delim)
 	if closeErr != nil || !isDelimiter || closingDelimiter != '}' {
-		return "", "", false
+		return "", "", "", "", false
 	}
 	var trailing json.RawMessage
 	if decoder.Decode(&trailing) != io.EOF || message != "controller child startup failed" || result != "failed" ||
 		!seen["msg"] || !seen["child_kind"] || !seen["child_stage"] || !seen["child_result"] ||
 		!controllerChildStartupKnownPair(kind, stage) {
-		return "", "", false
+		return "", "", "", "", false
 	}
-	return kind, stage, true
+	hasConstructionStage, hasConstructionReason := seen["construction_stage"], seen["construction_reason"]
+	if hasConstructionStage != hasConstructionReason || hasConstructionStage &&
+		(!controllerChildStartupConstructionEligible(kind, stage) ||
+			!controllerChildConstructionDiagnosticKnownPair(constructionStage, constructionReason)) {
+		return "", "", "", "", false
+	}
+	return kind, stage, constructionStage, constructionReason, true
 }
 
 func controllerChildStartupDiagnosticString(raw json.RawMessage) (string, bool) {

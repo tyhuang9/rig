@@ -1599,8 +1599,8 @@ func controllerJourneyRunRestartChild(t *testing.T, manifestPath string) {
 	options := runtimeCompositionOptions{dockerExecutable: manifest.Docker, runner: observer, routePauseLogger: newStructuredLogger(os.Stderr, "info")}
 	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, settings, dependencies, options)
 	if err != nil {
-		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupGeneratedDomain,
-			"construct cold restarted generated domain")
+		controllerChildStartupFailWithConstruction(t, controllerChildStartupControllerRestart,
+			controllerChildStartupGeneratedDomain, err, "construct cold restarted generated domain")
 	}
 	dependencies.generated = generated
 	composition, err := prepareRuntimeComposition(ctx, settings, dependencies, options)

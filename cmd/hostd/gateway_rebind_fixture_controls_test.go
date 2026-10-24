@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -12,10 +13,20 @@ import (
 
 func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	const secret = "token=do-not-disclose"
-	if os.Getenv("RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL") == "1" {
+	if mode := os.Getenv("RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL"); mode != "" {
 		_, _ = os.Stdout.WriteString("/private/path " + secret + "\n")
-		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupGeneratedDomain,
-			"controlled child failure /private/path "+secret)
+		construction := fmt.Errorf("controlled private cause /private/path %s: %w", secret,
+			errors.New("generated domain construction was refused: stage=empty_final_locked reason=docker_static_response"))
+		switch mode {
+		case "controller_restart":
+			controllerChildStartupFailWithConstruction(t, controllerChildStartupControllerRestart,
+				controllerChildStartupGeneratedDomain, construction, "controlled child failure /private/path "+secret)
+		case "process_kill":
+			controllerChildStartupFailWithConstruction(t, controllerChildStartupProcessKill,
+				controllerChildStartupRuntimeComposition, construction, "controlled child failure /private/path "+secret)
+		default:
+			t.Fatal("unknown child diagnostic control")
+		}
 		return
 	}
 	knownRuntime := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"runtime composition failed","error":"` + secret + `"}`
@@ -198,10 +209,17 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 			return `{"msg":"controller child startup failed","child_kind":"` + kind +
 				`","child_stage":"` + stage + `","child_result":"` + result + `"}`
 		}
+		constructionRecord := func(kind, stage, constructionStage, constructionReason string) string {
+			return `{"msg":"controller child startup failed","child_kind":"` + kind +
+				`","child_stage":"` + stage + `","child_result":"failed","construction_stage":"` +
+				constructionStage + `","construction_reason":"` + constructionReason + `"}`
+		}
 		for _, test := range []struct {
 			name, value, want string
 		}{
 			{name: "controller generated domain", value: record("controller_restart", "generated_domain", "failed"), want: "controller_restart/generated_domain/failed"},
+			{name: "controller generated domain construction", value: constructionRecord("controller_restart", "generated_domain", "empty_final_locked", "docker_static_response"), want: "controller_restart/generated_domain/failed construction=empty_final_locked/docker_static_response"},
+			{name: "process kill runtime construction", value: constructionRecord("process_kill", "runtime_composition", "startup_observation", "docker_network"), want: "process_kill/runtime_composition/failed construction=startup_observation/docker_network"},
 			{name: "process kill sealed database", value: record("process_kill", "sealed_database", "failed"), want: "process_kill/sealed_database/failed"},
 			{name: "newest exact record wins", value: record("process_kill", "owner_lease", "failed") + "\n" + record("controller_restart", "runtime_composition", "failed"), want: "controller_restart/runtime_composition/failed"},
 			{name: "unknown kind", value: record("forged", "generated_domain", "failed")},
@@ -211,6 +229,13 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 			{name: "duplicate stage", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":"generated_domain","child_stage":"manifest","child_result":"failed"}`},
 			{name: "case folded stage", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","Child_Stage":"generated_domain","child_result":"failed"}`},
 			{name: "non string stage", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":{"value":"generated_domain"},"child_result":"failed"}`},
+			{name: "construction on ineligible child stage", value: constructionRecord("process_kill", "sealed_database", "startup_observation", "database")},
+			{name: "construction missing reason", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":"generated_domain","child_result":"failed","construction_stage":"stable_final"}`},
+			{name: "construction missing stage", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":"generated_domain","child_result":"failed","construction_reason":"state_store"}`},
+			{name: "construction crossed pair", value: constructionRecord("controller_restart", "generated_domain", "join", "docker_network")},
+			{name: "construction unknown reason", value: constructionRecord("controller_restart", "generated_domain", "stable_final", "private_path")},
+			{name: "construction duplicate stage", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":"generated_domain","child_result":"failed","construction_stage":"stable_final","construction_stage":"join","construction_reason":"state_store"}`},
+			{name: "construction case folded reason", value: `{"msg":"controller child startup failed","child_kind":"controller_restart","child_stage":"generated_domain","child_result":"failed","construction_stage":"stable_final","Construction_Reason":"state_store"}`},
 			{name: "raw text cannot manufacture", value: `controller_restart/generated_domain/failed /private/path ` + secret},
 			{name: "exact record in bounded suffix", value: strings.Repeat("x", controllerChildStartupDiagnosticMaxBytes) + "\n" + record("controller_restart", "generated_domain", "failed"), want: "controller_restart/generated_domain/failed"},
 			{name: "exact record before byte bound", value: record("controller_restart", "generated_domain", "failed") + "\n" + strings.Repeat("x", controllerChildStartupDiagnosticMaxBytes)},
@@ -223,6 +248,44 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 				}
 			})
 		}
+
+		t.Run("construction error traversal is closed and bounded", func(t *testing.T) {
+			exact := errors.New("generated domain construction was refused: stage=stable_final reason=state_store")
+			wrapped := fmt.Errorf("private /path %s: %w", secret, exact)
+			stage, reason, ok := controllerChildConstructionDiagnostic(wrapped)
+			if !ok || stage != "stable_final" || reason != "state_store" {
+				t.Fatalf("closed construction diagnostic=%q/%q ok=%t", stage, reason, ok)
+			}
+			for _, rejected := range []error{
+				errors.New("private prefix: generated domain construction was refused: stage=stable_final reason=state_store"),
+				errors.New("generated domain construction was refused: stage=join reason=docker_network"),
+				errors.New("generated domain construction was refused: stage=stable_final reason=state_store /private/path " + secret),
+			} {
+				if stage, reason, ok := controllerChildConstructionDiagnostic(rejected); ok || stage != "" || reason != "" {
+					t.Fatalf("untrusted construction diagnostic=%q/%q ok=%t", stage, reason, ok)
+				}
+			}
+			cycle := &controllerChildConstructionDiagnosticCycle{message: "/private/path " + secret}
+			cycle.next = cycle
+			if stage, reason, ok := controllerChildConstructionDiagnostic(cycle); ok || stage != "" || reason != "" {
+				t.Fatalf("cyclic construction diagnostic=%q/%q ok=%t", stage, reason, ok)
+			}
+			beyondBound := error(exact)
+			for index := 0; index < controllerChildConstructionMaxErrors; index++ {
+				beyondBound = fmt.Errorf("private wrapper %d: %w", index, beyondBound)
+			}
+			if stage, reason, ok := controllerChildConstructionDiagnostic(beyondBound); ok || stage != "" || reason != "" {
+				t.Fatalf("out-of-bound construction diagnostic=%q/%q ok=%t", stage, reason, ok)
+			}
+			wide := make([]error, controllerChildConstructionMaxErrors+1)
+			for index := range wide[:len(wide)-1] {
+				wide[index] = fmt.Errorf("private wide error %d /private/path %s", index, secret)
+			}
+			wide[len(wide)-1] = exact
+			if stage, reason, ok := controllerChildConstructionDiagnostic(errors.Join(wide...)); ok || stage != "" || reason != "" {
+				t.Fatalf("over-wide construction diagnostic=%q/%q ok=%t", stage, reason, ok)
+			}
+		})
 		roster := map[string][]controllerChildStartupStage{
 			"controller_restart": {
 				controllerChildStartupManifest, controllerChildStartupDirectories, controllerChildStartupOwnerLease,
@@ -257,36 +320,54 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	})
 
 	t.Run("actual failing child exposes only closed stage", func(t *testing.T) {
-		command := exec.Command(os.Args[0], "-test.run=^TestLiveHostdRebindClosedDiagnosticControls$", "-test.timeout=30s")
-		for _, value := range os.Environ() {
-			if !strings.HasPrefix(value, "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL=") {
-				command.Env = append(command.Env, value)
-			}
-		}
-		command.Env = append(command.Env, "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL=1")
-		child := controllerProcessKillCapture(command)
-		if command.Stdout != nil {
-			t.Fatal("child diagnostic control captured arbitrary stdout")
-		}
-		child.err = command.Run()
-		close(child.done)
-		if child.err == nil {
-			t.Fatal("controlled failing child unexpectedly succeeded")
-		}
-		if strings.Contains(child.stderr.String(), secret) || strings.Contains(child.stderr.String(), "/private/path") {
-			t.Fatal("child stderr exposed the raw controlled failure")
-		}
-		got, ok := controllerProcessKillClosedDiagnostic(child)
-		if !ok || !strings.HasPrefix(got, "sha256:") ||
-			!strings.HasSuffix(got, " child=controller_restart/generated_domain/failed") {
-			t.Fatalf("actual child closed diagnostic=%q", got)
-		}
-		if strings.Contains(got, secret) || strings.Contains(got, "/private/path") {
-			t.Fatalf("actual child diagnostic exposed private output: %q", got)
+		for _, mode := range []string{"controller_restart", "process_kill"} {
+			t.Run(mode, func(t *testing.T) {
+				command := exec.Command(os.Args[0], "-test.run=^TestLiveHostdRebindClosedDiagnosticControls$", "-test.timeout=30s")
+				for _, value := range os.Environ() {
+					if !strings.HasPrefix(value, "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL=") {
+						command.Env = append(command.Env, value)
+					}
+				}
+				command.Env = append(command.Env, "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL="+mode)
+				child := controllerProcessKillCapture(command)
+				if command.Stdout != nil {
+					t.Fatal("child diagnostic control captured arbitrary stdout")
+				}
+				child.err = command.Run()
+				close(child.done)
+				if child.err == nil {
+					t.Fatal("controlled failing child unexpectedly succeeded")
+				}
+				if strings.Contains(child.stderr.String(), secret) || strings.Contains(child.stderr.String(), "/private/path") {
+					t.Fatal("child stderr exposed the raw controlled failure")
+				}
+				got, ok := controllerProcessKillClosedDiagnostic(child)
+				want := " child=" + mode + "/"
+				if mode == "controller_restart" {
+					want += "generated_domain/failed"
+				} else {
+					want += "runtime_composition/failed"
+				}
+				want += " construction=empty_final_locked/docker_static_response"
+				if !ok || !strings.HasPrefix(got, "sha256:") || !strings.HasSuffix(got, want) {
+					t.Fatalf("actual child closed diagnostic=%q want suffix %q", got, want)
+				}
+				if strings.Contains(got, secret) || strings.Contains(got, "/private/path") {
+					t.Fatalf("actual child diagnostic exposed private output: %q", got)
+				}
+			})
 		}
 	})
 
 }
+
+type controllerChildConstructionDiagnosticCycle struct {
+	message string
+	next    error
+}
+
+func (e *controllerChildConstructionDiagnosticCycle) Error() string { return e.message }
+func (e *controllerChildConstructionDiagnosticCycle) Unwrap() error { return e.next }
 
 func TestLiveHostdRebindClosedDiagnosticCheckpointRoster(t *testing.T) {
 	const secret = "token=do-not-disclose"
