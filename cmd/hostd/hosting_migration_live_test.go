@@ -29,6 +29,7 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
@@ -37,6 +38,7 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -60,6 +62,9 @@ const (
 // committed its additive database changes and before state completion is
 // recorded, so the durable Running state must refuse a replay after reopen.
 func TestLiveGeneratedMigrationApprovalAndUncertaintyJourney(t *testing.T) {
+	if liveColdRuntimeRestartChildRequested(t, "RIG_RUN_LIVE_MIGRATION_JOURNEY") {
+		return
+	}
 	runLiveGeneratedMigrationJourney(t, migrationJourneyApprovalAndUncertainty)
 }
 
@@ -118,7 +123,7 @@ func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneySce
 		}
 	}
 
-	root := t.TempDir()
+	root := newLiveColdRuntimeFixtureRoot(t)
 	dataRoot := filepath.Join(root, "controller")
 	fixtureRoot := filepath.Join(root, "external")
 	installed, err := filepath.Abs(filepath.Join("..", "..", "examples", "hosting-migration"))
@@ -186,10 +191,30 @@ func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneySce
 	if err := os.MkdirAll(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	db, err := database.Open(dataRoot)
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal("prepare migration controller directories:", err)
+	}
+	ownerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire migration controller owner:", err)
+	}
+	ownerLeaseClosed := false
+	defer func() {
+		if !ownerLeaseClosed {
+			_ = ownerLease.Close()
+		}
+	}()
+	db, err := database.OpenForGeneratedDomain(ctx, dataRoot, ownerLease)
 	if err != nil {
 		t.Fatal(err)
 	}
+	dbClosed := false
+	defer func() {
+		if !dbClosed {
+			_ = db.Close()
+		}
+	}()
 	provider := controllerJourneyNewGitHubProvider(t, sourceV1)
 	provider.AddRevision(t, migrationJourneyV2SHA, sourceV2)
 	provider.AddRevision(t, migrationJourneyV3SHA, sourceV3)
@@ -226,11 +251,12 @@ func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneySce
 	settings := config.Defaults()
 	settings.DataRoot = dataRoot
 	settings.GeneratedRuntime = true
-	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
+	dependencies := runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{
+	}
+	options := runtimeCompositionOptions{
 		dockerExecutable: docker,
 		runner:           migrationProcess,
 		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
@@ -238,7 +264,13 @@ func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneySce
 			migrationRunner.SetDelegate(delegate)
 			return migrationRunner
 		},
-	})
+	}
+	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, settings, dependencies, options)
+	if err != nil {
+		t.Fatal("construct generated migration domain:", err)
+	}
+	dependencies.generated = generated
+	composition, err := prepareRuntimeComposition(ctx, settings, dependencies, options)
 	if err != nil {
 		t.Fatal("compose production generated migration runtime:", err)
 	}
@@ -691,69 +723,32 @@ func runLiveGeneratedMigrationJourney(t *testing.T, scenario migrationJourneySce
 	if err := db.Close(); err != nil {
 		t.Fatal("close durable controller state before migration recovery:", err)
 	}
+	dbClosed = true
+	if err := ownerLease.Close(); err != nil {
+		t.Fatal("release controller owner before migration recovery:", err)
+	}
+	ownerLeaseClosed = true
+	cold := startLiveColdRuntimeRestartChild(t, ctx, "TestLiveGeneratedMigrationApprovalAndUncertaintyJourney", liveColdRuntimeRestartManifest{
+		Mode: liveColdRuntimeMigration, DataRoot: dataRoot, Source: sourceV1,
+		SourceV2: sourceV2, SourceV3: sourceV3, Docker: docker,
+	})
+	cold.stop()
 	db, err = database.Open(dataRoot)
 	if err != nil {
-		t.Fatal("reopen durable controller state:", err)
+		t.Fatal("open durable controller state after cold migration recovery:", err)
 	}
 	defer db.Close()
-	reopenedConfiguration, err := appconfig.New(db, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedPlans, err := deploymentplans.New(db, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedSources := sourceconnections.NewService(sourceconnections.NewRepository(db), provider, sourceconnections.NewFileCredentialStore(dataRoot), "fixture-app", time.Now)
-	reopenedSnapshots, err := releasesnapshot.New(db, reopenedSources, dataRoot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reopenedJobs, reopenedBindings, err := newDeploymentJobService(db)
+	reopenedJobs, _, err := newDeploymentJobService(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	reopenedDeployments := deployments.New(db)
-	reopenedEffectsWorkingDirectory, reopenedScopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
-	recoveryRunner := &migrationJourneyRunner{}
-	reopened, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
-		db: db, applications: apps.New(db), snapshots: reopenedSnapshots, configuration: reopenedConfiguration,
-		deployments: reopenedDeployments, plans: reopenedPlans, bindings: reopenedBindings,
-		effectsWorkingDirectory: reopenedEffectsWorkingDirectory,
-	}, runtimeCompositionOptions{
-		dockerExecutable: docker,
-		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
-		migrationRunnerFactory: func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
-			recoveryRunner.SetDelegate(delegate)
-			return recoveryRunner
-		},
-	})
-	if err != nil {
-		t.Fatal("reopen production generated migration runtime:", err)
-	}
-	recoveryWorkerContext, stopRecoveryWorkerContext := context.WithCancel(ctx)
-	recoveryWorkerDone, err := prepareRuntimeWorker(recoveryWorkerContext, runtimeRecovery{
-		recoverState: reopenedJobs.RecoverRuntimeContext,
-	}, reopened.executor, func(workerContext context.Context, executor jobs.Executor) error {
-		return reopenedJobs.RunWorkerWithScopedAdmission(workerContext, executor, reopenedScopedAdmission)
-	}, func(workerErr error) { t.Errorf("migration journey recovery worker: %v", workerErr) })
-	if err != nil {
-		t.Fatal("start recovered migration journey worker:", err)
-	}
-	defer func() {
-		stopRecoveryWorkerContext()
-		if !waitForWorker(recoveryWorkerDone, 10*time.Second) {
-			t.Error("recovered migration journey worker did not stop")
-		}
-	}()
+	reopenedState := generatedruntimestate.New(db)
 	recoveredJob, err := reopenedJobs.Get(v3Mutation.Job.ID)
 	if err != nil || recoveredJob.Status != string(jobs.Interrupted) || recoveredJob.Phase != string(jobs.Interrupted) || recoveredJob.ErrorCode != string(generatedruntimestate.DiagnosticDaemonRestarted) || recoveredJob.Attempt != 2 {
 		t.Fatalf("recovered v3 job=%#v err=%v", recoveredJob, err)
 	}
-	if recoveryRunner.Calls() != 0 {
-		t.Fatalf("durable interrupted migration replayed the real migration runner %d times", recoveryRunner.Calls())
-	}
-	recovered, err := reopened.state.Get(ctx, application.ID, deploymentID)
+	recovered, err := reopenedState.Get(ctx, application.ID, deploymentID)
 	if err != nil || recovered.Phase != generatedruntimestate.PhaseFailed || recovered.MigrationState != generatedruntimestate.MigrationFailed || recovered.DiagnosticCode != generatedruntimestate.DiagnosticDaemonRestarted {
 		t.Fatalf("reopened migration state=%#v err=%v", recovered, err)
 	}

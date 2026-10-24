@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -32,6 +33,7 @@ import (
 	"github.com/hostd/hostd/internal/auth"
 	"github.com/hostd/hostd/internal/config"
 	"github.com/hostd/hostd/internal/controller"
+	"github.com/hostd/hostd/internal/controllerowner"
 	"github.com/hostd/hostd/internal/database"
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
@@ -42,18 +44,26 @@ import (
 	"github.com/hostd/hostd/internal/jobs"
 	"github.com/hostd/hostd/internal/machines"
 	"github.com/hostd/hostd/internal/releasesnapshot"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/sourceconnections"
+	generateddomaintest "github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 const (
 	lanTwoAppClientNetworkPrefix = "rig-lan-two-app-test-client"
 	lanTwoAppNodeImage           = "node:24-bookworm-slim@sha256:ba849c60be29959425b8734d57b8b4b7d56f98edd9504c9af091d5281095a71e"
+	liveColdRuntimeManifestEnv   = "RIG_LIVE_COLD_RUNTIME_RESTART_MANIFEST"
+	liveColdRuntimeLAN           = "lan"
+	liveColdRuntimeMigration     = "migration"
 )
 
 // The opt-in job runs on a disposable Linux runner. Every administrative
 // transition goes through the authenticated production controller handler.
 func TestLiveControllerTwoAppLANJourney(t *testing.T) {
+	if liveColdRuntimeRestartChildRequested(t, "RIG_RUN_LIVE_TWO_APP_LAN") {
+		return
+	}
 	if os.Getenv("RIG_RUN_LIVE_TWO_APP_LAN") != "1" {
 		t.Fatal("set RIG_RUN_LIVE_TWO_APP_LAN=1 on a disposable Linux Docker host")
 	}
@@ -65,7 +75,7 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	defer cancel()
 	selected, ports := lanTwoAppHostPorts(t)
 	lanTwoAppDockerPreflight(t, ctx, docker)
-	root := t.TempDir()
+	root := newLiveColdRuntimeFixtureRoot(t)
 	dataRoot := filepath.Join(root, "controller")
 	if err := os.Mkdir(dataRoot, 0o700); err != nil {
 		t.Fatal(err)
@@ -95,11 +105,30 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 		t.Fatal(err)
 	}
 	provider := controllerJourneyNewGitHubProvider(t, source)
-	db, err := database.Open(dataRoot)
+	directories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
+	if err != nil {
+		t.Fatal("prepare two-app controller directories:", err)
+	}
+	ownerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire two-app controller owner:", err)
+	}
+	ownerLeaseClosed := false
+	defer func() {
+		if !ownerLeaseClosed {
+			_ = ownerLease.Close()
+		}
+	}()
+	db, err := database.OpenForGeneratedDomain(ctx, dataRoot, ownerLease)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	dbClosed := false
+	defer func() {
+		if !dbClosed {
+			_ = db.Close()
+		}
+	}()
 	authService := auth.New(db)
 	bootstrap, err := authService.EnsureBootstrapToken()
 	if err != nil {
@@ -136,15 +165,23 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	effectsWorkingDirectory, scopedAdmission := liveDeploymentExecutionFixture(t, db, dataRoot)
 	settings := config.Defaults()
 	settings.DataRoot, settings.GeneratedRuntime = dataRoot, true
-	composition, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
+	dependencies := runtimeCompositionDependencies{
 		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
 		deployments: deploymentStore, plans: plans, bindings: bindingStore,
 		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{
+	}
+	runner := &runtimeprocess.ExecRunner{}
+	options := runtimeCompositionOptions{
 		dockerExecutable: docker,
-		runner:           &runtimeprocess.ExecRunner{},
+		runner:           runner,
 		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
-	})
+	}
+	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, settings, dependencies, options)
+	if err != nil {
+		t.Fatal("construct two-app generated domain:", err)
+	}
+	dependencies.generated = generated
+	composition, err := prepareRuntimeComposition(ctx, settings, dependencies, options)
 	if err != nil {
 		t.Fatal("compose production runtime:", err)
 	}
@@ -189,11 +226,22 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
+	workerStopped := false
+	stopInitialWorker := func() bool {
+		if workerStopped {
+			return true
+		}
 		stopWorker()
 		select {
 		case <-done:
+			workerStopped = true
+			return true
 		case <-time.After(10 * time.Second):
+			return false
+		}
+	}
+	defer func() {
+		if !stopInitialWorker() {
 			t.Error("runtime worker did not stop")
 		}
 	}()
@@ -290,44 +338,31 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 			t.Fatalf("fresh LAN access observation for app %s is not bound to its durable claim", app.id)
 		}
 	}
-	// A second Manager uses the same protected data root and a new process-level
-	// lock handle. It must rediscover the committed gateway, not inherit a test
-	// object that already saw the grants.
-	fresh, err := prepareRuntimeComposition(ctx, settings, runtimeCompositionDependencies{
-		db: db, applications: appStore, snapshots: snapshots, configuration: configuration,
-		deployments: deploymentStore, plans: plans, bindings: bindingStore,
-		effectsWorkingDirectory: effectsWorkingDirectory,
-	}, runtimeCompositionOptions{
-		dockerExecutable: docker,
-		runner:           &runtimeprocess.ExecRunner{},
-		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
+	// A fresh process must rediscover the committed gateway. It cannot inherit
+	// the domain owner or Manager that observed the grants in this process.
+	if !stopInitialWorker() {
+		t.Fatal("runtime worker did not stop before cold controller restart")
+	}
+	api.Close()
+	if err := db.Close(); err != nil {
+		t.Fatal("close two-app controller database before cold restart:", err)
+	}
+	dbClosed = true
+	if err := ownerLease.Close(); err != nil {
+		t.Fatal("release two-app controller owner before cold restart:", err)
+	}
+	ownerLeaseClosed = true
+	cold := startLiveColdRuntimeRestartChild(t, ctx, "TestLiveControllerTwoAppLANJourney", liveColdRuntimeRestartManifest{
+		Mode: liveColdRuntimeLAN, DataRoot: dataRoot, Source: source, Docker: docker,
 	})
-	if err != nil {
-		t.Fatal("open fresh production ingress manager:", err)
-	}
-	status, err := fresh.ingress.ObserveGatewayV2Operation(ctx, upgradeID)
-	if err != nil || status.Availability != "serving" {
-		t.Fatalf("fresh manager gateway observation=%v err=%v", status.Availability, err)
-	}
-	freshDB, err := database.Open(dataRoot)
-	if err != nil {
-		t.Fatal("reopen durable app access database:", err)
-	}
-	defer freshDB.Close()
-	freshAccess := appaccess.New(freshDB)
-	freshAPI := httptest.NewServer((&controller.Server{
-		Auth: authService, Apps: appStore, Jobs: jobStore, Machines: machineStore, Sources: sources,
-		Configuration: configuration, Deployments: deploymentStore, DeploymentPlans: plans,
-		GeneratedIngress: fresh.ingress, GeneratedRuntimeState: fresh.state,
-		GeneratedRuntime: true, Caddy: true, DataRoot: dataRoot,
-		GatewayProfiles: freshAccess, GatewayUpgrades: freshAccess, GatewayUpgradeRuntime: fresh.ingress,
-		AppAccess: freshAccess, AppGrants: freshAccess, LANGrantRuntime: fresh.ingress,
-		AppDisables: freshAccess, LANDisableRuntime: fresh.ingress,
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}).Handler())
-	defer freshAPI.Close()
 	freshRequest := request
-	freshRequest.base = freshAPI.URL
+	freshRequest.base = cold.url
+	var freshUpgrade apicontract.LANGatewayUpgradeRead
+	freshRequest.do(http.MethodGet, "/api/v1/system/lan-gateway-upgrade", nil, http.StatusOK, &freshUpgrade)
+	if freshUpgrade.DesiredClaim == nil || freshUpgrade.DesiredClaim.OperationID != upgradeID ||
+		freshUpgrade.Observed.OperationID != upgradeID || freshUpgrade.Observed.Availability != "serving" {
+		t.Fatalf("fresh manager gateway observation=%#v, want exact serving operation %s", freshUpgrade, upgradeID)
+	}
 	for _, app := range []struct {
 		id   string
 		port uint16
@@ -338,6 +373,563 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 			read.GrantClaim == nil || read.GrantClaim.State != "committed" {
 			t.Fatalf("fresh manager did not reattest app %s LAN claim", app.id)
 		}
+	}
+	cold.stop()
+}
+
+// Cold restart control files contain only fixture-owned paths and a closed
+// scenario. Authentication, claims, receipts, authority proofs and secrets
+// remain in the parent process or in the sealed database.
+type liveColdRuntimeRestartManifest struct {
+	Mode             string `json:"mode"`
+	DataRoot         string `json:"dataRoot"`
+	Source           string `json:"source"`
+	SourceV2         string `json:"sourceV2"`
+	SourceV3         string `json:"sourceV3"`
+	Docker           string `json:"docker"`
+	ControlDirectory string `json:"controlDirectory"`
+}
+
+type liveColdRuntimeRestartResponse struct {
+	Sequence uint64
+	PID      int
+	URL      string
+}
+
+type liveColdRuntimeRestartProcess struct {
+	t         *testing.T
+	ctx       context.Context
+	child     *controllerProcessKillProcess
+	directory string
+	url       string
+}
+
+func newLiveColdRuntimeFixtureRoot(t *testing.T) string {
+	t.Helper()
+	return generateddomaintest.NewRetainedRoot(t)
+}
+
+func liveColdRuntimeExactDirectory(path string, private bool) bool {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return false
+	}
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode()&os.ModeSymlink == 0 && info.IsDir() &&
+		(!private || runtime.GOOS == "windows" || info.Mode().Perm()&0o077 == 0)
+}
+
+func validLiveColdRuntimeRestartManifest(manifest liveColdRuntimeRestartManifest, manifestPath, expectedDocker string) bool {
+	if manifest.Docker == "" || manifest.Docker != expectedDocker || !filepath.IsAbs(expectedDocker) ||
+		filepath.Clean(expectedDocker) != expectedDocker || filepath.Base(manifest.DataRoot) != "controller" ||
+		filepath.Base(manifestPath) != "manifest.json" || filepath.Dir(manifestPath) != manifest.ControlDirectory {
+		return false
+	}
+	root := filepath.Dir(manifest.DataRoot)
+	owner := filepath.Dir(root)
+	if filepath.Base(root) == "." || !strings.HasPrefix(filepath.Base(root), "domain-") ||
+		!strings.HasPrefix(filepath.Base(owner), "rig-generated-domain-test-roots-") ||
+		filepath.Dir(manifest.ControlDirectory) != root ||
+		!strings.HasPrefix(filepath.Base(manifest.ControlDirectory), "cold-restart-") ||
+		!liveColdRuntimeExactDirectory(owner, true) || !liveColdRuntimeExactDirectory(root, true) ||
+		!liveColdRuntimeExactDirectory(manifest.DataRoot, true) ||
+		!liveColdRuntimeExactDirectory(manifest.ControlDirectory, true) {
+		return false
+	}
+	marker, err := os.Lstat(filepath.Join(owner, ".owner"))
+	if err != nil || marker.Mode()&os.ModeSymlink != 0 || !marker.Mode().IsRegular() ||
+		(runtime.GOOS != "windows" && marker.Mode().Perm()&0o077 != 0) {
+		return false
+	}
+	sources := []struct {
+		path string
+		base string
+	}{{manifest.Source, "source"}}
+	if manifest.Mode == liveColdRuntimeMigration {
+		sources = []struct {
+			path string
+			base string
+		}{{manifest.Source, "source-v1"}, {manifest.SourceV2, "source-v2"}, {manifest.SourceV3, "source-v3"}}
+	} else if manifest.Mode != liveColdRuntimeLAN || manifest.SourceV2 != "" || manifest.SourceV3 != "" {
+		return false
+	}
+	for _, source := range sources {
+		if filepath.Dir(source.path) != root || filepath.Base(source.path) != source.base ||
+			!liveColdRuntimeExactDirectory(source.path, false) {
+			return false
+		}
+	}
+	return true
+}
+
+func rejectLiveColdRuntimeDuplicateKeys(body []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	opening, err := decoder.Token()
+	if err != nil || opening != json.Delim('{') {
+		return errors.New("restart manifest is not an object")
+	}
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		key, ok := keyToken.(string)
+		folded := strings.ToLower(key)
+		if err != nil || !ok || folded == "" {
+			return errors.New("restart manifest key is invalid")
+		}
+		if _, exists := seen[folded]; exists {
+			return errors.New("restart manifest key is duplicated")
+		}
+		seen[folded] = struct{}{}
+		var value json.RawMessage
+		if decoder.Decode(&value) != nil {
+			return errors.New("restart manifest value is invalid")
+		}
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return errors.New("restart manifest object is incomplete")
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return errors.New("restart manifest has trailing input")
+	}
+	return nil
+}
+
+func readLiveColdRuntimeRestartManifest(path, expectedDocker string) (liveColdRuntimeRestartManifest, error) {
+	var manifest liveColdRuntimeRestartManifest
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.Base(path) != "manifest.json" {
+		return manifest, errors.New("restart manifest path is invalid")
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 || !pathInfo.Mode().IsRegular() ||
+		(runtime.GOOS != "windows" && pathInfo.Mode().Perm()&0o077 != 0) {
+		return manifest, errors.New("restart manifest file is invalid")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return manifest, errors.New("restart manifest cannot be opened")
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !os.SameFile(pathInfo, openedInfo) {
+		return manifest, errors.New("restart manifest identity changed")
+	}
+	body, err := io.ReadAll(io.LimitReader(file, (16<<10)+1))
+	if err != nil || len(body) == 0 || len(body) > 16<<10 || rejectLiveColdRuntimeDuplicateKeys(body) != nil {
+		return manifest, errors.New("restart manifest JSON is invalid")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&manifest) != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+		!validLiveColdRuntimeRestartManifest(manifest, path, expectedDocker) {
+		return liveColdRuntimeRestartManifest{}, errors.New("restart manifest is invalid")
+	}
+	return manifest, nil
+}
+
+func TestLiveColdRuntimeRestartManifestRejectsCrossedOrSensitiveShape(t *testing.T) {
+	newFixture := func(t *testing.T, mode string) (liveColdRuntimeRestartManifest, string) {
+		t.Helper()
+		root := newLiveColdRuntimeFixtureRoot(t)
+		for _, name := range []string{"controller", "source", "source-v1", "source-v2", "source-v3"} {
+			if err := os.Mkdir(filepath.Join(root, name), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		docker := filepath.Join(root, "docker")
+		if err := os.WriteFile(docker, []byte("fixture"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		control, err := os.MkdirTemp(root, "cold-restart-")
+		if err != nil || os.Chmod(control, 0o700) != nil {
+			t.Fatal("create private restart control directory")
+		}
+		manifest := liveColdRuntimeRestartManifest{
+			Mode: mode, DataRoot: filepath.Join(root, "controller"), Docker: docker, ControlDirectory: control,
+		}
+		if mode == liveColdRuntimeMigration {
+			manifest.Source = filepath.Join(root, "source-v1")
+			manifest.SourceV2 = filepath.Join(root, "source-v2")
+			manifest.SourceV3 = filepath.Join(root, "source-v3")
+		} else {
+			manifest.Source = filepath.Join(root, "source")
+		}
+		return manifest, filepath.Join(control, "manifest.json")
+	}
+	t.Run("exact LAN and migration manifests", func(t *testing.T) {
+		for _, mode := range []string{liveColdRuntimeLAN, liveColdRuntimeMigration} {
+			manifest, path := newFixture(t, mode)
+			if !validLiveColdRuntimeRestartManifest(manifest, path, manifest.Docker) ||
+				controllerJourneyWriteRestartFile(path, manifest) != nil {
+				t.Fatalf("exact %s restart manifest was rejected", mode)
+			}
+			got, err := readLiveColdRuntimeRestartManifest(path, manifest.Docker)
+			if err != nil || got != manifest {
+				t.Fatalf("exact %s restart manifest did not round trip", mode)
+			}
+		}
+	})
+	t.Run("crossed paths and executable", func(t *testing.T) {
+		base, path := newFixture(t, liveColdRuntimeLAN)
+		mutations := []func(*liveColdRuntimeRestartManifest, *string, *string){
+			func(value *liveColdRuntimeRestartManifest, _, _ *string) { value.Mode = "unknown" },
+			func(value *liveColdRuntimeRestartManifest, _, _ *string) { value.DataRoot = "relative" },
+			func(value *liveColdRuntimeRestartManifest, _, _ *string) {
+				value.SourceV2 = filepath.Join(filepath.Dir(value.DataRoot), "source-v2")
+			},
+			func(_ *liveColdRuntimeRestartManifest, value, _ *string) {
+				*value = filepath.Join(filepath.Dir(*value), "other.json")
+			},
+			func(_ *liveColdRuntimeRestartManifest, _, expectedDocker *string) { *expectedDocker += "-crossed" },
+		}
+		for index, mutate := range mutations {
+			candidate, candidatePath, expectedDocker := base, path, base.Docker
+			mutate(&candidate, &candidatePath, &expectedDocker)
+			if validLiveColdRuntimeRestartManifest(candidate, candidatePath, expectedDocker) {
+				t.Fatalf("invalid restart manifest mutation %d was accepted", index)
+			}
+		}
+	})
+	t.Run("unknown and duplicate fields", func(t *testing.T) {
+		for name, mutate := range map[string]func([]byte) []byte{
+			"unknown": func(body []byte) []byte { return bytes.Replace(body, []byte(`}`), []byte(`,"unknown":"value"}`), 1) },
+			"duplicate": func(body []byte) []byte {
+				return bytes.Replace(body, []byte(`"mode":"lan"`), []byte(`"mode":"lan","mode":"lan"`), 1)
+			},
+			"case folded duplicate": func(body []byte) []byte {
+				return bytes.Replace(body, []byte(`"mode":"lan"`), []byte(`"mode":"lan","Mode":"lan"`), 1)
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				manifest, path := newFixture(t, liveColdRuntimeLAN)
+				body, err := json.Marshal(manifest)
+				if err != nil || os.WriteFile(path, mutate(body), 0o600) != nil {
+					t.Fatal("write invalid restart manifest")
+				}
+				if _, err := readLiveColdRuntimeRestartManifest(path, manifest.Docker); err == nil {
+					t.Fatal("invalid restart manifest JSON was accepted")
+				}
+			})
+		}
+	})
+	t.Run("symlink manifest and source", func(t *testing.T) {
+		manifest, path := newFixture(t, liveColdRuntimeLAN)
+		body, err := json.Marshal(manifest)
+		target := filepath.Join(manifest.ControlDirectory, "payload.json")
+		if err != nil || os.WriteFile(target, body, 0o600) != nil || os.Symlink(target, path) != nil {
+			if runtime.GOOS == "windows" {
+				t.Skip("file symlink unavailable")
+			}
+			t.Fatal("create manifest symlink")
+		}
+		if _, err := readLiveColdRuntimeRestartManifest(path, manifest.Docker); err == nil {
+			t.Fatal("restart manifest symlink was accepted")
+		}
+		if err := os.Remove(path); err != nil || os.RemoveAll(manifest.Source) != nil ||
+			os.Symlink(filepath.Dir(filepath.Dir(manifest.DataRoot)), manifest.Source) != nil {
+			t.Fatal("create crossed source symlink")
+		}
+		if validLiveColdRuntimeRestartManifest(manifest, path, manifest.Docker) {
+			t.Fatal("restart source symlink was accepted")
+		}
+	})
+}
+
+func startLiveColdRuntimeRestartChild(t *testing.T, ctx context.Context, selector string, manifest liveColdRuntimeRestartManifest) *liveColdRuntimeRestartProcess {
+	t.Helper()
+	switch selector {
+	case "TestLiveControllerTwoAppLANJourney", "TestLiveControllerLANDatabaseJourney",
+		"TestLiveGeneratedMigrationApprovalAndUncertaintyJourney":
+	default:
+		t.Fatal("cold restart child selector is invalid")
+	}
+	root := filepath.Dir(manifest.DataRoot)
+	control, err := os.MkdirTemp(root, "cold-restart-")
+	if err != nil || os.Chmod(control, 0o700) != nil {
+		t.Fatal("create private cold restart control directory")
+	}
+	controlInfo, err := os.Lstat(control)
+	if err != nil {
+		t.Fatal("inspect private cold restart control directory")
+	}
+	t.Cleanup(func() {
+		current, statErr := os.Lstat(control)
+		if statErr != nil || !os.SameFile(controlInfo, current) || current.Mode()&os.ModeSymlink != 0 || !current.IsDir() {
+			t.Error("cold restart control directory identity changed; retaining")
+			return
+		}
+		if removeErr := os.RemoveAll(control); removeErr != nil {
+			t.Error("remove exact cold restart control directory")
+		}
+	})
+	manifest.ControlDirectory = control
+	manifestPath := filepath.Join(manifest.ControlDirectory, "manifest.json")
+	if !validLiveColdRuntimeRestartManifest(manifest, manifestPath, manifest.Docker) ||
+		controllerJourneyWriteRestartFile(manifestPath, manifest) != nil {
+		t.Fatal("write private cold restart manifest")
+	}
+	written, err := readLiveColdRuntimeRestartManifest(manifestPath, manifest.Docker)
+	if err != nil || written != manifest {
+		t.Fatal("verify private cold restart manifest")
+	}
+	command := exec.CommandContext(ctx, os.Args[0], "-test.run=^"+regexp.QuoteMeta(selector)+"$", "-test.timeout=26m")
+	command.Env = liveColdRuntimeChildEnvironment(manifestPath)
+	child := controllerProcessKillCapture(command)
+	if err := command.Start(); err != nil {
+		t.Fatal("start cold runtime process")
+	}
+	go func() {
+		child.err = command.Wait()
+		close(child.done)
+	}()
+	t.Cleanup(func() { controllerProcessKillCleanupChild(child) })
+	process := &liveColdRuntimeRestartProcess{t: t, ctx: ctx, child: child, directory: manifest.ControlDirectory}
+	ready := process.wait(0, 7*time.Minute)
+	if ready.PID != child.command.Process.Pid || ready.PID == os.Getpid() {
+		t.Fatal("cold restart readiness did not identify the fresh process")
+	}
+	address, err := controllerJourneyFixtureControllerListenAddress(ready.URL)
+	if err != nil || !strings.HasPrefix(address, "127.0.0.1:") {
+		t.Fatal("cold restarted controller did not bind loopback")
+	}
+	process.url = ready.URL
+	return process
+}
+
+func liveColdRuntimeChildEnvironment(manifestPath string) []string {
+	values := make([]string, 0, len(os.Environ())+1)
+	for _, value := range os.Environ() {
+		if strings.HasPrefix(value, liveColdRuntimeManifestEnv+"=") {
+			continue
+		}
+		values = append(values, value)
+	}
+	return append(values, liveColdRuntimeManifestEnv+"="+manifestPath)
+}
+
+func (child *liveColdRuntimeRestartProcess) wait(sequence uint64, maximum time.Duration) liveColdRuntimeRestartResponse {
+	child.t.Helper()
+	ctx, cancel := context.WithTimeout(child.ctx, maximum)
+	defer cancel()
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	path := filepath.Join(child.directory, fmt.Sprintf("%06d.response.json", sequence))
+	for {
+		var response liveColdRuntimeRestartResponse
+		if err := controllerJourneyReadRestartFile(path, &response); err == nil {
+			if response.Sequence != sequence || response.PID != child.child.command.Process.Pid {
+				child.t.Fatal("cold restart response identity mismatch")
+			}
+			return response
+		} else if !errors.Is(err, os.ErrNotExist) {
+			child.t.Fatal("cold restart response is invalid")
+		}
+		select {
+		case <-child.child.done:
+			controllerProcessKillReportClosedDiagnostic(child.t, child.child)
+			child.t.Fatal("cold restarted controller exited before response")
+		case <-ctx.Done():
+			child.t.Fatal("cold restart response exceeded bound")
+		case <-tick.C:
+		}
+	}
+}
+
+func (child *liveColdRuntimeRestartProcess) stop() {
+	child.t.Helper()
+	path := filepath.Join(child.directory, "000001.request.json")
+	if err := controllerJourneyWriteRestartFile(path, controllerJourneyRestartCommand{Sequence: 1, Action: "stop"}); err != nil {
+		child.t.Fatal("write cold restart stop command")
+	}
+	child.wait(1, 3*time.Minute)
+	select {
+	case <-child.child.done:
+		if child.child.err != nil {
+			controllerProcessKillReportClosedDiagnostic(child.t, child.child)
+			child.t.Fatal("cold restart child did not stop cleanly")
+		}
+	case <-time.After(10 * time.Second):
+		child.t.Fatal("cold restart child did not exit after stopping")
+	}
+}
+
+func liveColdRuntimeRestartChildRequested(t *testing.T, requiredOptIn string) bool {
+	t.Helper()
+	manifestPath := os.Getenv(liveColdRuntimeManifestEnv)
+	if manifestPath == "" {
+		return false
+	}
+	if requiredOptIn == "" || os.Getenv(requiredOptIn) != "1" {
+		t.Fatal("cold runtime child requires the selected hosted test opt-in")
+	}
+	expectedDocker, err := exec.LookPath("docker")
+	if err == nil {
+		expectedDocker, err = filepath.Abs(expectedDocker)
+	}
+	manifest, manifestErr := readLiveColdRuntimeRestartManifest(manifestPath, expectedDocker)
+	if err != nil || manifestErr != nil || runtime.GOOS != "linux" ||
+		os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
+		t.Fatal("cold runtime child requires an exact local Linux fixture manifest")
+	}
+	liveColdRuntimeRunRestartChild(t, manifest)
+	return true
+}
+
+func liveColdRuntimeRunRestartChild(t *testing.T, manifest liveColdRuntimeRestartManifest) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+	directories, err := runtimedocker.PrepareControllerDirectories(manifest.DataRoot)
+	if err != nil {
+		t.Fatal("prepare cold restarted controller directories")
+	}
+	ownerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
+	if err != nil {
+		t.Fatal("acquire cold restarted controller owner")
+	}
+	defer func() { _ = ownerLease.Close() }()
+	db, err := database.OpenForGeneratedDomain(ctx, manifest.DataRoot, ownerLease)
+	if err != nil {
+		t.Fatal("open sealed cold restarted controller database")
+	}
+	defer db.Close()
+	provider := controllerJourneyNewGitHubProvider(t, manifest.Source)
+	if manifest.Mode == liveColdRuntimeMigration {
+		provider.AddRevision(t, migrationJourneyV2SHA, manifest.SourceV2)
+		provider.AddRevision(t, migrationJourneyV3SHA, manifest.SourceV3)
+	}
+	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), provider,
+		sourceconnections.NewFileCredentialStore(manifest.DataRoot), "fixture-app", time.Now)
+	snapshots, err := releasesnapshot.New(db, sources, manifest.DataRoot)
+	if err != nil || snapshots.Recover() != nil {
+		t.Fatal("recover cold restarted source materializer")
+	}
+	configuration, err := appconfig.New(db, manifest.DataRoot)
+	if err != nil || configuration.Recover(ctx) != nil {
+		t.Fatal("recover cold restarted scoped configuration")
+	}
+	plans, err := deploymentplans.New(db, manifest.DataRoot)
+	if err != nil || plans.Recover(ctx) != nil {
+		t.Fatal("recover cold restarted deployment plans")
+	}
+	jobStore, bindings, err := newDeploymentJobService(db)
+	if err != nil {
+		t.Fatal("open cold restarted deployment jobs")
+	}
+	effectsDirectory, admission := liveDeploymentExecutionFixture(t, db, manifest.DataRoot)
+	settings := config.Defaults()
+	settings.DataRoot, settings.GeneratedRuntime = manifest.DataRoot, true
+	dependencies := runtimeCompositionDependencies{
+		db: db, applications: apps.New(db), snapshots: snapshots, configuration: configuration,
+		deployments: deployments.New(db), plans: plans, bindings: bindings, effectsWorkingDirectory: effectsDirectory,
+	}
+	var runner runtimeprocess.CommandRunner = &runtimeprocess.ExecRunner{}
+	var recoveryMigration *migrationJourneyRunner
+	options := runtimeCompositionOptions{dockerExecutable: manifest.Docker, runner: runner,
+		routePauseLogger: newStructuredLogger(os.Stderr, "info")}
+	if manifest.Mode == liveColdRuntimeMigration {
+		runner = newMigrationAuthorityProcessObserver(db)
+		recoveryMigration = &migrationJourneyRunner{}
+		options.runner = runner
+		options.migrationRunnerFactory = func(delegate generatedruntime.MigrationRunner) generatedruntime.MigrationRunner {
+			recoveryMigration.SetDelegate(delegate)
+			return recoveryMigration
+		}
+	}
+	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, settings, dependencies, options)
+	if err != nil {
+		t.Fatal("construct cold restarted generated domain:", err)
+	}
+	dependencies.generated = generated
+	composition, err := prepareRuntimeComposition(ctx, settings, dependencies, options)
+	if err != nil {
+		t.Fatal("compose cold restarted generated runtime:", err)
+	}
+	workerContext, stopWorker := context.WithCancel(ctx)
+	workerFailure := false
+	done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{recoverState: jobStore.RecoverRuntimeContext}, composition.executor,
+		func(workerContext context.Context, executor jobs.Executor) error {
+			return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, admission)
+		}, func(error) { workerFailure = true })
+	if err != nil {
+		t.Fatal("recover cold restarted durable worker")
+	}
+	workerJoined := false
+	workerOutcomeChecked := false
+	joinWorker := func() bool {
+		if workerJoined {
+			return true
+		}
+		stopWorker()
+		select {
+		case <-done:
+			workerJoined = true
+			return true
+		case <-time.After(10 * time.Second):
+			return false
+		}
+	}
+	defer func() {
+		if !joinWorker() {
+			t.Error("cold restarted durable worker did not stop")
+		} else if !workerOutcomeChecked && workerFailure {
+			t.Error("cold restarted durable worker failed")
+		}
+	}()
+	access := appaccess.New(db)
+	server := controllerJourneyRestartControllerServer(t, (&controller.Server{
+		Auth: auth.New(db), Apps: dependencies.applications, Jobs: jobStore, Machines: machines.New(db), Sources: sources,
+		Configuration: configuration, Deployments: dependencies.deployments, DeploymentPlans: plans,
+		GeneratedIngress: composition.ingress, GeneratedRuntimeState: composition.state,
+		GeneratedRuntime: true, Caddy: true, DataRoot: manifest.DataRoot,
+		GatewayProfiles: access, GatewayUpgrades: access, GatewayUpgradeRuntime: composition.ingress,
+		AppAccess: access, AppGrants: access, LANGrantRuntime: composition.ingress,
+		AppDisables: access, LANDisableRuntime: composition.ingress,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}).Handler())
+	defer server.Close()
+	respond := func(sequence uint64) {
+		path := filepath.Join(manifest.ControlDirectory, fmt.Sprintf("%06d.response.json", sequence))
+		if err := controllerJourneyWriteRestartFile(path, liveColdRuntimeRestartResponse{
+			Sequence: sequence, PID: os.Getpid(), URL: server.URL,
+		}); err != nil {
+			t.Fatal("publish cold restart response")
+		}
+	}
+	respond(0)
+	tick := time.NewTicker(25 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatal("cold restart child exceeded bound")
+		case <-done:
+			workerJoined = true
+			workerOutcomeChecked = true
+			if workerFailure {
+				t.Fatal("cold restarted durable worker failed")
+			}
+			t.Fatal("cold restarted durable worker stopped unexpectedly")
+		case <-tick.C:
+		}
+		var command controllerJourneyRestartCommand
+		path := filepath.Join(manifest.ControlDirectory, "000001.request.json")
+		if err := controllerJourneyReadRestartFile(path, &command); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil || command.Sequence != 1 || command.Action != "stop" || command.Target != "" {
+			t.Fatal("cold restart command is invalid")
+		}
+		if !joinWorker() {
+			t.Fatal("cold restarted durable worker did not stop")
+		}
+		workerOutcomeChecked = true
+		if workerFailure {
+			t.Fatal("cold restarted durable worker failed")
+		}
+		if recoveryMigration != nil && recoveryMigration.Calls() != 0 {
+			t.Fatal("cold migration recovery replayed the migration runner")
+		}
+		server.Close()
+		respond(1)
+		return
 	}
 }
 
