@@ -17,6 +17,114 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Full-controller diagnostic projection
+
+The full-hostd test harness previously discarded an existing closed construction
+reason from the production JSON log, leaving only a stderr digest on readiness
+failure. A separate test-only change recognizes the exact construction-failure
+message and projects only its known stage/reason pair alongside the existing
+digest. Production logging and startup behavior are unchanged.
+
+The bounded parser rejects duplicate or case-folded relevant keys, non-string or
+missing errors, malformed records, unknown/crossed pairs and prefixed/suffixed
+private content. A recognized invalid construction record cannot fall through to
+generic startup classification. Other metadata remains private; existing byte,
+record and first-primary ordering limits remain.
+
+Windows compilation, exact changed-parent discovery and execution pass:
+`TestLiveHostdRebindClosedDiagnosticControls` and its 150 children, 151 unique
+passes with no failure or skip. Formatting, tagged hostd vet, canonical
+generation and diff checks pass. Source/privacy review is clear. The network
+repair's two source hashes remain unchanged; its successful checks are reused.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `full-hostd-construction-projection-20261024T025616Z/focused-receipt.json` | `7b552ec2e9238bcf06f1cc16e6f71834e22c944ba2d8553ed5efad2ff8026f8f` |
+| `full-hostd-construction-projection-20261024T025616Z/static-receipt.json` | `511c17451f0d516c5a201df845b704b06c874345343e806831d80ce9f339823a` |
+| `full-hostd-construction-projection-source-security-review-20261024.md` | `64a1e350b658a29bfdbe8d593b8c1eef92f4db8c20913bd34c7bbab9e0bc6439` |
+| `full-hostd-construction-projection-root-audit-20261024.json` | `7131991e5b0663cfbb91c72602ad3e7fbd35ed720311ec52e67c226852aa73a4` |
+
+Actual focused execution was 02:56:16–02:56:23 UTC on 24 October. Root verification
+matched current source, binary, raw results and discovery. This improves safe
+attribution; actual full-controller Docker behavior remains a hosted gate.
+
+## Builder network policy alignment
+
+Commit `ddedf04286e3ec4425ccfd6a92f142d7ea208163` aligns cold reconstruction with
+the existing shared builder network policy. The shared policy accepts ordinary
+additional bridge options while requiring ICC to be disabled; cold startup
+incorrectly required an options map containing only that one key. A regression
+fixture adds `enable_ip_masquerade=true` consistently, confirms the shared writer
+policy accepts it, and reproduces `cold_builder_attestation` on unchanged
+production.
+
+The repair retains exact identity, ownership, bridge/local/non-internal policy,
+ICC=false, sole network membership and container attachment checks. It requires
+the complete census options map to match the first detailed inspection, retains
+complete first/second physical equality and final attestation, and changes no
+writer, schema, lifecycle, capacity, traffic or cleanup operation.
+
+The Windows successor passes the cold parent and all 31 unique children, plus
+the shared network matcher parent: 33 passes, no failure or skip. Controls
+independently exercise missing, true and other invalid ICC values at both
+census and detailed boundaries, consistent extra options, crossed maps and
+addition/removal/value drift between reads. Formatting of both changed files,
+vet of ingress and builder packages, canonical generation and diff checks pass.
+Source/security and final integration review found no blocker for this bounded
+repair; publication still requires the recorded documentation and identity
+checks.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `cold-builder-network-options-red-successor-20261024T024835Z/selector-successor-receipt.json` | `768dc80e0fe2a01cf359eec05820ef541b942908faa8914624ffbd220ef1f787` |
+| `cold-builder-network-options-successor-20261024T025132Z/receipt.json` | `8d7e2f94522c1f68ad98b33ca8383579caa88c71007e89936d53d8c5108c0bea` |
+| `cold-builder-network-options-successor-20261024T025132Z/static-receipt.json` | `e7c8a671d1db9f1e202f65f601a7be4044ee135cd5ff5e74de32787150d3fd68` |
+| `cold-builder-network-options-source-security-review-20261024.md` | `41baa546b678362f1a68852bf3d50d46ca1460191ce7b24991f7f55df356a138` |
+| `cold-builder-network-options-root-audit-20261024.json` | `8f5746069dbd895d677cb5576bb23073b218cafec54147437650c7bc395b8025` |
+| `pr222-cold-builder-network-options-final-integration-20261024.md` | `1c91eedcde1722acef2cb6cb0fbfd5675c4be52bbef78cf68a24ba0ed537a930` |
+
+The authoritative red ran at 02:49:14–02:49:32 UTC; the successful behavior run
+at 02:51:32–02:52:07 UTC on 24 October. Earlier harness/selector attempts remain
+retained. Root verification matched current sources, binaries, raw results,
+discovery and review bindings. Actual hosted option maps remain unobserved:
+the local contract defect is established, but this repair has not yet passed
+hosted Docker or proved the sole restart cause. Linux race, E5 and M4 remain
+unaccepted.
+
+## Hosted attribution on the diagnostic successor
+
+Published `92b687d6a20101871e7136fe566b76faa83de8e1` executes through synthetic
+merge `d5af8c08d07fc14d43ef5c9970c4847612cc872f`, tree
+`fa0edf55de5ae33d1567b591a29daa6ac387f3ce`, identical to the published head.
+Both real controller restart children now report
+`cold_construction/cold_builder_attestation`:
+
+- [TLS restart](https://github.com/tyhuang9/rig/actions/runs/40055093411/job/120756223879),
+  raw SHA-256 `70be001bfca2bf71ad9fb3812beb0a151be6493efb26a635777c02cc71ad44b3`.
+- [Process-kill restart](https://github.com/tyhuang9/rig/actions/runs/40055093411/job/120756223651),
+  raw SHA-256 `149fb591b176898c0376cc5fae5799f680e7fe6912c457be8296ef32e67d4384`.
+
+This identifies the retained-builder validation boundary, without yet proving
+the exact failing predicate. The 02:45 UTC snapshot has four failed checks,
+seven successful, 15 running, 114 queued and one skipped. Migration still
+pauses at predecessor retirement; the stopped-stage test still fails before
+fresh-manager replay. All four logs are captured against the exact checkout in
+`pr222-92b-first-failure-batch-20261024.json`, SHA-256
+`5029456e1990ca7b710821859d76b578725c3bead2eb9b4308902eb4d62cafe5`.
+
+The 02:52 UTC snapshot has 11 failed checks, ten successful, 15 running, 104
+queued and one skipped. Both LAN checks repeat predecessor-retirement refusal;
+runtime/controller-recovery and stage/final-config tests repeat typed-manager
+or fresh-manager failures. One stage-start case refuses initial classification
+after an earlier uncertain stage; this does not prove carryover as its cause.
+All 11 exact-checkout logs are indexed in
+`pr222-92b-second-failure-batch-20261024.json`, SHA-256
+`9ac6d8c8aef7930c160006ec12edf4ddb0eee651f4309318db0f48c015c23c09`.
+
 ## Cold-accounting boundary attribution
 
 The remaining hosted `cold_accounting` refusal does not identify which
