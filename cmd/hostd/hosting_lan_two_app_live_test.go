@@ -187,7 +187,6 @@ func TestLiveControllerTwoAppLANJourney(t *testing.T) {
 	}
 	access := appaccess.New(db)
 	grantTrace := &lanTwoAppGrantTrace{Manager: composition.ingress}
-	composition.ingress.TraceGatewayV2LANGrantForLiveDocker(grantTrace.recordDriver)
 	t.Cleanup(func() { grantTrace.logFailure(t) })
 	api := httptest.NewServer((&controller.Server{
 		Auth: authService, Apps: appStore, Jobs: jobStore, Machines: machineStore, Sources: sources,
