@@ -388,13 +388,8 @@ func candidateOwnerPhysicalInspection(physical candidateOwnerPhysical) generated
 	if receiptID == "" {
 		receiptID = policy.identity.ReceiptID
 	}
-	labels := map[string]string{
-		"io.rig.managed": "generated-runtime", "io.rig.application": policy.identity.AppID,
-		"io.rig.release": policy.identity.ReleaseID, "io.rig.deployment": policy.identity.DeploymentID,
-		"io.rig.artifact": policy.identity.ArtifactID, "io.rig.plan": policy.identity.DeploymentPlanRevisionID,
-		"io.rig.component": policy.identity.Component, "io.rig.role": policy.identity.Role,
-		"io.rig.slot": policy.identity.Slot, generatedcontainer.ReceiptLabel: receiptID,
-	}
+	policy.identity.ReceiptID = receiptID
+	labels := candidatePolicyContainerLabels(policy)
 	tmpfs := map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=" + strconv.FormatInt(policy.limits.TmpfsBytes, 10)}
 	if policy.identity.Technology == "nextjs" {
 		tmpfs[policy.identity.WorkingDirectory+"/.next/cache"] = "rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size=" + strconv.FormatInt(generatedcontainer.NextCacheTmpfsBytes, 10)

@@ -723,7 +723,7 @@ func TestGeneratedDomainConstructionReconstructsColdAccounting(t *testing.T) {
 						"io.rig.managed": "generated-runtime-network", "io.rig.application": policy.identity.AppID,
 					}, data: generatedDomainDockerObjectData{driver: "bridge", scope: "local", options: map[string]string{}}},
 				generatedDomainDockerObject{kind: "container", id: candidateIdentity.ContainerID,
-					name: policy.identity.ContainerName, labels: generatedDomainColdContainerLabels(policy.identity)},
+					name: policy.identity.ContainerName, labels: candidatePolicyContainerLabels(policy)},
 			)
 			identity.options.HostPort = journal.Source.LocalHostPort
 			runner := &generatedDomainConstructionRunner{candidate: candidate.runner,
@@ -827,7 +827,7 @@ func TestGeneratedDomainConstructionReconstructsColdAccounting(t *testing.T) {
 						"io.rig.managed": "generated-runtime-network", "io.rig.application": policy.identity.AppID,
 					}, data: generatedDomainDockerObjectData{driver: "bridge", scope: "local", options: map[string]string{}}},
 				generatedDomainDockerObject{kind: "container", id: candidateIdentity.ContainerID,
-					name: policy.identity.ContainerName, labels: generatedDomainColdContainerLabels(policy.identity)},
+					name: policy.identity.ContainerName, labels: candidatePolicyContainerLabels(policy)},
 			)
 			identity.options.HostPort = journal.Source.LocalHostPort
 			runner := &generatedDomainConstructionRunner{candidate: candidate.runner,

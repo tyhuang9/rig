@@ -1006,7 +1006,7 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 						errors.Join(errGeneratedDomainConstructionRefused, err))
 				}
 				container := expectedObject{name: policy.identity.ContainerName,
-					id: component.containerID, labels: generatedDomainColdContainerLabels(policy.identity)}
+					id: component.containerID, labels: candidatePolicyContainerLabels(policy)}
 				if previous, exists := containers[component.containerID]; exists && !reflect.DeepEqual(previous, container) {
 					return errGeneratedDomainConstructionRefused
 				}
@@ -1186,16 +1186,6 @@ func attestGeneratedDomainColdGateway(ctx context.Context, manager *Manager,
 		return errors.Join(errGeneratedDomainConstructionRefused, err)
 	}
 	return nil
-}
-
-func generatedDomainColdContainerLabels(identity generatedcontainer.Identity) map[string]string {
-	return map[string]string{
-		"io.rig.managed": "generated-runtime", "io.rig.application": identity.AppID,
-		"io.rig.release": identity.ReleaseID, "io.rig.deployment": identity.DeploymentID,
-		"io.rig.artifact": identity.ArtifactID, "io.rig.plan": identity.DeploymentPlanRevisionID,
-		"io.rig.component": identity.Component, "io.rig.slot": identity.Slot,
-		"io.rig.role": identity.Role, generatedcontainer.ReceiptLabel: identity.ReceiptID,
-	}
 }
 
 func generatedDomainColdImageLabels(pins candidateValidationPins, component candidateAdmissionComponent,

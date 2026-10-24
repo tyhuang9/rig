@@ -260,18 +260,7 @@ func candidatePolicyCreateArgs(p candidatePolicy, environmentPath string) ([]str
 	if p.identity.Technology == "nextjs" {
 		args = append(args, "--tmpfs", p.identity.WorkingDirectory+"/.next/cache:rw,noexec,nosuid,nodev,uid=1000,gid=1000,mode=0700,size="+strconv.FormatInt(generatedcontainer.NextCacheTmpfsBytes, 10))
 	}
-	labels := map[string]string{
-		"io.rig.managed":                "generated-runtime",
-		"io.rig.application":            p.identity.AppID,
-		"io.rig.release":                p.identity.ReleaseID,
-		"io.rig.deployment":             p.identity.DeploymentID,
-		"io.rig.artifact":               p.identity.ArtifactID,
-		"io.rig.plan":                   p.identity.DeploymentPlanRevisionID,
-		"io.rig.component":              p.identity.Component,
-		"io.rig.role":                   p.identity.Role,
-		"io.rig.slot":                   p.identity.Slot,
-		generatedcontainer.ReceiptLabel: p.identity.ReceiptID,
-	}
+	labels := candidatePolicyContainerLabels(p)
 	keys := make([]string, 0, len(labels))
 	for key := range labels {
 		keys = append(keys, key)
@@ -282,6 +271,22 @@ func candidatePolicyCreateArgs(p candidatePolicy, environmentPath string) ([]str
 	}
 	args = append(args, p.identity.ImageContentID, "/bin/sh", "-lc", p.runCommand)
 	return args, nil
+}
+
+func candidatePolicyContainerLabels(p candidatePolicy) map[string]string {
+	return map[string]string{
+		"io.rig.managed":                "generated-runtime",
+		"io.rig.application":            p.identity.AppID,
+		"io.rig.release":                p.identity.ReleaseID,
+		"io.rig.deployment":             p.identity.DeploymentID,
+		"io.rig.artifact":               p.identity.ArtifactID,
+		"io.rig.plan":                   p.identity.DeploymentPlanRevisionID,
+		"io.rig.component":              p.identity.Component,
+		"io.rig.definition":             p.buildDefinitionDigest,
+		"io.rig.role":                   p.identity.Role,
+		"io.rig.slot":                   p.identity.Slot,
+		generatedcontainer.ReceiptLabel: p.identity.ReceiptID,
+	}
 }
 
 func (a *GeneratedCandidateAuthority) prepareCandidateCommand(args []string) (runtimeprocess.CommandRequest, error) {

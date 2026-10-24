@@ -303,6 +303,127 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBaseline)
 }
 
+func TestGeneratedDomainColdAcceptsDockerMergedCandidateContainerLabels(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(candidatePolicy, map[string]string) bool
+		pass   bool
+	}{
+		{name: "docker_merged_authenticated_definition", pass: true},
+		{name: "missing_authenticated_definition", mutate: func(policy candidatePolicy, labels map[string]string) bool {
+			if policy.identity.Component == "frontend" {
+				delete(labels, "io.rig.definition")
+				return true
+			}
+			return false
+		}},
+		{name: "crossed_authenticated_definition", mutate: func(policy candidatePolicy, labels map[string]string) bool {
+			if policy.identity.Component == "frontend" {
+				crossed := strings.Repeat("0", 64)
+				if crossed == policy.buildDefinitionDigest {
+					crossed = strings.Repeat("1", 64)
+				}
+				labels["io.rig.definition"] = crossed
+				return true
+			}
+			return false
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture := newGeneratedDomainTwoComponentColdFixture(t)
+				generatedDomainTwoComponentApplyLegacyDockerLabelMerge(t, &fixture, test.mutate)
+				result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+					fixture.construction, fixture.environment, fixture.identity.options)
+				if test.pass {
+					if err != nil {
+						t.Fatalf("Docker-merged authenticated candidate labels remained refused: %v", err)
+					}
+					if result == nil || result.cold == nil || len(result.cold.groups) != 1 ||
+						len(result.cold.groups[0].components) != 2 {
+						t.Fatal("Docker-merged authenticated candidate labels did not reconstruct the exact group")
+					}
+				} else {
+					if result != nil || err == nil || !errors.Is(err, errGeneratedDomainConstructionRefused) {
+						t.Fatalf("invalid Docker-merged authenticated candidate labels = %#v, %v", result, err)
+					}
+					assertGeneratedDomainConstructionDiagnostic(t, err,
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupLabels,
+						"generated domain construction was refused: stage=cold_construction reason=cold_group_labels")
+				}
+				commands := fixture.runner.snapshot()
+				for _, command := range commands {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+						t.Fatal("Docker-merged candidate labels dispatched an effect or capacity probe")
+					}
+				}
+				if !test.pass {
+					generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+				}
+			})
+		})
+	}
+}
+
+func generatedDomainTwoComponentApplyLegacyDockerLabelMerge(t *testing.T,
+	fixture *generatedDomainTwoComponentColdFixture, mutate func(candidatePolicy, map[string]string) bool,
+) {
+	t.Helper()
+	roster, ok := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
+	if !ok {
+		t.Fatal("two-component candidate roster is unavailable")
+	}
+	mutations := 0
+	for _, physical := range roster.physical {
+		args, err := physical.policy.createArgs("")
+		if err != nil {
+			t.Fatal("create authenticated candidate arguments")
+		}
+		explicit := candidatePolicyLabels(args)
+		if explicit["io.rig.definition"] != physical.policy.buildDefinitionDigest {
+			t.Fatal("candidate create arguments omitted the authenticated definition")
+		}
+		delete(explicit, "io.rig.definition")
+		if _, exists := explicit["io.rig.definition"]; exists {
+			t.Fatal("legacy candidate labels retained an explicit definition")
+		}
+
+		var imageLabels map[string]string
+		containerIndex := -1
+		for index := range fixture.runner.delegate.objects {
+			object := &fixture.runner.delegate.objects[index]
+			switch {
+			case object.kind == "image" && object.id == physical.policy.identity.ImageContentID:
+				imageLabels = cloneStringMap(object.labels)
+			case object.kind == "container" && object.id == physical.containerID:
+				containerIndex = index
+			}
+		}
+		if imageLabels["io.rig.definition"] != physical.policy.buildDefinitionDigest || containerIndex < 0 {
+			t.Fatal("authenticated image and container labels are incomplete")
+		}
+		for key, value := range imageLabels {
+			if _, exists := explicit[key]; !exists {
+				explicit[key] = value
+			}
+		}
+		if explicit["io.rig.definition"] != physical.policy.buildDefinitionDigest {
+			t.Fatal("Docker image label merge omitted the authenticated definition")
+		}
+		if mutate != nil && mutate(physical.policy, explicit) {
+			mutations++
+		}
+		fixture.runner.delegate.objects[containerIndex].labels = explicit
+	}
+	if mutate != nil && mutations != 1 {
+		t.Fatal("Docker label mismatch control did not alter exactly one candidate container")
+	}
+}
+
 func TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDrift(t *testing.T) {
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdGroupAttestation)
 }
@@ -1040,7 +1161,7 @@ func newGeneratedDomainTwoComponentColdFixture(t *testing.T, builderOptions ...b
 					"io.rig.definition": policy.buildDefinitionDigest},
 				data: generatedDomainDockerObjectData{contentID: policy.identity.ImageContentID}},
 			generatedDomainDockerObject{kind: "container", id: value.containerID,
-				name: policy.identity.ContainerName, labels: generatedDomainColdContainerLabels(policy.identity)},
+				name: policy.identity.ContainerName, labels: candidatePolicyContainerLabels(policy)},
 		)
 	}
 	objects = append(objects, generatedDomainDockerObject{kind: "network", id: strings.Repeat("6", 64),

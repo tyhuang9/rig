@@ -832,7 +832,7 @@ func generatedDomainA0ApplicationObjects(t *testing.T,
 					"io.rig.definition": policy.buildDefinitionDigest},
 				data: generatedDomainDockerObjectData{contentID: policy.identity.ImageContentID}},
 			generatedDomainDockerObject{kind: "container", id: value.containerID,
-				name: policy.identity.ContainerName, labels: generatedDomainColdContainerLabels(policy.identity)})
+				name: policy.identity.ContainerName, labels: candidatePolicyContainerLabels(policy)})
 		if previous, exists := networks[policy.identity.NetworkName]; exists && previous != policy.identity.AppID {
 			t.Fatal("A0 application network is crossed")
 		}
