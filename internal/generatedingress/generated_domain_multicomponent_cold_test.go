@@ -55,6 +55,30 @@ type generatedDomainCandidateRosterRunner struct {
 	after      func()
 }
 
+type generatedDomainTwoComponentColdCase struct {
+	name                   string
+	builder                bool
+	mutate                 func(*generatedDomainTwoComponentColdFixture)
+	pass                   bool
+	stage                  generatedDomainConstructionStage
+	reason                 generatedDomainConstructionReason
+	withoutRefusalSentinel bool
+	privateCause           bool
+}
+
+type generatedDomainTwoComponentColdPartition uint8
+
+const (
+	generatedDomainTwoComponentColdBaseline generatedDomainTwoComponentColdPartition = iota
+	generatedDomainTwoComponentColdGroupAttestation
+	generatedDomainTwoComponentColdBuilderNamespace
+	generatedDomainTwoComponentColdBuilderIdentityAndRead
+	generatedDomainTwoComponentColdBuilderPhysicalPolicy
+	generatedDomainTwoComponentColdBuilderRequiredNetworkOptions
+	generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondence
+	generatedDomainTwoComponentColdBuilderFinalIdentity
+)
+
 type generatedDomainTwoComponentRouteRunner struct {
 	daemonID           string
 	delegate           runtimeprocess.CommandRunner
@@ -276,19 +300,40 @@ func (r *generatedDomainCandidateRosterRunner) Run(_ context.Context,
 }
 
 func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
-	for _, test := range []struct {
-		name                   string
-		builder                bool
-		mutate                 func(*generatedDomainTwoComponentColdFixture)
-		pass                   bool
-		stage                  generatedDomainConstructionStage
-		reason                 generatedDomainConstructionReason
-		withoutRefusalSentinel bool
-		privateCause           bool
-	}{
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBaseline)
+}
+
+func TestGeneratedDomainColdRejectsTwoComponentGroupAttestationDrift(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdGroupAttestation)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderNamespaceDrift(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderNamespace)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderIdentityAndReadDrift(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderIdentityAndRead)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderPhysicalPolicyDrift(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderPhysicalPolicy)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderRequiredNetworkOptions(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderRequiredNetworkOptions)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderNetworkOptionCorrespondence(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondence)
+}
+
+func TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDrift(t *testing.T) {
+	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderFinalIdentity)
+}
+
+func generatedDomainTwoComponentColdCases(t *testing.T) []generatedDomainTwoComponentColdCase {
+	t.Helper()
+	return []generatedDomainTwoComponentColdCase{
 		{name: "exact_api_and_frontend_without_builder", pass: true},
 		{name: "exact_api_frontend_and_persisted_builder", builder: true, pass: true},
 		{name: "writer_accepted_persisted_builder_network_options", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
@@ -485,7 +530,49 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 				clear(body)
 			}
 		}, reason: generatedDomainConstructionReasonColdBuilderFinal},
-	} {
+	}
+}
+
+func generatedDomainTwoComponentColdPartitionBounds(t *testing.T,
+	partition generatedDomainTwoComponentColdPartition,
+) (int, int) {
+	t.Helper()
+	switch partition {
+	case generatedDomainTwoComponentColdBaseline:
+		return 0, 5
+	case generatedDomainTwoComponentColdGroupAttestation:
+		return 5, 9
+	case generatedDomainTwoComponentColdBuilderNamespace:
+		return 9, 13
+	case generatedDomainTwoComponentColdBuilderIdentityAndRead:
+		return 13, 18
+	case generatedDomainTwoComponentColdBuilderPhysicalPolicy:
+		return 18, 23
+	case generatedDomainTwoComponentColdBuilderRequiredNetworkOptions:
+		return 23, 28
+	case generatedDomainTwoComponentColdBuilderNetworkOptionCorrespondence:
+		return 28, 33
+	case generatedDomainTwoComponentColdBuilderFinalIdentity:
+		return 33, 38
+	default:
+		t.Fatalf("unknown two-component cold partition: %d", partition)
+		return 0, 0
+	}
+}
+
+func testGeneratedDomainTwoComponentColdPartition(t *testing.T,
+	partition generatedDomainTwoComponentColdPartition,
+) {
+	t.Helper()
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	cases := generatedDomainTwoComponentColdCases(t)
+	if len(cases) != 38 {
+		t.Fatalf("two-component cold case count = %d, want 38", len(cases))
+	}
+	start, end := generatedDomainTwoComponentColdPartitionBounds(t, partition)
+	for _, test := range cases[start:end] {
 		t.Run(test.name, func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture := newGeneratedDomainTwoComponentColdFixture(t, test.builder)
@@ -557,62 +644,66 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 		})
 	}
 
-	t.Run("cold_group_gateway_attestation_failure", func(t *testing.T) {
-		generatedDomainConstructionCase(t, func(t *testing.T) {
-			fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
-			roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
-			for _, group := range groups {
-				for _, component := range group.snapshot.components {
-					if component.state == generatedruntimestate.ComponentRunning ||
-						component.state == generatedruntimestate.ComponentHealthy ||
-						component.state == generatedruntimestate.ComponentActive ||
-						component.state == generatedruntimestate.ComponentDraining {
-						roster.afterAt++
+	if partition == generatedDomainTwoComponentColdGroupAttestation {
+		t.Run("cold_group_gateway_attestation_failure", func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
+				roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
+				for _, group := range groups {
+					for _, component := range group.snapshot.components {
+						if component.state == generatedruntimestate.ComponentRunning ||
+							component.state == generatedruntimestate.ComponentHealthy ||
+							component.state == generatedruntimestate.ComponentActive ||
+							component.state == generatedruntimestate.ComponentDraining {
+							roster.afterAt++
+						}
 					}
 				}
-			}
-			roster.afterKind = candidateOwnerNetworkInspect
-			roster.after = func() {
-				result.candidates.process = &generatedDomainCandidateRosterRunner{}
-			}
-			err := attestGeneratedDomainColdGroups(context.Background(), result.manager, result.candidates, observed, groups)
-			assertGeneratedDomainConstructionDiagnostic(t, err,
-				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdGroupGatewayAttestation,
-				"generated domain construction was refused: stage=cold_construction reason=cold_group_gateway_attestation")
-			if !errors.Is(err, errGeneratedDomainConstructionRefused) {
-				t.Fatalf("cold group gateway attestation hid refusal sentinel: %v", err)
-			}
-			for _, command := range fixture.runner.snapshot() {
-				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
-					t.Fatalf("cold group gateway refusal dispatched effect/capacity probe: %#v", command)
+				roster.afterKind = candidateOwnerNetworkInspect
+				roster.after = func() {
+					result.candidates.process = &generatedDomainCandidateRosterRunner{}
 				}
-			}
+				err := attestGeneratedDomainColdGroups(context.Background(), result.manager, result.candidates, observed, groups)
+				assertGeneratedDomainConstructionDiagnostic(t, err,
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupGatewayAttestation,
+					"generated domain construction was refused: stage=cold_construction reason=cold_group_gateway_attestation")
+				if !errors.Is(err, errGeneratedDomainConstructionRefused) {
+					t.Fatalf("cold group gateway attestation hid refusal sentinel: %v", err)
+				}
+				for _, command := range fixture.runner.snapshot() {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+						t.Fatalf("cold group gateway refusal dispatched effect/capacity probe: %#v", command)
+					}
+				}
+			})
 		})
-	})
+	}
 
-	t.Run("cold_group_structural_fallback_remains_generic", func(t *testing.T) {
-		generatedDomainConstructionCase(t, func(t *testing.T) {
-			fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
-			delete(groups[0].policies, "api")
-			source := attestGeneratedDomainColdGroups(context.Background(), result.manager, result.candidates, observed, groups)
-			if !errors.Is(source, errGeneratedDomainConstructionRefused) {
-				t.Fatalf("cold group structural refusal = %v", source)
-			}
-			err := generatedDomainConstructionBoundaryDiagnostic(
-				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdGroupAttestation, source)
-			assertGeneratedDomainConstructionDiagnostic(t, err,
-				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdGroupAttestation,
-				"generated domain construction was refused: stage=cold_construction reason=cold_group_attestation")
-			for _, command := range fixture.runner.snapshot() {
-				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
-					t.Fatalf("cold group structural refusal dispatched effect/capacity probe: %#v", command)
+	if partition == generatedDomainTwoComponentColdBuilderNamespace {
+		t.Run("cold_group_structural_fallback_remains_generic", func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
+				delete(groups[0].policies, "api")
+				source := attestGeneratedDomainColdGroups(context.Background(), result.manager, result.candidates, observed, groups)
+				if !errors.Is(source, errGeneratedDomainConstructionRefused) {
+					t.Fatalf("cold group structural refusal = %v", source)
 				}
-			}
+				err := generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupAttestation, source)
+				assertGeneratedDomainConstructionDiagnostic(t, err,
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupAttestation,
+					"generated domain construction was refused: stage=cold_construction reason=cold_group_attestation")
+				for _, command := range fixture.runner.snapshot() {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+						t.Fatalf("cold group structural refusal dispatched effect/capacity probe: %#v", command)
+					}
+				}
+			})
 		})
-	})
+	}
 }
 
 func generatedDomainTwoComponentColdAttestationFixture(t *testing.T) (generatedDomainTwoComponentColdFixture,
