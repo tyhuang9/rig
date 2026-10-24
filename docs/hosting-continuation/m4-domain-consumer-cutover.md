@@ -17,6 +17,90 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Retained-builder invariant attribution
+
+The current controller failure is still collapsed at retained-builder validation.
+A six-file diagnostic change adds eleven fixed reasons at the existing protected
+identity, census, container/network/image read and policy, census-to-detail
+correspondence, repeated observation and final protected-identity boundaries.
+The existing predicates, short-circuit order, read count, effects and collapsed
+error causes remain unchanged. Input and fallback reasons remain available.
+
+The controls exercise actual failures at every new boundary and require the
+specific reason, refusal sentinel, absence of the injected private read error
+throughout the error tree, and the existing no-effect checks. Both hostd
+projection surfaces accept the new reasons only with `cold_construction`.
+Review identified a missing wrong-stage control; two refusal rows were added
+for `empty_construction/cold_builder_identity` before the final freeze.
+
+The initial Windows run at 03:10:49–03:11:47 UTC on 24 October passed the two
+ingress parents, the hostd projection parent, formatting of all six files,
+ingress and tagged hostd vet, canonical generation and diff checks. Only the
+hostd control file subsequently changed. Its successor at 03:12:25–03:12:34
+passed tagged compilation, exact discovery/execution, formatting, tagged vet,
+canonical generation and diff checks. Unchanged ingress evidence is retained.
+
+The final composite contains 54 unique ingress passes (two parents and 52
+children) and 175 hostd passes (one parent and 174 children): 229 passes with
+no failures or skips. Counts come from terminal raw records, deduplicating
+child-process echoes. Source/privacy review found no remaining issue; root
+verification matched all six final sources, binaries, raw results and discovery.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `cold-builder-finite-attribution-20261024T031043Z/receipt.json` | `d4dd65bb5c58983e081790d8cdcc7387a8341f3f8c0fb818e726fb140190768e` |
+| `cold-builder-finite-attribution-successor-20261024T031222Z/receipt.json` | `4d57705d9a78208e17e56fed5ca46c0d46a9df5fb83f575e47467cdd33067eb2` |
+| `cold-builder-invariant-attribution-source-security-review-20261024.md` | `dec764fa57a4fc178096b5708aa663801fe6a0f8c797af29ec4f863dd79b0083` |
+| `cold-builder-invariant-attribution-root-audit-20261024.json` | `5a08624676324314a6b13c2d76063f3459dd075917dca1d794a0f308bad0db15` |
+
+This is diagnostic coverage. Actual hosted predicate identification, Docker
+and race acceptance, predecessor retirement and M4 remain incomplete.
+
+## Hosted results after network-policy alignment
+
+Published `6da5c421714d385913bcbee265a1644ada08e3e9` executes through synthetic
+merge `5dcaff21e545f7a30c87eeb009174331f3340f4c`, with tree
+`37207f309a61aef7654f4e1f534aa3e9522913ee`, identical to the published head.
+Both controller restart jobs still fail at
+`cold_construction/cold_builder_attestation`:
+
+- [Process-kill restart](https://github.com/tyhuang9/rig/actions/runs/40056485792/job/120760495254),
+  raw SHA-256 `be4833d684c2527050ff52e50625d91e16bd3e3a66453d581308cd4c5e8adc13`.
+- [TLS restart](https://github.com/tyhuang9/rig/actions/runs/40056485792/job/120760495494),
+  raw SHA-256 `dec0cc73435a7648db9f11ecbfb295bcf80f3e28ba5567713b6b66f69bf07fee`.
+
+The local network-policy defect is established, but its repair is insufficient
+for these paths. The underlying hosted builder predicate remains unknown.
+
+The separate [full-controller first-boundary test](https://github.com/tyhuang9/rig/actions/runs/40056485869/job/120760686607)
+now retains `startup_observation/physical_identity` for the `a0-sql-claim`
+child's failure before daemon assembly. Its raw SHA-256 is
+`b8f6ef4691b664961e1e393f8dfe898b904f5743cbfd7f2e84765b5876d47dfe`.
+This demonstrates that the diagnostic projection works on the hosted failure;
+it identifies a distinct boundary, without proving its deeper cause.
+
+At 03:05:11 UTC on 24 October, the partial snapshot has six failed checks,
+six successful, 16 running, 112 queued and one skipped. The other failures
+remain predecessor retirement, typed-manager opening and final-config replay
+construction. All six exact-checkout logs are indexed in
+`pr222-6da5-first-failure-batch-20261024.json`, SHA-256
+`bde022654b0180de93c551a2b51348c57f047c35d229263f540356e7961fdc38`.
+The snapshot SHA-256 is
+`4924f675dc3b4a78ced2f9fe4a86f514b2f442bdaa28ff21a1741cbfac02d5ec`.
+The controller workflow is terminal; broader hosted acceptance remains pending.
+
+At 03:12:01 UTC, the snapshot has 12 failures, 12 successful checks, 17 running,
+99 queued and one skipped. New captures repeat predecessor-retirement refusal,
+typed-manager opening, proposal-manager opening and fresh-manager replay
+construction. The current stopped-stage job fails at the same direct `New`
+call before replay. All 12 exact-checkout logs are indexed in
+`pr222-6da5-second-failure-batch-20261024.json`, SHA-256
+`4eec75c0f57de1f3e9085ad184dbc1027e59c1133e12b4a9610e2d1aac737af8`.
+The snapshot SHA-256 is
+`92dcc0657d8890e74da6a190e29918a666e2c44192d5f9461be05f11e796d93f`.
+
 ## Full-controller diagnostic projection
 
 The full-hostd test harness previously discarded an existing closed construction
