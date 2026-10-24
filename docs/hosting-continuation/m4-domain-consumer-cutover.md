@@ -17,6 +17,69 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Authenticated database opening in full hostd
+
+The full-controller `startup_observation/physical_identity` failure exposed a
+concrete opener mismatch. `runServerWithAssembly` held the controller-owner
+lease but passed an ordinary `database.Open` handle into generated-domain
+construction. That constructor requires protected database provenance issued
+by `OpenForGeneratedDomain`. The working controller restart helper already
+used that authenticated opener.
+
+Commit `b32a771e3e16652ae580372ba04e27a6e298e343` routes the existing server
+database open through a private mode-aware helper. Generated hosting uses
+`OpenForGeneratedDomain` with the configured root and already-held owner lease;
+disabled and Compose-only modes retain the ordinary opener. Acquisition,
+recovery, emergency-stop and teardown order remain unchanged. The database
+still closes before its owner lease. No provenance check is relaxed.
+
+The regression exercises the actual production helper with the old plain-open
+behavior first. It fails for missing provenance with the exact lease and for
+incorrectly returning databases with missing or foreign leases; ordinary modes
+pass. The repaired parent and all five children pass on Windows and native
+Linux. They require accepted exact-owner provenance, ordinary modes remaining
+unsealed, and missing/foreign leases returning no database or target file.
+
+The red ran at 03:19:59–03:20:04 UTC on 24 October; Windows successor at
+03:20:39–03:20:48 and native Linux/extra tagged compilation at 03:21:41–03:21:57.
+Formatting, hostd vet, canonical generation, diff checks, ordinary compilation
+and live-tagged hostd compilation pass. Source/security review found no issue;
+root verification binds both final sources, actual raw results and binaries.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `hostd-generated-database-opener-red-20261024T031959Z/receipt.json` | `4174203146839dc1dafe98f73fe2f727ab4df40fa82a3817062d00666c040e79` |
+| `hostd-generated-database-opener-successor-20261024T032035Z/receipt.json` | `f25fbff7f1a5449cf8017fe0fafce9b49e15fba652a794a3b3ecf13e44ff48b8` |
+| `hostd-generated-database-opener-linux-20261024T032137Z/receipt.json` | `8629fbeff2b02e9de0a5401a6ead597270d54170fb0cd25b79a5ac156a8b4281` |
+| `hostd-generated-database-opener-source-security-review-20261024.md` | `3974e77b756d7de17b60ab7b1154647aed2f04105954465453ad0b349120da96` |
+| `hostd-generated-database-opener-root-audit-20261024.json` | `42f9da72bdf192a04f0f44c810db8420a800d3e7a676987f80590822fac59f9e` |
+
+This establishes the opener contract repair. Full-hostd and real Docker
+acceptance still require hosted execution; it is not evidence that this was
+the only startup failure. Builder validation and predecessor retirement remain
+separate work.
+
+## Hosted builder read attribution
+
+On published `22b40e4bc42bf974014f9792f7447cface1c098c`, both controller
+restart jobs now report `cold_construction/cold_builder_container_read`:
+
+- [TLS restart](https://github.com/tyhuang9/rig/actions/runs/40057623879/job/120763994032),
+  raw SHA-256 `07d1bf3afd82844b58dc8df42efd88e992f874ef00c388db38845cd4dee4d64e`.
+- [Process-kill restart](https://github.com/tyhuang9/rig/actions/runs/40057623879/job/120763993817),
+  raw SHA-256 `d40b38732b90f85f16317240e0a26d6d941a6099277369fb1a3f9dccb725769f`.
+
+Both execute synthetic merge `b7be999e90a59ea498513eda8bf9379cf50a8902`, tree
+`b337eb5f51d823247bc472e03f094f381662f486`, identical to the published head.
+This narrows the failure to the container read boundary, which also includes
+decode and image-identity checks. It does not yet prove the exact cause.
+At 03:22:05 UTC the partial snapshot has two failures, four successful checks,
+13 running, 121 queued and one skipped. Both logs are indexed in
+`pr222-22b-first-failure-batch-20261024.json`, SHA-256
+`262362275bd4898b9c01a0548804607bbb0b89bc475f738e3be4ac8b4c0d7e13`.
+
 ## Retained-builder invariant attribution
 
 The current controller failure is still collapsed at retained-builder validation.
