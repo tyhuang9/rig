@@ -29,6 +29,7 @@ import (
 	"github.com/hostd/hostd/internal/hostnetwork"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/runtime/securetemp"
 )
 
 const (
@@ -66,6 +67,27 @@ type liveGatewayV2Fixture struct {
 	port         uint16
 	request      GatewayV2UpgradeRequest
 	source       routeState
+}
+
+func newLiveGatewayV2FixtureRoot(t testing.TB) string {
+	t.Helper()
+	root := t.TempDir()
+	if runtime.GOOS == "windows" {
+		builder, err := securetemp.NewGeneratedBuilderDirectory(root)
+		if err != nil {
+			t.Fatal("create live gateway-v2 fixture namespace")
+		}
+		root, err = builder.EnsureDirectory("gateway-v2-fixture")
+		if err != nil {
+			t.Fatal("create live gateway-v2 fixture root")
+		}
+	} else if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal("protect live gateway-v2 fixture root")
+	}
+	if err := securetemp.ValidatePrivateDirectory(root); err != nil {
+		t.Fatal("validate live gateway-v2 fixture root")
+	}
+	return root
 }
 
 // TestLiveGatewayV2UpgradeCommitAndRestart is the hosted Linux acceptance
@@ -196,7 +218,7 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 		t.Fatal("resolve docker executable")
 	}
 
-	root := t.TempDir()
+	root := newLiveGatewayV2FixtureRoot(t)
 	stateRoot := filepath.Join(root, "ingress-state")
 	if err := os.Mkdir(stateRoot, 0o700); err != nil {
 		t.Fatal("create live gateway-v2 controller state root:", err)

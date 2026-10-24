@@ -21,7 +21,6 @@ import (
 	"github.com/hostd/hostd/internal/database"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 	"github.com/hostd/hostd/internal/runtime/securetemp"
-	generateddomaintest "github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 const (
@@ -487,7 +486,7 @@ func newLiveGatewayRebindStoppedStageManifestFixture(t *testing.T) (
 	liveGatewayRebindStoppedStageReplayManifest, string,
 ) {
 	t.Helper()
-	root := generateddomaintest.NewRetainedRoot(t)
+	root := newLiveGatewayV2FixtureRoot(t)
 	dataRoot := filepath.Join(root, "ingress-state")
 	if err := os.Mkdir(dataRoot, 0o700); err != nil {
 		t.Fatal("create stopped-stage protocol data root")
@@ -599,6 +598,24 @@ func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
 	})
 
 	if runtime.GOOS != "windows" {
+		t.Run("broad fixture root is refused without repair", func(t *testing.T) {
+			value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
+			if err := os.Chmod(value.FixtureRoot, 0o755); err != nil {
+				t.Fatal("broaden stopped-stage replay fixture root")
+			}
+			path := filepath.Join(value.ControlDirectory, "manifest.json")
+			if _, err := writeLiveGatewayRebindStoppedStageReplayManifest(value, docker); err == nil {
+				t.Fatal("broad stopped-stage replay fixture root was accepted")
+			}
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				t.Fatal("refused stopped-stage replay manifest was created")
+			}
+			info, err := os.Stat(value.FixtureRoot)
+			if err != nil || info.Mode().Perm() != 0o755 {
+				t.Fatal("stopped-stage replay manifest writer repaired a broad fixture root")
+			}
+		})
+
 		t.Run("broad control directory is refused without repair", func(t *testing.T) {
 			value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
 			path, err := writeLiveGatewayRebindStoppedStageReplayManifest(value, docker)
