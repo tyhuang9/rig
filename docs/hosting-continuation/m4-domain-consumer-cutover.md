@@ -17,6 +17,161 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Retained builder accounting repair
+
+Commit `8c67e25b22f20426c307cbdd8423576d041dbec2` accounts for the persistent
+BuildKit container and network during cold reconstruction. A neutral internal
+package shares the existing identity schema, naming rules and fixed resource
+policy. The image builder remains the sole identity writer. Startup reads only
+existing protected directories and files, correlates them with the exact
+container, network and referenced image, then repeats the checks before accepting
+accounting. It neither creates state nor contacts BuildKit or application ports.
+
+Both absent builder state/resources and one exact persisted pair are valid.
+Incomplete, extra, crossed or changed resources refuse startup. The final check
+binds the identity file object and contents, the protected directory, exact
+container attachment network ID, pinned image reference, resource limits,
+network membership and running state. Existing accepted identity name suffixes
+remain valid. Ordinary gateway/application labels do not identify a builder.
+The runtime parent and builder directory must both already be private; startup
+does not repair their permissions. Receipts, capacity and immutable history
+retain their existing requirements.
+
+The selected verification results are:
+
+| Selection | Windows | Native Linux |
+| --- | --- | --- |
+| Identity codec and static policy: 3 parents | 15 passes | Not selected |
+| Existing image-builder regressions: 10 parents | 16 passes | Not selected |
+| Protected-directory controls: 3 parents | 6 passes, 2 OS skips | 8 passes |
+| Two-component cold reconstruction: 1 parent, 21 children | 22 passes | 22 passes |
+
+Counts include unique parents and children, without counting repeated subprocess
+echoes. Windows skips symlink creation and portable permission broadening; both
+execute and pass on Linux. The cold controls cover the two positive states,
+missing/crossed applications, malformed or replaced identity, re-encoding,
+resource-only/identity-only state, extra/orphan objects, configuration, image,
+attachment, membership and running-state drift. Eight-file formatting,
+four-package vet, diff checks and `pwsh -NoProfile -File
+scripts/check-generation.ps1` passed.
+
+The first Windows run retained global exit status, exact discovery, binaries
+and raw output, but a function-local status accumulator omitted its per-package
+status file. An additive record discloses that limitation. Its unchanged
+identity/image cases were reused. The required permission correction received
+fresh protected-directory and cold tests on both platforms, with proper status
+records. No tests were replayed solely to manufacture missing metadata.
+
+Final source manifests match all 1,209 Go/module/SQL entries, including new
+files. Independent source security review is clear for this delta. The root
+audit verifies source/binary/raw hashes, exact discovery, actual OS skips and
+the Linux permission refusal. Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `cold-builder-ingress-final-20261024T021142Z/final-evidence-receipt.json` | `3468cbf7a8251a9f17563bea7b9fd5676ef78d393aeb4d83408c7728b92ce3d9` |
+| `cold-builder-accounting-source-security-review-20261024.md` | `3927edda725fa2d2278e4a633b544e506804ca02bc3e5f9c2e0b5a01d935ee26` |
+| `cold-builder-accounting-root-audit-20261024.json` | `cb78425e80a6f6ddddb91d05306875206437e785946060b0e449e0c8544aa5a8` |
+
+Actual Docker restart and Linux race execution remain hosted gates. These
+controlled tests do not prove that builder accounting was the only hosted
+failure. Predecessor retirement and M4 remain incomplete.
+
+## Completed second source session release
+
+Commit `198638233c5d52541030821b7c5cb2b6172b5f82` closes the second completed
+candidate session in the shared live rebind source fixture. The source already
+has two active applications, validated runtime and seeded passive lineage when
+the exact session is closed. Its map entry and immutable history remain
+available, and registered cleanup is idempotent. This releases the deployment
+effects scope before a later stage or child process acquires it. No timeout,
+child-process boundary, SQL claim, production lock or assertion is weakened.
+
+The existing `TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes` passes.
+Tagged ingress compilation and seven affected live-parent discoveries pass;
+the seventh indirect consumer was discovered separately against the same
+retained binary after the initial six-name selector omitted it. Formatting,
+tagged vet, diff checks and canonical generation pass. Actual Docker journeys
+were not run locally.
+
+Fixture receipt `gateway-rebind-second-session-close-20261024T021711Z/receipt.json`
+has SHA-256 `8dd5fd7f4c1cde7b0fd48e577074258509ae0ebf23b71274de274cf070369af6`.
+The seventh-parent addendum SHA-256 is
+`58190884d2304c197852abc29cef81e8c22b00ab8f94a80f144b922989081b85`;
+independent source review SHA-256 is
+`654c0cdcd1148ffd510d499031337e455ad3c06a0cfeec4d62756eca7bb0ec5e`.
+Zero-output compile, formatter and vet log files were not created by the
+PowerShell pipeline; their original command, time and exit records remain.
+The diff log contains only a line-ending warning. An earlier metadata note
+incorrectly listed that existing diff log as absent; it is retained and
+corrected additively without rerunning the checks.
+
+## Hosted restart refusal narrowed to cold accounting
+
+Published `2ebd18c5d0ff65236e80eaa193fa70edf1d4fbca` ran through synthetic
+merge `39271cfe2bb0c32842b9f71828f7555f8768ce76`, with identical tree
+`63d54e783fd13d6601fdbaabed30a4c83837bff7`. Both restart jobs now retain
+`construction=cold_construction/cold_accounting` in their private diagnostic:
+
+- [Process-kill recovery](https://github.com/tyhuang9/rig/actions/runs/40050347719/job/120741406528)
+  fails in its `before_build` child before the durable barrier, after healthy
+  API/frontend containers and the Chromium create journey. Raw SHA-256:
+  `b8dd79e69c9e8ecbec5eac107c116589aa1313e34e8fd82b7511d7b66d5fc739`.
+- [TLS controller journey](https://github.com/tyhuang9/rig/actions/runs/40050347719/job/120741406762)
+  passes the external PostgreSQL outage/recovery subtest before its restart
+  child fails at the same boundary. Raw SHA-256:
+  `e4f7238906352527766d93c5e6c0d75aa9d20ae3f7011ce14413bcc7c6943f31`.
+
+The label follows the error returned by `reconstructGeneratedDomainCold`.
+It narrows investigation to retained accounting reconstruction, but does not
+identify the exact census, receipt, policy, budget or durable-state predicate.
+The passing internal two-component simulation remains insufficient to explain
+the actual Docker failure. No persisted run artifacts were available from the
+controller workflow; these observations come from its retained job logs.
+
+The migration job on this head still reaches the separate unfinished
+receipt-owned predecessor retirement step. Neither restart journey passes,
+and M4 remains incomplete.
+
+### Retained builder regression reproduced locally
+
+Source inspection found that the image builder deliberately retains its
+BuildKit container and network after builds. Startup includes these resources
+in its census, but the cold expected sets currently account only for gateway
+and application resources. The prior passing two-component simulation omitted
+both the protected builder identity and the retained builder pair.
+
+The corrected simulated fixture adds `builder-identity-v2.json` and its exact
+container/network pair. On unchanged production source at `2ebd18c`, the
+`exact_api_and_frontend` child fails with `cold_construction/cold_accounting`.
+Missing/crossed application and builder controls continue to refuse startup.
+This is a reproduced accounting defect in a controlled simulation; the hosted
+logs do not contain a persisted Docker census proving that it is their only
+failed predicate.
+
+The red run occurred at 01:43:35–01:43:53 UTC on 2026-10-24. Its retained
+receipt, `cold-builder-accounting-red-20261024T0145Z/receipt.json`, has SHA-256
+`96ecf4a161e56c96674aee5481fe747349fc1cbd1bfb483415c67f7a4cb8e227`;
+the folder label is approximate. Raw SHA-256:
+`9b7ae6995a26a0402c05d2b21a08672ea018dbbd93c4fc7f49199cb983fbd0f2`.
+The command, exit status, source hash and actual times are retained. The fix
+must preserve both empty-builder and exact persisted-builder positive states,
+reject incomplete or foreign resources, and keep observation free of writes.
+
+The 02:16 UTC snapshot has 14 failed checks, 45 successful checks, 13 running,
+68 queued and one skipped. Both LAN jobs still fail at predecessor retirement;
+gateway and rebind jobs still fail at fresh-manager construction. These remain
+separate unaccepted journeys. All 14 immutable failure logs are indexed in
+`pr222-2ebd-fifth-failure-batch-20261024.json`, SHA-256
+`478c65e3542c644670f1e2a69415d89f7450fc5e75b8b0d108cd6accda243b45`.
+
+The [prepared-claim process job](https://github.com/tyhuang9/rig/actions/runs/40050347874/job/120742102090)
+advances past the initial-manager correction in `17f400c`, but its admission
+child fails after 5.02 seconds with `context deadline exceeded` at
+`gateway_rebind_cross_store_live_test.go:403`, before the SQL claim exit boundary.
+Raw SHA-256: `107390feb3ed08e782603b73e0b5fc164fa95e82774f4ea2c2a33c7fe69c2fe6`.
+This records progress and a new failure boundary, not a passed recovery journey.
+
 ## Construction boundary attribution follow-up
 
 Commit `2f534b74ad595523308f4268e5503f6e9a7da658` closes the observed
