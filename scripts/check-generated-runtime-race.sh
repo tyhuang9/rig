@@ -59,6 +59,8 @@ current_serving_predecessor_pattern='^TestGatewayCurrentPredecessor'
 domain_pattern='^TestGeneratedDomain'
 domain_startup_pattern='^TestGeneratedDomain(Startup|ProtectedStartup)'
 domain_stable_pattern='^TestGeneratedDomainStartupClassifiesStableGateway'
+domain_a0_pattern='^TestGeneratedDomainA0(CommittedV2NamespaceRequiresColdAccounting|CommittedV2NamespaceRequiresColdAccountingPart2|GatewayOnlyNamespaceRemainsExact|GatewayOnlyNamespaceRemainsExactPart2)'
+domain_cold_pattern='^TestGeneratedDomainCold(ReconstructsExactTwoComponentCurrentRoster|ReconstructsExactTwoComponentCurrentRosterPart2|AcceptsDockerMergedCandidateContainerLabels|RejectsTwoComponentGroupAttestationDrift|RejectsTwoComponentGroupAttestationDriftPart2|RejectsPersistedBuilderNamespaceDrift|RejectsPersistedBuilderNamespaceDriftPart2|RejectsPersistedBuilderIdentityAndReadDrift|RejectsPersistedBuilderIdentityAndReadDriftPart2|RejectsPersistedBuilderPhysicalPolicyDrift|RejectsPersistedBuilderPhysicalPolicyDriftPart2|RejectsPersistedBuilderRequiredNetworkOptions|RejectsPersistedBuilderRequiredNetworkOptionsPart2|RejectsPersistedBuilderNetworkOptionCorrespondence|RejectsPersistedBuilderNetworkOptionCorrespondencePart2|RejectsPersistedBuilderFinalIdentityDrift|RejectsPersistedBuilderFinalIdentityDriftPart2|RejectsTwoComponentCensusDetails|RejectsTwoComponentCensusDetailsPart2)'
 capacity_pattern='^TestGeneratedIngressCapacity'
 gateway_operations_pattern='^Test(Prepare|Observe|Recover|Commit|Retire)Gateway'
 case "$suite" in
@@ -200,7 +202,15 @@ case "$suite" in
     ;;
   domain-construction)
     packages=(./internal/generatedingress)
-    filter=(-run "$domain_pattern" -skip "$domain_startup_pattern")
+    filter=(-run "$domain_pattern" -skip "$domain_startup_pattern|$domain_a0_pattern|$domain_cold_pattern")
+    ;;
+  domain-a0)
+    packages=(./internal/generatedingress)
+    filter=(-run "$domain_a0_pattern")
+    ;;
+  domain-cold)
+    packages=(./internal/generatedingress)
+    filter=(-run "$domain_cold_pattern")
     ;;
   domain-startup-stable)
     packages=(./internal/generatedingress)
@@ -229,4 +239,15 @@ trap 'rm -f "$output"' EXIT
 go test -json "${race_flags[@]}" -count=1 -timeout=32m "${filter[@]}" "${packages[@]}" | tee "$output"
 # An empty selection must not satisfy a required race check. pipefail above
 # preserves every test, race, compilation and output-capture failure.
-jq -se 'any(.[]; .Action == "pass" and ((.Test // "") | test("^Test[^/]+$")))' "$output" > /dev/null
+expected_outer_tests=0
+case "$suite" in
+  domain-a0) expected_outer_tests=4 ;;
+  domain-cold) expected_outer_tests=19 ;;
+esac
+if [[ "$expected_outer_tests" -gt 0 ]]; then
+  jq -se --argjson expected "$expected_outer_tests" '
+    ([.[] | select(.Action == "pass" and ((.Test // "") | test("^Test[^/]+$"))) ] | length) == $expected
+  ' "$output" > /dev/null
+else
+  jq -se 'any(.[]; .Action == "pass" and ((.Test // "") | test("^Test[^/]+$")))' "$output" > /dev/null
+fi
