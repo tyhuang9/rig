@@ -122,6 +122,13 @@ func TestGeneratedDomainConstructionDiagnosticClosedAttribution(t *testing.T) {
 			generatedDomainConstructionReasonColdGroupContainerAttestation,
 			generatedDomainConstructionReasonColdGroupNetworkAttestation,
 			generatedDomainConstructionReasonColdGroupCensus,
+			generatedDomainConstructionReasonColdGroupCorrespondence,
+			generatedDomainConstructionReasonColdGroupLabels,
+			generatedDomainConstructionReasonColdGroupNetworkShape,
+			generatedDomainConstructionReasonColdGroupNetworkOptions,
+			generatedDomainConstructionReasonColdGroupMissingContainer,
+			generatedDomainConstructionReasonColdGroupMissingImage,
+			generatedDomainConstructionReasonColdGroupMissingNetwork,
 			generatedDomainConstructionReasonColdGroupGatewayAttestation,
 			generatedDomainConstructionReasonColdManifest,
 		} {
@@ -238,8 +245,8 @@ func TestGeneratedDomainConstructionDiagnosticClosedAttribution(t *testing.T) {
 			}
 			assertGeneratedDomainConstructionDiagnostic(t, err,
 				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdGroupCensus,
-				"generated domain construction was refused: stage=cold_construction reason=cold_group_census")
+				generatedDomainConstructionReasonColdGroupMissingContainer,
+				"generated domain construction was refused: stage=cold_construction reason=cold_group_missing_container")
 			if !errors.Is(err, errGeneratedDomainConstructionRefused) {
 				t.Fatalf("cold accounting diagnostic hid refusal sentinel: %v", err)
 			}

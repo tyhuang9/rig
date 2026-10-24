@@ -1059,40 +1059,78 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 			}
 		}
 		var expected expectedObject
-		var ok bool
 		switch object.kind {
 		case "container":
+			var ok bool
 			expected, ok = containers[object.id]
-			ok = ok && expected.name == name
-			if ok {
-				seenContainers[object.id] = struct{}{}
+			if !ok || expected.name != name {
+				return generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupCorrespondence,
+					errGeneratedDomainConstructionRefused)
 			}
+			seenContainers[object.id] = struct{}{}
 		case "network":
+			var ok bool
 			expected, ok = networks[name]
-			ok = ok && object.data.driver == "bridge" && object.data.scope == "local" && len(object.data.options) == 0
-			if ok {
-				seenNetworks[name] = struct{}{}
+			if !ok {
+				return generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupCorrespondence,
+					errGeneratedDomainConstructionRefused)
 			}
+			if object.data.driver != "bridge" || object.data.scope != "local" {
+				return generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupNetworkShape,
+					errGeneratedDomainConstructionRefused)
+			}
+			if len(object.data.options) != 0 {
+				return generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupNetworkOptions,
+					errGeneratedDomainConstructionRefused)
+			}
+			seenNetworks[name] = struct{}{}
 		case "image":
+			var ok bool
 			expected, ok = images[object.id]
-			ok = ok && object.data.contentID == object.id
-			if ok {
-				seenImages[object.id] = struct{}{}
+			if !ok || object.data.contentID != object.id {
+				return generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupCorrespondence,
+					errGeneratedDomainConstructionRefused)
 			}
+			seenImages[object.id] = struct{}{}
 		default:
-			ok = false
-		}
-		if !ok || !generatedDomainExactRigLabels(object.labels, expected.labels) {
 			return generatedDomainConstructionBoundaryDiagnostic(
 				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdGroupCensus,
+				generatedDomainConstructionReasonColdGroupCorrespondence,
+				errGeneratedDomainConstructionRefused)
+		}
+		if !generatedDomainExactRigLabels(object.labels, expected.labels) {
+			return generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdGroupLabels,
 				errGeneratedDomainConstructionRefused)
 		}
 	}
-	if len(seenContainers) != len(containers) || len(seenImages) != len(images) || len(seenNetworks) != len(networks) {
+	if len(seenContainers) != len(containers) {
 		return generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
-			generatedDomainConstructionReasonColdGroupCensus,
+			generatedDomainConstructionReasonColdGroupMissingContainer,
+			errGeneratedDomainConstructionRefused)
+	}
+	if len(seenImages) != len(images) {
+		return generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupMissingImage,
+			errGeneratedDomainConstructionRefused)
+	}
+	if len(seenNetworks) != len(networks) {
+		return generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupMissingNetwork,
 			errGeneratedDomainConstructionRefused)
 	}
 	if err := attestGeneratedDomainColdGateway(ctx, manager, authority, observed.docker, gateway); err != nil {

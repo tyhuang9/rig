@@ -75,6 +75,13 @@ const (
 	generatedDomainConstructionReasonColdGroupContainerAttestation generatedDomainConstructionReason = "cold_group_container_attestation"
 	generatedDomainConstructionReasonColdGroupNetworkAttestation   generatedDomainConstructionReason = "cold_group_network_attestation"
 	generatedDomainConstructionReasonColdGroupCensus               generatedDomainConstructionReason = "cold_group_census"
+	generatedDomainConstructionReasonColdGroupCorrespondence       generatedDomainConstructionReason = "cold_group_correspondence"
+	generatedDomainConstructionReasonColdGroupLabels               generatedDomainConstructionReason = "cold_group_labels"
+	generatedDomainConstructionReasonColdGroupNetworkShape         generatedDomainConstructionReason = "cold_group_network_shape"
+	generatedDomainConstructionReasonColdGroupNetworkOptions       generatedDomainConstructionReason = "cold_group_network_options"
+	generatedDomainConstructionReasonColdGroupMissingContainer     generatedDomainConstructionReason = "cold_group_missing_container"
+	generatedDomainConstructionReasonColdGroupMissingImage         generatedDomainConstructionReason = "cold_group_missing_image"
+	generatedDomainConstructionReasonColdGroupMissingNetwork       generatedDomainConstructionReason = "cold_group_missing_network"
 	generatedDomainConstructionReasonColdGroupGatewayAttestation   generatedDomainConstructionReason = "cold_group_gateway_attestation"
 	generatedDomainConstructionReasonColdManifest                  generatedDomainConstructionReason = "cold_manifest"
 	generatedDomainConstructionReasonLock                          generatedDomainConstructionReason = "lock"
@@ -203,6 +210,13 @@ func validGeneratedDomainConstructionReason(reason generatedDomainConstructionRe
 		generatedDomainConstructionReasonColdGroupContainerAttestation,
 		generatedDomainConstructionReasonColdGroupNetworkAttestation,
 		generatedDomainConstructionReasonColdGroupCensus,
+		generatedDomainConstructionReasonColdGroupCorrespondence,
+		generatedDomainConstructionReasonColdGroupLabels,
+		generatedDomainConstructionReasonColdGroupNetworkShape,
+		generatedDomainConstructionReasonColdGroupNetworkOptions,
+		generatedDomainConstructionReasonColdGroupMissingContainer,
+		generatedDomainConstructionReasonColdGroupMissingImage,
+		generatedDomainConstructionReasonColdGroupMissingNetwork,
 		generatedDomainConstructionReasonColdGroupGatewayAttestation,
 		generatedDomainConstructionReasonColdManifest,
 		generatedDomainConstructionReasonLock,

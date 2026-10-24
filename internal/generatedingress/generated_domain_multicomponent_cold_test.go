@@ -331,6 +331,101 @@ func TestGeneratedDomainColdRejectsPersistedBuilderFinalIdentityDrift(t *testing
 	testGeneratedDomainTwoComponentColdPartition(t, generatedDomainTwoComponentColdBuilderFinalIdentity)
 }
 
+func TestGeneratedDomainColdRejectsTwoComponentCensusDetails(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*generatedDomainTwoComponentColdFixture)
+		reason generatedDomainConstructionReason
+	}{
+		{name: "exact_rig_labels", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			for index := range fixture.runner.delegate.objects {
+				object := &fixture.runner.delegate.objects[index]
+				if object.kind == "container" && object.labels["io.rig.component"] == "frontend" {
+					object.labels["io.rig.unexpected"] = "crossed"
+					return
+				}
+			}
+			t.Fatal("frontend container is absent from the cold census")
+		}, reason: generatedDomainConstructionReasonColdGroupLabels},
+		{name: "application_network_shape", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			for index := range fixture.runner.delegate.objects {
+				object := &fixture.runner.delegate.objects[index]
+				if object.kind == "network" && object.labels["io.rig.managed"] == "generated-runtime-network" {
+					object.data.driver = "overlay"
+					return
+				}
+			}
+			t.Fatal("application network is absent from the cold census")
+		}, reason: generatedDomainConstructionReasonColdGroupNetworkShape},
+		{name: "application_network_options", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			for index := range fixture.runner.delegate.objects {
+				object := &fixture.runner.delegate.objects[index]
+				if object.kind == "network" && object.labels["io.rig.managed"] == "generated-runtime-network" {
+					object.data.options["com.docker.network.bridge.enable_icc"] = "false"
+					return
+				}
+			}
+			t.Fatal("application network is absent from the cold census")
+		}, reason: generatedDomainConstructionReasonColdGroupNetworkOptions},
+		{name: "missing_frontend_image", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			objects := make([]generatedDomainDockerObject, 0, len(fixture.runner.delegate.objects)-1)
+			found := false
+			for _, object := range fixture.runner.delegate.objects {
+				if !found && object.kind == "image" && object.labels["io.rig.component"] == "frontend" {
+					found = true
+					continue
+				}
+				objects = append(objects, object)
+			}
+			if !found {
+				t.Fatal("frontend image is absent from the cold census")
+			}
+			fixture.runner.delegate.objects = objects
+		}, reason: generatedDomainConstructionReasonColdGroupMissingImage},
+		{name: "missing_application_network", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			objects := make([]generatedDomainDockerObject, 0, len(fixture.runner.delegate.objects)-1)
+			found := false
+			for _, object := range fixture.runner.delegate.objects {
+				if !found && object.kind == "network" &&
+					object.labels["io.rig.managed"] == "generated-runtime-network" {
+					found = true
+					continue
+				}
+				objects = append(objects, object)
+			}
+			if !found {
+				t.Fatal("application network is absent from the cold census")
+			}
+			fixture.runner.delegate.objects = objects
+		}, reason: generatedDomainConstructionReasonColdGroupMissingNetwork},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture := newGeneratedDomainTwoComponentColdFixture(t)
+				test.mutate(&fixture)
+				result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+					fixture.construction, fixture.environment, fixture.identity.options)
+				if result != nil || err == nil || !errors.Is(err, errGeneratedDomainConstructionRefused) {
+					t.Fatalf("invalid two-component cold census = %#v, %v", result, err)
+				}
+				assertGeneratedDomainConstructionDiagnostic(t, err,
+					generatedDomainConstructionStageColdConstruction, test.reason,
+					"generated domain construction was refused: stage=cold_construction reason="+string(test.reason))
+				commands := fixture.runner.snapshot()
+				for _, command := range commands {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+						t.Fatalf("cold census refusal dispatched an effect/capacity probe: %#v", command)
+					}
+				}
+				generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+			})
+		})
+	}
+}
+
 func generatedDomainTwoComponentColdCases(t *testing.T) []generatedDomainTwoComponentColdCase {
 	t.Helper()
 	return []generatedDomainTwoComponentColdCase{
@@ -347,7 +442,7 @@ func generatedDomainTwoComponentColdCases(t *testing.T) []generatedDomainTwoComp
 		{name: "missing_frontend", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentContainer(
 				fixture.runner.delegate.objects, "frontend")
-		}, reason: generatedDomainConstructionReasonColdGroupCensus},
+		}, reason: generatedDomainConstructionReasonColdGroupMissingContainer},
 		{name: "crossed_frontend", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			for index := range fixture.runner.delegate.objects {
 				object := &fixture.runner.delegate.objects[index]
@@ -357,7 +452,7 @@ func generatedDomainTwoComponentColdCases(t *testing.T) []generatedDomainTwoComp
 				}
 			}
 			t.Fatal("frontend container is absent from the cold census")
-		}, reason: generatedDomainConstructionReasonColdGroupCensus},
+		}, reason: generatedDomainConstructionReasonColdGroupCorrespondence},
 		{name: "cold_group_image_attestation_failure", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
 			roster.failKind = candidateOwnerImageInspect
