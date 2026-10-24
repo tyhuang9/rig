@@ -17,6 +17,133 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Authenticated inherited candidate labels
+
+The generated-image writer includes `io.rig.definition`, derived from the
+artifact's build-definition digest. Docker copies image labels that the
+container creation request does not override. Rig's container writer and cold
+reconstruction previously both omitted that label from their ten-label maps,
+so a real container could pass detailed ownership attestation and then fail
+the strict cold census on its inherited definition label.
+
+The captured TLS and A0 jobs report Docker Engine 28.0.4. The corresponding
+[Moby merge implementation](https://github.com/moby/moby/blob/v28.0.4/daemon/commit.go#L63-L69)
+copies missing image labels, and the
+[container creation path](https://github.com/moby/moby/blob/v28.0.4/daemon/create.go#L295-L298)
+calls that merge. The hosted logs identify the label-comparison boundary but
+do not expose the physical label map; hosted confirmation of the repair is
+still required.
+
+Commit `27602741234ee31812c5f59ab762394b23d07bb9` uses one private label builder
+for candidate creation and cold reconstruction. It explicitly includes the definition from the validated
+stored artifact policy and preserves deterministic argument ordering. The
+exact Rig-label comparison, policy validation, image attestation, Docker read
+sequence, deadlines and effects remain unchanged. No existing container is
+rewritten, and no adoption or fallback path is added.
+
+The new regression derives container labels from actual creation arguments,
+removes the explicit definition to reproduce the historical writer, then
+applies Docker's missing-key merge using the image labels. Missing and crossed
+definitions must still refuse construction; the existing extra-Rig-label
+control remains active. The initial run on unchanged production reached
+`cold_construction/cold_group_labels`. Its runner misclassified the indented
+subprocess output, so the original failed receipt remains alongside an additive
+validator erratum; no test was replayed merely to replace that record.
+
+Source/security review SHA-256:
+`347f3e2e879284cf321387af8eb9b6edc4a6b6d025bb9780a8489070bfc17c5b`.
+The reviewed eight-file source manifest is
+`f1a92072b0261d5051c70cee4a8d44721fa66b20eca4974fddd93074ddc08955`.
+This source review does not establish hosted Docker acceptance.
+
+### Focused repair verification
+
+The formal Windows amd64 non-race run at 06:22:39–06:23:21 UTC on
+24 October 2026 discovered exactly seven parents and passed all 35 selected
+test names (seven parents and 28 descendants), with no failure or skip.
+The selection covers creation arguments, legacy Docker label inheritance,
+missing/crossed definitions, the existing extra-label refusal, the two-component
+baseline, full A0 namespace accounting, cold runtime recovery and cold accounting.
+Both isolation layers remain active. All eight source hashes were unchanged
+during execution.
+
+The retained commands built `./internal/generatedingress` once with `go test -c`,
+discovered the exact seven-name selection with `-test.list`, and ran that binary
+with `-test.count 1 -test.timeout 32m`. Changed-file `gofmt -l`,
+`go vet ./internal/generatedingress` and `scripts/check-generation.ps1` all
+exited zero. Commands, source hashes, binary and raw output are retained under
+`cold-group-label-inheritance-final-20261024T062236Z`.
+
+| Evidence | SHA-256 |
+| --- | --- |
+| Formal receipt | `a4696f8eb7e5a75670f95b6500be23fb7b0b3e301e146e8573872dbc703b9e6e` |
+| Raw results | `8b8b667a567993b85eeb95edef7bc3a97e8d0bfc342f0935d68306b69a05381f` |
+| Test binary | `d57d1f76052d835331064331bed0c282c9f96f75951b9ce1ceeb6455e4aee21c` |
+| Independent root audit | `e739feecc3ae0e80092c9d7add33b83d309fe5c0b197b562da18c3e15661c743` |
+| Final integration review | `2181b2467f0accf7bac7dbc4ac3021a7e3d377f1d2a7eecbdbd57decd2a3510d` |
+
+The earlier behavioral failure occurred at 06:16:18–06:16:28 UTC on unchanged
+production. Its raw hash is
+`c4bd6fa4fc317c5db7c453a46c2484e2757a55e82c4bca97e0d4ff004ac0e467`;
+validator erratum hash is
+`89643d14013428d4905d4a0f8ab754e0ec3caf7d19dd8c0513937496ac339291`.
+The independent audit validates that distinction and the complete formal
+RUN/PASS census. These local checks do not replace hosted Docker advancement,
+Linux race, full CI or remaining M4 acceptance.
+
+## Hosted startup refusal narrowed to resource labels
+
+Published `86b629a6378afb8beedf8a4941ad7dcbc38e83ae` ran through merge
+checkout `a09dc525013149bf788b84762eb395aac53bb16e`, with exactly the published
+tree `9e601f4aeb23e379794e1a2cb4ef5096443c2d9a`. On 24 October 2026, the
+[TLS journey](https://github.com/tyhuang9/rig/actions/runs/40068387861/job/120796343281),
+[process restart](https://github.com/tyhuang9/rig/actions/runs/40068387861/job/120796343551)
+and [full hostd A0 diagnostic](https://github.com/tyhuang9/rig/actions/runs/40068387846/job/120796452205)
+all refused construction with `cold_construction/cold_group_labels`.
+The A0 result is the actual `boundary/a0-sql-claim` failure, separate from the
+passing closed-diagnostic controls in the same job. TLS reached healthy
+containers, external-database outage recovery and Chromium creation before the
+restart refusal. Process restart failed before its durable barrier.
+
+| Captured job | Raw log SHA-256 |
+| --- | --- |
+| TLS | `244ee67cc4188160a059012b9f0a1ec2131fecf714c5cee65e4f11876faada9f` |
+| Process restart | `ea8350c747de90ee32eb06518e9fdd9c568bdb44d18627f6c4e954d791798374` |
+| Full hostd A0 | `395fc1e26efaaa546580efc707524e5497b5dbf29d847fef030e727e8ccb8141` |
+
+This identifies the strict label comparison as the reached refusal. It does
+not yet identify the mismatched resource or label, and does not justify
+relaxing ownership validation. The network-options hypothesis is not the
+reported failure at this boundary.
+
+The 06:07:10 UTC snapshot contained 12 failed, eight successful, 15 running,
+105 queued and one skipped check. All 12 terminal failures were captured once
+and bound to the same checkout. Snapshot SHA-256:
+`01c5ce451bce526ec3c56db2d529c137aa7775508cb4b054aa07c9385e21a80c`;
+failure index SHA-256:
+`9082ec8b388046a94c8139951b2262b168f7d26444e8d279c3c5ba8b6a6a3230`.
+Migration, LAN redeploy and LAN database persistence still stop at
+`previous_retirement/retirement_unavailable`. Other rebind/gateway restart
+failures and hosted race verification remain open. This is partial CI evidence;
+M4 acceptance is not complete.
+
+At 06:15:07 UTC the same head had 14 failed, 17 successful, 14 running,
+95 queued and one skipped check. The two additional captured jobs failed when
+restarting for successor data-volume and stage-config-copy replay. They do not
+identify a more precise construction reason. The updated capture index is
+`6587ceb42ce8149b0e7c6b1e2df34b6b33022270e3373a54bf108d0b1b6b748b`;
+the snapshot is `8e9fc4fbf296afb90607d3560a8e3cd59090ee2fe9c0a2f4dc4fb7da990e8e5f`.
+
+At 06:23:21 UTC the snapshot had 15 failed, 27 successful, 16 running,
+83 queued and two skipped checks. The added failure is runtime commit/replay
+at manager startup. All 15 failed jobs are captured in index
+`0b6f0a29085e36e4c1fd7959b034da640800d0a610561f2b9ec6e5fa1133178d`;
+snapshot SHA-256 is
+`7463fbb7147524b884a740a5b693746668f43117e77d6230e69b8c929ab657fc`.
+The repository domain-construction race job was running, and the stopped-stage
+Docker job reported success again. The current run remains active to retain
+that race evidence before the next publication.
+
 ## Stopped-stage Docker acceptance and precise census follow-up
 
 The [stopped-stage Docker job](https://github.com/tyhuang9/rig/actions/runs/40066795509/job/120791649086)
