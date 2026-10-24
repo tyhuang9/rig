@@ -30,6 +30,8 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		return
 	}
 	knownRuntime := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"runtime composition failed","error":"` + secret + `"}`
+	constructionError := "generated domain construction was refused: stage=empty_final_locked reason=docker_static_response"
+	knownConstruction := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"generated domain construction failed","error":"` + constructionError + `"}`
 	knownGateway := `{"msg":"gateway startup inspection failed","error":"/private/path ` + secret + `"}`
 	knownGatewayCheckpoint := `{"msg":"gateway startup inspection failed","startup_checkpoint":"upgrade_gateway_lock","error":"/private/path ` + secret + `"}`
 	unknownGatewayCheckpoint := `{"msg":"gateway startup inspection failed","startup_checkpoint":"forged-checkpoint","error":"/private/path ` + secret + `"}`
@@ -43,6 +45,20 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		wantEmpty bool
 	}{
 		{name: "known exact message", stderr: knownRuntime, wantCode: "runtime_composition"},
+		{name: "known generated domain construction", stderr: knownConstruction, wantCode: "construction=empty_final_locked/docker_static_response"},
+		{name: "construction unrelated slog field is ignored", stderr: `{"time":"2026-10-15T00:00:00Z","level":"ERROR","source":{"function":"main.runServerWithAssembly"},"msg":"generated domain construction failed","error":"` + constructionError + `"}`, wantCode: "construction=empty_final_locked/docker_static_response"},
+		{name: "construction missing error", stderr: `{"msg":"generated domain construction failed"}`},
+		{name: "construction non string error", stderr: `{"msg":"generated domain construction failed","error":{"value":"` + constructionError + `"}}`},
+		{name: "invalid construction cannot fall back through checkpoint", stderr: `{"msg":"generated domain construction failed","error":{"value":"` + constructionError + `"},"startup_checkpoint":"upgrade_gateway_lock"}`},
+		{name: "construction case folded message key", stderr: `{"Msg":"generated domain construction failed","error":"` + constructionError + `"}`},
+		{name: "construction case folded error key", stderr: `{"msg":"generated domain construction failed","Error":"` + constructionError + `"}`},
+		{name: "construction duplicate message key", stderr: `{"msg":"runtime composition failed","msg":"generated domain construction failed","error":"` + constructionError + `"}`},
+		{name: "construction duplicate error key", stderr: `{"msg":"generated domain construction failed","error":"` + secret + `","error":"` + constructionError + `"}`},
+		{name: "construction prefixed error", stderr: `{"msg":"generated domain construction failed","error":"private: ` + constructionError + `"}`},
+		{name: "construction suffixed error", stderr: `{"msg":"generated domain construction failed","error":"` + constructionError + ` ` + secret + `"}`},
+		{name: "construction unknown pair", stderr: `{"msg":"generated domain construction failed","error":"generated domain construction was refused: stage=private reason=private"}`},
+		{name: "construction crossed pair", stderr: `{"msg":"generated domain construction failed","error":"generated domain construction was refused: stage=cold_construction reason=docker_network"}`},
+		{name: "construction malformed JSON", stderr: `{"msg":"generated domain construction failed","error":"` + constructionError + `"`},
 		{name: "primary precedes emergency stop", stderr: knownGateway + "\n" + secondary, wantCode: "gateway_inspection"},
 		{name: "known gateway checkpoint", stderr: knownGatewayCheckpoint, wantCode: "upgrade_gateway_lock"},
 		{name: "known snapshot stage and cause", stderr: knownSnapshotCause, wantCode: "startup_snapshot_grants cause=sqlite_locked"},

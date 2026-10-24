@@ -1104,10 +1104,11 @@ func liveHostdRebindKnownRoutePausePair(stage, cause string) bool {
 }
 
 // liveHostdRebindStartupDiagnosticCode accepts only the fixed slog message
-// values emitted before the full daemon signals readiness. It deliberately
-// ignores every other JSON field, including the error value, and examines a
-// bounded prefix of stderr. A later emergency-stop record therefore cannot
-// replace the first primary startup failure.
+// values emitted before the full daemon signals readiness. It examines the
+// error value only for the exact generated-domain construction message and
+// accepts that value only through the closed construction diagnostic grammar.
+// Every other error field remains ignored. A later emergency-stop record
+// therefore cannot replace the first primary startup failure.
 func liveHostdRebindStartupDiagnosticCode(stderr string) string {
 	if len(stderr) > liveHostdRebindStartupDiagnosticMaxBytes {
 		stderr = stderr[:liveHostdRebindStartupDiagnosticMaxBytes]
@@ -1123,6 +1124,12 @@ func liveHostdRebindStartupDiagnosticCode(stderr string) string {
 		}
 		line = bytes.TrimSpace(line)
 		if len(line) == 0 {
+			continue
+		}
+		if code, handled := liveHostdRebindConstructionDiagnosticCode(line); handled {
+			if code != "" {
+				return code
+			}
 			continue
 		}
 		var record struct {
@@ -1151,6 +1158,78 @@ func liveHostdRebindStartupDiagnosticCode(stderr string) string {
 		}
 	}
 	return secondary
+}
+
+// liveHostdRebindConstructionDiagnosticCode treats only the exact production
+// construction-failure record as authoritative. Relevant duplicate or
+// case-folded keys refuse the complete record rather than inheriting the JSON
+// package's last-value-wins behavior. Other slog fields remain ignorable.
+func liveHostdRebindConstructionDiagnosticCode(line []byte) (string, bool) {
+	const message = "generated domain construction failed"
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	token, err := decoder.Token()
+	delimiter, ok := token.(json.Delim)
+	if err != nil || !ok || delimiter != '{' {
+		return "", false
+	}
+	var recordMessage, recordError string
+	var seenMessage, seenError, constructionRecord, invalid bool
+	for decoder.More() {
+		token, err = decoder.Token()
+		key, keyOK := token.(string)
+		if err != nil || !keyOK {
+			return "", constructionRecord
+		}
+		var raw json.RawMessage
+		if decoder.Decode(&raw) != nil {
+			return "", constructionRecord
+		}
+		switch {
+		case strings.EqualFold(key, "msg"):
+			if key != "msg" || seenMessage {
+				invalid = true
+			}
+			seenMessage = true
+			value, valid := controllerChildStartupDiagnosticString(raw)
+			if !valid {
+				invalid = true
+				continue
+			}
+			recordMessage = value
+			constructionRecord = constructionRecord || value == message
+		case strings.EqualFold(key, "error"):
+			if key != "error" || seenError {
+				invalid = true
+			}
+			seenError = true
+			value, valid := controllerChildStartupDiagnosticString(raw)
+			if !valid {
+				invalid = true
+				continue
+			}
+			recordError = value
+		}
+	}
+	closing, err := decoder.Token()
+	delimiter, ok = closing.(json.Delim)
+	if err != nil || !ok || delimiter != '}' {
+		return "", constructionRecord
+	}
+	var trailing json.RawMessage
+	if decoder.Decode(&trailing) != io.EOF {
+		return "", constructionRecord
+	}
+	if !constructionRecord {
+		return "", false
+	}
+	if invalid || !seenMessage || !seenError || recordMessage != message {
+		return "", true
+	}
+	stage, reason, valid := controllerChildConstructionDiagnosticText(recordError)
+	if !valid {
+		return "", true
+	}
+	return "construction=" + stage + "/" + reason, true
 }
 
 // liveHostdRebindGatewayStartupDiagnosticCode accepts the checkpoint only on
