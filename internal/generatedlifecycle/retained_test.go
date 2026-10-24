@@ -275,7 +275,7 @@ type retainedAdapterFixture struct {
 
 func newRetainedAdapterFixture(t *testing.T, componentCount int, action applifecycle.Action, baseline applifecycle.BaselineDisposition) *retainedAdapterFixture {
 	t.Helper()
-	root := t.TempDir()
+	root := generateddomain.NewRetainedRoot(t)
 	directories, err := runtimedocker.PrepareControllerDirectories(root)
 	if err != nil {
 		t.Fatal(err)

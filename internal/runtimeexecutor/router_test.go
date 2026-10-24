@@ -168,6 +168,9 @@ type routerBindingFixture struct {
 func newRouterBindingFixture(t *testing.T, running bool) *routerBindingFixture {
 	t.Helper()
 	root := t.TempDir()
+	if running {
+		root = generateddomain.NewRetainedRoot(t)
+	}
 	var db *sql.DB
 	var directories runtimedocker.ControllerDirectories
 	var err error
