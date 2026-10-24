@@ -71,9 +71,19 @@ type GeneratedRouteExecution struct {
 }
 
 type generatedRouteExecutionLiveness struct {
-	mu   sync.Mutex
-	used bool
+	mu         sync.Mutex
+	entry      generatedRouteActivationEntry
+	completed  bool
+	deployment generatedruntimestate.Deployment
+	retirement *generatedPredecessorRetirementState
 }
+
+type generatedRouteActivationEntry uint8
+
+const (
+	generatedRouteActivationLegacy generatedRouteActivationEntry = iota + 1
+	generatedRouteActivationRetirement
+)
 
 type generatedRouteIntentDocument struct {
 	Version           int                                              `json:"version"`
@@ -183,23 +193,83 @@ func (a *GeneratedRouteAuthority) Pin(ctx context.Context, candidate *GeneratedC
 // Activate switches the exact pinned route and commits the durable activation
 // receipt/head/rosters/phase in one original-Claim writer transaction.
 func (e *GeneratedRouteExecution) Activate(ctx context.Context) (generatedruntimestate.Deployment, error) {
+	deployment, _, err := e.activateEntry(ctx, generatedRouteActivationLegacy)
+	return deployment, err
+}
+
+// ActivateWithPredecessorRetirement is the only activation entry point that
+// may return a receipt-owned retirement handle. The handle is minted from the
+// internally committed activation result and accepts no caller proof input.
+func (e *GeneratedRouteExecution) ActivateWithPredecessorRetirement(ctx context.Context) (
+	generatedruntimestate.Deployment, *GeneratedPredecessorRetirement, error,
+) {
+	return e.activateEntry(ctx, generatedRouteActivationRetirement)
+}
+
+func (e *GeneratedRouteExecution) activateEntry(ctx context.Context, entry generatedRouteActivationEntry) (
+	generatedruntimestate.Deployment, *GeneratedPredecessorRetirement, error,
+) {
 	if e == nil || e.self != e || e.liveness == nil || ctx == nil {
-		return generatedruntimestate.Deployment{}, deploymentexecution.ErrInvalidConfiguration
+		return generatedruntimestate.Deployment{}, nil, deploymentexecution.ErrInvalidConfiguration
 	}
 	e.liveness.mu.Lock()
-	if e.liveness.used {
+	if e.liveness.entry != 0 {
+		if entry == generatedRouteActivationRetirement && e.liveness.entry == entry &&
+			e.liveness.completed && e.liveness.retirement != nil {
+			deployment := e.liveness.deployment
+			retirement := &GeneratedPredecessorRetirement{state: e.liveness.retirement}
+			e.liveness.mu.Unlock()
+			if err := retirement.current(); err != nil {
+				return generatedruntimestate.Deployment{}, nil, err
+			}
+			return deployment, retirement, nil
+		}
 		e.liveness.mu.Unlock()
-		return generatedruntimestate.Deployment{}, deploymentexecution.ErrScopeUnavailable
+		return generatedruntimestate.Deployment{}, nil, deploymentexecution.ErrScopeUnavailable
 	}
-	e.liveness.used = true
+	e.liveness.entry = entry
 	e.liveness.mu.Unlock()
+	var successorPolicies map[string]candidatePolicy
+	var err error
+	if entry == generatedRouteActivationRetirement {
+		successorPolicies, err = e.capturePredecessorRetirementSuccessor()
+		if err != nil {
+			return generatedruntimestate.Deployment{}, nil, err
+		}
+	}
+	deployment, activation, err := e.activateCore(ctx)
+	if err != nil {
+		return generatedruntimestate.Deployment{}, nil, err
+	}
+	if entry == generatedRouteActivationLegacy {
+		e.liveness.mu.Lock()
+		e.liveness.completed = true
+		e.liveness.deployment = deployment
+		e.liveness.mu.Unlock()
+		return deployment, nil, nil
+	}
+	retirement, err := e.mintPredecessorRetirement(ctx, activation, successorPolicies)
+	if err != nil {
+		return generatedruntimestate.Deployment{}, nil, err
+	}
+	e.liveness.mu.Lock()
+	e.liveness.completed = true
+	e.liveness.deployment = deployment
+	e.liveness.retirement = retirement.state
+	e.liveness.mu.Unlock()
+	return deployment, retirement, nil
+}
+
+func (e *GeneratedRouteExecution) activateCore(ctx context.Context) (
+	generatedruntimestate.Deployment, generatedRouteActivationResult, error,
+) {
 	a := e.authority
 	if !a.configured() || e.candidate == nil {
-		return generatedruntimestate.Deployment{}, deploymentexecution.ErrInvalidConfiguration
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, deploymentexecution.ErrInvalidConfiguration
 	}
 	s, done, err := e.candidate.begin(false)
 	if err != nil {
-		return generatedruntimestate.Deployment{}, err
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, err
 	}
 	defer done()
 	current, err := s.observeCandidateState(true)
@@ -210,22 +280,22 @@ func (e *GeneratedRouteExecution) Activate(ctx context.Context) (generatedruntim
 	}
 	if err != nil || !routeRosterMatchesCandidateSnapshot(e.candidateRoster, current) ||
 		current.observedHead != expectedCandidateHead {
-		return generatedruntimestate.Deployment{}, errors.Join(deploymentexecution.ErrAuthorityStale, err)
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, errors.Join(deploymentexecution.ErrAuthorityStale, err)
 	}
 	if e.hadPrevious {
 		observation, observeErr := a.manager.Observe(ctx, e.request.AppID)
 		if observeErr != nil || !sameRoute(e.previous, routeRecord{Slot: observation.Slot, Endpoints: observation.Endpoints}) {
-			return generatedruntimestate.Deployment{}, errors.Join(deploymentexecution.ErrAuthorityStale, observeErr)
+			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, errors.Join(deploymentexecution.ErrAuthorityStale, observeErr)
 		}
 	}
 	if err := a.manager.switchGeneratedDomainRoute(ctx, e.request); err != nil {
-		return generatedruntimestate.Deployment{}, err
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, err
 	}
 	afterObservation, err := a.manager.Observe(ctx, e.request.AppID)
 	after := routeRecord{Slot: afterObservation.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), afterObservation.Endpoints...)}
 	proposed := routeRecord{Slot: e.request.ToSlot, Endpoints: append([]generatedroute.RouteEndpoint(nil), e.request.Endpoints...)}
 	if err != nil || !sameRoute(after, proposed) {
-		return generatedruntimestate.Deployment{}, errors.Join(deploymentexecution.ErrIdentityLost, err)
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, errors.Join(deploymentexecution.ErrIdentityLost, err)
 	}
 	proofDocument := generatedRouteProofDocument{Version: 1, ReceiptID: e.receiptID, After: after}
 	if e.hadPrevious {
@@ -234,7 +304,7 @@ func (e *GeneratedRouteExecution) Activate(ctx context.Context) (generatedruntim
 	}
 	proof, err := marshalCanonicalGeneratedRouteDocument(proofDocument)
 	if err != nil {
-		return generatedruntimestate.Deployment{}, err
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, err
 	}
 	input := generatedRouteActivationInput{
 		receiptID: e.receiptID, appID: e.request.AppID,
@@ -249,7 +319,7 @@ func (e *GeneratedRouteExecution) Activate(ctx context.Context) (generatedruntim
 		// exact state. No new receipt or generic self-head success is accepted.
 		result, err = a.activateRoute(ctx, s.pinned, s.pins.claim, input)
 		if err != nil {
-			return generatedruntimestate.Deployment{}, e.resolveActivationFailure(ctx,
+			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, e.resolveActivationFailure(ctx,
 				errors.Join(activateErr, err))
 		}
 	}
@@ -257,9 +327,13 @@ func (e *GeneratedRouteExecution) Activate(ctx context.Context) (generatedruntim
 		releaseID: result.head.ReleaseID, slot: result.head.Slot, generation: result.head.Generation,
 		activationReceiptID: result.head.ActivationReceiptID}
 	if _, err := a.candidates.heads.bindSelf(current.headPins, self); err != nil {
-		return generatedruntimestate.Deployment{}, err
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, err
 	}
-	return a.runtime.Get(ctx, e.request.AppID, s.pins.deploymentID)
+	deployment, err := a.runtime.Get(ctx, e.request.AppID, s.pins.deploymentID)
+	if err != nil {
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, err
+	}
+	return deployment, result, nil
 }
 
 // resolveActivationFailure restores a predecessor route only after a fresh

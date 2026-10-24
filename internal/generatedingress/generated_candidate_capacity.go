@@ -220,6 +220,16 @@ type candidateRosterOperation struct {
 	tokens      []candidateRosterToken
 }
 
+// candidateRetirementRosterOperation holds the complete fixed predecessor
+// roster. It retains all raw charges and never performs the later accounting
+// handoff or release.
+type candidateRetirementRosterOperation struct {
+	group     *candidateCapacityGroup
+	lifecycle *candidateOperationLifecycle
+	tokens    []candidateRosterToken
+	byName    map[string]*candidateCapacityComponent
+}
+
 // candidateReceiptSnapshot is read-only evidence. It exposes no transition or
 // release capability and its fields remain private to the concrete owner.
 type candidateReceiptSnapshot struct {
@@ -281,6 +291,155 @@ func (l *candidateCapacityLedger) reserve(
 	l.mu.Unlock()
 
 	return group.reserve(ctx, l, normalized)
+}
+
+func (l *candidateCapacityLedger) enterRetirementRoster(appID, deploymentID string,
+	receipts map[string]string,
+) (*candidateRetirementRosterOperation, error) {
+	if l == nil || l.budget == nil || appID == "" || deploymentID == "" || len(receipts) == 0 {
+		return nil, errCandidateCapacityInvalid
+	}
+	l.mu.Lock()
+	group := l.groups[candidateCapacityGroupKey{appID: appID, deploymentID: deploymentID}]
+	l.mu.Unlock()
+	if group == nil {
+		return nil, errCandidateCapacityStale
+	}
+	group.mu.Lock()
+	defer group.mu.Unlock()
+	if group.reserving || len(receipts) != len(group.components) {
+		return nil, errCandidateCapacityBusy
+	}
+	for _, name := range group.components {
+		component := group.byName[name]
+		if component == nil || component.charge == nil || component.charge.state != candidateChargeActive ||
+			component.charge.logicallyRetired || component.receipt == nil || component.receipt.id != receipts[name] {
+			return nil, errCandidateReceiptMismatch
+		}
+		word := component.receipt.state.Load()
+		if word&candidateReceiptUnquiesced != 0 {
+			return nil, errCandidateMutationUnquiesced
+		}
+		physical := candidatePhysicalFromWord(word)
+		if physical != candidatePhysicalPresent && physical != candidatePhysicalHandedToRoute &&
+			physical != candidatePhysicalConfirmedAbsent {
+			return nil, errCandidatePhysicalTransition
+		}
+		if component.tokenHeld {
+			return nil, errCandidateCapacityBusy
+		}
+	}
+	operation := &candidateRetirementRosterOperation{
+		group: group, lifecycle: &candidateOperationLifecycle{},
+		tokens: make([]candidateRosterToken, 0, len(group.components)),
+		byName: make(map[string]*candidateCapacityComponent, len(group.components)),
+	}
+	for _, name := range group.components {
+		component := group.byName[name]
+		component.tokenHeld = true
+		component.tokenGeneration++
+		if component.tokenGeneration == 0 {
+			component.tokenGeneration++
+		}
+		operation.tokens = append(operation.tokens, candidateRosterToken{component: component, generation: component.tokenGeneration})
+		operation.byName[name] = component
+	}
+	return operation, nil
+}
+
+func (o *candidateRetirementRosterOperation) enterCommand(componentName string, command candidateCommand) error {
+	if o == nil || o.lifecycle == nil || o.lifecycle.done.Load() ||
+		(command != candidateCommandStop && command != candidateCommandRemove) {
+		return errCandidateCapacityInvalid
+	}
+	o.group.mu.Lock()
+	defer o.group.mu.Unlock()
+	component := o.byName[componentName]
+	if !o.validComponentLocked(component) || component.receipt == nil {
+		return errCandidateCapacityStale
+	}
+	marker, _ := candidateCommandMarker(command)
+	for {
+		word := component.receipt.state.Load()
+		if word&candidateReceiptUnquiesced != 0 {
+			return errCandidateMutationUnquiesced
+		}
+		if word&marker != 0 {
+			return errCandidateCommandEntered
+		}
+		physical := candidatePhysicalFromWord(word)
+		if physical != candidatePhysicalPresent && physical != candidatePhysicalHandedToRoute {
+			return errCandidatePhysicalTransition
+		}
+		if component.receipt.state.CompareAndSwap(word, word|marker) {
+			return nil
+		}
+	}
+}
+
+func (o *candidateRetirementRosterOperation) markConfirmedAbsentRetained(componentName string) error {
+	if o == nil || o.lifecycle == nil || o.lifecycle.done.Load() {
+		return errCandidateCapacityStale
+	}
+	o.group.mu.Lock()
+	defer o.group.mu.Unlock()
+	component := o.byName[componentName]
+	if !o.validComponentLocked(component) || component.receipt == nil || component.charge == nil {
+		return errCandidateCapacityStale
+	}
+	if component.receipt.state.Load()&candidateReceiptUnquiesced != 0 {
+		return errCandidateMutationUnquiesced
+	}
+	if err := candidateTransitionPhysical(&component.receipt.state, candidatePhysicalConfirmedAbsent,
+		candidatePhysicalPresent, candidatePhysicalHandedToRoute, candidatePhysicalConfirmedAbsent); err != nil {
+		return err
+	}
+	component.charge.explicitRetained = true
+	return nil
+}
+
+func (o *candidateRetirementRosterOperation) latchMutationUnquiesced(componentName string) {
+	if o == nil || o.lifecycle == nil || o.lifecycle.done.Load() {
+		return
+	}
+	o.group.mu.Lock()
+	defer o.group.mu.Unlock()
+	component := o.byName[componentName]
+	if !o.validComponentLocked(component) || component.receipt == nil || component.charge == nil {
+		return
+	}
+	word := component.receipt.state.Load()
+	if word&(candidateReceiptStop|candidateReceiptRemove) == 0 {
+		return
+	}
+	candidateAtomicSet(&component.receipt.state, candidateReceiptUnquiesced)
+	component.charge.explicitRetained = true
+}
+
+func (o *candidateRetirementRosterOperation) validComponentLocked(component *candidateCapacityComponent) bool {
+	if component == nil || component.charge == nil || component.charge.state != candidateChargeActive || component.charge.logicallyRetired {
+		return false
+	}
+	for _, token := range o.tokens {
+		if token.component == component {
+			return component.tokenHeld && component.tokenGeneration == token.generation
+		}
+	}
+	return false
+}
+
+func (o *candidateRetirementRosterOperation) leave() {
+	if o == nil || o.lifecycle == nil || o.lifecycle.done.Swap(true) {
+		return
+	}
+	o.group.mu.Lock()
+	for _, token := range o.tokens {
+		if token.component.tokenHeld && token.component.tokenGeneration == token.generation {
+			token.component.tokenHeld = false
+		}
+	}
+	o.group.changed.Broadcast()
+	o.group.mu.Unlock()
 }
 
 func normalizeCandidateGroupSpec(spec candidateGroupSpec) (candidateGroupSpec, error) {

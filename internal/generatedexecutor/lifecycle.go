@@ -284,21 +284,28 @@ func (e *Executor) candidateFailure(ctx context.Context, execution *generateding
 func (e *Executor) switchRoute(ctx context.Context, resolved resolvedDeployment,
 	runtimeDeployment generatedruntimestate.Deployment, candidateExecution *generatedingress.GeneratedCandidateExecution,
 	candidates map[string]generatedruntime.Candidate,
-) (generatedruntimestate.Deployment, error) {
+) (generatedruntimestate.Deployment, predecessorRetirement, error) {
 	request := generatedruntime.RouteSwitchRequest{
 		AppID: resolved.deployment.AppID, FromSlot: generatedruntime.Slot(runtimeDeployment.PreviousActiveSlot),
 		ToSlot: generatedruntime.Slot(runtimeDeployment.CandidateSlot), DrainPeriod: e.options.DrainPeriod,
 		Endpoints: routeEndpoints(resolved.plan, candidates),
 	}
-	updated, err := e.routes.activate(ctx, candidateExecution, request, runtimeDeployment)
+	activation, err := e.routes.activate(ctx, candidateExecution, request, runtimeDeployment)
 	if err != nil {
-		return runtimeDeployment, newRouteSwitchError(err, "route activation failed")
+		if activation.retirement != nil {
+			activation.retirement.Leave()
+		}
+		return runtimeDeployment, nil, newRouteSwitchError(err, "route activation failed")
 	}
+	updated := activation.deployment
 	if updated.DeploymentID != runtimeDeployment.DeploymentID || updated.AppID != runtimeDeployment.AppID ||
-		updated.Phase != generatedruntimestate.PhaseDraining {
-		return runtimeDeployment, staticError("route activation returned invalid runtime state")
+		updated.Phase != generatedruntimestate.PhaseDraining || activation.retirement == nil {
+		if activation.retirement != nil {
+			activation.retirement.Leave()
+		}
+		return runtimeDeployment, nil, staticError("route activation returned invalid runtime state")
 	}
-	return updated, nil
+	return updated, activation.retirement, nil
 }
 
 // routeSwitchError preserves only the closed pause cause derived at the
@@ -401,6 +408,14 @@ func (e *Executor) drainPrevious(ctx context.Context, resolved resolvedDeploymen
 		}
 	}
 	return nil
+}
+
+func (e *Executor) retirePrevious(ctx context.Context, retirement predecessorRetirement) error {
+	if retirement == nil {
+		return deployments.ErrGeneratedCandidateRetirementUnavailable
+	}
+	_, err := retirement.Retire(ctx)
+	return err
 }
 
 func (e *Executor) previousResources(ctx context.Context, appID, deploymentID string) (generatedruntimestate.Deployment, deploymentplans.DeploymentPlanRevision, map[string]generatedimage.Artifact, error) {
