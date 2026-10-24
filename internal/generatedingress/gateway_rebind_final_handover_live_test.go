@@ -101,6 +101,14 @@ func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment strin
 	validateLiveGatewayRebindPublishedRuntime(t, db, &secondFixture)
 	proposal := seedLiveGatewayRebindPublicPassiveLineage(t, fixture, db, repository, profile, appaccess.GatewayProfileSpec{
 		SelectedIPv4: after.IPv4, InterfaceID: after.InterfaceID, PortStart: fixture.port, PortEnd: fixture.port})
+	session := authority.sessions[second.DeploymentID]
+	if session == nil {
+		t.Fatal("release loopback-only source candidate authority: missing original session")
+	}
+	// The second source candidate is complete. Retain its immutable history for
+	// later restart checks, but release its effects scope before another stage or
+	// child process acquires that scope. The registered cleanup is idempotent.
+	session.Close()
 	return liveGatewayRebindSourceFixture{fixture: fixture, db: db, repository: repository,
 		profile: profile, proposal: proposal, loopbackID: loopbackID, loopbackReply: loopbackReply,
 		predecessorIPv4: before.IPv4, successorIPv4: after.IPv4}
