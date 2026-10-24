@@ -3,6 +3,7 @@
 package generatedingress
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"text/template"
 
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/generatedbuilder"
@@ -56,6 +58,132 @@ type generatedDomainTwoComponentRouteRunner struct {
 }
 
 const generatedDomainTwoComponentBuilderPrivateReadError = "private persisted builder observation failed"
+
+func TestGeneratedDomainColdBuilderContainerProjectionHonorsDockerTypedAndRawFallbackFields(t *testing.T) {
+	type dockerContainerShape struct {
+		ID    string `json:"Id"`
+		Name  string `json:"Name"`
+		Image string `json:"Image"`
+		State struct {
+			Running    bool `json:"Running"`
+			Paused     bool `json:"Paused"`
+			Restarting bool `json:"Restarting"`
+		} `json:"State"`
+		Config struct {
+			Image  string            `json:"Image"`
+			Cmd    []string          `json:"Cmd"`
+			Labels map[string]string `json:"Labels"`
+		} `json:"Config"`
+		HostConfig struct {
+			Memory       int64                              `json:"Memory"`
+			MemorySwap   int64                              `json:"MemorySwap"`
+			CPUPeriod    int64                              `json:"CpuPeriod"`
+			CPUQuota     int64                              `json:"CpuQuota"`
+			PidsLimit    *int64                             `json:"PidsLimit"`
+			NetworkMode  string                             `json:"NetworkMode"`
+			Privileged   bool                               `json:"Privileged"`
+			Binds        []string                           `json:"Binds"`
+			Mounts       []generatedbuilder.ConfiguredMount `json:"Mounts"`
+			PortBindings map[string]json.RawMessage         `json:"PortBindings"`
+			LogConfig    struct {
+				Type   string            `json:"Type"`
+				Config map[string]string `json:"Config"`
+			} `json:"LogConfig"`
+			RestartPolicy struct {
+				Name string `json:"Name"`
+			} `json:"RestartPolicy"`
+		} `json:"HostConfig"`
+		NetworkSettings struct {
+			Networks map[string]generatedbuilder.NetworkAttachment `json:"Networks"`
+		} `json:"NetworkSettings"`
+		Mounts []generatedbuilder.Mount `json:"Mounts"`
+	}
+
+	pids := generatedbuilder.PIDsLimit
+	var input dockerContainerShape
+	input.ID = strings.Repeat("b", 64)
+	input.Name = "/rig-buildkitd-" + generatedDomainTwoComponentBuilderSuffix
+	input.Image = "sha256:" + strings.Repeat("a", 64)
+	input.HostConfig.CPUPeriod = 100000
+	input.HostConfig.CPUQuota = 100000
+	input.HostConfig.PidsLimit = &pids
+
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal("Docker inspection raw response did not encode")
+	}
+	originalFormat := strings.NewReplacer(
+		".HostConfig.CPUPeriod", ".HostConfig.CpuPeriod",
+		".HostConfig.CPUQuota", ".HostConfig.CpuQuota",
+	).Replace(generatedDomainColdBuilderContainerInspectFormat)
+	typedFormat := strings.NewReplacer(
+		".HostConfig.CpuPeriod", ".HostConfig.CPUPeriod",
+		".HostConfig.CpuQuota", ".HostConfig.CPUQuota",
+	).Replace(generatedDomainColdBuilderContainerInspectFormat)
+	if originalFormat == typedFormat {
+		t.Fatal("Docker inspection selector variants were not distinct")
+	}
+	if generatedDomainColdBuilderContainerInspectFormat != typedFormat {
+		t.Fatal("generated builder container projection did not use typed Docker selectors")
+	}
+
+	originalResult := renderDockerInspectWithRawFallback(t, originalFormat, input, raw)
+	if originalResult.typedErr == nil || !originalResult.usedFallback || originalResult.fallbackErr == nil ||
+		!strings.Contains(originalResult.fallbackErr.Error(), `map has no entry for key "ID"`) ||
+		len(originalResult.body) != 0 {
+		t.Fatalf("legacy Docker inspection renderer = typed %v, fallback %v, body %d bytes",
+			originalResult.typedErr, originalResult.fallbackErr, len(originalResult.body))
+	}
+	typedResult := renderDockerInspectWithRawFallback(t, typedFormat, input, raw)
+	if typedResult.typedErr != nil || typedResult.usedFallback || typedResult.fallbackErr != nil {
+		t.Fatalf("typed Docker inspection renderer = typed %v, fallback %v",
+			typedResult.typedErr, typedResult.fallbackErr)
+	}
+	typedProjection, typedErr := generatedbuilder.DecodeContainer(typedResult.body)
+	if typedErr != nil || typedProjection.HostConfig.CPUPeriod != input.HostConfig.CPUPeriod ||
+		typedProjection.HostConfig.CPUQuota != input.HostConfig.CPUQuota ||
+		typedProjection.HostConfig.PidsLimit != pids || typedProjection.Image != input.Image ||
+		!generatedDomainCanonicalDockerID(typedProjection.Image, true) {
+		t.Fatalf("typed generated builder projection = %#v, %v", typedProjection, typedErr)
+	}
+}
+
+type dockerInspectRenderResult struct {
+	body         []byte
+	typedErr     error
+	usedFallback bool
+	fallbackErr  error
+}
+
+func renderDockerInspectWithRawFallback(t *testing.T, format string, typed any, raw []byte) dockerInspectRenderResult {
+	t.Helper()
+	templateValue, err := template.New("docker-inspect").Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			encoded, err := json.Marshal(value)
+			return string(encoded), err
+		},
+	}).Parse(format)
+	if err != nil {
+		t.Fatal("Docker inspection template did not parse")
+	}
+	var rendered bytes.Buffer
+	typedErr := templateValue.Execute(&rendered, typed)
+	if typedErr == nil {
+		return dockerInspectRenderResult{body: rendered.Bytes()}
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var rawValue any
+	if err := decoder.Decode(&rawValue); err != nil {
+		t.Fatal("Docker inspection raw response did not decode")
+	}
+	rendered.Reset()
+	fallbackErr := templateValue.Option("missingkey=error").Execute(&rendered, rawValue)
+	if fallbackErr != nil {
+		return dockerInspectRenderResult{typedErr: typedErr, usedFallback: true, fallbackErr: fallbackErr}
+	}
+	return dockerInspectRenderResult{body: rendered.Bytes(), typedErr: typedErr, usedFallback: true}
+}
 
 func (r *generatedDomainTwoComponentRouteRunner) builderResult(
 	result runtimeprocess.CommandResult, image bool,

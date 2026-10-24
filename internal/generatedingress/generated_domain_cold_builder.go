@@ -29,8 +29,8 @@ const (
 		`"Paused":{{json .State.Paused}},"Restarting":{{json .State.Restarting}}},` +
 		`"Config":{"Image":{{json .Config.Image}},"Cmd":{{json .Config.Cmd}},` +
 		`"Labels":{{json .Config.Labels}}},"HostConfig":{"Memory":{{json .HostConfig.Memory}},` +
-		`"MemorySwap":{{json .HostConfig.MemorySwap}},"CpuPeriod":{{json .HostConfig.CpuPeriod}},` +
-		`"CpuQuota":{{json .HostConfig.CpuQuota}},"PidsLimit":{{json .HostConfig.PidsLimit}},` +
+		`"MemorySwap":{{json .HostConfig.MemorySwap}},"CpuPeriod":{{json .HostConfig.CPUPeriod}},` +
+		`"CpuQuota":{{json .HostConfig.CPUQuota}},"PidsLimit":{{json .HostConfig.PidsLimit}},` +
 		`"NetworkMode":{{json .HostConfig.NetworkMode}},"Privileged":{{json .HostConfig.Privileged}},` +
 		`"Binds":{{json .HostConfig.Binds}},"Mounts":` + generatedDomainColdBuilderConfiguredMountsProjection + `,` +
 		`"PortBindings":{{json .HostConfig.PortBindings}},"LogConfig":{"Type":{{json .HostConfig.LogConfig.Type}},` +
