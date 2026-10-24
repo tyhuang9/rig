@@ -17,6 +17,86 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Cold-accounting boundary attribution
+
+The remaining hosted `cold_accounting` refusal does not identify which
+reconstruction check failed. A focused diagnostic change adds seven closed
+reasons under the existing `cold_construction` stage: group reconstruction,
+builder attestation, reservation, ownership, head binding, group attestation and
+manifest creation. The outer boundary preserves the nested reason. Hostd accepts
+only the corresponding fixed stage/reason pairs.
+
+This change preserves the existing checks, execution order, effects and error
+cause visibility. It adds no raw error, path, identifier or secret output, and
+does not claim a repair of the unidentified hosted predicate.
+
+Windows execution on 24 October passed the two ingress parents with 39 children
+(41 unique passes), the existing process-kill boundary parent with ten children
+(11 passes), and the changed closed-projection parent with 136 children
+(137 passes). All seven added projection rows ran. There were no failures or
+skips in the final selection. Counts deduplicate child-process echoes.
+Formatting, ingress vet, live-tagged hostd vet, diff checks and canonical
+generation passed. Source/privacy review and its narrow test-expectation
+supplement found no blocker.
+
+Two earlier attempts remain recorded: a runner array-shape bug stopped discovery
+after compilation, then an existing removed-frontend assertion expected the old
+generic reason. The assertion now requires the exact `cold_group_attestation`
+reason while retaining refusal and no-effect checks. Root review also caught
+the hostd selector pointing to a neighboring boundary parent. The changed
+projection parent was subsequently discovered and executed on the same retained
+binary; successful earlier behavior was not replayed for that correction.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `cold-accounting-attribution-successor-20261024T023512Z/receipt.json` | `8ae97df00c98960ad573050f6a46a04a008c3dcb3933a95f14c0f8aef0c00845` |
+| `cold-accounting-attribution-successor-20261024T023512Z/hostd-projection-supplement-receipt.json` | `f9fae753179e4b08b5d5a8293109e0c925c6b1d8755f89c76ccf50c9e873052a` |
+| `cold-accounting-attribution-source-security-review-20261024.md` | `69bc2e41f49d23ea491506e9925c34bc2004645bf7f097ca249c07254dc0a925` |
+| `cold-accounting-attribution-test-successor-security-supplement-20261024.md` | `ab0d94673acc865345d9a6b9c7fb295f34d0532088954ce5eb1d2f72ea314334` |
+| `cold-accounting-attribution-root-audit-20261024.json` | `6fa1b0fcb6e5840fdf38fd2347aee0423c731e3a6ec31efcd4e012cdb48a90ae` |
+
+The main execution ran at 02:35:14–02:35:56 UTC; the projection supplement at
+02:36:22–02:36:24 UTC. Root verification matched the six current source hashes,
+retained binaries, discovery, command exits and raw results. Actual Docker,
+Linux race, full-suite and hosted root-cause acceptance remain unverified.
+
+## Hosted verification after the builder repair
+
+Published `07919b6eddb95d41651ca6611fdaca39a1708b68` ran through synthetic
+merge `eb59a88e342f1a2c91d867552a842f5ae2c2ddcd`, whose tree
+`880032441243b69bd66130545f6a76925f41ca37` equals the published head.
+Both real controller children still fail at
+`construction=cold_construction/cold_accounting`:
+
+- [TLS controller restart](https://github.com/tyhuang9/rig/actions/runs/40053901074/job/120752467987),
+  raw SHA-256 `d287a2906a01cdd24c0eaa942612ad72c7360c0bed2865a3d4ff063291305fb7`.
+- [Process-kill restart](https://github.com/tyhuang9/rig/actions/runs/40053901074/job/120752467768),
+  raw SHA-256 `880ad67ca23dd4a0032999e4ed33f1172110360b01c42ce4d1cd70b69c144b13`.
+
+The local builder regression is fixed, but these results do not prove that its
+predicate was the actual or only hosted failure. Further reconstruction
+investigation is required. The 02:28 UTC snapshot has six failed checks, nine
+successful, 15 running, 110 queued and one skipped. Both LAN jobs and migration
+still reach unfinished predecessor retirement; the data-volume job still fails
+fresh-manager replay. All six failure logs are captured against this exact
+checkout in `pr222-07919-first-failure-batch-20261024.json`, SHA-256
+`a8bd90a54ab6af55b0623dfd458b59d8e6ce4d3668ca0e06ef04e46f92ad55de`.
+
+At 02:33 UTC, the same head has nine failed checks, 15 successful, 16 running,
+100 queued and one skipped. Both final-config copy variants fail restarting the
+manager before sequence-ten replay. The full-hostd first-boundary diagnostic
+fails at `a0-sql-claim`: its child exits before daemon assembly, with only a
+closed stderr digest available. The log does not identify its internal cause.
+The three additional raw hashes are, respectively,
+`ec466338eec641885beb8566d4086f4d1b97cf0ebba255ecebcbbc5dbdbdd54d`,
+`bc969bb2bb440a94c6adeaa946186cbe1d19cc951c37c0657708defd958f9d72`
+and `cbd4b16880ace65bd0e579913ff93eb3cba695fae54901903fe0bc7c6305d6b8`.
+All nine captures are indexed in `pr222-07919-second-failure-batch-20261024.json`,
+SHA-256 `5ed87c693b40dc5364a6cb51f8915bb86820baf29a7343dc093b903671768f57`.
+These are partial check counts, not counts of independent defects.
+
 ## Retained builder accounting repair
 
 Commit `8c67e25b22f20426c307cbdd8423576d041dbec2` accounts for the persistent
