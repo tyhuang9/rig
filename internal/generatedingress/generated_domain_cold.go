@@ -969,7 +969,9 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 					Component:                component.plan.Name, Role: component.plan.Role,
 					ImageContentID: artifact.imageContentID}, buildDefinitionDigest: artifact.buildDefinitionDigest}
 				if err := authority.attestCandidateImage(ctx, policy); err != nil {
-					return err
+					return generatedDomainConstructionBoundaryDiagnostic(
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupImageAttestation, err)
 				}
 				expected := expectedObject{id: artifact.imageContentID,
 					labels: generatedDomainColdImageLabels(group.pins, component, artifact)}
@@ -998,7 +1000,10 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 				if err != nil || !found || !generatedcontainer.MatchesRunning(actual, expectedIdentity, policy.limits) ||
 					!generatedcontainer.CurrentlyRunning(actual) ||
 					(component.state == generatedruntimestate.ComponentHealthy && actual.Health != "healthy") {
-					return errors.Join(errGeneratedDomainConstructionRefused, err)
+					return generatedDomainConstructionBoundaryDiagnostic(
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupContainerAttestation,
+						errors.Join(errGeneratedDomainConstructionRefused, err))
 				}
 				container := expectedObject{name: policy.identity.ContainerName,
 					id: component.containerID, labels: generatedDomainColdContainerLabels(policy.identity)}
@@ -1014,7 +1019,9 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 				}
 				networks[policy.identity.NetworkName] = network
 				if err := authority.attestCandidateNetwork(ctx, policy); err != nil {
-					return err
+					return generatedDomainConstructionBoundaryDiagnostic(
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupNetworkAttestation, err)
 				}
 				continue
 			}
@@ -1076,13 +1083,24 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 			ok = false
 		}
 		if !ok || !generatedDomainExactRigLabels(object.labels, expected.labels) {
-			return errGeneratedDomainConstructionRefused
+			return generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdGroupCensus,
+				errGeneratedDomainConstructionRefused)
 		}
 	}
 	if len(seenContainers) != len(containers) || len(seenImages) != len(images) || len(seenNetworks) != len(networks) {
-		return errGeneratedDomainConstructionRefused
+		return generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupCensus,
+			errGeneratedDomainConstructionRefused)
 	}
-	return attestGeneratedDomainColdGateway(ctx, manager, authority, observed.docker, gateway)
+	if err := attestGeneratedDomainColdGateway(ctx, manager, authority, observed.docker, gateway); err != nil {
+		return generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupGatewayAttestation, err)
+	}
+	return nil
 }
 
 func attestGeneratedDomainColdGateway(ctx context.Context, manager *Manager,

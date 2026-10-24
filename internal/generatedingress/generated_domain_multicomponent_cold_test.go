@@ -44,7 +44,15 @@ type generatedDomainTwoComponentBuilderFixture struct {
 }
 
 type generatedDomainCandidateRosterRunner struct {
-	physical []candidateOwnerPhysical
+	physical   []candidateOwnerPhysical
+	failKind   candidateOwnerCommandKind
+	failErr    error
+	beforeKind candidateOwnerCommandKind
+	before     func()
+	afterKind  candidateOwnerCommandKind
+	afterAt    int
+	afterSeen  int
+	after      func()
 }
 
 type generatedDomainTwoComponentRouteRunner struct {
@@ -58,6 +66,8 @@ type generatedDomainTwoComponentRouteRunner struct {
 }
 
 const generatedDomainTwoComponentBuilderPrivateReadError = "private persisted builder observation failed"
+
+var generatedDomainTwoComponentGroupPrivateReadError = errors.New("private cold group attestation failed")
 
 func TestGeneratedDomainColdBuilderContainerProjectionHonorsDockerTypedAndRawFallbackFields(t *testing.T) {
 	type dockerContainerShape struct {
@@ -233,6 +243,14 @@ func (r *generatedDomainCandidateRosterRunner) Run(_ context.Context,
 		(kind != candidateOwnerImageInspect && kind != candidateOwnerNetworkInspect && kind != candidateOwnerInspect) {
 		return runtimeprocess.CommandResult{}, errors.New("unexpected two-component candidate command")
 	}
+	if kind == r.beforeKind && r.before != nil {
+		before := r.before
+		r.before = nil
+		before()
+	}
+	if kind == r.failKind {
+		return runtimeprocess.CommandResult{}, r.failErr
+	}
 	target := request.Args[4]
 	for _, physical := range r.physical {
 		matches := kind == candidateOwnerImageInspect && target == physical.policy.identity.ImageContentID ||
@@ -243,7 +261,16 @@ func (r *generatedDomainCandidateRosterRunner) Run(_ context.Context,
 			continue
 		}
 		candidate := &candidateOwnerRunner{physical: physical}
-		return candidate.defaultResult(kind, request)
+		result, err := candidate.defaultResult(kind, request)
+		if err == nil && kind == r.afterKind && r.after != nil {
+			r.afterSeen++
+			if r.afterSeen == r.afterAt {
+				after := r.after
+				r.after = nil
+				after()
+			}
+		}
+		return result, err
 	}
 	return runtimeprocess.CommandResult{}, errors.New("two-component candidate object is absent")
 }
@@ -253,11 +280,14 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 		return
 	}
 	for _, test := range []struct {
-		name    string
-		builder bool
-		mutate  func(*generatedDomainTwoComponentColdFixture)
-		pass    bool
-		reason  generatedDomainConstructionReason
+		name                   string
+		builder                bool
+		mutate                 func(*generatedDomainTwoComponentColdFixture)
+		pass                   bool
+		stage                  generatedDomainConstructionStage
+		reason                 generatedDomainConstructionReason
+		withoutRefusalSentinel bool
+		privateCause           bool
 	}{
 		{name: "exact_api_and_frontend_without_builder", pass: true},
 		{name: "exact_api_frontend_and_persisted_builder", builder: true, pass: true},
@@ -272,7 +302,7 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 		{name: "missing_frontend", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentContainer(
 				fixture.runner.delegate.objects, "frontend")
-		}, reason: generatedDomainConstructionReasonColdGroupAttestation},
+		}, reason: generatedDomainConstructionReasonColdGroupCensus},
 		{name: "crossed_frontend", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			for index := range fixture.runner.delegate.objects {
 				object := &fixture.runner.delegate.objects[index]
@@ -282,7 +312,32 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 				}
 			}
 			t.Fatal("frontend container is absent from the cold census")
-		}, reason: generatedDomainConstructionReasonColdGroupAttestation},
+		}, reason: generatedDomainConstructionReasonColdGroupCensus},
+		{name: "cold_group_image_attestation_failure", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
+			roster.failKind = candidateOwnerImageInspect
+			roster.failErr = generatedDomainTwoComponentGroupPrivateReadError
+		}, reason: generatedDomainConstructionReasonColdGroupImageAttestation,
+			withoutRefusalSentinel: true, privateCause: true},
+		{name: "cold_group_container_attestation_failure", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
+			roster.failKind = candidateOwnerInspect
+			roster.failErr = generatedDomainTwoComponentGroupPrivateReadError
+		}, reason: generatedDomainConstructionReasonColdGroupContainerAttestation, privateCause: true},
+		{name: "cold_group_network_attestation_failure", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
+			roster.failKind = candidateOwnerNetworkInspect
+			roster.failErr = generatedDomainTwoComponentGroupPrivateReadError
+		}, reason: generatedDomainConstructionReasonColdGroupNetworkAttestation,
+			withoutRefusalSentinel: true, privateCause: true},
+		{name: "nested_gateway_reason_remains_authoritative", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
+			roster.beforeKind = candidateOwnerNetworkInspect
+			roster.before = func() {
+				fixture.runner.delegate.gateway.live = []byte("changed-after-startup-observation")
+			}
+		}, stage: generatedDomainConstructionStageStartupObservation,
+			reason: generatedDomainConstructionReasonDockerLiveConfig},
 		{name: "orphan_persisted_builder_label", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = append(fixture.runner.delegate.objects, generatedDomainDockerObject{
 				kind: "volume", name: "ordinary-volume", labels: map[string]string{"rig.builder": "orphan"}})
@@ -464,21 +519,33 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 						t.Fatalf("two-component cold names=%v receipts=%d", names, len(receipts))
 					}
 				} else {
-					if result != nil || err == nil || !errors.Is(err, errGeneratedDomainConstructionRefused) {
+					if result != nil || err == nil ||
+						(!test.withoutRefusalSentinel && !errors.Is(err, errGeneratedDomainConstructionRefused)) ||
+						(test.withoutRefusalSentinel && errors.Is(err, errGeneratedDomainConstructionRefused)) {
 						t.Fatalf("invalid two-component cold roster = %#v, %v", result, err)
 					}
 					reason := test.reason
 					if reason == "" {
 						reason = generatedDomainConstructionReasonColdBuilderAttestation
 					}
+					stage := test.stage
+					if stage == "" {
+						stage = generatedDomainConstructionStageColdConstruction
+					}
 					var diagnostic *generatedDomainConstructionDiagnostic
 					if !errors.As(err, &diagnostic) || diagnostic == nil ||
-						diagnostic.stage != generatedDomainConstructionStageColdConstruction || diagnostic.reason != reason {
+						diagnostic.stage != stage || diagnostic.reason != reason {
 						t.Fatalf("invalid two-component cold reason = %#v, want %q", diagnostic, reason)
 					}
 					if generatedDomainDiagnosticErrorTreeContains(err,
 						generatedDomainTwoComponentBuilderPrivateReadError) {
 						t.Fatalf("invalid two-component cold reason exposed private read error: %v", err)
+					}
+					if strings.Contains(err.Error(), generatedDomainTwoComponentGroupPrivateReadError.Error()) {
+						t.Fatalf("invalid two-component cold reason rendered private group error: %v", err)
+					}
+					if test.privateCause && !errors.Is(err, generatedDomainTwoComponentGroupPrivateReadError) {
+						t.Fatalf("invalid two-component cold reason hid its previously visible cause: %v", err)
 					}
 				}
 				for _, command := range fixture.runner.snapshot() {
@@ -489,6 +556,85 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 			})
 		})
 	}
+
+	t.Run("cold_group_gateway_attestation_failure", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
+			roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
+			for _, group := range groups {
+				for _, component := range group.snapshot.components {
+					if component.state == generatedruntimestate.ComponentRunning ||
+						component.state == generatedruntimestate.ComponentHealthy ||
+						component.state == generatedruntimestate.ComponentActive ||
+						component.state == generatedruntimestate.ComponentDraining {
+						roster.afterAt++
+					}
+				}
+			}
+			roster.afterKind = candidateOwnerNetworkInspect
+			roster.after = func() {
+				result.candidates.process = &generatedDomainCandidateRosterRunner{}
+			}
+			err := attestGeneratedDomainColdGroups(context.Background(), result.manager, result.candidates, observed, groups)
+			assertGeneratedDomainConstructionDiagnostic(t, err,
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdGroupGatewayAttestation,
+				"generated domain construction was refused: stage=cold_construction reason=cold_group_gateway_attestation")
+			if !errors.Is(err, errGeneratedDomainConstructionRefused) {
+				t.Fatalf("cold group gateway attestation hid refusal sentinel: %v", err)
+			}
+			for _, command := range fixture.runner.snapshot() {
+				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+					t.Fatalf("cold group gateway refusal dispatched effect/capacity probe: %#v", command)
+				}
+			}
+		})
+	})
+
+	t.Run("cold_group_structural_fallback_remains_generic", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
+			delete(groups[0].policies, "api")
+			source := attestGeneratedDomainColdGroups(context.Background(), result.manager, result.candidates, observed, groups)
+			if !errors.Is(source, errGeneratedDomainConstructionRefused) {
+				t.Fatalf("cold group structural refusal = %v", source)
+			}
+			err := generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdGroupAttestation, source)
+			assertGeneratedDomainConstructionDiagnostic(t, err,
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdGroupAttestation,
+				"generated domain construction was refused: stage=cold_construction reason=cold_group_attestation")
+			for _, command := range fixture.runner.snapshot() {
+				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+					t.Fatalf("cold group structural refusal dispatched effect/capacity probe: %#v", command)
+				}
+			}
+		})
+	})
+}
+
+func generatedDomainTwoComponentColdAttestationFixture(t *testing.T) (generatedDomainTwoComponentColdFixture,
+	*generatedDomainConstruction, generatedDomainStartupObservation, []generatedDomainColdGroup,
+) {
+	t.Helper()
+	fixture := newGeneratedDomainTwoComponentColdFixture(t)
+	result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+		fixture.construction, fixture.environment, fixture.identity.options)
+	if err != nil || result == nil || result.manager == nil || result.candidates == nil {
+		t.Fatalf("valid cold attestation fixture = %#v, %v", result, err)
+	}
+	observed, err := inspectGeneratedDomainStartupObservation(context.Background(), fixture.identity.stores,
+		fixture.construction, fixture.identity.options)
+	if err != nil {
+		t.Fatalf("inspect valid cold attestation fixture: %v", err)
+	}
+	groups, err := readGeneratedDomainColdGroups(context.Background(), result.candidates, observed)
+	if err != nil || len(groups) != 1 {
+		t.Fatalf("read valid cold attestation groups = %d, %v", len(groups), err)
+	}
+	return fixture, result, observed, groups
 }
 
 func generatedDomainTwoComponentBuilderCensusNetwork(t *testing.T,
