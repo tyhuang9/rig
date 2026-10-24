@@ -60,32 +60,49 @@ func newGeneratedDomainConstruction(
 ) (result *generatedDomainConstruction, resultErr error) {
 	if ctx == nil || stores == nil || !generatedCandidatePointerIdentity(runner) ||
 		!generatedCandidatePointerIdentity(environment) {
-		return nil, errGeneratedDomainStartupInvalid
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageStartupObservation,
+			generatedDomainConstructionReasonInput, errGeneratedDomainStartupInvalid)
 	}
 	var valid bool
 	options, valid = normalizeGeneratedDomainOptions(options)
 	if !valid {
-		return nil, errGeneratedDomainStartupInvalid
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageStartupObservation,
+			generatedDomainConstructionReasonInput, errGeneratedDomainStartupInvalid)
 	}
 	fixedStores := *stores
 	physical, _, err := inspectGeneratedDomainPhysicalIdentity(ctx, &fixedStores, runner, options)
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageStartupObservation,
+			generatedDomainConstructionReasonPhysicalIdentity, err)
 	}
 	input, err := newGeneratedDomainReservationInput(&fixedStores, runner, environment, options, physical)
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageInitialClassification,
+			generatedDomainConstructionReasonInput, err)
 	}
 	reservation, owner, joined, err := reserveGeneratedDomainConstruction(ctx, input)
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageInitialClassification,
+			generatedDomainConstructionReasonDisposition, err)
 	}
 	if !owner {
-		return reattestGeneratedDomainConstructionJoin(ctx, reservation, input, joined)
+		joined, err = reattestGeneratedDomainConstructionJoin(ctx, reservation, input, joined)
+		if err != nil {
+			return nil, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageJoin, generatedDomainConstructionReasonManifest, err)
+		}
+		return joined, nil
 	}
 	completed := false
 	defer func() {
 		if !completed {
+			resultErr = generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageManifest, generatedDomainConstructionReasonManifest, resultErr)
 			failGeneratedDomainConstruction(reservation, resultErr)
 			result = nil
 		}
@@ -101,14 +118,25 @@ func newGeneratedDomainConstruction(
 	switch {
 	case observation.classification.disposition == generatedDomainStartupStable:
 		result, err = constructGeneratedDomainStable(ctx, reservation, input)
+		err = generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageStableConstruction,
+			generatedDomainConstructionReasonRecovery, err)
 	case observation.classification.disposition == generatedDomainStartupEmpty:
 		result, err = constructGeneratedDomainEmpty(ctx, reservation, input)
+		err = generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageEmptyConstruction,
+			generatedDomainConstructionReasonRecovery, err)
 	case observation.classification.disposition == generatedDomainStartupRecoveryRequired:
-		err = errGeneratedDomainConstructionRecovery
+		err = generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageInitialClassification,
+			generatedDomainConstructionReasonRecovery, errGeneratedDomainConstructionRecovery)
 	case observation.classification.disposition == generatedDomainStartupRefused &&
 		observation.classification.reason == generatedDomainStartupReasonColdAccounting &&
 		len(observation.classification.recovery) == 0:
 		result, err = constructGeneratedDomainCold(ctx, reservation, input, observation)
+		err = generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonFinalValidation, err)
 	default:
 		reason := generatedDomainConstructionReasonDisposition
 		if len(observation.classification.recovery) != 0 {
@@ -141,11 +169,14 @@ func constructGeneratedDomainCold(
 	if initial.classification.disposition != generatedDomainStartupRefused ||
 		initial.classification.reason != generatedDomainStartupReasonColdAccounting ||
 		len(initial.classification.recovery) != 0 || input.proof.ingressRoot == nil {
-		return nil, errGeneratedDomainConstructionRefused
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonInput, errGeneratedDomainConstructionRefused)
 	}
 	releaseEffects, err := deploymenteffects.Acquire(ctx, input.options.WorkingDirectory)
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonLock, err)
 	}
 	effectsHeld := true
 	root, err := inspectGeneratedLegacyRootObservation(input.runner, generatedDomainManagerOptions(input))
@@ -154,14 +185,18 @@ func constructGeneratedDomainCold(
 		!sameGeneratedDomainFileIdentity(root.ingressRoot, input.proof.ingressRoot) {
 		releaseErr := releaseEffects()
 		effectsHeld = false
-		return nil, errors.Join(errGeneratedDomainConstructionRefused, err, releaseErr)
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonPathIdentity,
+			errors.Join(errGeneratedDomainConstructionRefused, err, releaseErr))
 	}
 	view := newGeneratedManagerView(root)
 	releaseActivity, err := beginGeneratedDomainColdConstructionActivity(reservation, view)
 	if err != nil {
 		releaseErr := releaseEffects()
 		effectsHeld = false
-		return nil, errors.Join(err, releaseErr)
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonLock,
+			errors.Join(err, releaseErr))
 	}
 	activityHeld := true
 	var releaseGateway func() error
@@ -194,33 +229,46 @@ func constructGeneratedDomainCold(
 			}
 			effectsHeld = false
 		}
+		resultErr = generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonRelease, resultErr)
 	}()
 
 	store, present, _, err := inspectStateStoreReadOnly(input.options.DataRoot)
 	if err != nil || !present || store == nil {
-		return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonStateStore,
+			errors.Join(errGeneratedDomainConstructionRefused, err))
 	}
 	manager, err = assembleGeneratedDomainManager(input, store)
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonAssembly, err)
 	}
 	if err := bindGeneratedDomainManagerViewInto(manager, input.physical.manager, view); err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonAssembly, err)
 	}
 	result, err := assembleGeneratedDomainOwners(reservation, input, manager)
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonAssembly, err)
 	}
 	if err := checkGeneratedDomainManagerRebindFence(ctx, manager); err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonFence, err)
 	}
 	observed, err := inspectGeneratedDomainStartupObservation(ctx, input.stores, input.runner, input.options)
 	if err != nil || !sameGeneratedDomainStartupObservation(initial, observed) {
-		return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonStability,
+			errors.Join(errGeneratedDomainConstructionRefused, err))
 	}
 	cold, err := reconstructGeneratedDomainCold(ctx, result, observed)
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdAccounting, err)
 	}
 	result.cold = &cold
 
@@ -229,31 +277,39 @@ func constructGeneratedDomainCold(
 	// only after every risky share is retained and seeded.
 	releaseGateway, err = manager.lockGateway(ctx)
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonLock, err)
 	}
 	if err := verifyGeneratedDomainColdConstruction(ctx, reservation, input, result, initial); err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonFinalValidation, err)
 	}
 	if err := releaseGateway(); err != nil {
 		releaseGateway = nil
 		manager.gatewayRebindFailStopLatch().Store(true)
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonRelease, err)
 	}
 	releaseGateway = nil
 	if err := releaseActivity(); err != nil {
 		activityHeld = false
 		manager.gatewayRebindFailStopLatch().Store(true)
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonRelease, err)
 	}
 	activityHeld = false
 	if err := releaseEffects(); err != nil {
 		effectsHeld = false
 		manager.gatewayRebindFailStopLatch().Store(true)
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, generatedDomainConstructionReasonRelease, err)
 	}
 	effectsHeld = false
 	if err := verifyGeneratedDomainColdConstruction(ctx, reservation, input, result, initial); err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonFinalValidation, err)
 	}
 	return result, nil
 }

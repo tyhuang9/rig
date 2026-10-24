@@ -5,6 +5,7 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -88,6 +89,132 @@ func TestGeneratedDomainConstructionDiagnosticClosedAttribution(t *testing.T) {
 			generatedDomainDiagnosticErrorTreeContains(collapsed, privateCause.Error()) {
 			t.Fatalf("collapsed Docker diagnostic exposed its replaced cause: %v", collapsed)
 		}
+
+		cold := generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdAccounting, privateCause)
+		assertGeneratedDomainConstructionDiagnostic(t, cold,
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdAccounting,
+			"generated domain construction was refused: stage=cold_construction reason=cold_accounting")
+		if !errors.Is(cold, privateCause) {
+			t.Fatalf("cold boundary hid its previously visible cause: %v", cold)
+		}
+
+		secondary := errors.New("secondary visible release error")
+		joined := errors.Join(cold, secondary)
+		retained := generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageManifest,
+			generatedDomainConstructionReasonManifest, joined)
+		assertGeneratedDomainConstructionDiagnostic(t, retained,
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdAccounting,
+			"generated domain construction was refused: stage=cold_construction reason=cold_accounting")
+		if retained == joined || !errors.Is(retained, privateCause) || !errors.Is(retained, secondary) ||
+			strings.Contains(retained.Error(), secondary.Error()) {
+			t.Fatalf("existing specific diagnostic was replaced: %v", retained)
+		}
+		if direct := generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageManifest,
+			generatedDomainConstructionReasonManifest, cold); direct != cold {
+			t.Fatalf("direct specific diagnostic identity changed: %v", direct)
+		}
+		prefixed := fmt.Errorf("private prefix: %w", cold)
+		closed := generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageManifest,
+			generatedDomainConstructionReasonManifest, prefixed)
+		assertGeneratedDomainConstructionDiagnostic(t, closed,
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdAccounting,
+			"generated domain construction was refused: stage=cold_construction reason=cold_accounting")
+		if !errors.Is(closed, privateCause) || strings.Contains(closed.Error(), "private prefix") {
+			t.Fatalf("wrapped diagnostic rendered its private prefix: %v", closed)
+		}
+	})
+
+	t.Run("public_and_private_entry_boundaries_are_named", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			fixture := newGeneratedDomainStableConstructionFixture(t)
+			domain, err := NewGeneratedDomain(context.Background(), nil, fixture.runner, fixture.environment,
+				GeneratedDomainOptions{})
+			if domain != nil {
+				t.Fatalf("invalid public construction published %#v", domain)
+			}
+			assertGeneratedDomainConstructionDiagnostic(t, err,
+				generatedDomainConstructionStageStartupObservation,
+				generatedDomainConstructionReasonInput,
+				"generated domain construction was refused: stage=startup_observation reason=input")
+			if !errors.Is(err, errGeneratedDomainStartupInvalid) {
+				t.Fatalf("public input diagnostic hid startup sentinel: %v", err)
+			}
+
+			privateCause := errors.New("private physical inspection cause")
+			fault := &generatedDomainConstructionDiagnosticFaultRunner{delegate: fixture.runner,
+				failAt: 1, err: privateCause, match: func(args []string) bool {
+					return reflect.DeepEqual(args, []string{"info", "--format", "{{json .ID}}"})
+				}}
+			result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+				fault, fixture.environment, fixture.identity.options)
+			if result != nil {
+				t.Fatalf("failed physical inspection published %#v", result)
+			}
+			assertGeneratedDomainConstructionDiagnostic(t, err,
+				generatedDomainConstructionStageStartupObservation,
+				generatedDomainConstructionReasonPhysicalIdentity,
+				"generated domain construction was refused: stage=startup_observation reason=physical_identity")
+			if errors.Is(err, privateCause) ||
+				generatedDomainDiagnosticErrorTreeContains(err, privateCause.Error()) {
+				t.Fatalf("physical diagnostic exposed the reader's collapsed cause: %v", err)
+			}
+		})
+	})
+
+	t.Run("sticky_recovery_retains_first_closed_diagnostic", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			identity, runner, environment := newGeneratedDomainPreparedRecoveryConstructionFixture(t)
+			result, firstErr := newGeneratedDomainConstruction(context.Background(), identity.stores,
+				runner, environment, identity.options)
+			if result != nil {
+				t.Fatalf("recovery construction published %#v", result)
+			}
+			assertGeneratedDomainConstructionDiagnostic(t, firstErr,
+				generatedDomainConstructionStageInitialClassification,
+				generatedDomainConstructionReasonRecovery,
+				"generated domain construction was refused: stage=initial_classification reason=recovery")
+			if !errors.Is(firstErr, errGeneratedDomainConstructionRecovery) {
+				t.Fatalf("recovery diagnostic hid recovery sentinel: %v", firstErr)
+			}
+			joined, joinErr := newGeneratedDomainConstruction(context.Background(), identity.stores,
+				runner, environment, identity.options)
+			if joined != nil || !errors.Is(joinErr, firstErr) || joinErr.Error() != firstErr.Error() {
+				t.Fatalf("sticky recovery join = %#v, %v; want %v", joined, joinErr, firstErr)
+			}
+		})
+	})
+
+	t.Run("cold_accounting_refusal_is_named_without_effects", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			fixture := newGeneratedDomainTwoComponentColdFixture(t)
+			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentContainer(
+				fixture.runner.delegate.objects, "frontend")
+			result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+				fixture.runner, fixture.environment, fixture.identity.options)
+			if result != nil {
+				t.Fatalf("incomplete cold roster published %#v", result)
+			}
+			assertGeneratedDomainConstructionDiagnostic(t, err,
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdAccounting,
+				"generated domain construction was refused: stage=cold_construction reason=cold_accounting")
+			if !errors.Is(err, errGeneratedDomainConstructionRefused) {
+				t.Fatalf("cold accounting diagnostic hid refusal sentinel: %v", err)
+			}
+			for _, command := range fixture.runner.snapshot() {
+				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+					t.Fatalf("cold accounting refusal dispatched effect/capacity probe: %#v", command)
+				}
+			}
+		})
 	})
 
 	t.Run("gateway_reader_failures_have_finite_reasons", func(t *testing.T) {

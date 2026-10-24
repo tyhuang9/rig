@@ -49,11 +49,14 @@ func NewGeneratedDomain(ctx context.Context, stores *deployments.GeneratedOwnerS
 	construction, err := newGeneratedDomainConstruction(ctx, stores, runner, environment,
 		privateGeneratedDomainOptions(options))
 	if err != nil {
-		return nil, err
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageManifest, generatedDomainConstructionReasonManifest, err)
 	}
 	if !validGeneratedDomainConstructionResult(construction.reservation, construction) ||
 		construction.domain == nil || construction.domain.construction != construction {
-		return nil, errGeneratedDomainConstructionRefused
+		return nil, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageManifest, generatedDomainConstructionReasonManifest,
+			errGeneratedDomainConstructionRefused)
 	}
 	return construction.domain, nil
 }

@@ -14,10 +14,13 @@ type generatedDomainConstructionStage string
 const (
 	generatedDomainConstructionStageStartupObservation    generatedDomainConstructionStage = "startup_observation"
 	generatedDomainConstructionStageInitialClassification generatedDomainConstructionStage = "initial_classification"
+	generatedDomainConstructionStageStableConstruction    generatedDomainConstructionStage = "stable_construction"
 	generatedDomainConstructionStageStableFinal           generatedDomainConstructionStage = "stable_final"
+	generatedDomainConstructionStageEmptyConstruction     generatedDomainConstructionStage = "empty_construction"
 	generatedDomainConstructionStageEmptyReclassification generatedDomainConstructionStage = "empty_reclassification"
 	generatedDomainConstructionStageEmptyFinalLocked      generatedDomainConstructionStage = "empty_final_locked"
 	generatedDomainConstructionStageEmptyFinalReleased    generatedDomainConstructionStage = "empty_final_released"
+	generatedDomainConstructionStageColdConstruction      generatedDomainConstructionStage = "cold_construction"
 	generatedDomainConstructionStageManifest              generatedDomainConstructionStage = "manifest"
 	generatedDomainConstructionStageJoin                  generatedDomainConstructionStage = "join"
 )
@@ -49,6 +52,11 @@ const (
 	generatedDomainConstructionReasonManifest             generatedDomainConstructionReason = "manifest"
 	generatedDomainConstructionReasonProcessLatch         generatedDomainConstructionReason = "process_latch"
 	generatedDomainConstructionReasonFence                generatedDomainConstructionReason = "fence"
+	generatedDomainConstructionReasonAssembly             generatedDomainConstructionReason = "assembly"
+	generatedDomainConstructionReasonColdAccounting       generatedDomainConstructionReason = "cold_accounting"
+	generatedDomainConstructionReasonLock                 generatedDomainConstructionReason = "lock"
+	generatedDomainConstructionReasonRelease              generatedDomainConstructionReason = "release"
+	generatedDomainConstructionReasonFinalValidation      generatedDomainConstructionReason = "final_validation"
 )
 
 type generatedDomainConstructionDiagnostic struct {
@@ -84,16 +92,43 @@ func validGeneratedDomainConstructionStage(stage generatedDomainConstructionStag
 	switch stage {
 	case generatedDomainConstructionStageStartupObservation,
 		generatedDomainConstructionStageInitialClassification,
+		generatedDomainConstructionStageStableConstruction,
 		generatedDomainConstructionStageStableFinal,
+		generatedDomainConstructionStageEmptyConstruction,
 		generatedDomainConstructionStageEmptyReclassification,
 		generatedDomainConstructionStageEmptyFinalLocked,
 		generatedDomainConstructionStageEmptyFinalReleased,
+		generatedDomainConstructionStageColdConstruction,
 		generatedDomainConstructionStageManifest,
 		generatedDomainConstructionStageJoin:
 		return true
 	default:
 		return false
 	}
+}
+
+// generatedDomainConstructionBoundaryDiagnostic decorates a construction
+// boundary that already returned its source error. Existing closed diagnostics
+// pass through unchanged, so the first precise stage remains authoritative and
+// no previously collapsed source error becomes unwrap-visible.
+func generatedDomainConstructionBoundaryDiagnostic(stage generatedDomainConstructionStage,
+	reason generatedDomainConstructionReason, source error,
+) error {
+	if source == nil {
+		return nil
+	}
+	if diagnostic, ok := source.(*generatedDomainConstructionDiagnostic); ok && diagnostic != nil &&
+		validGeneratedDomainConstructionStage(diagnostic.stage) &&
+		validGeneratedDomainConstructionReason(diagnostic.reason) {
+		return source
+	}
+	var diagnostic *generatedDomainConstructionDiagnostic
+	if errors.As(source, &diagnostic) && diagnostic != nil &&
+		validGeneratedDomainConstructionStage(diagnostic.stage) &&
+		validGeneratedDomainConstructionReason(diagnostic.reason) {
+		stage, reason = diagnostic.stage, diagnostic.reason
+	}
+	return newGeneratedDomainConstructionDiagnostic(stage, reason, source)
 }
 
 func validGeneratedDomainConstructionReason(reason generatedDomainConstructionReason) bool {
@@ -121,7 +156,12 @@ func validGeneratedDomainConstructionReason(reason generatedDomainConstructionRe
 		generatedDomainConstructionReasonStateStore,
 		generatedDomainConstructionReasonManifest,
 		generatedDomainConstructionReasonProcessLatch,
-		generatedDomainConstructionReasonFence:
+		generatedDomainConstructionReasonFence,
+		generatedDomainConstructionReasonAssembly,
+		generatedDomainConstructionReasonColdAccounting,
+		generatedDomainConstructionReasonLock,
+		generatedDomainConstructionReasonRelease,
+		generatedDomainConstructionReasonFinalValidation:
 		return true
 	default:
 		return false

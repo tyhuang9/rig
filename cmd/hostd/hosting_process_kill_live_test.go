@@ -470,15 +470,25 @@ func controllerChildConstructionDiagnosticKnownPair(stage, reason string) bool {
 	case "startup_observation":
 		return startupReason(reason)
 	case "initial_classification":
-		return reason == "disposition" || reason == "recovery"
+		return reason == "input" || reason == "disposition" || reason == "recovery"
+	case "stable_construction", "empty_construction":
+		return reason == "recovery"
 	case "stable_final":
 		return reason == "state_store" || finalReason(reason)
 	case "empty_reclassification":
 		return reason == "classification" || startupReason(reason)
 	case "empty_final_locked", "empty_final_released":
 		return finalReason(reason)
+	case "cold_construction":
+		switch reason {
+		case "input", "path_identity", "state_store", "assembly", "fence", "stability",
+			"cold_accounting", "lock", "release", "final_validation":
+			return true
+		default:
+			return false
+		}
 	case "manifest":
-		return reason == "classification" || reason == "recovery" || reason == "disposition" ||
+		return reason == "manifest" || reason == "classification" || reason == "recovery" || reason == "disposition" ||
 			startupReason(reason)
 	case "join":
 		return reason == "manifest"
