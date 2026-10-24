@@ -5,19 +5,234 @@ published at `c676c5ca669ca3162fcdb3bdfb183e264aa78a8b`. The selected local Wind
 native Linux matrix and four added regression tests passed with explicit
 environment/live-test skips. The first hosted run subsequently finished with
 68 failed checks, 61 successful checks and two skipped checks. Repairs are in
-progress. The published diagnostic checkpoint is
-`cc1cccee1dba3c93803f4085924e1c1e1c890f2c`; its hosted run localizes the startup
-refusal to the locked final check's Docker static-response probe. Runtime fixture
-corrections were published at `44ca01022b6bfd6a45a1e6adf44ab8383cc4a57a`.
-The source correction for the missing V1 fallback is recorded below; hosted Docker
-acceptance remains required. Receipt-owned predecessor retirement remains open.
+progress. Native V1 fallback correction `f400b19` advances hosted Docker beyond
+the startup probe to healthy containers, Chromium create and the external-outage
+subtest. Fresh controller startup and gateway/rebind fixture failures remain.
+The following sections record the cold-process, diagnostic and fixture-lifetime
+repairs, with their actual verification boundaries. Hosted Docker and race
+acceptance remain required. Receipt-owned predecessor retirement remains open;
 M4 is incomplete.
 
 The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Concrete gateway V2 fixture and completed-session release
+
+Commit `8ab5b21c9289fa4678d391efbbdd7cf7c53fe078` repairs two fixture
+incompatibilities in `gateway_v2_live_test.go`.
+
+The two live upgrade parents no longer install diagnostic driver replacements.
+The complete generated domain requires its concrete driver family; replacing
+three private V2 drivers made its own reference-family check refuse before an
+operation or trace event existed. Production ownership checks, actual default
+drivers and the durable-operation failure diagnostic remain. Isolated tracing
+helpers and their controls are unchanged.
+
+The shared fixture also closes its exact initial candidate session after route
+activation, successful V1 response, source-state load and source attestation.
+Previously that session held the OS deployment-effects lease until test cleanup,
+while later rebind stages tried to acquire the same lease. The session's map entry
+remains available for read-only published history. Later mutations use separate
+sessions; registered cleanup remains idempotent. No production lock, deadline or
+authority check changes.
+
+The published `f400b19`
+[successor data-volume job](https://github.com/tyhuang9/rig/actions/runs/40041826101/job/120715216438)
+had already completed an actual default-driver V2 upgrade and profile-claim
+advancement, then failed at successor-network staging after the fixture's
+18-minute context expired. It retained resources without an exact sequence-five
+binding. That partial progress supports the source diagnosis but does not prove
+the new release fixes the complete Docker journey.
+
+Default and live-tagged ingress compilation, exact discovery of the two live
+upgrade parents, formatting, ingress vet and canonical generation passed on the
+final one-file source. Docker behavior was not executed locally. Evidence under
+`pr222-ci-repair-20261023T2125Z/`:
+
+- `v2-live-fixture-20261024T002329Z/receipt.json`, SHA-256
+  `98a3ebd2b5dc07ef9b8a3df90eed7bfe9828e3f85037a0451b055c767f178e7d`.
+- `v2-live-fixture-root-audit-20261024.json`, SHA-256
+  `c7e10f8538b869b4b9f174b549e575e3163364bba5938281600752fa78cdbd8c`.
+- Scoped source security review SHA-256
+  `878e495b6ebf2e55ac5d3331bc27ca42f7d27c1e94e9fb0c65a925031630e1cf`.
+
+The aggregate four-unit review, SHA-256
+`bca159d1ae7bfb7fc9a9098e375901c970286add66b6e51667b7c3a6150e12fc`,
+found no source blocker across the 11 changed Go test paths. Its original pending
+commit, documentation and publication conditions remain recorded; the publication
+receipt and additive review closure bind the final checkpoint separately.
+
+### Hosted status before the four-unit update
+
+At 00:23:18 UTC on 24 October, `f400b19` had 11 failed checks, 21 successful,
+12 running, 96 queued and one skipped. Snapshot SHA-256:
+`6a0515b139886c582dcf1ded9ca3f073df0eb433822acc225378954e2655c0a0`.
+All 11 completed failure logs were retained against the verified synthetic merge.
+These are check counts, not distinct defects or results for the new source.
+
+The [Windows handover job](https://github.com/tyhuang9/rig/actions/runs/40041826106/job/120715501297)
+still fails `TestGatewayRebindFinalHandoverFreshLoopbackHeadDriftPreventsAllEffects`
+because its intended drift update affects zero rows. Raw SHA-256:
+`a0a4ec46f5e520b50fe377f89aea2c15bbcf7c81ad8e8b74df9fcd922241e869`.
+That separate fixture correction remains queued. Full Docker, PostgreSQL, Linux
+race, receipt-owned predecessor retirement and milestone acceptance remain open.
+
+## Lifecycle and router fixture lifetime completion
+
+Commit `d345cd744222baa04358bf59b2dc0f401da9c8c4` uses the existing retained-root
+helper for the lifecycle adapter fixture and the router fixture's running-domain
+path. Each package adds the existing `RunTestMain` cleanup wrapper. The router's
+ordinary refusal fixture, assertions, database and lease cleanup, production
+identity registry and shared helper remain unchanged.
+
+The published `f400b19` fast verification job failed two lifecycle parents and
+four router parents with retained-identity conflicts. The correction was checked
+with those families together in their package processes, plus the lifecycle
+positive control: seven native Linux parents and 17 children passed, with no
+failure or skip. Both binaries were cross-compiled for Linux, then run through
+WSL with private native `/tmp` roots. Formatting of all four files, both package
+vet checks and canonical generation passed.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `lifetime2-packages-20261024T001729Z/receipt.json`, SHA-256
+  `7ea9d8c5af475bdf0838555726c54a4ffdf2a87c9130285f5b339647d0c8503a`.
+- `lifetime2-packages-root-audit-20261024.json`, SHA-256
+  `f5976ba616780f33ec28efc727d4bfe989255365bf5afb1a90b9700c9503a671`,
+  verifies source bytes, ELF binaries, exact discovery, raw test census and all
+  command log hashes. The additive execution note distinguishes the Windows
+  launcher environment from the Linux binaries actually executed.
+
+Independent source review found only these intended fixture-lifetime changes.
+The results establish focused non-race regression coverage; hosted race and full
+repository acceptance remain open. No specific reused filesystem identity is
+claimed from the original failure log.
+
+## Closed child startup diagnostics
+
+Commit `9e9d4ec95fb54343e32cf29678b81f31d1d00214` adds a private diagnostic to
+the controller-restart and process-kill fixtures. A failed startup emits only a
+fixed child kind, allowlisted stage and `failed` result to stderr. The parent
+keeps its existing stderr hash and appends that closed code after the child exits.
+Child stdout remains uncaptured. Runtime errors, credentials, paths and arbitrary
+command output are not forwarded.
+
+Parsing considers at most 8 KiB and 32 trailing records. Unknown fields, duplicate
+keys, crossed kind/stage pairs, non-string values and trailing JSON are refused.
+The existing failure paths, ownership, deadlines, worker behavior and readiness
+protocol remain unchanged. Capacity pressure is labeled only before readiness.
+
+Windows verification passed one exactly discovered parent and 111 unique child
+cases, including a real failing subprocess that writes private values to stdout
+and its fatal message. Neither captured stderr nor the projected diagnostic
+contains those values. Four explicit cases exercise both byte and record bounds.
+Live-tagged compilation, formatting of the three changed files, tagged hostd vet
+and canonical generation also passed with unchanged source.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `child-startup-diagnostic-final-20261024T001415Z/receipt.json`, SHA-256
+  `62436c7015148612492583a644578b2d4efada8c28f5f61fb064ae36b0918632`.
+- `child-startup-diagnostic-root-audit-20261024.json`, SHA-256
+  `db7efe78d599a96ada89ddc7629a2232501267babd8f9e25e5a793953c589ad3`,
+  independently verifies current source, binary, runner, raw results and reviews.
+- Source security review SHA-256
+  `b9bf314f3a556748b16055b45039368fb5997912746764ff6fb9f8d6f79edb9e`,
+  with additive four-boundary-case review
+  `2c1bba679e442fc7add85b68acc141d85a3ecf52224cefbb5c24fa8e0bae4919`.
+
+Two earlier harness attempts passed all behavior flags as one argument and ran
+no tests. Their receipts remain explicitly failed. The final run records and
+validates four distinct behavior arguments before invocation; it does not reuse
+either attempt as a behavior pass. These checks establish diagnostic behavior,
+not successful Docker restart or the cause of the original child exits.
+
+## Cold LAN and migration controller fixtures
+
+Commit `551c6529d35dedf97e91e7f7447e5d3e65071030` repairs the three live fixture
+files for the two-app LAN, application-owned database LAN and migration journeys.
+Initial controllers now acquire a protected owner lease, open the sealed database
+and construct a complete generated domain using the same real Docker runner.
+The migration path preserves its authority observer and migration-runner factory.
+Authentic test roots use the existing process-lifetime retention helper.
+
+Restart closes the original worker, API, database and owner lease before starting
+an exact test in a fresh process. The child reconstructs its own owner graph,
+domain and worker. The parent keeps authentication values in memory; the private
+manifest carries only fixture paths and a closed scenario. Entry requires the
+selected test's opt-in and local Linux Docker. Bounded decoding rejects unknown
+or duplicate keys, trailing data, crossed paths and symlinks; private object and
+opened-file checks remain required. This is not an atomic defense against a
+hostile writer with the same operating-system identity.
+
+Review found and corrected six fixture issues: root lifetime, private manifest
+validation, a migration count checked before worker completion, dropped worker
+errors, missing deferred worker shutdown, and an omitted explicit recovered
+gateway-serving assertion. The child now cancels and joins its worker before
+checking the final zero-migration count. Worker errors become a closed failure
+bit. Fatal cleanup closes the API, joins the worker, closes the database, then
+releases ownership. The parent verifies the original gateway operation and its
+serving observation through the fresh authenticated API. Existing LAN identity,
+secret-scoping, immutable release, migration-attempt and database-counter checks
+remain in place.
+
+Native Linux verification discovers five exact parents and executes the one
+Docker-independent protocol parent with seven passing children, including
+symlink refusal. Four actual Docker journey parents are compiled and discovered
+but remain unexecuted locally. Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+- `cold-runtime-restart-successor-20261024T000057Z/receipt.json`, SHA-256
+  `d620dabce36800a40206a1e8dfd0fbf2c921857b936a18ec4947a4a02e869627`.
+- `cold-runtime-restart-behavior-root-audit-20261024.json`, SHA-256
+  `8fa5461129f3750eabcb08fa91999b387d0c0ebbd215bca798169a11ba689419`.
+  It verifies raw results, binary and runner, and reconstructs the tested source
+  by reversing exactly the later seven-line migration database-close bookkeeping
+  change. The protocol source did not change; the original binary and receipt
+  retain their earlier migration source hash.
+- `cold-runtime-restart-static-20261024T000419Z/receipt.json`, SHA-256
+  `799f61a48764c14848f0a7883c28b4084aa37222b26525470a5e46a12e840de2`:
+  final three-file formatting, live-tagged hostd vet and compilation, and canonical
+  generation pass with stable source.
+- `cold-runtime-restart-static-root-audit-20261024.json`, SHA-256
+  `2677378428dfd107fcfb60e5effafaa28505f5fc6f2fed1b065418a2c47fd635`,
+  independently binds the final source, static logs and tagged binary.
+- Successor security review SHA-256
+  `c7f3fe021252afa1a31511082b15c75d6e89fbd64b1f736588f2afcdddd6ea06`,
+  with additive cleanup-order and test-count erratum
+  `72b57d1ea428bd7e39e71bcc41ec20153d94598c37c0f307bbf18043520db008`.
+  The original six-finding review is retained unchanged.
+
+These controls establish the fixture protocol and source checks, not successful
+Docker restart, migration recovery, complete CI or milestone acceptance.
+
 ## Native V1 unmatched-host response correction
+
+The correction was published in `f400b19929bdb9dbb8e2fcc8c8c983d34976cc3f`.
+Its hosted run advances past the original startup probe failure. The
+[controller TLS job](https://github.com/tyhuang9/rig/actions/runs/40041826113/job/120714445899)
+reaches healthy API and frontend containers, passes the `ExternalDependencyOutage`
+subtest, and records a successful deployed Chromium create journey. It then
+fails when a fresh controller child exits with code 1 before readiness. The
+[process-kill job](https://github.com/tyhuang9/rig/actions/runs/40041826113/job/120714445660)
+also reaches healthy containers and Chromium create, then fails at the
+`before_build` child's readiness boundary. These are partial journey results.
+
+The 23:56:14 UTC snapshot has six failed, five successful, 13 running, 116 queued
+and one skipped check. All six completed failure logs were retained against
+synthetic merge `b599e594bb1d50691c1c047c0e8762be22d939ae`, whose parents and tree
+match the published source and unchanged PR #220 base. Snapshot SHA-256:
+`ab7e735784e018ac3a835820865a52ae207b3c1219cf3b013ec701b0d3e38d49`.
+Failure index `pr222-f400-first-failure-batch-20261023.json` has SHA-256
+`66df864b1e441e40c63c1e0a50d1f47e9e3f371115b3c0b752386cabd8f104c3`.
+
+Both failed child diagnostics are `empty`. The fixture captures only stderr;
+its Go test failure output is discarded on stdout. Several child startup stages
+can fail before readiness, so the underlying cause remains unproven. A private
+closed diagnostic is required; arbitrary child output must remain private.
+Read-only source map `pr222-f400-child-reporting-map-20261023.md`, SHA-256
+`35b3a6162a708ee10b62196afda5f195ebbea43ed773dedc8c547acee1835d25`,
+records that boundary. Full Docker/race and M4 acceptance remain open.
 
 Commit `b13ddf5b72bbba90a566362ca78f5877a2fc3c66` adds one empty 404 fallback after
 the native V1 gateway's application proxy routes, including an empty bootstrap.
