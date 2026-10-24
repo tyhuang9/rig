@@ -17,6 +17,97 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Rebind authority and corruption-fixture alignment
+
+Commit `3daf9ce085740cb3033d3ec45c4a2320d47ddd45` updates two tests without
+changing production. Raw construction must install coherent concrete drivers,
+but it still has no generated-domain view. The corrected assertion requires
+typed mutation to refuse with no leave capability and no runner command.
+
+The existing fourth-inventory-read corruption control now drops the newer
+activation guard as well as the existing validity guard in its private fixture
+database. This allows the deliberate generation change to reach the reader
+under test. The result must remain empty with `DiagnosticRouteUnresolved`.
+Production triggers and common fixture setup are unchanged.
+
+Windows and native Linux execution at 04:45:40–04:46:11 UTC on 24 October
+passed both selected parents and nine distinct children on each platform:
+11 unique passes each, no failures or skips. Exact discovery, retained binaries
+and unchanged source hashes bind the results. Formatting, ingress vet and
+`scripts/check-generation.ps1` passed. Root independently checked all raw logs,
+binaries, discovery, source and review hashes before the exact two-file commit.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `rebind-history-two-fixtures-20261024T044535Z/receipt.json` | `22339fdebcbef1995cee3a4693709d6e8b5750af1e91c3ac4b128147f7c7e97f` |
+| `rebind-runtime-composition-preclaim-test-source-security-review-20261024.md` | `1244a99c27203ce3dd9d05d1845768377a2dfb5d53caa5799145fb7015423864` |
+| `rebind-two-fixtures-root-audit-20261024.json` | `19c387767fba8e987f3b2f2877ad76c12cbf158dc929e6cd98c2dfda2dde0204` |
+| `pr222-rebind-runtime-composition-preclaim-final-integration-20261024.md` | `4389f7ea43e0160002be7f7793fd18721cdede4268ad1f9685626f034dfe8e43` |
+
+This is focused fixture verification. Hosted race execution, Docker journeys
+and the complete suite remain separate gates.
+
+## Application namespace handoff to complete cold accounting
+
+Local commit `19b21bd9b6290c310dbe5de8712b15c2235c966a` corrects the A0
+startup ordering. Previously, an application-bearing native V2 gateway was
+checked against a gateway-only object set before its application resources
+could reach complete cold accounting. The authentic public-constructor
+regression first reproduced `startup_observation/docker_attestation` on
+24 October at 04:20:57–04:21:00 UTC. Earlier fixture-setup failures are retained
+and are not counted as that reproduction.
+
+The production change moves the existing gateway-only comparison after the
+valid application-bearing passive return. Typed expectation validation,
+gateway-only exactness, complete censuses and daemon checks remain. The
+passive result grants no authority. Before returning a public domain,
+unchanged cold reconstruction accounts for every application, image, network,
+builder and protected gateway object, then requires the full gateway proof.
+Pinned image, container, volumes, network, journal, restart config, live config
+and static challenge checks remain. `generated_domain_cold.go` has no Git diff.
+
+The new fixture uses two applications with two components each, distinct image
+identities, normal candidate/activation/grant/upgrade writers, reused sealed
+stores and the persisted builder. It checks the exact 17-object pre-call
+census and restores the canonical deployment-identity trigger before calling
+the public constructor. Successful reconstruction requires two cold groups.
+Missing, crossed, extra, unowned and inconsistent-builder cases must refuse
+without mutations, capacity probes, admin requests or challenges. Separate
+gateway-only controls cover exact, missing, extra, crossed and malformed state.
+
+Windows composite verification at 04:36:42–04:40:07 closes three parents and
+45 distinct children: six application cases, five gateway cases and 34 existing
+cold-roster cases. The first run failed overall because a gateway assertion
+incorrectly required a private error sentinel. Its application and cold-roster
+passes remain valid. The final assertion-only correction checks the existing
+closed public diagnostic; the rebuilt gateway parent and all five children
+pass. An exact predecessor reconstruction, explicitly created after execution,
+matches the earlier source hash and proves only gateway assertions changed.
+It is not represented as a source copy captured before execution.
+
+Vet, tagged compilation, generation checks and formatting pass. The earlier
+formatter status field was blank; its empty output and the successful final
+formatter check provide the actual evidence. Root independently audited source,
+binaries, discovery, raw test counts, static status and source-impact closure.
+SQL comparisons include schema and application rows but normalize
+`schema_migrations.applied_at`; those timestamp values are not independently
+bound. Protected file bytes and identities are compared separately.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `a0-gateway-final-successor-20261024T043952Z/composite-receipt.json` | `359a9ed0ab5e65f1d2e6b25be2a79b625e55b7a08894819562988628056503fa` |
+| `a0-prepared-claim-namespace-final-test-source-security-binding-20261024.md` | `df66ae8154444c4fb7b871af861bfa966adacf94abe5fc48c5ac8f33473cdc59` |
+| `a0-namespace-root-audit-20261024.json` | `6480411d1f7a011bc1f81a69fd3bdc8ce4a2a333777725aebe9b8cb14c049bba` |
+| `pr222-a0-prepared-claim-namespace-final-integration-20261024.md` | `20de2f6a46a2e71666ca772906a3ef8f4a331a6caf7beb31d22a75977953564c` |
+
+This establishes the local ordering repair. Actual Docker A0 startup, Linux
+race execution and the complete hosted journey remain unverified. The hosted
+incident may have a later independent failure; M4 remains incomplete.
+
 ## Stopped-stage replay in a genuine child process
 
 Commit `bdfd6a28991597163301abf40382b5e80285d92b` changes only
@@ -61,6 +152,42 @@ Evidence under `pr222-ci-repair-20261023T2125Z/`:
 The live parent and child are discovery-only locally. Actual Docker replay,
 unchanged physical state and cleanup require hosted execution; protocol
 success is not a Docker acceptance result.
+
+## Hosted checkpoint before the A0 and fixture updates
+
+Published `34a526897cbea3708b3ca7a030ef0eef089a8625` contains the stopped-stage
+fresh-process harness. Its synthetic merge is
+`e0528685b47bd86129565b524f74608fde85e3f5`; tree
+`97438a19c3bfeb3bed7d070a910b86d86042eb7d` matches the published head.
+The API binding has SHA-256
+`399b667fb7d8a069ef2135115bedaca755a5f8579eca748e364bd6363c620e49`.
+
+At 04:50:37 UTC on 24 October, the partial snapshot has 12 failed, 29 successful,
+15 running, 84 queued and one skipped check. Snapshot SHA-256:
+`3680e0e0b703d8350095211c8dfa1abbd018258ebebe8397aa63728b65a3daf8`.
+All 12 failures are retained once in
+`pr222-34a-fourth-failure-batch-20261024.json`, SHA-256
+`ddaa136c90ea8c568ee038369f95953cd3220d52b889503a9c9e2cdb0ef833af`.
+
+- [TLS restart](https://github.com/tyhuang9/rig/actions/runs/40062072641/job/120777536253)
+  and [process-kill restart](https://github.com/tyhuang9/rig/actions/runs/40062072641/job/120777536306)
+  still refuse at `cold_construction/cold_group_attestation`; the individual
+  rejecting predicate remains unresolved.
+- [Full-hostd A0](https://github.com/tyhuang9/rig/actions/runs/40062072608/job/120777536290)
+  still refuses at `startup_observation/docker_attestation`. This head predates
+  the local A0 repair and therefore does not test it.
+- Migration, LAN and external-database LAN jobs remain blocked at predecessor
+  retirement. Controller recovery, proposal, rollback/replay, data-volume,
+  stage-start and final-config fixtures retain construction failures. Their
+  logs establish separate boundaries, not a shared cause.
+- The [stopped-stage Docker job](https://github.com/tyhuang9/rig/actions/runs/40062072608/job/120777536330)
+  remains queued at this observation. Its queued `startedAt` field is not proof
+  that Docker execution began. The next publication is held locally so that
+  another push does not cancel this needed run.
+
+No failure is waived. Complete Docker/race acceptance, E5, physical second-device
+LAN qualification and M4 remain open. No live-controller refresh or deployment
+was performed.
 
 ## Hosted progress after the inspect-template repair
 
