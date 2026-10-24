@@ -727,19 +727,19 @@ func (r *generatedDomainStartupReader) attestGateway(ctx context.Context, deadli
 		return generatedDomainGatewayAttestation{}, nil
 	}
 	if r.recovery.kind == generatedDomainRecoveryDockerNone {
-		if !generatedDomainExpectedDockerObjects(snapshot.objects, expected) {
-			return generatedDomainGatewayAttestation{}, errors.New("generated domain gateway namespace is not exact")
-		}
 		applicationRoutes, valid := generatedDomainGatewayApplicationRoutes(expected)
 		if !valid {
 			return generatedDomainGatewayAttestation{}, errors.New("generated domain gateway expectation is invalid")
 		}
 		if applicationRoutes {
 			// The final classifier derives cold accounting independently from
-			// the sealed SQL and Docker snapshots. Once the complete passive
-			// census proves the exact namespace, do not dispatch admin or route
-			// traffic into an app-bearing gateway that cannot be Stable.
+			// the sealed SQL and complete passive Docker census before any
+			// publication. Do not dispatch admin or route traffic into an
+			// app-bearing gateway that cannot be Stable.
 			return generatedDomainGatewayAttestation{}, nil
+		}
+		if !generatedDomainExpectedDockerObjects(snapshot.objects, expected) {
+			return generatedDomainGatewayAttestation{}, errors.New("generated domain gateway namespace is not exact")
 		}
 	}
 	switch expected.kind {

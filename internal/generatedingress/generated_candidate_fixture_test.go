@@ -98,6 +98,7 @@ type generatedMigrationFixture struct {
 	repository     *candidateTestRepository
 	bindings       *deploymentbinding.Repository
 	jobService     *jobs.Service
+	plans          *deploymentplans.Store
 	configuration  *appconfig.Store
 	guarded        *candidateTestGuarded
 	releaseEffects func() error
@@ -222,9 +223,9 @@ func newGeneratedMigrationFixtureOnDomainWithComponents(t *testing.T, identity g
 	if !stores.ConfiguredForDomain(identity.dataRoot, identity.options.WorkingDirectory) {
 		t.Fatal("generated migration fixture did not retain exact domain provenance")
 	}
-	return newGeneratedMigrationFixtureWithDependencies(t, db, jobService, bindings, repository,
+	return newGeneratedMigrationFixtureWithDependenciesAndImages(t, db, jobService, bindings, repository,
 		stores, plans, configuration,
-		identity.options.WorkingDirectory, planComponentNames, runtimeComponentNames, explicitPlan...)
+		identity.options.WorkingDirectory, planComponentNames, runtimeComponentNames, nil, explicitPlan...)
 }
 
 func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobService *jobs.Service,
@@ -233,10 +234,32 @@ func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobS
 	plans *deploymentplans.Store, configuration *appconfig.Store, workingDirectory string,
 	planComponentNames, runtimeComponentNames []string, explicitPlan ...deploymentplans.Plan,
 ) *generatedMigrationFixture {
+	return newGeneratedMigrationFixtureWithDependenciesAndImages(t, db, jobService, bindings, repository, stores,
+		plans, configuration, workingDirectory, planComponentNames, runtimeComponentNames, nil, explicitPlan...)
+}
+
+func newGeneratedMigrationFixtureWithDependenciesAndImages(t *testing.T, db *sql.DB,
+	jobService *jobs.Service, bindings *deploymentbinding.Repository,
+	repository *deployments.Repository, stores *deployments.GeneratedOwnerStores,
+	plans *deploymentplans.Store, configuration *appconfig.Store, workingDirectory string,
+	planComponentNames, runtimeComponentNames []string, imageContentIDs map[string]string,
+	explicitPlan ...deploymentplans.Plan,
+) *generatedMigrationFixture {
 	t.Helper()
 	if db == nil || jobService == nil || bindings == nil || repository == nil || stores == nil || plans == nil ||
 		configuration == nil || workingDirectory == "" {
 		t.Fatal("generated migration fixture dependencies are incomplete")
+	}
+	if len(imageContentIDs) != 0 {
+		if len(imageContentIDs) != len(runtimeComponentNames) {
+			t.Fatal("explicit generated migration image roster is incomplete")
+		}
+		for _, name := range runtimeComponentNames {
+			imageID, exists := imageContentIDs[name]
+			if !exists || !generatedDomainCanonicalDockerID(imageID, true) {
+				t.Fatal("explicit generated migration image identity is invalid")
+			}
+		}
 	}
 	actorID := uuid.NewString()
 	appID := uuid.NewString()
@@ -365,6 +388,9 @@ func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobS
 			}
 		}
 		imageID := "sha256:" + strings.Repeat(imageDigit, 64)
+		if len(imageContentIDs) != 0 {
+			imageID = imageContentIDs[name]
+		}
 		componentArtifactID := uuid.NewString()
 		if _, err := db.Exec(`INSERT INTO generated_image_artifacts(id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at) VALUES(?,?,?,?,?,'test-compiler',?,3,?,'ready',?,?,?)`, componentArtifactID, releaseID, revision.ID, revision.RevisionNumber, name, buildDigest, imageID, now, now, now); err != nil {
 			t.Fatal(err)
@@ -384,7 +410,7 @@ func newGeneratedMigrationFixtureWithDependencies(t *testing.T, db *sql.DB, jobS
 	}
 	return &generatedMigrationFixture{
 		repository: testRepository, bindings: bindings, jobService: jobService,
-		configuration: configuration, guarded: guarded,
+		plans: plans, configuration: configuration, guarded: guarded,
 		releaseEffects: releaseEffects, plan: plan, claim: claim, binding: created.Binding,
 		request: candidateMigrationRequestFixture{
 			DeploymentID: deployment.ID, ReleaseID: releaseID,
