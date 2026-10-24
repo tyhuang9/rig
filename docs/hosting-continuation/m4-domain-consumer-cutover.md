@@ -17,6 +17,111 @@ The current status and final verification sections supersede earlier pending
 checkpoint descriptions below. Historical failures and source-only reviews are
 retained with their original acceptance limits.
 
+## Construction boundary attribution follow-up
+
+Commit `2f534b74ad595523308f4268e5503f6e9a7da658` closes the observed
+attribution gap at public/private construction entry, reservation, owner
+construction and publication. Cold-construction reasons distinguish input,
+path identity, state store, assembly, fence, repeated-observation stability,
+accounting reconstruction, lock acquisition, release and final validation.
+Generic stable/empty fallbacks use construction-stage labels rather than
+claiming a final or released boundary was reached.
+
+The wrapper preserves direct diagnostic identity and existing cause visibility.
+When a closed diagnostic is nested inside a private prefix or joined cause, it
+copies only the closed pair into its outer message and retains the original
+unwrap chain. Previously collapsed causes stay hidden. The owner's failure
+record receives that same final diagnostic. Construction predicates, operation
+ordering, lock/release handling and ownership remain unchanged. The private
+child projection accepts only the corresponding exact new pairs.
+
+Focused Windows checks passed on the final six source files:
+
+- `TestGeneratedDomainConstructionDiagnosticClosedAttribution` covers public
+  input, collapsed physical causes, sticky recovery, incomplete cold accounting,
+  mixed-error privacy and existing observation cases. An initial new assertion
+  incorrectly expected a collapsed runner cause to remain visible; the corrected
+  test preserves the prior behavior. This run has tool-session output only and
+  an additive receipt, without a pre-run raw artifact or source manifest.
+- `TestLiveHostdRebindClosedDiagnosticControls` passed one parent and 129 distinct
+  children, including actual failing subprocess controls. Its command, raw log
+  and exit are retained; source hashes were recorded after execution only.
+- The existing final-classification/release, canonical-input/sticky-failure,
+  complete-owner-join and two-component-cold parents passed. Exact discovery,
+  four parent passes and three direct child passes are retained with identical
+  source manifests before/after. Nested subprocess echoes are not extra cases.
+- Six-file formatting, ingress vet, tagged controller vet and canonical
+  generation passed, with raw logs and identical source manifests.
+
+Evidence under `pr222-ci-repair-20261023T2125Z/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `construction-boundary-attribution-20261024T013000Z/receipt.json` | `90fe510ce574c189e487aa3e33fd582f403f468bb7f4e26365dcb5077f6ab214` |
+| `construction-boundary-regression-20261024T013600Z/receipt.json` | `c6839db42cd855a2ae230d87fed4e5026ad0c8f8f0a4dd8ad3b82a68bac903a5` |
+| `construction-boundary-static-20261024T012645Z/receipt.json` | `758f6593775cf34930e855799cdcba9a3f1b042b41f1a414f2366cb54380a33b` |
+| `construction-boundary-root-audit-20261024.json` | `1f77c4c53410a6e351af9903f067f4fb69b36d2b31657cd9b7cafba5c9a60b62` |
+| Source/security review | `f3dfbb4c32688316c717ea1e4366579091008956123561467ce91935065c7a84` |
+
+The first two folder labels are not execution timestamps: retained hostd output
+was written from 01:25:14 to 01:25:21 UTC, and factory discovery/execution from
+01:26:16 to 01:26:32 UTC on 24 October. Receipts state this explicitly. No
+retained `go test` binary or local Docker/race evidence is claimed. The root
+audit independently checks retained raw results and final source; it does not
+upgrade the tool-output-only diagnostic run into raw-audited evidence.
+
+These changes make failure attribution usable; they do not identify or fix the
+hosted construction predicate. Genuine restart/replay and complete CI, E5 and
+M4 acceptance remain open.
+
+## Prepared-claim fixture retains its completed owner
+
+Local commit `17f400c15ae0c6bea6f8002502aa5698a1102820` replaces only the
+initial redundant `New` call in
+`TestLiveGatewayRebindCrossStorePreparedClaimProcessRecovery` with the fixture's
+completed manager and a read of its options. The completed domain already owns
+the same database and installs the fence/current-state repository callbacks.
+The fixture's separate repository wrapper is database-equivalent; this change
+does not rely on wrapper pointer equality or change any callback.
+
+The actual abrupt child still opens its database and constructs a fresh manager
+in a separate process. Its post-claim exit, two recovery processes, immutable
+history, active fence, runtime heads, grant provenance, Docker inventory, routed
+request count and LAN assertions are unchanged. The unrelated proposal test's
+fresh-manager replay is also unchanged. This corrects parent setup; it does not
+replace fresh-process recovery with an in-process replay.
+
+Tagged ingress compilation, exact parent discovery, formatting, tagged vet and
+canonical generation passed on unchanged source. Actual Docker execution was
+not run locally. Receipt
+`prepared-claim-owner-reuse-20261024T011520Z/receipt.json` has SHA-256
+`21317414051edc70a1591502db8b9a86c521e694846ad36bae2d05c89d85f9cf`.
+Root audit `prepared-claim-owner-reuse-root-audit-20261024.json`, SHA-256
+`2ed7f81d52edeb9212031b15d13f59cd88bb55bc87deb08f525e6c3599564738`,
+binds the exact block-only diff, source, binary, discovery and command exits.
+Compile, formatter and vet have exit records without dedicated raw logs.
+Independent source QA SHA-256:
+`20166f8f343de5ae982088f671b33203c5659d3a792346c42b0171dc7da1cd39`.
+
+## Hosted child attribution remains incomplete
+
+Published `c4591b325bb28fd82b36c72399e9d0b2ce657974` ran through synthetic
+merge `5d78315a8f9f7086669a8f487273288f76f47c6a`, with identical tree
+`46ab4b2ba235d1c88cbf85d03b1fc36a25f28b0d`. Its
+[TLS child](https://github.com/tyhuang9/rig/actions/runs/40048828365/job/120736636827)
+again reports `controller_restart/generated_domain/failed`, and its
+[process-kill child](https://github.com/tyhuang9/rig/actions/runs/40048828365/job/120736637032)
+reports `process_kill/runtime_composition/failed`. Neither includes a
+construction stage/reason pair. Raw SHA-256 values are
+`b69ca73be916c1e0f17c1b94aa506cbe4c79ba7032275f076f73a8b9a258f051`
+and `c18a407b1ba89e1a9b7356d454968df5e729abb1d7b1ebe348c33f242fe040e1`.
+
+This confirms incomplete attribution; it does not identify the failed predicate.
+The same head's prepared-claim test fails at the initial redundant manager
+construction addressed above. Its final-config lost-acknowledgment test still
+fails the intended fresh-manager replay. The migration journey still pauses at
+receipt-owned predecessor retirement. These remain failed hosted journeys.
+
 ## Closed attribution for child construction failures
 
 Commit `ce73d337090bfa6251a5fb10847c26a3d4c40365` adds optional paired
