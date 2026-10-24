@@ -103,8 +103,7 @@ func attestGeneratedDomainColdBuilder(ctx context.Context, manager *Manager,
 			generatedbuilder.ContainerLabels(initial.identity, generatedbuilder.DefaultStateQuotaBytes)) ||
 		!generatedDomainExactRigLabels(networkObject.labels, generatedbuilder.NetworkLabels(initial.identity)) ||
 		networkObject.data.driver != "bridge" || networkObject.data.scope != "local" ||
-		!reflect.DeepEqual(networkObject.data.options,
-			map[string]string{"com.docker.network.bridge.enable_icc": "false"}) {
+		networkObject.data.options["com.docker.network.bridge.enable_icc"] != "false" {
 		return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
 	}
 	reader := &generatedDomainStartupReader{runner: manager.runner,
@@ -118,7 +117,8 @@ func attestGeneratedDomainColdBuilder(ctx context.Context, manager *Manager,
 		environment: append([]string(nil), manager.dockerEnv...)}
 	first, err := readGeneratedDomainColdBuilderPhysical(ctx, reader, *containerObject, *networkObject)
 	if err != nil || !matchesGeneratedDomainColdBuilderPhysical(first, initial.identity,
-		containerObject.id, networkObject.id) {
+		containerObject.id, networkObject.id) ||
+		!reflect.DeepEqual(networkObject.data.options, first.network.Options) {
 		return generatedDomainColdBuilderAccount{}, errGeneratedDomainConstructionRefused
 	}
 	second, err := readGeneratedDomainColdBuilderPhysical(ctx, reader, *containerObject, *networkObject)
@@ -256,8 +256,6 @@ func matchesGeneratedDomainColdBuilderPhysical(value generatedDomainColdBuilderP
 			generatedbuilder.DefaultStateQuotaBytes) || !generatedbuilder.ContainerReady(value.container) ||
 		!generatedbuilder.MatchesContainerNetwork(value.container, identity, networkID) ||
 		!generatedbuilder.MatchesNetwork(value.network, identity) ||
-		!reflect.DeepEqual(value.network.Options,
-			map[string]string{"com.docker.network.bridge.enable_icc": "false"}) ||
 		!generatedDomainExactRigLabels(value.container.Config.Labels,
 			generatedbuilder.ContainerLabels(identity, generatedbuilder.DefaultStateQuotaBytes)) ||
 		!generatedDomainExactRigLabels(value.network.Labels, generatedbuilder.NetworkLabels(identity)) ||

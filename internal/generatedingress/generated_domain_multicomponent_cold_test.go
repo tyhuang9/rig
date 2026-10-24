@@ -118,6 +118,14 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 	}{
 		{name: "exact_api_and_frontend_without_builder", pass: true},
 		{name: "exact_api_frontend_and_persisted_builder", builder: true, pass: true},
+		{name: "writer_accepted_persisted_builder_network_options", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			const option = "com.docker.network.bridge.enable_ip_masquerade"
+			fixture.builder.physical.network.Options[option] = "true"
+			if !generatedbuilder.MatchesNetwork(fixture.builder.physical.network, fixture.builder.identity) {
+				t.Fatal("generated builder writer rejected its compatible network options")
+			}
+			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options[option] = "true"
+		}, pass: true},
 		{name: "missing_frontend", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.runner.delegate.objects = removeGeneratedDomainTwoComponentContainer(
 				fixture.runner.delegate.objects, "frontend")
@@ -185,8 +193,51 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 			fixture.builder.physical.network.Containers[strings.Repeat("f", 64)] = generatedbuilder.NetworkContainer{
 				Name: "foreign", IPv4Address: "172.30.0.3/16"}
 		}},
-		{name: "invalid_persisted_builder_network_configuration", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
-			fixture.builder.physical.network.Options["external.option"] = "unexpected"
+		{name: "missing_persisted_builder_census_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			const option = "com.docker.network.bridge.enable_icc"
+			delete(generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options, option)
+		}},
+		{name: "true_persisted_builder_census_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			const option = "com.docker.network.bridge.enable_icc"
+			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options[option] = "true"
+		}},
+		{name: "other_persisted_builder_census_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			const option = "com.docker.network.bridge.enable_icc"
+			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options[option] = "unexpected"
+		}},
+		{name: "missing_persisted_builder_detailed_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			delete(fixture.builder.physical.network.Options, "com.docker.network.bridge.enable_icc")
+		}},
+		{name: "true_persisted_builder_detailed_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.network.Options["com.docker.network.bridge.enable_icc"] = "true"
+		}},
+		{name: "other_persisted_builder_detailed_required_network_option", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.physical.network.Options["com.docker.network.bridge.enable_icc"] = "unexpected"
+		}},
+		{name: "crossed_persisted_builder_census_network_options", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).
+				data.options["com.docker.network.bridge.enable_ip_masquerade"] = "true"
+		}},
+		{name: "persisted_builder_network_option_added_between_reads", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			fixture.builder.runner.afterFirstPhysical = func() {
+				fixture.builder.physical.network.Options["com.docker.network.bridge.enable_ip_masquerade"] = "true"
+			}
+		}},
+		{name: "persisted_builder_network_option_removed_between_reads", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			const option = "com.docker.network.bridge.enable_ip_masquerade"
+			fixture.builder.physical.network.Options[option] = "true"
+			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options[option] = "true"
+			fixture.builder.runner.afterFirstPhysical = func() {
+				delete(fixture.builder.physical.network.Options, option)
+			}
+		}},
+		{name: "persisted_builder_network_option_changed_between_reads", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
+			const option = "com.docker.network.bridge.enable_ip_masquerade"
+			fixture.builder.physical.network.Options[option] = "true"
+			generatedDomainTwoComponentBuilderCensusNetwork(t, fixture).data.options[option] = "true"
+			fixture.builder.runner.afterFirstPhysical = func() {
+				fixture.builder.physical.network.Options[option] = "false"
+			}
 		}},
 		{name: "crossed_persisted_builder_container_attachment", builder: true, mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			fixture.builder.physical.container.NetworkSettings.Networks[fixture.builder.identity.NetworkName] =
@@ -282,6 +333,20 @@ func TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster(t *testin
 			})
 		})
 	}
+}
+
+func generatedDomainTwoComponentBuilderCensusNetwork(t *testing.T,
+	fixture *generatedDomainTwoComponentColdFixture,
+) *generatedDomainDockerObject {
+	t.Helper()
+	for index := range fixture.runner.delegate.objects {
+		object := &fixture.runner.delegate.objects[index]
+		if object.kind == "network" && object.name == fixture.builder.identity.NetworkName {
+			return object
+		}
+	}
+	t.Fatal("persisted builder network is absent from the cold census")
+	return nil
 }
 
 func newGeneratedDomainTwoComponentColdFixture(t *testing.T, builderOptions ...bool) generatedDomainTwoComponentColdFixture {
