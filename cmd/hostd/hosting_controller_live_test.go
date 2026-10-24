@@ -1532,50 +1532,61 @@ func controllerJourneyRunRestartChild(t *testing.T, manifestPath string) {
 		!filepath.IsAbs(manifest.DataRoot) || !filepath.IsAbs(manifest.Source) || !filepath.IsAbs(manifest.Docker) ||
 		filepath.Dir(manifestPath) != manifest.ControlDirectory || filepath.Base(manifestPath) != "manifest.json" ||
 		runtime.GOOS != "linux" || os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
-		t.Fatal("controller restart child requires an exact local Linux fixture manifest")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupManifest,
+			"controller restart child requires an exact local Linux fixture manifest")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	defer cancel()
 	directories, err := runtimedocker.PrepareControllerDirectories(manifest.DataRoot)
 	if err != nil {
-		t.Fatal("prepare restarted controller directories")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupDirectories,
+			"prepare restarted controller directories")
 	}
 	ownerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
 	if err != nil {
-		t.Fatal("acquire restarted controller owner")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupOwnerLease,
+			"acquire restarted controller owner")
 	}
 	defer func() { _ = ownerLease.Close() }()
 	db, err := database.OpenForGeneratedDomain(ctx, manifest.DataRoot, ownerLease)
 	if err != nil {
-		t.Fatal("open sealed restarted controller database")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupSealedDatabase,
+			"open sealed restarted controller database")
 	}
 	defer db.Close()
 	provider := controllerJourneyNewGitHubProvider(t, manifest.Source)
 	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), provider, sourceconnections.NewFileCredentialStore(manifest.DataRoot), "fixture-app", time.Now)
 	snapshots, err := releasesnapshot.New(db, sources, manifest.DataRoot)
 	if err != nil {
-		t.Fatal("open restarted source materializer")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupSourceMaterializer,
+			"open restarted source materializer")
 	}
 	if err := snapshots.Recover(); err != nil {
-		t.Fatal("recover restarted source materializer")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupSourceRecovery,
+			"recover restarted source materializer")
 	}
 	configuration, err := appconfig.New(db, manifest.DataRoot)
 	if err != nil {
-		t.Fatal("open restarted scoped configuration")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupConfiguration,
+			"open restarted scoped configuration")
 	}
 	if err := configuration.Recover(ctx); err != nil {
-		t.Fatal("recover restarted scoped configuration")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupConfigurationRecovery,
+			"recover restarted scoped configuration")
 	}
 	plans, err := deploymentplans.New(db, manifest.DataRoot)
 	if err != nil {
-		t.Fatal("open restarted deployment plans")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupDeploymentPlans,
+			"open restarted deployment plans")
 	}
 	if err := plans.Recover(ctx); err != nil {
-		t.Fatal("recover restarted deployment plans")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupPlanRecovery,
+			"recover restarted deployment plans")
 	}
 	jobStore, bindings, err := newDeploymentJobService(db)
 	if err != nil {
-		t.Fatal("open restarted deployment jobs")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupDeploymentJobs,
+			"open restarted deployment jobs")
 	}
 	effectsDirectory, admission := liveDeploymentExecutionFixture(t, db, manifest.DataRoot)
 	settings := config.Defaults()
@@ -1588,12 +1599,14 @@ func controllerJourneyRunRestartChild(t *testing.T, manifestPath string) {
 	options := runtimeCompositionOptions{dockerExecutable: manifest.Docker, runner: observer, routePauseLogger: newStructuredLogger(os.Stderr, "info")}
 	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, settings, dependencies, options)
 	if err != nil {
-		t.Fatal("construct cold restarted generated domain")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupGeneratedDomain,
+			"construct cold restarted generated domain")
 	}
 	dependencies.generated = generated
 	composition, err := prepareRuntimeComposition(ctx, settings, dependencies, options)
 	if err != nil {
-		t.Fatal("compose cold restarted generated runtime")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupRuntimeComposition,
+			"compose cold restarted generated runtime")
 	}
 	// Exercise the exact owner's raw budget through opaque, unattempted
 	// reservations. No capacity observation, factory or authority is overridden.
@@ -1611,9 +1624,15 @@ func controllerJourneyRunRestartChild(t *testing.T, manifestPath string) {
 		charges = nil
 	}
 	defer releasePressure()
-	armPressure := func() {
+	armPressure := func(startup bool) {
+		fail := func(message string) {
+			if startup {
+				controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupCapacityPressure, message)
+			}
+			t.Fatal(message)
+		}
 		if len(charges) != 0 {
-			t.Fatal("fixture capacity pressure already armed")
+			fail("fixture capacity pressure already armed")
 		}
 		pressureContext, stop := context.WithTimeout(ctx, 2*time.Minute)
 		defer stop()
@@ -1622,19 +1641,19 @@ func controllerJourneyRunRestartChild(t *testing.T, manifestPath string) {
 			reservation, err := generated.domain.Candidates().ReserveRetainedCapacity(pressureContext, id, 1)
 			if errors.Is(err, generatedcapacity.ErrInsufficientCapacity) {
 				if len(charges) == 0 {
-					t.Fatal("fixture host has no positive capacity before pressure")
+					fail("fixture host has no positive capacity before pressure")
 				}
 				return
 			}
 			if err != nil {
-				t.Fatal("reserve fixture pressure from concrete domain")
+				fail("reserve fixture pressure from concrete domain")
 			}
 			charges = append(charges, charge{id: id, reservation: reservation})
 		}
-		t.Fatal("fixture pressure exceeded bounded share count")
+		fail("fixture pressure exceeded bounded share count")
 	}
 	if manifest.CapacityPressure {
-		armPressure()
+		armPressure(true)
 	}
 	workerContext, stopWorker := context.WithCancel(ctx)
 	defer stopWorker()
@@ -1643,20 +1662,29 @@ func controllerJourneyRunRestartChild(t *testing.T, manifestPath string) {
 			return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, admission)
 		}, func(error) {})
 	if err != nil {
-		t.Fatal("recover restarted durable worker")
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupWorkerRecovery,
+			"recover restarted durable worker")
 	}
-	server := controllerJourneyRestartControllerServer(t, (&controller.Server{
+	server, err := controllerJourneyRestartControllerServerForChild((&controller.Server{
 		Auth: auth.New(db), Apps: dependencies.applications, Jobs: jobStore, Machines: machines.New(db), Sources: sources,
 		Configuration: configuration, Deployments: dependencies.deployments, DeploymentPlans: plans,
 		GeneratedIngress: composition.ingress, GeneratedRuntimeState: composition.state,
 		GeneratedRuntime: true, Caddy: true, DataRoot: manifest.DataRoot, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}).Handler(), manifest.ExcludedPorts...)
+	if err != nil {
+		controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupAPIListener,
+			"start restarted fixture controller listener")
+	}
 	defer server.Close()
 	respond := func(sequence uint64, candidate controllerJourneyCandidate, failed bool) {
 		response := controllerJourneyRestartResponse{Sequence: sequence, PID: os.Getpid(), URL: server.URL,
 			Builds: observer.BuildCalls(), ArchiveReads: provider.archiveReads.Load(), Candidate: candidate, GatewayProbeFailed: failed}
 		path := filepath.Join(manifest.ControlDirectory, fmt.Sprintf("%06d.response.json", sequence))
 		if err := controllerJourneyWriteRestartFile(path, response); err != nil {
+			if sequence == 0 {
+				controllerChildStartupFail(t, controllerChildStartupControllerRestart, controllerChildStartupReadyProtocol,
+					"publish controller restart response")
+			}
 			t.Fatal("publish controller restart response")
 		}
 	}
@@ -1684,7 +1712,7 @@ func controllerJourneyRunRestartChild(t *testing.T, manifestPath string) {
 		switch command.Action {
 		case "stats":
 		case "capacity-on":
-			armPressure()
+			armPressure(false)
 		case "capacity-off":
 			releasePressure()
 		case "capture-begin":
@@ -2142,6 +2170,14 @@ func controllerJourneyPort(t *testing.T, address string, excludedPorts ...int) i
 
 func controllerJourneyRestartControllerServer(t *testing.T, handler http.Handler, excludedPorts ...int) *httptest.Server {
 	t.Helper()
+	server, err := controllerJourneyRestartControllerServerForChild(handler, excludedPorts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return server
+}
+
+func controllerJourneyRestartControllerServerForChild(handler http.Handler, excludedPorts ...int) (*httptest.Server, error) {
 	excluded := make(map[int]struct{}, len(excludedPorts))
 	for _, port := range excludedPorts {
 		excluded[port] = struct{}{}
@@ -2151,20 +2187,19 @@ func controllerJourneyRestartControllerServer(t *testing.T, handler http.Handler
 		address, err := controllerJourneyFixtureControllerListenAddress(server.URL)
 		if err != nil {
 			server.Close()
-			t.Fatal("validate restarted fixture controller listener")
+			return nil, errors.New("validate restarted fixture controller listener")
 		}
 		port, err := controllerJourneyListenPort(address)
 		if err != nil {
 			server.Close()
-			t.Fatal("read restarted fixture controller listener port")
+			return nil, errors.New("read restarted fixture controller listener port")
 		}
 		if _, found := excluded[port]; !found {
-			return server
+			return server, nil
 		}
 		server.Close()
 	}
-	t.Fatal("could not start a controller listener disjoint from external fixture services")
-	return nil
+	return nil, errors.New("could not start a controller listener disjoint from external fixture services")
 }
 
 func controllerJourneyBrowser(t *testing.T, ctx context.Context, node, appID, routeURL, mode, note string) {

@@ -332,6 +332,62 @@ type controllerProcessKillManifest struct {
 	Boundary      controllerProcessKillBoundary `json:"boundary"`
 }
 
+type controllerChildStartupKind string
+type controllerChildStartupStage string
+
+const (
+	controllerChildStartupControllerRestart controllerChildStartupKind = "controller_restart"
+	controllerChildStartupProcessKill       controllerChildStartupKind = "process_kill"
+
+	controllerChildStartupManifest              controllerChildStartupStage = "manifest"
+	controllerChildStartupAddress               controllerChildStartupStage = "address"
+	controllerChildStartupLocalDocker           controllerChildStartupStage = "local_docker"
+	controllerChildStartupDirectories           controllerChildStartupStage = "controller_directories"
+	controllerChildStartupOwnerLease            controllerChildStartupStage = "owner_lease"
+	controllerChildStartupSealedDatabase        controllerChildStartupStage = "sealed_database"
+	controllerChildStartupSourceMaterializer    controllerChildStartupStage = "source_materializer"
+	controllerChildStartupSourceRecovery        controllerChildStartupStage = "source_recovery"
+	controllerChildStartupConfiguration         controllerChildStartupStage = "configuration"
+	controllerChildStartupConfigurationRecovery controllerChildStartupStage = "configuration_recovery"
+	controllerChildStartupDeploymentPlans       controllerChildStartupStage = "deployment_plans"
+	controllerChildStartupPlanRecovery          controllerChildStartupStage = "plan_recovery"
+	controllerChildStartupDeploymentJobs        controllerChildStartupStage = "deployment_jobs"
+	controllerChildStartupLocalMachine          controllerChildStartupStage = "local_machine"
+	controllerChildStartupGeneratedDomain       controllerChildStartupStage = "generated_domain"
+	controllerChildStartupRuntimeComposition    controllerChildStartupStage = "runtime_composition"
+	controllerChildStartupCapacityPressure      controllerChildStartupStage = "capacity_pressure"
+	controllerChildStartupWorkerRecovery        controllerChildStartupStage = "worker_recovery"
+	controllerChildStartupAPIListener           controllerChildStartupStage = "api_listener"
+	controllerChildStartupReadyProtocol         controllerChildStartupStage = "ready_protocol"
+
+	controllerChildStartupDiagnosticMaxBytes   = 8 << 10
+	controllerChildStartupDiagnosticMaxRecords = 32
+)
+
+// controllerChildStartupFail preserves the existing fixed test failure while
+// adding one private, closed diagnostic record to stderr. Child stdout remains
+// uncaptured because it can contain scoped runtime data.
+func controllerChildStartupFail(t *testing.T, kind controllerChildStartupKind, stage controllerChildStartupStage, message string) {
+	t.Helper()
+	record := struct {
+		Message string `json:"msg"`
+		Kind    string `json:"child_kind"`
+		Stage   string `json:"child_stage"`
+		Result  string `json:"child_result"`
+	}{
+		Message: "controller child startup failed",
+		Kind:    string(kind),
+		Stage:   string(stage),
+		Result:  "failed",
+	}
+	if controllerChildStartupKnownPair(record.Kind, record.Stage) {
+		if encoded, err := json.Marshal(record); err == nil {
+			_, _ = fmt.Fprintln(os.Stderr, string(encoded))
+		}
+	}
+	t.Fatal(message)
+}
+
 // The child executes production composition and the durable worker after
 // reopening the retained controller data root.
 func TestLiveControllerGeneratedProcessKillRecovery(t *testing.T) {
@@ -346,72 +402,88 @@ func controllerProcessKillRunChild(t *testing.T) {
 	path := os.Getenv("RIG_LIVE_PROCESS_KILL_MANIFEST")
 	marker := os.Getenv("RIG_LIVE_PROCESS_KILL_MARKER")
 	if path == "" || marker == "" || filepath.Base(marker) != "ready" {
-		t.Fatal("process-kill child manifest or marker unavailable")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupManifest,
+			"process-kill child manifest or marker unavailable")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil || len(data) > 4096 {
-		t.Fatal("process-kill child requires a fixture manifest")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupManifest,
+			"process-kill child requires a fixture manifest")
 	}
 	var manifest controllerProcessKillManifest
 	if json.Unmarshal(data, &manifest) != nil || manifest.DataRoot == "" || manifest.Source == "" || manifest.Docker == "" ||
 		uuid.Validate(manifest.AppID) != nil || uuid.Validate(manifest.JobID) != nil {
-		t.Fatal("process-kill child manifest invalid")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupManifest,
+			"process-kill child manifest invalid")
 	}
 	host, port, addressErr := net.SplitHostPort(manifest.ListenAddress)
 	portNumber, portErr := strconv.Atoi(port)
 	if addressErr != nil || portErr != nil || host != "127.0.0.1" || portNumber < 1 || portNumber > 65535 || filepath.Base(manifest.APIMarker) != "ready" {
-		t.Fatal("process-kill child requires an exact loopback API address and readiness marker")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupAddress,
+			"process-kill child requires an exact loopback API address and readiness marker")
 	}
 	if runtime.GOOS != "linux" || os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
-		t.Fatal("process-kill child requires local Linux Docker")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupLocalDocker,
+			"process-kill child requires local Linux Docker")
 	}
 	childContext, cancel := context.WithTimeout(context.Background(), 46*time.Minute)
 	defer cancel()
 	directories, err := runtimedocker.PrepareControllerDirectories(manifest.DataRoot)
 	if err != nil {
-		t.Fatal("prepare process-kill controller owner directories")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupDirectories,
+			"prepare process-kill controller owner directories")
 	}
 	ownerLease, err := controllerowner.Acquire(childContext, directories.WorkingDirectory)
 	if err != nil {
-		t.Fatal("acquire process-kill controller owner")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupOwnerLease,
+			"acquire process-kill controller owner")
 	}
 	defer func() { _ = ownerLease.Close() }()
 	db, err := database.OpenForGeneratedDomain(childContext, manifest.DataRoot, ownerLease)
 	if err != nil {
-		t.Fatal("open retained controller database")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupSealedDatabase,
+			"open retained controller database")
 	}
 	defer db.Close()
 	provider := controllerJourneyNewGitHubProvider(t, manifest.Source)
 	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), provider, sourceconnections.NewFileCredentialStore(manifest.DataRoot), "fixture-app", time.Now)
 	snapshots, err := releasesnapshot.New(db, sources, manifest.DataRoot)
 	if err != nil {
-		t.Fatal("reopen immutable release materializer")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupSourceMaterializer,
+			"reopen immutable release materializer")
 	}
 	if err := snapshots.Recover(); err != nil {
-		t.Fatal("recover immutable release workspace")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupSourceRecovery,
+			"recover immutable release workspace")
 	}
 	configuration, err := appconfig.New(db, manifest.DataRoot)
 	if err != nil {
-		t.Fatal("reopen scoped configuration")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupConfiguration,
+			"reopen scoped configuration")
 	}
 	if err := configuration.Recover(childContext); err != nil {
-		t.Fatal("recover scoped configuration")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupConfigurationRecovery,
+			"recover scoped configuration")
 	}
 	plans, err := deploymentplans.New(db, manifest.DataRoot)
 	if err != nil {
-		t.Fatal("reopen deployment plans")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupDeploymentPlans,
+			"reopen deployment plans")
 	}
 	if err := plans.Recover(childContext); err != nil {
-		t.Fatal("recover accepted deployment plans")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupPlanRecovery,
+			"recover accepted deployment plans")
 	}
 	deploymentStore := deployments.New(db)
 	jobStore, bindingStore, err := newDeploymentJobService(db)
 	if err != nil {
-		t.Fatal("reopen deployment job service")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupDeploymentJobs,
+			"reopen deployment job service")
 	}
 	machineStore := machines.New(db)
 	if _, err := machineStore.EnsureLocal(); err != nil {
-		t.Fatal("reopen controller local machine")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupLocalMachine,
+			"reopen controller local machine")
 	}
 	settings := config.Defaults()
 	settings.DataRoot = manifest.DataRoot
@@ -434,7 +506,8 @@ func controllerProcessKillRunChild(t *testing.T) {
 		routePauseLogger: newStructuredLogger(os.Stderr, "info"),
 	})
 	if err != nil {
-		t.Fatal("reopen production generated composition")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupRuntimeComposition,
+			"reopen production generated composition")
 	}
 	executor := jobs.Executor(composition.executor)
 	if barrier != nil {
@@ -446,7 +519,8 @@ func controllerProcessKillRunChild(t *testing.T) {
 		return jobStore.RunWorkerWithScopedAdmission(workerContext, executor, scopedAdmission)
 	}, func(error) {})
 	if err != nil {
-		t.Fatal("recover production deployment worker")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupWorkerRecovery,
+			"recover production deployment worker")
 	}
 	handler := (&controller.Server{
 		Auth: auth.New(db), Apps: apps.New(db), Jobs: jobStore, Machines: machineStore, Sources: sources,
@@ -457,13 +531,15 @@ func controllerProcessKillRunChild(t *testing.T) {
 	}).Handler()
 	listener, err := net.Listen("tcp", manifest.ListenAddress)
 	if err != nil || listener.Addr().String() != manifest.ListenAddress {
-		t.Fatal("child controller could not bind the same loopback API address")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupAPIListener,
+			"child controller could not bind the same loopback API address")
 	}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()
 	if err := controllerProcessKillMarker(manifest.APIMarker, "api_ready"); err != nil {
-		t.Fatal("child controller could not publish API readiness")
+		controllerChildStartupFail(t, controllerChildStartupProcessKill, controllerChildStartupReadyProtocol,
+			"child controller could not publish API readiness")
 	}
 	select {
 	case <-done:
@@ -832,10 +908,132 @@ func controllerProcessKillClosedDiagnostic(child *controllerProcessKillProcess) 
 	}
 	select {
 	case <-child.done:
-		return liveHostdRebindClosedDiagnostic(child.stderr.String()), true
+		stderr := child.stderr.String()
+		diagnostic := liveHostdRebindClosedDiagnostic(stderr)
+		if code := controllerChildStartupDiagnosticCode(stderr); code != "" {
+			diagnostic += " child=" + code
+		}
+		return diagnostic, true
 	default:
 		return "", false
 	}
+}
+
+func controllerChildStartupDiagnosticCode(stderr string) string {
+	limited := []byte(stderr)
+	if len(limited) > controllerChildStartupDiagnosticMaxBytes {
+		limited = limited[len(limited)-controllerChildStartupDiagnosticMaxBytes:]
+		if newline := bytes.IndexByte(limited, '\n'); newline < 0 {
+			return ""
+		} else {
+			limited = limited[newline+1:]
+		}
+	}
+	limited = bytes.TrimSpace(limited)
+	for records := 0; len(limited) > 0 && records < controllerChildStartupDiagnosticMaxRecords; records++ {
+		line := limited
+		if newline := bytes.LastIndexByte(limited, '\n'); newline >= 0 {
+			line, limited = limited[newline+1:], limited[:newline]
+		} else {
+			limited = nil
+		}
+		if kind, stage, ok := controllerChildStartupDiagnosticRecord(bytes.TrimSpace(line)); ok {
+			return kind + "/" + stage + "/failed"
+		}
+	}
+	return ""
+}
+
+func controllerChildStartupDiagnosticRecord(line []byte) (string, string, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	opening, err := decoder.Token()
+	openingDelimiter, isDelimiter := opening.(json.Delim)
+	if err != nil || !isDelimiter || openingDelimiter != '{' {
+		return "", "", false
+	}
+	var message, kind, stage, result string
+	seen := make(map[string]bool, 4)
+	for decoder.More() {
+		keyToken, keyErr := decoder.Token()
+		key, isString := keyToken.(string)
+		if keyErr != nil || !isString || seen[key] {
+			return "", "", false
+		}
+		seen[key] = true
+		var raw json.RawMessage
+		if decoder.Decode(&raw) != nil {
+			return "", "", false
+		}
+		value, valid := controllerChildStartupDiagnosticString(raw)
+		if !valid {
+			return "", "", false
+		}
+		switch key {
+		case "msg":
+			message = value
+		case "child_kind":
+			kind = value
+		case "child_stage":
+			stage = value
+		case "child_result":
+			result = value
+		default:
+			return "", "", false
+		}
+	}
+	closing, closeErr := decoder.Token()
+	closingDelimiter, isDelimiter := closing.(json.Delim)
+	if closeErr != nil || !isDelimiter || closingDelimiter != '}' {
+		return "", "", false
+	}
+	var trailing json.RawMessage
+	if decoder.Decode(&trailing) != io.EOF || message != "controller child startup failed" || result != "failed" ||
+		!seen["msg"] || !seen["child_kind"] || !seen["child_stage"] || !seen["child_result"] ||
+		!controllerChildStartupKnownPair(kind, stage) {
+		return "", "", false
+	}
+	return kind, stage, true
+}
+
+func controllerChildStartupDiagnosticString(raw json.RawMessage) (string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '"' {
+		return "", false
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return "", false
+	}
+	return value, true
+}
+
+func controllerChildStartupKnownPair(kind, stage string) bool {
+	switch controllerChildStartupKind(kind) {
+	case controllerChildStartupControllerRestart:
+		switch controllerChildStartupStage(stage) {
+		case controllerChildStartupManifest, controllerChildStartupDirectories, controllerChildStartupOwnerLease,
+			controllerChildStartupSealedDatabase, controllerChildStartupSourceMaterializer, controllerChildStartupSourceRecovery,
+			controllerChildStartupConfiguration, controllerChildStartupConfigurationRecovery,
+			controllerChildStartupDeploymentPlans, controllerChildStartupPlanRecovery, controllerChildStartupDeploymentJobs,
+			controllerChildStartupGeneratedDomain, controllerChildStartupRuntimeComposition,
+			controllerChildStartupCapacityPressure, controllerChildStartupWorkerRecovery,
+			controllerChildStartupAPIListener, controllerChildStartupReadyProtocol:
+			return true
+		}
+	case controllerChildStartupProcessKill:
+		switch controllerChildStartupStage(stage) {
+		case controllerChildStartupManifest, controllerChildStartupAddress, controllerChildStartupLocalDocker,
+			controllerChildStartupDirectories, controllerChildStartupOwnerLease, controllerChildStartupSealedDatabase,
+			controllerChildStartupSourceMaterializer, controllerChildStartupSourceRecovery,
+			controllerChildStartupConfiguration, controllerChildStartupConfigurationRecovery,
+			controllerChildStartupDeploymentPlans, controllerChildStartupPlanRecovery,
+			controllerChildStartupDeploymentJobs, controllerChildStartupLocalMachine,
+			controllerChildStartupRuntimeComposition, controllerChildStartupWorkerRecovery,
+			controllerChildStartupAPIListener, controllerChildStartupReadyProtocol:
+			return true
+		}
+	}
+	return false
 }
 
 func controllerProcessKillReportClosedDiagnostic(t *testing.T, child *controllerProcessKillProcess) {
