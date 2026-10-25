@@ -5,6 +5,10 @@ Status: source committed at `3581938` on
 `f4d0cb7bab280cc743c9b9d4c95f4d44c4d2dd0a`. Hosted acceptance and M4
 completion remain open.
 
+The 25 October follow-up corrects an active Native V1 regression found by PR #225's
+hosted tests. The original evidence below remains historical; the follow-up
+evidence is recorded separately at the end of the verification section.
+
 ## Startup boundary
 
 A committed gateway upgrade can retain the stopped V1 container, its network and
@@ -125,6 +129,51 @@ sets is `e73b8b36897fd17630535472248b53151f051736f8e6177df915b8d8868665b4`.
 An earlier manifest-harness setup failure occurred before compilation and is
 preserved separately. Documentation gates are recorded in the draft PR after this
 document is finalized.
+
+### Active Native V1 follow-up
+
+PR #225's initial hosted run exposed an overly broad retained-resource check. A
+canonical active Native V1 gateway also has a container, network and volume.
+Treating that triple as a retained predecessor rejected ordinary V1 startup before
+its existing active gateway proof could run.
+
+The repair recognizes only a valid, nonpending Native V1 projection produced by
+the protected resolver, with its exact canonical state digest, names and full
+identities and no competing projection. Its triple remains entirely owned by the
+active census. The retained proof accounts for none of those objects. Existing
+active physical, configuration, network, live and final observations remain
+mandatory. Names alone, unsupported lineage and ambiguous projections gain no
+authority. Native V2 and upgrade-origin Current V2 retained-proof rules remain
+unchanged. No effects, capacity behavior, public diagnostics or deadlines change.
+
+The published baseline at `a6f82a7` reproduced the public runtime-boundary failure
+at `cold_construction/cold_group_attestation`. Its isolation helper executed the
+whole parent despite the outer child filter; the record therefore includes both
+affected positive cases and passing negative cases.
+
+The corrected source compiled successfully, discovered exactly seven selected
+parents, and passed its test process. The existing nested isolation harness also
+executed the multicomponent `Part2` companion. The actual result is eight unique
+parent names and 34 unique child names, all passing. Coverage includes canonical
+V1 deferral, names-only refusal, public active V1 startup, complete multicomponent
+startup and missing/crossed refusals, closed diagnostic attribution, retained V2
+and Current V2 startup, and unsupported rebind lineage.
+
+An initial compile error and an evidence-checker error remain preserved. The
+checker rejected the expected companion parent even though the test process
+exited zero; an additive correction records the actual count without rerunning
+tests. Formatting, scoped ingress vet, canonical generation and whitespace checks
+passed on the same two source hashes. Source/security review passed. These are
+local Windows non-race checks; hosted verification is still required.
+
+| Follow-up evidence | SHA-256 |
+| --- | --- |
+| Published baseline RED artifact index | `97a7548a17d5b84207ca0fff287c8b6dfd752f2dc0a7166dcb086386ad621461` |
+| Final-source raw passing run | `ed9ed460b68038193884d1241f4bcb9ea50f7a67ad63d98e0ca83b401a191bd0` |
+| Companion-parent census correction | `834ffbe4e7ea33c22f3e0d1036bfa129d37f59c29b7be9a73bce3e5c593105e5` |
+| Static artifact index | `2f94bf52ebd5777c64b10fab4eb5338680c15799876d9fd76dc5e02aa3370ba6` |
+| Final source/security review | `3a05d9c585155e1e9090b1727b5c0fbd8226140839673087529c87faa77b74a5` |
+| Root audit of 35 artifacts and actual results | `87847198ba20ccb1eb840bac99242a236ec29b10a10b24e6bc84d33ec84fe960` |
 
 ## Rollback and remaining limits
 
