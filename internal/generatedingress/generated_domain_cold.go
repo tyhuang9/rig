@@ -39,7 +39,8 @@ type generatedDomainColdGroup struct {
 }
 
 type generatedDomainColdManifest struct {
-	groups []generatedDomainColdManifestGroup
+	groups          []generatedDomainColdManifestGroup
+	retainedGateway generatedDomainColdRetainedGatewayProof
 }
 
 type generatedDomainColdManifestGroup struct {
@@ -61,7 +62,8 @@ func sameGeneratedDomainColdManifest(left, right *generatedDomainColdManifest) b
 }
 
 func cloneGeneratedDomainColdManifest(value generatedDomainColdManifest) *generatedDomainColdManifest {
-	result := &generatedDomainColdManifest{groups: make([]generatedDomainColdManifestGroup, len(value.groups))}
+	result := &generatedDomainColdManifest{groups: make([]generatedDomainColdManifestGroup, len(value.groups)),
+		retainedGateway: cloneGeneratedDomainColdRetainedGatewayProof(value.retainedGateway)}
 	for index, group := range value.groups {
 		result.groups[index] = group
 		result.groups[index].components = append([]generatedDomainColdManifestComponent(nil), group.components...)
@@ -139,7 +141,9 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 			}
 		}
 	}
-	if err := attestGeneratedDomainColdGroups(ctx, result.manager, result.candidates, observed, groups); err != nil {
+	var retainedGateway generatedDomainColdRetainedGatewayProof
+	if err := attestGeneratedDomainColdGroupsWithRetained(ctx, result.manager, result.candidates, observed, groups,
+		&retainedGateway); err != nil {
 		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdGroupAttestation, err)
@@ -150,6 +154,7 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdManifest, err)
 	}
+	manifest.retainedGateway = cloneGeneratedDomainColdRetainedGatewayProof(retainedGateway)
 	return manifest, nil
 }
 
@@ -199,10 +204,13 @@ func reattestGeneratedDomainCold(ctx context.Context, manager *Manager, authorit
 	if err != nil {
 		return err
 	}
-	if err := attestGeneratedDomainColdGroups(ctx, manager, authority, observed, groups); err != nil {
+	var retainedGateway generatedDomainColdRetainedGatewayProof
+	if err := attestGeneratedDomainColdGroupsWithRetained(ctx, manager, authority, observed, groups,
+		&retainedGateway); err != nil {
 		return err
 	}
 	current, err := snapshotGeneratedDomainColdManifest(authority)
+	current.retainedGateway = cloneGeneratedDomainColdRetainedGatewayProof(retainedGateway)
 	if err != nil || !reflect.DeepEqual(expected, current) {
 		return errors.Join(errGeneratedDomainConstructionRefused, err)
 	}
@@ -947,6 +955,15 @@ func generatedDomainColdActivationReceiptLinksPredecessor(
 func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, authority *GeneratedCandidateAuthority,
 	observed generatedDomainStartupObservation, groups []generatedDomainColdGroup,
 ) error {
+	var retainedGateway generatedDomainColdRetainedGatewayProof
+	return attestGeneratedDomainColdGroupsWithRetained(ctx, manager, authority, observed, groups, &retainedGateway)
+}
+
+func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *Manager,
+	authority *GeneratedCandidateAuthority,
+	observed generatedDomainStartupObservation, groups []generatedDomainColdGroup,
+	retainedGateway *generatedDomainColdRetainedGatewayProof,
+) error {
 	type expectedObject struct {
 		name, id string
 		labels   map[string]string
@@ -976,7 +993,10 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 				expected := expectedObject{id: artifact.imageContentID,
 					labels: generatedDomainColdImageLabels(group.pins, component, artifact)}
 				if previous, exists := images[artifact.imageContentID]; exists && !reflect.DeepEqual(previous, expected) {
-					return errGeneratedDomainConstructionRefused
+					return generatedDomainConstructionBoundaryDiagnostic(
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupStructure,
+						errGeneratedDomainConstructionRefused)
 				}
 				images[artifact.imageContentID] = expected
 			}
@@ -984,7 +1004,10 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 			if component.state == generatedruntimestate.ComponentStarting {
 				// A name-only create acknowledgement cannot be upgraded to an
 				// immutable full Docker identity by reconstruction.
-				return errGeneratedDomainConstructionRefused
+				return generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupStructure,
+					errGeneratedDomainConstructionRefused)
 			}
 			present := component.state == generatedruntimestate.ComponentRunning ||
 				component.state == generatedruntimestate.ComponentHealthy ||
@@ -992,7 +1015,10 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 				component.state == generatedruntimestate.ComponentDraining
 			if present {
 				if !hasPolicy || !lowerHex(component.containerID, 64) {
-					return errGeneratedDomainConstructionRefused
+					return generatedDomainConstructionBoundaryDiagnostic(
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupStructure,
+						errGeneratedDomainConstructionRefused)
 				}
 				actual, found, err := authority.inspectCandidate(ctx, component.containerID)
 				expectedIdentity := policy.identity
@@ -1008,14 +1034,20 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 				container := expectedObject{name: policy.identity.ContainerName,
 					id: component.containerID, labels: candidatePolicyContainerLabels(policy)}
 				if previous, exists := containers[component.containerID]; exists && !reflect.DeepEqual(previous, container) {
-					return errGeneratedDomainConstructionRefused
+					return generatedDomainConstructionBoundaryDiagnostic(
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupStructure,
+						errGeneratedDomainConstructionRefused)
 				}
 				containers[component.containerID] = container
 				network := expectedObject{name: policy.identity.NetworkName,
 					labels: map[string]string{"io.rig.managed": "generated-runtime-network",
 						"io.rig.application": policy.identity.AppID}}
 				if previous, exists := networks[policy.identity.NetworkName]; exists && !reflect.DeepEqual(previous, network) {
-					return errGeneratedDomainConstructionRefused
+					return generatedDomainConstructionBoundaryDiagnostic(
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupStructure,
+						errGeneratedDomainConstructionRefused)
 				}
 				networks[policy.identity.NetworkName] = network
 				if err := authority.attestCandidateNetwork(ctx, policy); err != nil {
@@ -1031,20 +1063,39 @@ func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, auth
 					identity = component.containerName
 				}
 				if _, found, err := authority.inspectCandidate(ctx, identity); err != nil || found {
-					return errors.Join(errGeneratedDomainConstructionRefused, err)
+					return generatedDomainConstructionBoundaryDiagnostic(
+						generatedDomainConstructionStageColdConstruction,
+						generatedDomainConstructionReasonColdGroupCorrespondence,
+						errors.Join(errGeneratedDomainConstructionRefused, err))
 				}
 			}
 		}
 	}
 	gateway, err := resolveGeneratedDomainColdGatewayExpectation(observed.database, observed.protected)
 	if err != nil {
-		return err
+		return generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupGatewaySelection, err)
 	}
+	retained, err := attestGeneratedDomainColdRetainedGateway(ctx, manager, authority, observed.docker, gateway)
+	if err != nil {
+		return errors.Join(errGeneratedDomainConstructionRefused, err)
+	}
+	if retainedGateway == nil {
+		return generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupStructure,
+			errGeneratedDomainConstructionRefused)
+	}
+	*retainedGateway = cloneGeneratedDomainColdRetainedGatewayProof(retained)
 	seenContainers := make(map[string]struct{}, len(containers))
 	seenImages := make(map[string]struct{}, len(images))
 	seenNetworks := make(map[string]struct{}, len(networks))
 	for _, object := range observed.docker.objects {
 		if builder.accounts(object) {
+			continue
+		}
+		if retained.accounts(object) {
 			continue
 		}
 		name := object.name
@@ -1145,45 +1196,32 @@ func attestGeneratedDomainColdGateway(ctx context.Context, manager *Manager,
 	authority *GeneratedCandidateAuthority, snapshot generatedDomainDockerStartupSnapshot,
 	expected generatedDomainGatewayExpectation,
 ) error {
-	if ctx == nil || manager == nil || authority == nil || manager.runner != authority.process ||
-		expected.kind == generatedDomainGatewayNone || snapshot.daemonID == "" ||
-		manager.options.DockerExecutable != authority.options.DockerExecutable ||
-		manager.options.DockerEndpoint != authority.options.DockerEndpoint ||
-		manager.options.DockerConfigDirectory != authority.options.DockerConfigDirectory ||
-		manager.options.WorkingDirectory != authority.options.WorkingDirectory ||
-		manager.options.CommandTimeout != authority.options.CommandTimeout ||
-		manager.options.OutputLimit != authority.options.OutputLimit {
+	if ctx == nil {
 		return errGeneratedDomainConstructionRefused
 	}
-	reader := &generatedDomainStartupReader{runner: manager.runner,
-		options: generatedDomainOptions{DockerExecutable: manager.options.DockerExecutable,
-			DockerEndpoint:        manager.options.DockerEndpoint,
-			DockerConfigDirectory: manager.options.DockerConfigDirectory,
-			WorkingDirectory:      manager.options.WorkingDirectory,
-			DataRoot:              manager.options.DataRoot, HostPort: manager.options.HostPort,
-			CommandTimeout: manager.options.CommandTimeout, PullTimeout: manager.options.PullTimeout,
-			OutputLimit: manager.options.OutputLimit},
-		environment: append([]string(nil), manager.dockerEnv...), daemonID: snapshot.daemonID,
-		expectation: expected}
+	reader, err := newGeneratedDomainColdStartupReader(manager, authority, snapshot, expected)
+	if err != nil {
+		return err
+	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(generatedDomainStartupObservationTimeout)
 	}
 	var attestation generatedDomainGatewayAttestation
-	var err error
+	var attestErr error
 	switch expected.kind {
 	case generatedDomainGatewayNativeV1:
-		attestation, err = reader.attestNativeV1(ctx, deadline, snapshot, expected, true)
+		attestation, attestErr = reader.attestNativeV1(ctx, deadline, snapshot, expected, true)
 	case generatedDomainGatewayNativeV2:
-		attestation, err = reader.attestNativeV2(ctx, deadline, snapshot, expected, true)
+		attestation, attestErr = reader.attestNativeV2(ctx, deadline, snapshot, expected, true)
 	case generatedDomainGatewayCurrentV1, generatedDomainGatewayCurrentV2:
-		attestation, err = reader.attestCurrent(ctx, deadline, snapshot, expected, true)
+		attestation, attestErr = reader.attestCurrent(ctx, deadline, snapshot, expected, true)
 	default:
 		return errGeneratedDomainConstructionRefused
 	}
-	if err != nil || !attestation.exact || attestation.kind != expected.kind ||
+	if attestErr != nil || !attestation.exact || attestation.kind != expected.kind ||
 		attestation.stateDigest != expected.stateDigest {
-		return errors.Join(errGeneratedDomainConstructionRefused, err)
+		return errors.Join(errGeneratedDomainConstructionRefused, attestErr)
 	}
 	return nil
 }

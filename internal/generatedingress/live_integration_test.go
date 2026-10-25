@@ -258,6 +258,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 		failLiveIngress(t, "route first slot", err)
 	}
 	assertLiveResponse(t, hostPort, appID, "/", "blue")
+	authority.sessions[blue.DeploymentID].Close()
 
 	// Caddy is attached to every private application network. A qualified
 	// network alias must keep identical component/slot aliases isolated.
@@ -283,6 +284,7 @@ func TestLiveGeneratedBlueGreenLifecycle(t *testing.T) {
 	externalTLS := newLiveExternalTLSFixture(t)
 	defer externalTLS.Close(t)
 	assertLiveApplicationNetworkIsolation(t, ctx, runner, docker, working, dockerConfig, ingress, blue, other, hostPort, appID, "blue", otherAppID, "other", externalTLS)
+	authority.sessions[other.DeploymentID].Close()
 
 	// A failed inactive candidate is never committed. The engine owns its exact
 	// cleanup, while Caddy must continue serving the active blue route.

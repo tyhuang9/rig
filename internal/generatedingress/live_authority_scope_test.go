@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"testing"
 	"time"
 
@@ -26,6 +27,27 @@ func TestLiveGeneratedAuthorityAllowsSequentialEffectsScopes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer release()
+	blockedCtx, cancelBlocked := context.WithTimeout(ctx, time.Second)
+	_, blockedRelease, blockedErr := deploymenteffects.AcquireScoped(blockedCtx, directories.WorkingDirectory)
+	cancelBlocked()
+	if blockedErr == nil {
+		if blockedRelease == nil {
+			t.Fatal("second effects scope acquired without a release function")
+		}
+		if err := blockedRelease(); err != nil {
+			t.Fatal("release unexpected second effects scope:", err)
+		}
+		t.Fatal("second effects scope acquired while the first scope was held")
+	}
+	if blockedRelease != nil {
+		if err := blockedRelease(); err != nil {
+			t.Fatal("release unexpected second effects scope:", err)
+		}
+		t.Fatal("second effects scope returned a lease with an acquisition error")
+	}
+	if !errors.Is(blockedErr, context.DeadlineExceeded) {
+		t.Fatalf("second effects scope error = %v, want bounded context deadline", blockedErr)
+	}
 	// Construction must not acquire another lease. A second fixture for the
 	// same controller directory used to deadlock here before any Docker work.
 	newAuthority := func() *liveGeneratedAuthority {

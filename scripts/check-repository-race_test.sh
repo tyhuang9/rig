@@ -44,6 +44,9 @@ if [[ -z "$parent" ]]; then
     '^Test(Admitted|ScopedAdmission)') parent=TestAdmittedFuture ;;
     '^Test(CoordinatorJobRunsOwnerScopedGitHubComposeMaterialization|BlockingCompose|LegacyLocalSourceDraft|Compose)') parent=TestComposeFuture ;;
     '^Test(Deployment|Runtime|Latest|Reviewed|Prior|Release|Secret|Local|Resume|Generated)') parent=TestDeploymentFuture ;;
+    '^Test(GuardPolicyGateRejectsMutableIdentityAndStageChanges|GuardPolicyGateUsesClosedPersistedStagePolicy|GuardComposeChecksUseSeparateClosedStagePolicies|GuardRouteActivationUsesExactWaitingHealthStage|GuardPolicyGateRefusesLaterRunningAuthorityAsStale|GuardPolicyGatePreservesDependencyCausesAndPostCallbackCancellation)$') parent=TestGuardPolicyGateRejectsMutableIdentityAndStageChanges ;;
+    '^Test(GeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork|GeneratedNetworkBoundaryFailedCreateReinspectionPreservesCurrentCancellation|GeneratedRuntimeHealthWaitFailsClosed|GeneratedRuntimeCapacitySourceFailuresPreserveClosedDiagnostics|GeneratedNetworkBoundaryPreservesCancellationFromNilErrorInspectionResults|ReplacementReservationRejectsForeignRetentionAndReleasesUnattemptedAggregate|RetainedRuntimeRequiresOwnedNetworkForStoppedAndRunningTargets|RetainedRuntimeReservationCannotCrossEngineOrOperation|GeneratedNetworkBoundaryExistingExactNetworkRequiresFreshAuthority)$') parent=TestGeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork ;;
+    '^Test(GeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAndCandidateFacts|BeginCandidateTxRejectsForeignAndDriftedProvenance|GeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPartialResult|RecordCandidateObservedFailureTxRejectsForeignStageAndPostRoute|RecordCandidateObservedFailureTxRejectsIncompleteOrDriftedRoster)$') parent=TestGeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAndCandidateFacts ;;
     *)
       if [[ -n "$skip_pattern" ]]; then
         parent=ExampleFutureFallback
@@ -101,6 +104,9 @@ github.com/hostd/hostd/internal/database
 github.com/hostd/hostd/internal/generatedingress
 github.com/hostd/hostd/internal/generatedrecovery
 github.com/hostd/hostd/internal/jobs
+github.com/hostd/hostd/internal/deploymentexecution
+github.com/hostd/hostd/internal/generatedruntime
+github.com/hostd/hostd/internal/generatedruntimestate
 github.com/hostd/hostd/internal/future
 EOF
 
@@ -110,11 +116,11 @@ run() {
 
 system_tee="$(command -v tee)"
 
-for suite in repository-remainder hostd appaccess appconfig database generatedrecovery jobs-atomic jobs-admission jobs-compose jobs-remainder controller-lifecycle controller-remainder; do
+for suite in repository-remainder hostd appaccess appconfig database generatedrecovery jobs-atomic jobs-admission jobs-compose jobs-remainder deploymentexecution-heavy deploymentexecution-remainder generatedruntime-heavy generatedruntime-remainder generatedruntimestate-heavy generatedruntimestate-remainder controller-lifecycle controller-remainder; do
   run "$suite"
 done
 
-[[ $(wc -l < "$args") -eq 12 ]]
+[[ $(wc -l < "$args") -eq 18 ]]
 grep -Fx -- 'test -json -race -count=1 -timeout=40m github.com/hostd/hostd/internal/future' "$args" > /dev/null
 for package in \
   github.com/hostd/hostd/cmd/hostd \
@@ -128,12 +134,25 @@ grep -Fx -- 'test -json -race -count=1 -timeout=40m -run ^TestRunner(Cancellatio
 grep -Fx -- 'test -json -race -count=1 -timeout=40m -run ^Test(Admitted|ScopedAdmission) github.com/hostd/hostd/internal/jobs' "$args" > /dev/null
 grep -Fx -- 'test -json -race -count=1 -timeout=40m -run ^Test(CoordinatorJobRunsOwnerScopedGitHubComposeMaterialization|BlockingCompose|LegacyLocalSourceDraft|Compose) github.com/hostd/hostd/internal/jobs' "$args" > /dev/null
 grep -Fx -- 'test -json -race -count=1 -timeout=40m -skip (^TestRunner(CancellationAndProgress|CompletionAndCancellation)HaveOneTerminalOutcome$|^Test(Admitted|ScopedAdmission)|^Test(CoordinatorJobRunsOwnerScopedGitHubComposeMaterialization|BlockingCompose|LegacyLocalSourceDraft|Compose)) github.com/hostd/hostd/internal/jobs' "$args" > /dev/null
+grep -Fx -- 'test -json -race -count=1 -timeout=40m -run ^Test(GuardPolicyGateRejectsMutableIdentityAndStageChanges|GuardPolicyGateUsesClosedPersistedStagePolicy|GuardComposeChecksUseSeparateClosedStagePolicies|GuardRouteActivationUsesExactWaitingHealthStage|GuardPolicyGateRefusesLaterRunningAuthorityAsStale|GuardPolicyGatePreservesDependencyCausesAndPostCallbackCancellation)$ github.com/hostd/hostd/internal/deploymentexecution' "$args" > /dev/null
+grep -Fx -- 'test -json -race -count=1 -timeout=40m -skip ^Test(GuardPolicyGateRejectsMutableIdentityAndStageChanges|GuardPolicyGateUsesClosedPersistedStagePolicy|GuardComposeChecksUseSeparateClosedStagePolicies|GuardRouteActivationUsesExactWaitingHealthStage|GuardPolicyGateRefusesLaterRunningAuthorityAsStale|GuardPolicyGatePreservesDependencyCausesAndPostCallbackCancellation)$ github.com/hostd/hostd/internal/deploymentexecution' "$args" > /dev/null
+grep -Fx -- 'test -json -race -count=1 -timeout=40m -run ^Test(GeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork|GeneratedNetworkBoundaryFailedCreateReinspectionPreservesCurrentCancellation|GeneratedRuntimeHealthWaitFailsClosed|GeneratedRuntimeCapacitySourceFailuresPreserveClosedDiagnostics|GeneratedNetworkBoundaryPreservesCancellationFromNilErrorInspectionResults|ReplacementReservationRejectsForeignRetentionAndReleasesUnattemptedAggregate|RetainedRuntimeRequiresOwnedNetworkForStoppedAndRunningTargets|RetainedRuntimeReservationCannotCrossEngineOrOperation|GeneratedNetworkBoundaryExistingExactNetworkRequiresFreshAuthority)$ github.com/hostd/hostd/internal/generatedruntime' "$args" > /dev/null
+grep -Fx -- 'test -json -race -count=1 -timeout=40m -skip ^Test(GeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork|GeneratedNetworkBoundaryFailedCreateReinspectionPreservesCurrentCancellation|GeneratedRuntimeHealthWaitFailsClosed|GeneratedRuntimeCapacitySourceFailuresPreserveClosedDiagnostics|GeneratedNetworkBoundaryPreservesCancellationFromNilErrorInspectionResults|ReplacementReservationRejectsForeignRetentionAndReleasesUnattemptedAggregate|RetainedRuntimeRequiresOwnedNetworkForStoppedAndRunningTargets|RetainedRuntimeReservationCannotCrossEngineOrOperation|GeneratedNetworkBoundaryExistingExactNetworkRequiresFreshAuthority)$ github.com/hostd/hostd/internal/generatedruntime' "$args" > /dev/null
+grep -Fx -- 'test -json -race -count=1 -timeout=40m -run ^Test(GeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAndCandidateFacts|BeginCandidateTxRejectsForeignAndDriftedProvenance|GeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPartialResult|RecordCandidateObservedFailureTxRejectsForeignStageAndPostRoute|RecordCandidateObservedFailureTxRejectsIncompleteOrDriftedRoster)$ github.com/hostd/hostd/internal/generatedruntimestate' "$args" > /dev/null
+grep -Fx -- 'test -json -race -count=1 -timeout=40m -skip ^Test(GeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAndCandidateFacts|BeginCandidateTxRejectsForeignAndDriftedProvenance|GeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPartialResult|RecordCandidateObservedFailureTxRejectsForeignStageAndPostRoute|RecordCandidateObservedFailureTxRejectsIncompleteOrDriftedRoster)$ github.com/hostd/hostd/internal/generatedruntimestate' "$args" > /dev/null
 grep -F -- '-run ^Test(Deployment|Runtime|Latest|Reviewed|Prior|Release|Secret|Local|Resume|Generated) github.com/hostd/hostd/internal/controller' "$args" > /dev/null
 grep -F -- '-skip ^Test(Deployment|Runtime|Latest|Reviewed|Prior|Release|Secret|Local|Resume|Generated) github.com/hostd/hostd/internal/controller' "$args" > /dev/null
 if grep -F -- 'github.com/hostd/hostd/internal/generatedingress' "$args" > /dev/null; then
   printf 'ingress appeared in a repository race command\n' >&2
   exit 1
 fi
+for package in \
+  github.com/hostd/hostd/internal/deploymentexecution \
+  github.com/hostd/hostd/internal/generatedruntime \
+  github.com/hostd/hostd/internal/generatedruntimestate; do
+  count=$(awk -v package="$package" '{ for (field = 1; field <= NF; field++) if ($field == package) count++ } END { print count + 0 }' "$args")
+  [[ "$count" -eq 2 ]]
+done
 if run unknown; then
   printf 'unknown suite succeeded\n' >&2
   exit 1

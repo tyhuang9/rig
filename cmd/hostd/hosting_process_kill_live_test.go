@@ -488,11 +488,15 @@ func controllerChildConstructionDiagnosticKnownPair(stage, reason string) bool {
 			"cold_builder_network_policy", "cold_builder_image_policy", "cold_builder_correspondence",
 			"cold_builder_repeated", "cold_builder_final",
 			"cold_reservation", "cold_ownership", "cold_head", "cold_group_attestation",
+			"cold_group_structure", "cold_group_gateway_selection",
 			"cold_group_image_attestation", "cold_group_container_attestation",
 			"cold_group_network_attestation", "cold_group_census", "cold_group_correspondence",
 			"cold_group_labels", "cold_group_network_shape", "cold_group_network_options",
 			"cold_group_missing_container", "cold_group_missing_image", "cold_group_missing_network",
-			"cold_group_gateway_attestation",
+			"cold_group_gateway_attestation", "cold_retained_gateway_selection",
+			"cold_retained_gateway_triple", "cold_retained_gateway_read",
+			"cold_retained_gateway_policy", "cold_retained_gateway_protected_digest",
+			"cold_retained_gateway_final_consistency",
 			"cold_manifest", "lock", "release", "final_validation":
 			return true
 		default:

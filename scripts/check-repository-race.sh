@@ -14,10 +14,16 @@ module='github.com/hostd/hostd'
 ingress_package="$module/internal/generatedingress"
 controller_package="$module/internal/controller"
 jobs_package="$module/internal/jobs"
+deploymentexecution_package="$module/internal/deploymentexecution"
+generatedruntime_package="$module/internal/generatedruntime"
+generatedruntimestate_package="$module/internal/generatedruntimestate"
 controller_lifecycle_pattern='^Test(Deployment|Runtime|Latest|Reviewed|Prior|Release|Secret|Local|Resume|Generated)'
 jobs_atomic_pattern='^TestRunner(CancellationAndProgress|CompletionAndCancellation)HaveOneTerminalOutcome$'
 jobs_admission_pattern='^Test(Admitted|ScopedAdmission)'
 jobs_compose_pattern='^Test(CoordinatorJobRunsOwnerScopedGitHubComposeMaterialization|BlockingCompose|LegacyLocalSourceDraft|Compose)'
+deploymentexecution_heavy_pattern='^Test(GuardPolicyGateRejectsMutableIdentityAndStageChanges|GuardPolicyGateUsesClosedPersistedStagePolicy|GuardComposeChecksUseSeparateClosedStagePolicies|GuardRouteActivationUsesExactWaitingHealthStage|GuardPolicyGateRefusesLaterRunningAuthorityAsStale|GuardPolicyGatePreservesDependencyCausesAndPostCallbackCancellation)$'
+generatedruntime_heavy_pattern='^Test(GeneratedRuntimeCleanupOwnershipDoesNotRequireConfiguredNetwork|GeneratedNetworkBoundaryFailedCreateReinspectionPreservesCurrentCancellation|GeneratedRuntimeHealthWaitFailsClosed|GeneratedRuntimeCapacitySourceFailuresPreserveClosedDiagnostics|GeneratedNetworkBoundaryPreservesCancellationFromNilErrorInspectionResults|ReplacementReservationRejectsForeignRetentionAndReleasesUnattemptedAggregate|RetainedRuntimeRequiresOwnedNetworkForStoppedAndRunningTargets|RetainedRuntimeReservationCannotCrossEngineOrOperation|GeneratedNetworkBoundaryExistingExactNetworkRequiresFreshAuthority)$'
+generatedruntimestate_heavy_pattern='^Test(GeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAndCandidateFacts|BeginCandidateTxRejectsForeignAndDriftedProvenance|GeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPartialResult|RecordCandidateObservedFailureTxRejectsForeignStageAndPostRoute|RecordCandidateObservedFailureTxRejectsIncompleteOrDriftedRoster)$'
 # The exact atomic parent is excluded as an exact match. The admission and
 # Compose families retain their existing prefix semantics so future parents in
 # those families remain in their designated lanes. Deriving this union from
@@ -31,7 +37,14 @@ heavy_packages=(
   "$module/internal/generatedrecovery"
   "$jobs_package"
 )
-designated_packages=("$ingress_package" "$controller_package" "${heavy_packages[@]}")
+designated_packages=(
+  "$ingress_package"
+  "$controller_package"
+  "$deploymentexecution_package"
+  "$generatedruntime_package"
+  "$generatedruntimestate_package"
+  "${heavy_packages[@]}"
+)
 
 package_list="$(mktemp)"
 output="$(mktemp)"
@@ -110,6 +123,30 @@ case "$suite" in
   jobs-remainder)
     packages=("$jobs_package")
     filters=(-skip "$jobs_remainder_skip_pattern")
+    ;;
+  deploymentexecution-heavy)
+    packages=("$deploymentexecution_package")
+    filters=(-run "$deploymentexecution_heavy_pattern")
+    ;;
+  deploymentexecution-remainder)
+    packages=("$deploymentexecution_package")
+    filters=(-skip "$deploymentexecution_heavy_pattern")
+    ;;
+  generatedruntime-heavy)
+    packages=("$generatedruntime_package")
+    filters=(-run "$generatedruntime_heavy_pattern")
+    ;;
+  generatedruntime-remainder)
+    packages=("$generatedruntime_package")
+    filters=(-skip "$generatedruntime_heavy_pattern")
+    ;;
+  generatedruntimestate-heavy)
+    packages=("$generatedruntimestate_package")
+    filters=(-run "$generatedruntimestate_heavy_pattern")
+    ;;
+  generatedruntimestate-remainder)
+    packages=("$generatedruntimestate_package")
+    filters=(-skip "$generatedruntimestate_heavy_pattern")
     ;;
   controller-lifecycle)
     packages=("$controller_package")

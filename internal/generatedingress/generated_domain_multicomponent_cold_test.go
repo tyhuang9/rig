@@ -9,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -962,21 +963,18 @@ func testGeneratedDomainTwoComponentColdPartition(t *testing.T,
 	}
 
 	if partition == generatedDomainTwoComponentColdBuilderNamespacePart2 {
-		t.Run("cold_group_structural_fallback_remains_generic", func(t *testing.T) {
+		t.Run("cold_group_structural_refusal_retains_specific_reason", func(t *testing.T) {
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
 				delete(groups[0].policies, "api")
-				source := attestGeneratedDomainColdGroups(context.Background(), result.manager, result.candidates, observed, groups)
-				if !errors.Is(source, errGeneratedDomainConstructionRefused) {
-					t.Fatalf("cold group structural refusal = %v", source)
-				}
-				err := generatedDomainConstructionBoundaryDiagnostic(
-					generatedDomainConstructionStageColdConstruction,
-					generatedDomainConstructionReasonColdGroupAttestation, source)
+				err := attestGeneratedDomainColdGroups(context.Background(), result.manager, result.candidates, observed, groups)
 				assertGeneratedDomainConstructionDiagnostic(t, err,
 					generatedDomainConstructionStageColdConstruction,
-					generatedDomainConstructionReasonColdGroupAttestation,
-					"generated domain construction was refused: stage=cold_construction reason=cold_group_attestation")
+					generatedDomainConstructionReasonColdGroupStructure,
+					"generated domain construction was refused: stage=cold_construction reason=cold_group_structure")
+				if !errors.Is(err, errGeneratedDomainConstructionRefused) {
+					t.Fatalf("cold group structural refusal hid construction sentinel: %v", err)
+				}
 				for _, command := range fixture.runner.snapshot() {
 					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
 						t.Fatalf("cold group structural refusal dispatched effect/capacity probe: %#v", command)
@@ -1007,6 +1005,118 @@ func generatedDomainTwoComponentColdAttestationFixture(t *testing.T) (generatedD
 		t.Fatalf("read valid cold attestation groups = %d, %v", len(groups), err)
 	}
 	return fixture, result, observed, groups
+}
+
+func TestGeneratedDomainColdGroupStructuralAttribution(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func([]generatedDomainColdGroup)
+	}{
+		{name: "missing_component_policy", mutate: func(groups []generatedDomainColdGroup) {
+			delete(groups[0].policies, "api")
+		}},
+		{name: "starting_component", mutate: func(groups []generatedDomainColdGroup) {
+			groups[0].snapshot.components[0].state = generatedruntimestate.ComponentStarting
+		}},
+		{name: "invalid_present_container_identity", mutate: func(groups []generatedDomainColdGroup) {
+			groups[0].snapshot.components[0].containerID = ""
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
+				test.mutate(groups)
+				before := len(fixture.runner.snapshot())
+				var retained generatedDomainColdRetainedGatewayProof
+				err := attestGeneratedDomainColdGroupsWithRetained(context.Background(), result.manager,
+					result.candidates, observed, groups, &retained)
+				assertGeneratedDomainConstructionDiagnostic(t, err,
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReason("cold_group_structure"),
+					"generated domain construction was refused: stage=cold_construction reason=cold_group_structure")
+				if !reflect.DeepEqual(retained, generatedDomainColdRetainedGatewayProof{}) {
+					t.Fatalf("cold group structural refusal populated retained proof: %#v", retained)
+				}
+				commands := fixture.runner.snapshot()[before:]
+				for _, command := range commands {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+						t.Fatalf("cold group structural refusal dispatched effect/capacity probe: %#v", command)
+					}
+				}
+				generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+			})
+		})
+	}
+}
+
+func TestGeneratedDomainColdGroupGatewaySelectionAttribution(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	generatedDomainConstructionCase(t, func(t *testing.T) {
+		fixture, result, observed, expected := generatedDomainRetainedV1ColdAttestationFixture(t)
+		groups, err := readGeneratedDomainColdGroups(context.Background(), result.candidates, observed)
+		if err != nil || len(groups) == 0 {
+			t.Fatalf("read repeated-selection cold groups = %d, %v", len(groups), err)
+		}
+		lineage, err := gatewayUpgradeCurrentLineage(*expected.upgrade)
+		if err != nil {
+			t.Fatal(err)
+		}
+		selection := gatewayCurrentSelection{Kind: gatewayCurrentSelectionUpgrade, Lineage: lineage,
+			Upgrade: expected.upgrade, UpgradeSource: expected.nativeV1}
+		authority := gatewayCurrentV2PromotionAuthority{Snapshot: observed.database.Gateway}
+		if !gatewayCurrentV2PromotionSnapshotMatches(selection, authority.Snapshot) {
+			t.Fatal("repeated-selection promotion authority does not match the exact startup snapshot")
+		}
+		current, err := gatewayCurrentV2BaselineFor(selection, authority)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed.protected.currentV2 = gatewayCurrentV2Census{files: map[string]gatewayCurrentV2CensusEntry{
+			"first": {State: current}, "second": {State: current},
+		}}
+		if _, err := resolveGeneratedDomainColdGatewayExpectation(observed.database, observed.protected); err == nil {
+			t.Fatal("duplicate current V2 projections did not make repeated selection ambiguous")
+		}
+		before := len(fixture.runner.snapshot())
+		var retained generatedDomainColdRetainedGatewayProof
+		err = attestGeneratedDomainColdGroupsWithRetained(context.Background(), result.manager,
+			result.candidates, observed, groups, &retained)
+		assertGeneratedDomainConstructionDiagnostic(t, err,
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReason("cold_group_gateway_selection"),
+			"generated domain construction was refused: stage=cold_construction reason=cold_group_gateway_selection")
+		commands := fixture.runner.snapshot()[before:]
+		if len(commands) == 0 {
+			t.Fatal("repeated gateway selection refusal did not traverse the required cold group attestations")
+		}
+		for _, command := range commands {
+			if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+				t.Fatalf("repeated gateway selection refusal dispatched effect/capacity probe: %#v", command)
+			}
+			if generatedDomainRetainedV1DetailedReadCommand(command, fixture.observation) ||
+				len(command) == 5 && command[0] == "image" && command[1] == "inspect" &&
+					command[3] == imageInspectFormat &&
+					normalizeID(command[4]) == normalizeID(fixture.observation.Image.ID) {
+				t.Fatalf("repeated gateway selection refusal performed a retained gateway physical read: %#v", command)
+			}
+			builderInspection := len(command) == 5 && command[1] == "inspect" && command[2] == "--format" &&
+				(command[0] == "container" && command[3] == generatedDomainColdBuilderContainerInspectFormat ||
+					command[0] == "network" && command[3] == generatedDomainColdBuilderNetworkInspectFormat ||
+					command[0] == "image" && command[3] == generatedDomainColdBuilderImageInspectFormat)
+			if !generatedDomainCandidateInspectionCommand(command) && !builderInspection {
+				t.Fatalf("repeated gateway selection refusal dispatched a read outside the builder/component prefix: %#v", command)
+			}
+		}
+		generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+		if !reflect.DeepEqual(retained, generatedDomainColdRetainedGatewayProof{}) {
+			t.Fatalf("repeated gateway selection populated retained proof: %#v", retained)
+		}
+	})
 }
 
 func generatedDomainTwoComponentBuilderCensusNetwork(t *testing.T,

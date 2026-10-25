@@ -118,6 +118,8 @@ func TestGeneratedDomainConstructionDiagnosticClosedAttribution(t *testing.T) {
 			generatedDomainConstructionReasonColdOwnership,
 			generatedDomainConstructionReasonColdHead,
 			generatedDomainConstructionReasonColdGroupAttestation,
+			generatedDomainConstructionReasonColdGroupStructure,
+			generatedDomainConstructionReasonColdGroupGatewaySelection,
 			generatedDomainConstructionReasonColdGroupImageAttestation,
 			generatedDomainConstructionReasonColdGroupContainerAttestation,
 			generatedDomainConstructionReasonColdGroupNetworkAttestation,
@@ -130,6 +132,12 @@ func TestGeneratedDomainConstructionDiagnosticClosedAttribution(t *testing.T) {
 			generatedDomainConstructionReasonColdGroupMissingImage,
 			generatedDomainConstructionReasonColdGroupMissingNetwork,
 			generatedDomainConstructionReasonColdGroupGatewayAttestation,
+			generatedDomainConstructionReasonColdRetainedGatewaySelection,
+			generatedDomainConstructionReasonColdRetainedGatewayTriple,
+			generatedDomainConstructionReasonColdRetainedGatewayRead,
+			generatedDomainConstructionReasonColdRetainedGatewayPolicy,
+			generatedDomainConstructionReasonColdRetainedGatewayDigest,
+			generatedDomainConstructionReasonColdRetainedGatewayFinal,
 			generatedDomainConstructionReasonColdManifest,
 		} {
 			diagnostic := generatedDomainConstructionBoundaryDiagnostic(

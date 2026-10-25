@@ -195,6 +195,12 @@ jobs:
           - appconfig
           - database
           - generatedrecovery
+          - deploymentexecution-heavy
+          - deploymentexecution-remainder
+          - generatedruntime-heavy
+          - generatedruntime-remainder
+          - generatedruntimestate-heavy
+          - generatedruntimestate-remainder
           - jobs-atomic
           - jobs-admission
           - jobs-compose
@@ -228,6 +234,7 @@ jobs:
       matrix:
         suite:
           - gateway-v2
+          - rebind-history-heavy
           - rebind-history
           - rebind-startup-runtime
           - rebind-recovery

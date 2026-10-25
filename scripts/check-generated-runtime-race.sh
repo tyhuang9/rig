@@ -20,6 +20,7 @@ filter=()
 # tree. All three workflows use this command so their partitions cannot drift.
 gateway_v2_pattern='^TestGatewayV2'
 rebind_pattern='^Test(GatewayRebind|InspectGatewayRebind)'
+rebind_history_heavy_pattern='^Test(GatewayRebindCommitReplayRequiresUniqueExactReviewedHistory|GatewayRebindAbortedTerminalProofCoreIsFreshAndReadOnly|GatewayRebindRollbackTerminalObserverBindsCheckpointRoutesDigest|GatewayRebindHistoricalTerminalWithNewActiveReturnsUnavailableProofs|GatewayRebindAbortedTerminalExportedWrapperRejectsMissingPredecessorInventory|GatewayRebindTerminalAttestationWithdrawsOnlyRetainedOwner|GatewayRebindAdmissionCurrentPredecessorRejectsClosingConfigDrift)$'
 rebind_effects_pattern='^Test(GatewayRebind(Stage|Final|Successor)|InspectGatewayRebindSuccessor)'
 rebind_config_pattern='^TestGatewayRebind(StageConfig|FinalConfig)'
 rebind_current_pattern='^Test(GatewayRebind(Committed|Current)|InspectGatewayRebindCurrent)'
@@ -104,9 +105,13 @@ case "$suite" in
     packages=(./internal/generatedingress)
     filter=(-run "$gateway_v2_pattern")
     ;;
+  rebind-history-heavy)
+    packages=(./internal/generatedingress)
+    filter=(-run "$rebind_history_heavy_pattern")
+    ;;
   rebind-history)
     packages=(./internal/generatedingress)
-    filter=(-run "$rebind_pattern" -skip "$rebind_effects_pattern|$rebind_typed_pattern|$rebind_composition_pattern|$rebind_current_pattern|$rebind_recovery_pattern|$rebind_startup_runtime_pattern")
+    filter=(-run "$rebind_pattern" -skip "$rebind_history_heavy_pattern|$rebind_effects_pattern|$rebind_typed_pattern|$rebind_composition_pattern|$rebind_current_pattern|$rebind_recovery_pattern|$rebind_startup_runtime_pattern")
     ;;
   rebind-startup-runtime)
     packages=(./internal/generatedingress)

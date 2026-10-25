@@ -17,6 +17,18 @@ type liveGatewayRebindFinalConfigCopyDriver struct {
 	loseAck   bool
 }
 
+type liveGatewayRebindFinalConfigCopyRefusalDriver struct {
+	managerGatewayRebindFinalConfigCopyDriver
+	copyCalls int
+}
+
+func (d *liveGatewayRebindFinalConfigCopyRefusalDriver) copyFinalConfig(context.Context,
+	gatewayRebindProtectedIntent, gatewayRebindStageIntent, []byte,
+) error {
+	d.copyCalls++
+	return errors.New("final-config replay attempted a config copy")
+}
+
 func (d *liveGatewayRebindFinalConfigCopyDriver) copyFinalConfig(ctx context.Context,
 	intent gatewayRebindProtectedIntent, stage gatewayRebindStageIntent, contents []byte,
 ) error {
@@ -28,6 +40,122 @@ func (d *liveGatewayRebindFinalConfigCopyDriver) copyFinalConfig(ctx context.Con
 		return errors.New("injected acknowledgment loss after actual Docker final config copy")
 	}
 	return nil
+}
+
+func TestLiveGatewayRebindSuccessorFinalConfigCopyAdoptionChild(t *testing.T) {
+	runLiveGatewayRebindStoppedStageReplayChildProcess(t, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindFinalConfigAdoptionTest, successMarker: liveGatewayRebindFinalConfigAdoptionMarker,
+	}, func(child *liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome {
+		before, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if err != nil || len(before.Intents) != 1 || len(before.Progress) != 11 ||
+			before.Intents[0].Intent.OperationID != child.value.OperationID || before.Progress[10].Record.OperationID != child.value.OperationID ||
+			before.Progress[10].Record.Sequence != 11 || before.Progress[10].Record.Stage == nil ||
+			before.Progress[10].Record.Stage.FinalConfigIntent == nil || before.Progress[10].Record.Stage.FinalConfigCopy != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "final-config adoption child did not select exact sequence-eleven source"}
+		}
+		beforeBytes, err := readLiveGatewayRebindStoppedStageProgressBytes(before)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "read final-config adoption protected history bytes"}
+		}
+		intent := before.Intents[0].Intent
+		stage := *before.Progress[10].Record.Stage
+		stageBytes, err := gatewayRebindStageConfigBytes(intent)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "regenerate exact stage config bytes for final adoption"}
+		}
+		defer clear(stageBytes)
+		activeBytes, err := gatewayRebindFinalConfigBytes(intent, stage.FinalConfigIntent.RoutePlan)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "regenerate exact active config bytes for final adoption"}
+		}
+		defer clear(activeBytes)
+		driver := &liveGatewayRebindFinalConfigCopyRefusalDriver{
+			managerGatewayRebindFinalConfigCopyDriver: managerGatewayRebindFinalConfigCopyDriver{manager: child.manager},
+		}
+		inventory, err := driver.finalConfigVolumeInventory(child.ctx, intent, stage, stageBytes, activeBytes)
+		if err != nil || inventory != gatewayRebindFinalConfigInventoryExactPair {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"physical", "final-config adoption child did not select exact copied pair"}
+		}
+		reads := liveGatewayRebindStageProductionReads(child.manager)
+		if err := child.manager.copyGatewayRebindSuccessorFinalConfigWithDriver(child.ctx, child.repository,
+			reads, child.manager.inspectGatewayRebindDocker, driver, time.Now().UTC(), nil); err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"replay", "production final-config adoption rejected exact copied pair"}
+		}
+		if driver.copyCalls != 0 {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"create", "final-config adoption dispatched a config copy"}
+		}
+		after, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		afterBytes, bytesErr := readLiveGatewayRebindStoppedStageProgressBytes(after)
+		if err != nil || bytesErr != nil || len(after.Progress) != 12 || len(afterBytes) < len(beforeBytes) ||
+			!reflect.DeepEqual(beforeBytes, afterBytes[:len(beforeBytes)]) {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "final-config adoption changed protected history unexpectedly"}
+		}
+		if after.Progress[11].Record.Stage == nil || after.Progress[11].Record.Stage.FinalConfigCopy == nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"receipt", "final-config adoption did not retain sequence-twelve receipt"}
+		}
+		inventory, err = driver.finalConfigVolumeInventory(child.ctx, intent, *after.Progress[11].Record.Stage,
+			stageBytes, activeBytes)
+		if err != nil || inventory != gatewayRebindFinalConfigInventoryExactPair {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"physical", "final-config adoption changed exact copied pair"}
+		}
+		return liveGatewayRebindStoppedStageReplayChildOutcome{}
+	})
+}
+
+func TestLiveGatewayRebindSuccessorFinalConfigCopyReplayChild(t *testing.T) {
+	runLiveGatewayRebindStoppedStageReplayChildProcess(t, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindFinalConfigReplayTest, successMarker: liveGatewayRebindFinalConfigReplayMarker,
+	}, func(child *liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome {
+		before, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if err != nil || len(before.Intents) != 1 || len(before.Progress) != 12 ||
+			before.Intents[0].Intent.OperationID != child.value.OperationID || before.Progress[11].Record.OperationID != child.value.OperationID ||
+			before.Progress[11].Record.Sequence != 12 || before.Progress[11].Record.Stage == nil ||
+			before.Progress[11].Record.Stage.FinalConfigIntent == nil || before.Progress[11].Record.Stage.FinalConfigCopy == nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "final-config replay child did not select exact sequence-twelve source"}
+		}
+		beforeBytes, err := readLiveGatewayRebindStoppedStageProgressBytes(before)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "read final-config replay protected history bytes"}
+		}
+		intent := before.Intents[0].Intent
+		stage := *before.Progress[11].Record.Stage
+		stageBytes, err := gatewayRebindStageConfigBytes(intent)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "regenerate exact stage config bytes for final replay"}
+		}
+		defer clear(stageBytes)
+		activeBytes, err := gatewayRebindFinalConfigBytes(intent, stage.FinalConfigIntent.RoutePlan)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "regenerate exact active config bytes for final replay"}
+		}
+		defer clear(activeBytes)
+		driver := &liveGatewayRebindFinalConfigCopyRefusalDriver{
+			managerGatewayRebindFinalConfigCopyDriver: managerGatewayRebindFinalConfigCopyDriver{manager: child.manager},
+		}
+		beforeInventory, err := driver.finalConfigVolumeInventory(child.ctx, intent, stage, stageBytes, activeBytes)
+		if err != nil || beforeInventory != gatewayRebindFinalConfigInventoryExactPair {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"physical", "final-config replay child did not select exact copied pair"}
+		}
+		reads := liveGatewayRebindStageProductionReads(child.manager)
+		if err := child.manager.copyGatewayRebindSuccessorFinalConfigWithDriver(child.ctx, child.repository,
+			reads, child.manager.inspectGatewayRebindDocker, driver, time.Now().UTC(), nil); err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"replay", "production final-config replay rejected exact receipt"}
+		}
+		if driver.copyCalls != 0 {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"create", "final-config replay dispatched a config copy"}
+		}
+		after, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		afterBytes, bytesErr := readLiveGatewayRebindStoppedStageProgressBytes(after)
+		if err != nil || bytesErr != nil || !reflect.DeepEqual(before, after) ||
+			!reflect.DeepEqual(beforeBytes, afterBytes) {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "final-config replay changed protected history"}
+		}
+		afterInventory, err := driver.finalConfigVolumeInventory(child.ctx, intent, stage, stageBytes, activeBytes)
+		if err != nil || afterInventory != gatewayRebindFinalConfigInventoryExactPair {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"physical", "final-config replay changed exact copied pair"}
+		}
+		return liveGatewayRebindStoppedStageReplayChildOutcome{}
+	})
 }
 
 func TestLiveGatewayRebindSuccessorFinalConfigCopy(t *testing.T) {
@@ -111,19 +239,10 @@ func liveGatewayRebindSuccessorFinalConfigCopy(t *testing.T, loseAck bool) {
 				reads, manager.inspectGatewayRebindDocker, baseTime.Add(13*time.Nanosecond), nil); err == nil {
 				t.Fatal("old sequence-eleven replay accepted an unexpected active configuration")
 			}
-			manager, err = New(fixture.runner, fixture.ingress.options)
-			if err != nil {
-				t.Fatal("restart Manager after uncertain final configuration copy")
-			}
-			adopter := &liveGatewayRebindFinalConfigCopyDriver{
-				managerGatewayRebindFinalConfigCopyDriver: managerGatewayRebindFinalConfigCopyDriver{manager: manager},
-			}
-			copyErr = manager.copyGatewayRebindSuccessorFinalConfigWithDriver(fixture.ctx, repository,
-				liveGatewayRebindStageProductionReads(manager), manager.inspectGatewayRebindDocker,
-				adopter, baseTime.Add(14*time.Nanosecond), nil)
-			if adopter.copyCalls != 0 {
-				t.Fatal("fresh Manager overwrote the exact previously copied final configuration")
-			}
+			runLiveGatewayRebindStoppedStageReplayChildWithPair(t, fixture, intent, liveGatewayRebindStoppedStageReplayPair{
+				testName: liveGatewayRebindFinalConfigAdoptionTest, successMarker: liveGatewayRebindFinalConfigAdoptionMarker,
+			})
+			copyErr = nil
 		}
 		if copyErr != nil {
 			failLiveIngress(t, "copy or adopt exact final configuration", copyErr)
@@ -148,20 +267,11 @@ func liveGatewayRebindSuccessorFinalConfigCopy(t *testing.T, loseAck bool) {
 			t.Fatal("copy activated final application configuration or changed live stage configuration")
 		}
 		clear(live)
-		replayed, err := New(fixture.runner, fixture.ingress.options)
-		if err != nil {
-			t.Fatal("restart Manager before final configuration receipt replay")
-		}
-		replayDriver := &liveGatewayRebindFinalConfigCopyDriver{
-			managerGatewayRebindFinalConfigCopyDriver: managerGatewayRebindFinalConfigCopyDriver{manager: replayed},
-		}
-		if err := replayed.copyGatewayRebindSuccessorFinalConfigWithDriver(fixture.ctx, repository,
-			liveGatewayRebindStageProductionReads(replayed), replayed.inspectGatewayRebindDocker,
-			replayDriver, baseTime.Add(15*time.Nanosecond), nil); err != nil {
-			failLiveIngress(t, "fresh Manager final configuration receipt replay", err)
-		}
-		replayedHistory, err := replayed.scanGatewayRebindProtectedIntentHistoryLocked(nil)
-		if err != nil || replayDriver.copyCalls != 0 ||
+		runLiveGatewayRebindStoppedStageReplayChildWithPair(t, fixture, intent, liveGatewayRebindStoppedStageReplayPair{
+			testName: liveGatewayRebindFinalConfigReplayTest, successMarker: liveGatewayRebindFinalConfigReplayMarker,
+		})
+		replayedHistory, err := manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if err != nil ||
 			!reflect.DeepEqual(twelveBytes, liveGatewayRebindProgressBytes(t, replayedHistory)) {
 			t.Fatal("final configuration replay copied again or changed protected history")
 		}

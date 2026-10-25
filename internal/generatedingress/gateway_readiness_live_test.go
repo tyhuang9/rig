@@ -120,6 +120,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	if err != nil || blueObservation.URL == "" || blueObservation.Slot != blue.Slot || !reflect.DeepEqual(blueObservation.Endpoints, blueRoute.Endpoints) {
 		t.Fatal("healthy blue route was not attested")
 	}
+	authority.sessions[blue.DeploymentID].Close()
 
 	loopbackSpec := liveCandidateSpec("green", appA, plan)
 	loopbackSpec.ActiveSlot = blue.Slot
@@ -168,6 +169,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 	if err := authority.activate(t, baseline, baselineRoute); err != nil {
 		failLiveIngress(t, "route replacement baseline", err)
 	}
+	authority.sessions[baseline.DeploymentID].Close()
 
 	replacementSpec := liveCandidateSpec("green", appC, plan)
 	replacementSpec.ReleaseID = "d1111111-1111-4111-8111-111111111111"
@@ -186,6 +188,7 @@ func TestLiveGeneratedGatewayReadiness(t *testing.T) {
 		failLiveIngress(t, "route healthy replacement", err)
 	}
 	assertLiveOneShot(t, ctx, ingress.options.HostPort, appC, "/", "replacement", "healthy replacement did not serve through Caddy")
+	authority.sessions[replacement.DeploymentID].Close()
 
 	firstSpec := liveCandidateSpec("other", appB, plan)
 	firstSpec = authority.PrepareCandidate(t, ctx, firstSpec)
