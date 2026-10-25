@@ -24,17 +24,20 @@ type GeneratedPredecessorRetirement struct {
 }
 
 type generatedPredecessorRetirementState struct {
-	mu      sync.Mutex
-	changed *sync.Cond
-	active  int
-	closing bool
-	left    bool
+	completionEntry sync.Mutex
+	mu              sync.Mutex
+	changed         *sync.Cond
+	active          int
+	closing         bool
+	left            bool
 
 	execution           *GeneratedRouteExecution
 	receipt             generatedruntimestate.RouteActivationReceipt
 	successorPolicies   map[string]candidatePolicy
 	predecessorPolicies map[string]candidatePolicy
 	retired             *generatedruntimestate.PredecessorRetirementReceipt
+	accounting          *generatedRouteAccountingHandoffOperation
+	completion          *generatedRouteCompletionOperation
 }
 
 func (e *GeneratedRouteExecution) mintPredecessorRetirement(ctx context.Context,
@@ -163,11 +166,21 @@ func (r *GeneratedPredecessorRetirement) Leave() {
 		state.changed.Wait()
 	}
 	state.left = true
+	completion := state.completion
+	state.completion = nil
+	accounting := state.accounting
+	state.accounting = nil
 	state.execution = nil
 	state.successorPolicies = nil
 	state.predecessorPolicies = nil
 	state.changed.Broadcast()
 	state.mu.Unlock()
+	if completion != nil {
+		completion.close()
+	}
+	if accounting != nil {
+		accounting.close()
+	}
 }
 
 // Retire removes the exact fixed predecessor roster. It retains all capacity
@@ -183,6 +196,12 @@ func (r *GeneratedPredecessorRetirement) Retire(ctx context.Context) (
 	if ctx == nil {
 		return generatedruntimestate.PredecessorRetirementReceipt{}, deploymentexecution.ErrInvalidConfiguration
 	}
+	return state.retire(ctx, candidate)
+}
+
+func (state *generatedPredecessorRetirementState) retire(ctx context.Context,
+	candidate *generatedCandidateExecutionState,
+) (generatedruntimestate.PredecessorRetirementReceipt, error) {
 	state.mu.Lock()
 	if state.retired != nil {
 		result := *state.retired
@@ -205,6 +224,7 @@ func (r *GeneratedPredecessorRetirement) Retire(ctx context.Context) (
 		receipts[component.ComponentName] = component.CandidateReceiptID
 	}
 	var roster *candidateRetirementRosterOperation
+	var err error
 	if len(receipts) > 0 {
 		roster, err = state.execution.authority.candidates.ledger.enterRetirementRoster(
 			state.receipt.AppID, state.receipt.PredecessorDeploymentID, receipts)

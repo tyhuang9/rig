@@ -23,6 +23,7 @@ import (
 
 type predecessorRetirement interface {
 	Retire(context.Context) (generatedruntimestate.PredecessorRetirementReceipt, error)
+	Complete(context.Context) error
 	Leave()
 }
 

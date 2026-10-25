@@ -410,12 +410,11 @@ func (e *Executor) drainPrevious(ctx context.Context, resolved resolvedDeploymen
 	return nil
 }
 
-func (e *Executor) retirePrevious(ctx context.Context, retirement predecessorRetirement) error {
+func (e *Executor) completePrevious(ctx context.Context, retirement predecessorRetirement) error {
 	if retirement == nil {
 		return deployments.ErrGeneratedCandidateRetirementUnavailable
 	}
-	_, err := retirement.Retire(ctx)
-	return err
+	return retirement.Complete(ctx)
 }
 
 func (e *Executor) previousResources(ctx context.Context, appID, deploymentID string) (generatedruntimestate.Deployment, deploymentplans.DeploymentPlanRevision, map[string]generatedimage.Artifact, error) {

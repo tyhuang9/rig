@@ -145,6 +145,60 @@ func candidateCapacityTestMarkPresent(
 	}
 }
 
+func candidateCapacityTestHandedRoster(t *testing.T, ledger *candidateCapacityLedger,
+	spec candidateGroupSpec, receiptPrefix string,
+) (*candidateCapacityReservation, *candidateRosterOperation, map[string]string) {
+	t.Helper()
+	reservation := candidateCapacityTestReserve(t, ledger, spec)
+	receipts := make(map[string]string, len(spec.components))
+	for _, component := range spec.components {
+		receipt := receiptPrefix + "-" + component
+		receipts[component] = receipt
+		candidateCapacityTestRecordReceipt(t, reservation, component, receipt, candidateReceiptCommitAcknowledged)
+		candidateCapacityTestMarkPresent(t, reservation, component, receipt)
+	}
+	roster, err := reservation.closeCleanupAndEnterRoster(receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := roster.markHandedToRoute(); err != nil {
+		t.Fatal(err)
+	}
+	return reservation, roster, receipts
+}
+
+func candidateCapacityTestAbsentPredecessor(t *testing.T, ledger *candidateCapacityLedger,
+	spec candidateGroupSpec, receiptPrefix string,
+) (*candidateCapacityReservation, *candidateRetirementRosterOperation, map[string]string) {
+	t.Helper()
+	reservation, handed, receipts := candidateCapacityTestHandedRoster(t, ledger, spec, receiptPrefix)
+	handed.leave()
+	if err := reservation.release(); err != nil {
+		t.Fatal(err)
+	}
+	retirement, err := ledger.enterRetirementRoster(spec.appID, spec.deploymentID, receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, component := range spec.components {
+		if err := retirement.markConfirmedAbsentRetained(component); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return reservation, retirement, receipts
+}
+
+func candidateCapacityTestRequireCompetitorRefused(t *testing.T, ledger *candidateCapacityLedger,
+	appID, deploymentID string,
+) {
+	t.Helper()
+	competitor := candidateCapacityTestSpec(appID, deploymentID, "competitor")
+	competitor.limits = generatedcapacity.Limits{MemoryBytes: 1, DiskBytes: 1}
+	if _, err := ledger.reserve(context.Background(), competitor); !errors.Is(err, generatedcapacity.ErrInsufficientCapacity) {
+		t.Fatalf("competing ledger reservation error = %v", err)
+	}
+}
+
 func candidateCapacityTestWait(t *testing.T, condition func() bool, message string) {
 	t.Helper()
 	for range 100000 {
@@ -1003,6 +1057,423 @@ func TestCandidateRetirementRosterRetainsExactHandedCharges(t *testing.T) {
 			t.Fatalf("duplicate stop error = %v", err)
 		}
 	})
+}
+
+func TestCandidateAccountingHandoffTransfersWholeRoster(t *testing.T) {
+	t.Run("full_predecessor_keeps_every_lease_live", func(t *testing.T) {
+		ledger, _, _ := candidateCapacityTestLedger(t, 40, 40)
+		successorSpec := candidateCapacityTestSpec("app-1", "deployment-new", "api", "web")
+		predecessorSpec := candidateCapacityTestSpec("app-1", "deployment-old", "api", "web")
+		successorReservation, successorRoster, successorReceipts := candidateCapacityTestHandedRoster(
+			t, ledger, successorSpec, "successor",
+		)
+		_, predecessorRoster, _ := candidateCapacityTestAbsentPredecessor(
+			t, ledger, predecessorSpec, "predecessor",
+		)
+		successorLeases := map[string]*generatedcapacity.Lease{}
+		predecessorLeases := map[string]*generatedcapacity.Lease{}
+		for _, name := range successorSpec.components {
+			successorLeases[name] = successorRoster.group.byName[name].charge.lease
+			predecessorLeases[name] = predecessorRoster.group.byName[name].charge.lease
+		}
+
+		handoff, err := ledger.beginAccountingHandoff(successorRoster, predecessorRoster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range successorSpec.components {
+			charge := successorRoster.group.byName[name].charge
+			if charge.owner != candidateAccountingTransferring || charge.lease != successorLeases[name] ||
+				charge.state != candidateChargeActive || charge.logicallyRetired {
+				t.Fatalf("successor %s charge = %+v", name, charge)
+			}
+			predecessorCharge := predecessorRoster.group.byName[name].charge
+			if predecessorCharge.owner != candidateAccountingPredecessorRetiring ||
+				predecessorCharge.lease != predecessorLeases[name] || predecessorCharge.state != candidateChargeActive ||
+				predecessorCharge.logicallyRetired {
+				t.Fatalf("predecessor %s charge = %+v", name, predecessorCharge)
+			}
+		}
+		// Roster tokens may be returned after authorization failure. The exact
+		// private handoff remains charged and retryable in the same process.
+		successorRoster.leave()
+		predecessorRoster.leave()
+		if err := handoff.markGatewayUnlocked(); err != nil {
+			t.Fatal(err)
+		}
+		if err := successorReservation.release(); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range successorSpec.components {
+			charge := handoff.successorGroup.byName[name].charge
+			if charge.owner != candidateAccountingRouteActive || charge.lease != successorLeases[name] || charge.refs != 0 {
+				t.Fatalf("route-active successor %s charge = %+v", name, charge)
+			}
+		}
+		future, err := ledger.enterRetirementRoster(successorSpec.appID, successorSpec.deploymentID, successorReceipts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		future.leave()
+		candidateCapacityTestRequireCompetitorRefused(t, ledger, "app-2", "deployment-competitor")
+	})
+
+	t.Run("empty_predecessor_transfers_without_release", func(t *testing.T) {
+		ledger, _, _ := candidateCapacityTestLedger(t, 20, 20)
+		spec := candidateCapacityTestSpec("app-1", "deployment-new", "api", "web")
+		reservation, roster, receipts := candidateCapacityTestHandedRoster(t, ledger, spec, "successor")
+		leases := map[string]*generatedcapacity.Lease{}
+		for _, name := range spec.components {
+			leases[name] = roster.group.byName[name].charge.lease
+		}
+		handoff, err := ledger.beginAccountingHandoff(roster, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		roster.leave()
+		if err := handoff.markGatewayUnlocked(); err != nil {
+			t.Fatal(err)
+		}
+		if err := reservation.release(); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range spec.components {
+			charge := handoff.successorGroup.byName[name].charge
+			if charge.owner != candidateAccountingRouteActive || charge.lease != leases[name] || charge.refs != 0 {
+				t.Fatalf("empty-predecessor successor %s charge = %+v", name, charge)
+			}
+		}
+		future, err := ledger.enterRetirementRoster(spec.appID, spec.deploymentID, receipts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		future.leave()
+		candidateCapacityTestRequireCompetitorRefused(t, ledger, "app-2", "deployment-competitor")
+	})
+}
+
+func TestCandidateAccountingHandoffRejectsInvalidBatchWithoutMutation(t *testing.T) {
+	t.Run("successor_not_handed", func(t *testing.T) {
+		ledger, _, _ := candidateCapacityTestLedger(t, 10, 10)
+		spec := candidateCapacityTestSpec("app-1", "deployment-new", "web")
+		reservation := candidateCapacityTestReserve(t, ledger, spec)
+		candidateCapacityTestRecordReceipt(t, reservation, "web", "receipt-web", candidateReceiptCommitAcknowledged)
+		candidateCapacityTestMarkPresent(t, reservation, "web", "receipt-web")
+		roster, err := reservation.closeCleanupAndEnterRoster(map[string]string{"web": "receipt-web"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer roster.leave()
+		charge := roster.group.byName["web"].charge
+		lease := charge.lease
+		if _, err := ledger.beginAccountingHandoff(roster, nil); !errors.Is(err, errCandidatePhysicalTransition) {
+			t.Fatalf("not-handed error = %v", err)
+		}
+		if charge.owner != candidateAccountingCandidate || charge.lease != lease || !reservation.bindings["web"].attached {
+			t.Fatalf("not-handed charge = %+v binding=%+v", charge, reservation.bindings["web"])
+		}
+	})
+
+	t.Run("predecessor_not_absent", func(t *testing.T) {
+		ledger, _, _ := candidateCapacityTestLedger(t, 20, 20)
+		successorSpec := candidateCapacityTestSpec("app-1", "deployment-new", "web")
+		predecessorSpec := candidateCapacityTestSpec("app-1", "deployment-old", "web")
+		successorReservation, successor, _ := candidateCapacityTestHandedRoster(t, ledger, successorSpec, "successor")
+		predecessorReservation, predecessorHanded, predecessorReceipts := candidateCapacityTestHandedRoster(
+			t, ledger, predecessorSpec, "predecessor",
+		)
+		predecessorHanded.leave()
+		if err := predecessorReservation.retainAll(); err != nil {
+			t.Fatal(err)
+		}
+		if err := predecessorReservation.release(); err != nil {
+			t.Fatal(err)
+		}
+		predecessor, err := ledger.enterRetirementRoster(
+			predecessorSpec.appID, predecessorSpec.deploymentID, predecessorReceipts,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer successor.leave()
+		defer predecessor.leave()
+		successorCharge := successor.group.byName["web"].charge
+		predecessorCharge := predecessor.group.byName["web"].charge
+		if _, err := ledger.beginAccountingHandoff(successor, predecessor); !errors.Is(err, errCandidatePhysicalTransition) {
+			t.Fatalf("present predecessor error = %v", err)
+		}
+		if successorCharge.owner != candidateAccountingCandidate || predecessorCharge.owner != candidateAccountingCandidate ||
+			!successorReservation.bindings["web"].attached {
+			t.Fatalf("mutated charges successor=%+v predecessor=%+v", successorCharge, predecessorCharge)
+		}
+	})
+
+	t.Run("crossed_ledger", func(t *testing.T) {
+		successorLedger, _, _ := candidateCapacityTestLedger(t, 10, 10)
+		predecessorLedger, _, _ := candidateCapacityTestLedger(t, 10, 10)
+		successorSpec := candidateCapacityTestSpec("app-1", "deployment-new", "web")
+		predecessorSpec := candidateCapacityTestSpec("app-1", "deployment-old", "web")
+		reservation, successor, _ := candidateCapacityTestHandedRoster(t, successorLedger, successorSpec, "successor")
+		_, predecessor, _ := candidateCapacityTestAbsentPredecessor(t, predecessorLedger, predecessorSpec, "predecessor")
+		defer successor.leave()
+		defer predecessor.leave()
+		if _, err := successorLedger.beginAccountingHandoff(successor, predecessor); !errors.Is(err, errCandidateCapacityInvalid) {
+			t.Fatalf("crossed ledger error = %v", err)
+		}
+		charge := successor.group.byName["web"].charge
+		if charge.owner != candidateAccountingCandidate || !reservation.bindings["web"].attached {
+			t.Fatalf("crossed ledger successor = %+v", charge)
+		}
+	})
+}
+
+func TestCandidateRouteActiveOwnershipSurvivesCandidateAliases(t *testing.T) {
+	ledger, _, _ := candidateCapacityTestLedger(t, 10, 10)
+	spec := candidateCapacityTestSpec("app-1", "deployment-new", "web")
+	reservation, roster, receipts := candidateCapacityTestHandedRoster(t, ledger, spec, "successor")
+	alias := candidateCapacityTestReserve(t, ledger, spec)
+	charge := roster.group.byName["web"].charge
+	lease := charge.lease
+	if charge.refs != 2 {
+		t.Fatalf("shared charge refs = %d", charge.refs)
+	}
+	handoff, err := ledger.beginAccountingHandoff(roster, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roster.leave()
+	if err := handoff.markGatewayUnlocked(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reservation.release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := alias.release(); err != nil {
+		t.Fatal(err)
+	}
+	if charge.owner != candidateAccountingRouteActive || charge.state != candidateChargeActive ||
+		charge.lease != lease || charge.refs != 0 || charge.logicallyRetired {
+		t.Fatalf("route-active charge after alias leave = %+v", charge)
+	}
+	if _, err := ledger.reserve(context.Background(), spec); !errors.Is(err, errCandidateCapacityStale) {
+		t.Fatalf("route-active candidate reserve error = %v", err)
+	}
+	future, err := ledger.enterRetirementRoster(spec.appID, spec.deploymentID, receipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	future.leave()
+	candidateCapacityTestRequireCompetitorRefused(t, ledger, "app-2", "deployment-competitor")
+}
+
+func TestCandidateAccountingHandoffReleasesOnlyExactPredecessorOnce(t *testing.T) {
+	t.Run("release_before_gateway_unlock_refuses", func(t *testing.T) {
+		ledger, _, _ := candidateCapacityTestLedger(t, 20, 20)
+		successorSpec := candidateCapacityTestSpec("app-1", "deployment-new", "web")
+		predecessorSpec := candidateCapacityTestSpec("app-1", "deployment-old", "web")
+		_, successor, _ := candidateCapacityTestHandedRoster(t, ledger, successorSpec, "successor")
+		_, predecessor, _ := candidateCapacityTestAbsentPredecessor(t, ledger, predecessorSpec, "predecessor")
+		defer successor.leave()
+		defer predecessor.leave()
+		handoff, err := ledger.beginAccountingHandoff(successor, predecessor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		charge := predecessor.group.byName["web"].charge
+		lease := charge.lease
+		if err := handoff.releasePredecessorOnce(); !errors.Is(err, errCandidateCapacityStale) {
+			t.Fatalf("release before unlock error = %v", err)
+		}
+		if charge.lease != lease || charge.owner != candidateAccountingPredecessorRetiring ||
+			charge.state != candidateChargeActive || charge.logicallyRetired {
+			t.Fatalf("release before unlock changed predecessor = %+v", charge)
+		}
+	})
+
+	t.Run("crossed_entry_refuses_without_partial_release", func(t *testing.T) {
+		ledger, _, _ := candidateCapacityTestLedger(t, 40, 40)
+		successorSpec := candidateCapacityTestSpec("app-1", "deployment-new", "api", "web")
+		predecessorSpec := candidateCapacityTestSpec("app-1", "deployment-old", "api", "web")
+		_, successor, _ := candidateCapacityTestHandedRoster(t, ledger, successorSpec, "successor")
+		_, predecessor, _ := candidateCapacityTestAbsentPredecessor(t, ledger, predecessorSpec, "predecessor")
+		defer successor.leave()
+		defer predecessor.leave()
+		handoff, err := ledger.beginAccountingHandoff(successor, predecessor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := handoff.markGatewayUnlocked(); err != nil {
+			t.Fatal(err)
+		}
+		crossed := predecessor.group.byName["web"].charge
+		crossed.epoch++
+		if err := handoff.releasePredecessorOnce(); !errors.Is(err, errCandidateCapacityStale) {
+			t.Fatalf("crossed release error = %v", err)
+		}
+		for _, name := range predecessorSpec.components {
+			charge := predecessor.group.byName[name].charge
+			if charge.lease == nil || charge.state != candidateChargeActive ||
+				charge.owner != candidateAccountingPredecessorRetiring || charge.logicallyRetired {
+				t.Fatalf("crossed release partially changed %s = %+v", name, charge)
+			}
+		}
+	})
+
+	t.Run("exact_predecessor_release_is_idempotent", func(t *testing.T) {
+		ledger, _, _ := candidateCapacityTestLedger(t, 20, 20)
+		successorSpec := candidateCapacityTestSpec("app-1", "deployment-new", "web")
+		predecessorSpec := candidateCapacityTestSpec("app-1", "deployment-old", "web")
+		_, successor, _ := candidateCapacityTestHandedRoster(t, ledger, successorSpec, "successor")
+		_, predecessor, _ := candidateCapacityTestAbsentPredecessor(t, ledger, predecessorSpec, "predecessor")
+		defer successor.leave()
+		defer predecessor.leave()
+		handoff, err := ledger.beginAccountingHandoff(successor, predecessor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		successorCharge := successor.group.byName["web"].charge
+		successorLease, successorEpoch := successorCharge.lease, successorCharge.epoch
+		if err := handoff.markGatewayUnlocked(); err != nil {
+			t.Fatal(err)
+		}
+		if err := handoff.releasePredecessorOnce(); err != nil {
+			t.Fatal(err)
+		}
+		if err := handoff.releasePredecessorOnce(); err != nil {
+			t.Fatalf("release replay: %v", err)
+		}
+		if err := handoff.validateFinalState(); err != nil {
+			t.Fatal(err)
+		}
+		predecessorCharge := predecessor.group.byName["web"].charge
+		if predecessorCharge.lease != nil || predecessorCharge.state != candidateChargeReleased ||
+			predecessorCharge.owner != candidateAccountingPredecessorRetired || !predecessorCharge.logicallyRetired {
+			t.Fatalf("terminal predecessor = %+v", predecessorCharge)
+		}
+		if successorCharge.lease != successorLease || successorCharge.epoch != successorEpoch ||
+			successorCharge.owner != candidateAccountingRouteActive || successorCharge.logicallyRetired {
+			t.Fatalf("terminal successor = %+v", successorCharge)
+		}
+	})
+}
+
+func TestCandidateAccountingHandoffRetainsSuccessorMemoryCharge(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		withPredecessor bool
+	}{{"full_predecessor", true}, {"empty_predecessor", false}} {
+		t.Run(test.name, func(t *testing.T) {
+			candidateCapacityTestAccountingContinuity(t, test.withPredecessor, true)
+		})
+	}
+}
+
+func TestCandidateAccountingHandoffRetainsSuccessorDiskCharge(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		withPredecessor bool
+	}{{"full_predecessor", true}, {"empty_predecessor", false}} {
+		t.Run(test.name, func(t *testing.T) {
+			candidateCapacityTestAccountingContinuity(t, test.withPredecessor, false)
+		})
+	}
+}
+
+func candidateCapacityTestAccountingContinuity(t *testing.T, withPredecessor, memoryOnly bool) {
+	t.Helper()
+	ledger, _, source := candidateCapacityTestLedger(t, 20, 20)
+	currentSpec := candidateCapacityTestSpec("app-current", "deployment-current", "web")
+	_, current, currentReceipts := candidateCapacityTestHandedRoster(t, ledger, currentSpec, "current")
+	defer current.leave()
+	currentCharge := current.group.byName["web"].charge
+	currentLease, currentEpoch := currentCharge.lease, currentCharge.epoch
+
+	var predecessor *candidateRetirementRosterOperation
+	if withPredecessor {
+		predecessorSpec := candidateCapacityTestSpec("app-current", "deployment-old", "web")
+		_, predecessor, _ = candidateCapacityTestAbsentPredecessor(t, ledger, predecessorSpec, "old")
+		defer predecessor.leave()
+	}
+	handoff, err := ledger.beginAccountingHandoff(current, predecessor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current.leave()
+	if err := handoff.markGatewayUnlocked(); err != nil {
+		t.Fatal(err)
+	}
+	if err := handoff.releasePredecessorOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if currentCharge.lease != currentLease || currentCharge.epoch != currentEpoch ||
+		currentCharge.owner != candidateAccountingRouteActive || currentCharge.logicallyRetired {
+		t.Fatalf("route-active successor = %+v", currentCharge)
+	}
+
+	setSnapshot := func(memory, disk uint64) {
+		source.mu.Lock()
+		source.snapshot = generatedcapacity.Snapshot{MemoryAvailableBytes: memory, DiskAvailableBytes: disk}
+		source.mu.Unlock()
+	}
+	if memoryOnly {
+		setSnapshot(10, 100)
+	} else {
+		setSnapshot(100, 10)
+	}
+	candidateCapacityTestRequireCompetitorRefused(t, ledger, "app-competitor", "deployment-competitor")
+
+	// A later authentic successor may release this exact route-active charge
+	// only after it becomes the fixed, freshly absent predecessor of that next
+	// handoff. Replaying the release cannot return another share.
+	setSnapshot(20, 20)
+	nextSpec := candidateCapacityTestSpec("app-current", "deployment-next", "web")
+	_, next, _ := candidateCapacityTestHandedRoster(t, ledger, nextSpec, "next")
+	defer next.leave()
+	futurePredecessor, err := ledger.enterRetirementRoster(
+		currentSpec.appID, currentSpec.deploymentID, currentReceipts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer futurePredecessor.leave()
+	if err := futurePredecessor.markConfirmedAbsentRetained("web"); err != nil {
+		t.Fatal(err)
+	}
+	future, err := ledger.beginAccountingHandoff(next, futurePredecessor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next.leave()
+	if err := future.markGatewayUnlocked(); err != nil {
+		t.Fatal(err)
+	}
+	if err := future.releasePredecessorOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if err := future.releasePredecessorOnce(); err != nil {
+		t.Fatalf("future release replay: %v", err)
+	}
+	if currentCharge.lease != nil || currentCharge.state != candidateChargeReleased ||
+		currentCharge.owner != candidateAccountingPredecessorRetired || !currentCharge.logicallyRetired {
+		t.Fatalf("later authenticated release = %+v", currentCharge)
+	}
+	if memoryOnly {
+		setSnapshot(11, 100)
+	} else {
+		setSnapshot(100, 11)
+	}
+	competitor := candidateCapacityTestSpec("app-later", "deployment-later", "competitor")
+	competitor.limits = generatedcapacity.Limits{MemoryBytes: 1, DiskBytes: 1}
+	admitted := candidateCapacityTestReserve(t, ledger, competitor)
+	defer func() {
+		if err := admitted.release(); err != nil {
+			t.Error(err)
+		}
+	}()
+	second := candidateCapacityTestSpec("app-later-2", "deployment-later-2", "competitor")
+	second.limits = competitor.limits
+	if _, err := ledger.reserve(context.Background(), second); !errors.Is(err, generatedcapacity.ErrInsufficientCapacity) {
+		t.Fatalf("later release admitted more than one restored share: %v", err)
+	}
 }
 
 func TestCandidateInvalidAndZeroValuesRefuseSafely(t *testing.T) {
