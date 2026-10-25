@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/hostd/hostd/internal/appaccess"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedbuilder"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -41,6 +42,50 @@ func TestCloneGeneratedDomainColdRetainedGatewayNetworkPreservesMembership(t *te
 		cloned := cloneGeneratedDomainColdRetainedGatewayNetwork(caddyNetworkInspection{})
 		if cloned.Containers != nil {
 			t.Fatalf("nil retained network members cloned as %#v", cloned.Containers)
+		}
+	})
+}
+
+func TestGeneratedDomainColdRetainedGatewayDefersCanonicalNativeV1ToActiveCensus(t *testing.T) {
+	state, _, observation := generatedDomainNativeV1AttestationFixture(t)
+	expected, err := resolveGeneratedDomainColdGatewayExpectation(
+		deployments.GeneratedDomainStartupSnapshot{},
+		generatedDomainProtectedStartupSnapshot{nativeV1: &state},
+	)
+	if err != nil || !generatedDomainColdActiveNativeV1Expectation(expected) {
+		t.Fatalf("canonical active native V1 expectation = %#v, %v", expected, err)
+	}
+	snapshot := generatedDomainDockerStartupSnapshot{
+		objects: generatedDomainRetainedV1CensusObjects(t, observation),
+	}
+
+	t.Run("canonical_selection_leaves_complete_triple_to_active_census", func(t *testing.T) {
+		proof, err := attestGeneratedDomainColdRetainedGateway(
+			context.Background(), nil, nil, snapshot, expected,
+		)
+		if err != nil || proof.presence != generatedDomainColdRetainedGatewayAbsent ||
+			proof.authority != nil || len(proof.objects) != 0 || proof.digest == "" {
+			t.Fatalf("active native V1 retained proof = %#v, %v", proof, err)
+		}
+		for _, object := range snapshot.objects {
+			if proof.accounts(object) {
+				t.Fatalf("active native V1 object was consumed by retained proof: %#v", object)
+			}
+		}
+	})
+
+	t.Run("names_without_canonical_authority_remain_closed", func(t *testing.T) {
+		malformed := expected
+		malformed.nativeV1 = nil
+		if generatedDomainColdActiveNativeV1Expectation(malformed) {
+			t.Fatal("names-only native V1 projection gained active authority")
+		}
+		proof, err := attestGeneratedDomainColdRetainedGateway(
+			context.Background(), nil, nil, snapshot, malformed,
+		)
+		if !errors.Is(err, errGeneratedDomainConstructionRefused) ||
+			!reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
+			t.Fatalf("names-only native V1 retained proof = %#v, %v", proof, err)
 		}
 	})
 }

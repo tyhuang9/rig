@@ -60,6 +60,11 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 		return generatedDomainColdRetainedGatewayProof{}, errGeneratedDomainConstructionRefused
 	}
 	result := generatedDomainColdRetainedGatewayProof{presence: generatedDomainColdRetainedGatewayAbsent}
+	if generatedDomainColdActiveNativeV1Expectation(expected) {
+		digest, err := generatedDomainColdRetainedGatewayDigest(result)
+		result.digest = digest
+		return result, err
+	}
 	objects, presence, err := generatedDomainColdRetainedGatewayObjects(snapshot)
 	if err != nil {
 		return generatedDomainColdRetainedGatewayProof{}, err
@@ -133,6 +138,26 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 		return generatedDomainColdRetainedGatewayProof{}, err
 	}
 	return result, nil
+}
+
+// generatedDomainColdActiveNativeV1Expectation recognizes only the exact
+// native V1 projection minted by the protected cold-start resolver. Its Docker
+// objects remain owned by the active gateway census and its mandatory full
+// attestation rather than the retained-predecessor proof.
+func generatedDomainColdActiveNativeV1Expectation(expected generatedDomainGatewayExpectation) bool {
+	if expected.kind != generatedDomainGatewayNativeV1 || expected.nativeV1 == nil ||
+		expected.nativeV2 != nil || expected.journal != nil || expected.upgrade != nil ||
+		expected.currentV1 != nil || expected.currentV2 != nil || expected.terminal != nil ||
+		!validRouteState(*expected.nativeV1) || expected.nativeV1.Pending != nil {
+		return false
+	}
+	digest, err := canonicalDigest(*expected.nativeV1)
+	if err != nil || digest != expected.stateDigest ||
+		!reflect.DeepEqual(expected.names, generatedDomainGatewayExpectedNames(expected)) {
+		return false
+	}
+	ids, err := generatedDomainGatewayExpectedIDs(expected)
+	return err == nil && reflect.DeepEqual(expected.ids, ids)
 }
 
 func generatedDomainColdRetainedGatewaySelectedAuthority(expected generatedDomainGatewayExpectation) (
