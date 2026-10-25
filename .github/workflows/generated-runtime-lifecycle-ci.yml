@@ -297,6 +297,7 @@ jobs:
           - runtime-packages-state
           - runtime-packages-recovery
           - gateway-v2
+          - rebind-history-heavy
           - rebind-history
           - rebind-startup-runtime
           - rebind-recovery

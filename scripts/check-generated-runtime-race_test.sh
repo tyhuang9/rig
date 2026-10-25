@@ -54,6 +54,11 @@ run() {
 }
 
 composition='^TestGatewayRebindConcreteComposition'
+rebind_pattern='^Test(GatewayRebind|InspectGatewayRebind)'
+rebind_effects='^Test(GatewayRebind(Stage|Final|Successor)|InspectGatewayRebindSuccessor)'
+rebind_current='^Test(GatewayRebind(Committed|Current)|InspectGatewayRebindCurrent)'
+rebind_recovery='^TestGatewayRebind(ForwardConfirmation|Interactive|Reconcile|Recovery|Requested|RollbackConfirmation)'
+rebind_startup_runtime='^TestGatewayRebind(Runtime|Startup)'
 startup='^TestGatewayRebindConcreteComposition(ReconstructsFreshA0|RecoversUnboundCreate)'
 transferred='^TestGatewayRebindConcreteCompositionTransferred'
 second='^TestGatewayRebindConcreteCompositionSecondGeneration'
@@ -62,6 +67,7 @@ typed='^TestGatewayRebindTyped'
 withdrawal='^TestGatewayRebindTyped(Rollback|ForwardOnly)'
 completed='^TestGatewayRebindTyped(Completed|Committed|Recovery|Undurable)'
 handover='^TestGatewayRebindTypedHandover'
+rebind_history_heavy='^Test(GatewayRebindCommitReplayRequiresUniqueExactReviewedHistory|GatewayRebindAbortedTerminalProofCoreIsFreshAndReadOnly|GatewayRebindRollbackTerminalObserverBindsCheckpointRoutesDigest|GatewayRebindHistoricalTerminalWithNewActiveReturnsUnavailableProofs|GatewayRebindAbortedTerminalExportedWrapperRejectsMissingPredecessorInventory|GatewayRebindTerminalAttestationWithdrawsOnlyRetainedOwner|GatewayRebindAdmissionCurrentPredecessorRejectsClosingConfigDrift)$'
 domain='^TestGeneratedDomain'
 domain_startup='^TestGeneratedDomain(Startup|ProtectedStartup)'
 domain_stable='^TestGeneratedDomainStartupClassifiesStableGateway'
@@ -73,8 +79,9 @@ old_remainder_skip='^TestGatewayV2|^Test(GatewayRebind|InspectGatewayRebind)|^Te
 remainder_skip="$old_remainder_skip|$domain|$capacity|$gateway_operations"
 typed_suites=(rebind-typed-withdrawal rebind-typed-completed rebind-typed-handover rebind-typed-runtime)
 composition_suites=(rebind-composition-native rebind-composition-startup rebind-composition-transferred rebind-composition-second-generation rebind-composition-legacy-source)
+history_suites=(rebind-history-heavy rebind-history)
 remainder_suites=(domain-construction domain-a0 domain-cold domain-startup-stable domain-startup ingress-capacity gateway-operations ingress-remainder)
-suites=("${typed_suites[@]}" "${composition_suites[@]}" "${remainder_suites[@]}")
+suites=("${history_suites[@]}" "${typed_suites[@]}" "${composition_suites[@]}" "${remainder_suites[@]}")
 runtime_packages=(
   ./internal/projectanalysis
   ./internal/deploymentplans
@@ -90,6 +97,7 @@ runtime_packages=(
 runtime_package_suites=(runtime-packages-core runtime-packages-executor runtime-packages-state runtime-packages-recovery)
 ingress_suites=(
   gateway-v2
+  rebind-history-heavy
   rebind-history
   rebind-startup-runtime
   rebind-recovery
@@ -165,6 +173,8 @@ for mode in default race plain; do
     expected+=(-count=1 -timeout=32m)
     if [[ "$suite" != ingress-remainder ]]; then expected+=(-run); fi
     case "$suite" in
+      rebind-history-heavy) expected+=("$rebind_history_heavy") ;;
+      rebind-history) expected+=("$rebind_pattern" -skip "$rebind_history_heavy|$rebind_effects|$typed|$composition|$rebind_current|$rebind_recovery|$rebind_startup_runtime") ;;
       rebind-typed-withdrawal) expected+=("$withdrawal") ;;
       rebind-typed-completed) expected+=("$completed") ;;
       rebind-typed-handover) expected+=("$handover") ;;
@@ -192,7 +202,8 @@ done
 # Exercise the actual emitted filters against parent names, including future
 # family members and names already owned by older partitions. Subtests inherit
 # each complete parent; no slash selector may split those trees.
-for suite in "${remainder_suites[@]}"; do
+partition_suites=("${history_suites[@]}" "${remainder_suites[@]}")
+for suite in "${partition_suites[@]}"; do
   run "$suite"
   cp "$temp/args" "$temp/args-$suite"
 done
@@ -211,7 +222,7 @@ selected_by() {
 }
 while read -r name expected_suite; do
   actual=()
-  for suite in "${remainder_suites[@]}"; do
+  for suite in "${partition_suites[@]}"; do
     if selected_by "$name" "$suite"; then actual+=("$suite"); fi
   done
   if [[ "$expected_suite" == none ]]; then
@@ -220,6 +231,17 @@ while read -r name expected_suite; do
     [[ "${#actual[@]}" == 1 && "${actual[0]}" == "$expected_suite" ]]
   fi
 done <<'EOF'
+TestGatewayRebindCommitReplayRequiresUniqueExactReviewedHistory rebind-history-heavy
+TestGatewayRebindAbortedTerminalProofCoreIsFreshAndReadOnly rebind-history-heavy
+TestGatewayRebindRollbackTerminalObserverBindsCheckpointRoutesDigest rebind-history-heavy
+TestGatewayRebindHistoricalTerminalWithNewActiveReturnsUnavailableProofs rebind-history-heavy
+TestGatewayRebindAbortedTerminalExportedWrapperRejectsMissingPredecessorInventory rebind-history-heavy
+TestGatewayRebindTerminalAttestationWithdrawsOnlyRetainedOwner rebind-history-heavy
+TestGatewayRebindAdmissionCurrentPredecessorRejectsClosingConfigDrift rebind-history-heavy
+TestGatewayRebindHistoryFutureControl rebind-history
+TestGatewayRebindTypedFutureControl none
+TestGatewayRebindConcreteCompositionFutureControl none
+TestInspectGatewayRebindFutureControl rebind-history
 TestGeneratedDomainEmptyBootstrapEffectBoundaries domain-construction
 TestGeneratedDomainConstructionReconstructsColdAccounting domain-construction
 TestGeneratedDomainRegistryFutureControl domain-construction
@@ -322,8 +344,8 @@ TestPrepareGatewayFutureControl gateway-operations
 TestCandidateHeadSelfIsReadOnlyAndNeverInfersPredecessor ingress-remainder
 TestUnrelatedIngressFutureControl ingress-remainder
 TestGatewayV2FutureControl none
-TestGatewayRebindFutureControl none
-TestInspectGatewayRebindFutureControl none
+TestGatewayRebindFutureControl rebind-history
+TestInspectGatewayRebindFutureControl rebind-history
 TestManagedGatewayCurrentFutureControl none
 TestGatewayCurrentFutureControl none
 TestInspectGatewayCurrentFutureControl none
@@ -394,15 +416,15 @@ for output in empty child; do
   must_fail run rebind-composition-startup
   must_fail run rebind-typed-handover
   must_fail run rebind-typed-runtime
-  for suite in "${remainder_suites[@]}"; do must_fail run "$suite"; done
+  for suite in "${partition_suites[@]}"; do must_fail run "$suite"; done
 done
 unset RIG_INGRESS_SELECTOR_OUTPUT
 export RIG_INGRESS_SELECTOR_FAIL_GO=1
 must_fail run rebind-composition-transferred
-for suite in "${remainder_suites[@]}"; do must_fail run "$suite"; done
+for suite in "${partition_suites[@]}"; do must_fail run "$suite"; done
 unset RIG_INGRESS_SELECTOR_FAIL_GO
 export RIG_INGRESS_SELECTOR_FAIL_TEE=1
 must_fail run rebind-composition-native
-for suite in "${remainder_suites[@]}"; do must_fail run "$suite"; done
+for suite in "${partition_suites[@]}"; do must_fail run "$suite"; done
 unset RIG_INGRESS_SELECTOR_FAIL_TEE
 printf 'Generated runtime selector contract passed: 60 argument checks, 24 partition controls, three matrices, 40 refusal/failure cases.\n'
