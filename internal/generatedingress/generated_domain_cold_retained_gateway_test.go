@@ -816,6 +816,218 @@ func newGeneratedDomainRetainedV1ColdFixture(t *testing.T) generatedDomainRetain
 	return generatedDomainRetainedV1ColdFixture{generatedDomainA0NamespaceFixture: fixture, observation: observation}
 }
 
+func generatedDomainRetainedV1ColdAttestationFixture(t *testing.T) (generatedDomainRetainedV1ColdFixture,
+	*generatedDomainConstruction, generatedDomainStartupObservation, generatedDomainGatewayExpectation,
+) {
+	t.Helper()
+	fixture := newGeneratedDomainRetainedV1ColdFixture(t)
+	result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+		fixture.construction, fixture.environment, fixture.identity.options)
+	if err != nil || result == nil || result.manager == nil || result.candidates == nil {
+		t.Fatalf("valid retained V1 attestation fixture = %#v, %v", result, err)
+	}
+	observed, err := inspectGeneratedDomainStartupObservation(context.Background(), fixture.identity.stores,
+		fixture.construction, fixture.identity.options)
+	if err != nil {
+		t.Fatalf("inspect retained V1 attestation fixture: %v", err)
+	}
+	expected, err := resolveGeneratedDomainColdGatewayExpectation(observed.database, observed.protected)
+	if err != nil {
+		t.Fatalf("resolve retained V1 attestation fixture: %v", err)
+	}
+	return fixture, result, observed, expected
+}
+
+func TestGeneratedDomainColdRetainedGatewaySelectionTripleAndReadAttribution(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	for _, test := range []struct {
+		name   string
+		reason generatedDomainConstructionReason
+		run    func(*testing.T)
+	}{
+		{name: "present_unsupported_selection", reason: generatedDomainConstructionReason("cold_retained_gateway_selection"), run: func(t *testing.T) {
+			fixture := newGeneratedDomainRetainedV1RebindFixture(t)
+			database, err := fixture.identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			protected, err := readGeneratedDomainProtectedStartup(context.Background(), fixture.identity.options.DataRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			expected, err := resolveGeneratedDomainColdGatewayExpectation(database, protected)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := len(fixture.runner.snapshot())
+			proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), nil, nil,
+				generatedDomainDockerStartupSnapshot{objects: fixture.runner.delegate.objects}, expected)
+			assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReason("cold_retained_gateway_selection"),
+				"generated domain construction was refused: stage=cold_construction reason=cold_retained_gateway_selection")
+			if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
+				t.Fatalf("unsupported retained selection populated proof: %#v", proof)
+			}
+			commands := fixture.runner.snapshot()[before:]
+			for _, command := range commands {
+				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+					t.Fatalf("unsupported retained selection dispatched effect/capacity probe: %#v", command)
+				}
+			}
+			generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+		}},
+		{name: "incomplete_triple", reason: generatedDomainConstructionReason("cold_retained_gateway_triple"), run: func(t *testing.T) {
+			fixture, result, observed, expected := generatedDomainRetainedV1ColdAttestationFixture(t)
+			observed.docker.objects = generatedDomainRetainedV1RemoveCensusObject(t, observed.docker.objects,
+				"volume", caddyVolumeName)
+			before := len(fixture.runner.snapshot())
+			proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), result.manager,
+				result.candidates, observed.docker, expected)
+			assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReason("cold_retained_gateway_triple"),
+				"generated domain construction was refused: stage=cold_construction reason=cold_retained_gateway_triple")
+			if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
+				t.Fatalf("incomplete retained triple populated proof: %#v", proof)
+			}
+			commands := fixture.runner.snapshot()[before:]
+			for _, command := range commands {
+				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+					t.Fatalf("incomplete retained triple dispatched effect/capacity probe: %#v", command)
+				}
+			}
+			generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+		}},
+		{name: "pinned_image_read", reason: generatedDomainConstructionReason("cold_retained_gateway_read"), run: func(t *testing.T) {
+			fixture, result, observed, expected := generatedDomainRetainedV1ColdAttestationFixture(t)
+			fixture.runner.delegate.gateway.image.ID = "sha256:" + strings.Repeat("f", 64)
+			before := len(fixture.runner.snapshot())
+			proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), result.manager,
+				result.candidates, observed.docker, expected)
+			assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReason("cold_retained_gateway_read"),
+				"generated domain construction was refused: stage=cold_construction reason=cold_retained_gateway_read")
+			if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
+				t.Fatalf("retained image read refusal populated proof: %#v", proof)
+			}
+			commands := fixture.runner.snapshot()[before:]
+			for _, command := range commands {
+				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+					t.Fatalf("retained image read refusal dispatched effect/capacity probe: %#v", command)
+				}
+			}
+			generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) { test.run(t) })
+		})
+	}
+}
+
+func TestGeneratedDomainColdRetainedGatewayPolicyAndDigestAttribution(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	for _, test := range []struct {
+		name   string
+		reason generatedDomainConstructionReason
+		mutate func(*gatewayContainerInspection)
+		check  func(*testing.T, generatedDomainColdRetainedGatewayAuthority, gatewayV2DockerObservation)
+	}{
+		{name: "policy_with_matching_digest", reason: generatedDomainConstructionReason("cold_retained_gateway_policy"),
+			mutate: func(container *gatewayContainerInspection) { container.Running = true },
+			check: func(t *testing.T, selected generatedDomainColdRetainedGatewayAuthority, observation gatewayV2DockerObservation) {
+				digest, err := gatewayV1ObservedIdentityDigest(observation)
+				if err != nil || digest != selected.journal.Source.IdentityDigest {
+					t.Fatalf("policy-only observed digest = %q, %v; want protected digest", digest, err)
+				}
+			}},
+		{name: "protected_digest_only", reason: generatedDomainConstructionReason("cold_retained_gateway_protected_digest"),
+			mutate: func(container *gatewayContainerInspection) { container.RestartCount++ },
+			check: func(t *testing.T, selected generatedDomainColdRetainedGatewayAuthority, observation gatewayV2DockerObservation) {
+				digest, err := gatewayV1ObservedIdentityDigest(observation)
+				copied := selected.journal
+				copied.Source.IdentityDigest = digest
+				if err != nil || digest == selected.journal.Source.IdentityDigest ||
+					!validStoppedGatewayV1Base(selected.source, copied, observation, false) {
+					t.Fatalf("digest-only fixture did not preserve every non-digest policy predicate: %v", err)
+				}
+			}},
+		{name: "policy_precedes_digest", reason: generatedDomainConstructionReason("cold_retained_gateway_policy"),
+			mutate: func(container *gatewayContainerInspection) { container.Running = true; container.RestartCount++ },
+			check: func(t *testing.T, selected generatedDomainColdRetainedGatewayAuthority, observation gatewayV2DockerObservation) {
+				digest, err := gatewayV1ObservedIdentityDigest(observation)
+				copied := selected.journal
+				copied.Source.IdentityDigest = digest
+				if err != nil || digest == selected.journal.Source.IdentityDigest ||
+					validStoppedGatewayV1Base(selected.source, copied, observation, false) {
+					t.Fatalf("simultaneous-failure fixture did not independently fail policy and digest: %v", err)
+				}
+			}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture, result, observed, expected := generatedDomainRetainedV1ColdAttestationFixture(t)
+				selected, ok := generatedDomainColdRetainedGatewaySelectedAuthority(expected)
+				if !ok {
+					t.Fatal("retained V1 policy fixture lacks selected authority")
+				}
+				container := fixture.runner.delegate.gateway.containers[fixture.observation.V1Container.ID]
+				test.mutate(&container)
+				fixture.runner.delegate.gateway.containers[fixture.observation.V1Container.ID] = container
+				physical := fixture.observation
+				physical.V1Container = container.caddyInspection
+				physical.V1Runtime = container.gatewayContainerRuntime
+				test.check(t, selected, physical)
+				before := len(fixture.runner.snapshot())
+				proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), result.manager,
+					result.candidates, observed.docker, expected)
+				assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageColdConstruction,
+					test.reason, "generated domain construction was refused: stage=cold_construction reason="+string(test.reason))
+				if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
+					t.Fatalf("retained policy/digest refusal populated proof: %#v", proof)
+				}
+				commands := fixture.runner.snapshot()[before:]
+				for _, command := range commands {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+						t.Fatalf("retained policy/digest refusal dispatched effect/capacity probe: %#v", command)
+					}
+				}
+				generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+			})
+		})
+	}
+}
+
+func TestGeneratedDomainColdRetainedGatewayFinalConsistencyAttribution(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	generatedDomainConstructionCase(t, func(t *testing.T) {
+		fixture, result, observed, expected := generatedDomainRetainedV1ColdAttestationFixture(t)
+		volume := generatedDomainRetainedV1CensusObject(t, observed.docker.objects, "volume", caddyVolumeName)
+		volume.data.mountpoint += "-crossed"
+		before := len(fixture.runner.snapshot())
+		proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), result.manager,
+			result.candidates, observed.docker, expected)
+		assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReason("cold_retained_gateway_final_consistency"),
+			"generated domain construction was refused: stage=cold_construction reason=cold_retained_gateway_final_consistency")
+		if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
+			t.Fatalf("retained final consistency refusal populated proof: %#v", proof)
+		}
+		commands := fixture.runner.snapshot()[before:]
+		for _, command := range commands {
+			if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+				t.Fatalf("retained final consistency refusal dispatched effect/capacity probe: %#v", command)
+			}
+		}
+		generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+	})
+}
+
 func generatedDomainRetainedV1Observation(t *testing.T,
 	fixture generatedDomainA0NamespaceFixture,
 ) gatewayV2DockerObservation {

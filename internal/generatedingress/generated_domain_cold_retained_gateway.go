@@ -67,7 +67,9 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 	}
 	objects, presence, err := generatedDomainColdRetainedGatewayObjects(snapshot)
 	if err != nil {
-		return generatedDomainColdRetainedGatewayProof{}, err
+		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdRetainedGatewayTriple, err)
 	}
 	selected, supported := generatedDomainColdRetainedGatewaySelectedAuthority(expected)
 	if supported {
@@ -78,12 +80,17 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 		return result, err
 	}
 	if !supported {
-		return generatedDomainColdRetainedGatewayProof{}, errGeneratedDomainConstructionRefused
+		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdRetainedGatewaySelection,
+			errGeneratedDomainConstructionRefused)
 	}
 
 	reader, err := newGeneratedDomainColdStartupReader(manager, authority, snapshot, expected)
 	if err != nil {
-		return generatedDomainColdRetainedGatewayProof{}, err
+		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdRetainedGatewaySelection, err)
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -91,7 +98,9 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 	}
 	image, err := reader.readPinnedImage(ctx, deadline, selected.journal.Resources.ImageID)
 	if err != nil {
-		return generatedDomainColdRetainedGatewayProof{}, err
+		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdRetainedGatewayRead, err)
 	}
 	container, runtime, err := reader.readDetailedContainer(ctx, deadline, objects[0].id)
 	if err != nil {
@@ -118,9 +127,19 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 		V1Network: network, V1NetworkID: networkID, V1NetworkFound: true,
 		V1RestartConfig: restart,
 	}
-	if !validStoppedGatewayV1Base(selected.source, selected.journal, observation, false) ||
-		!generatedDomainColdRetainedGatewayCensusMatches(objects, observation) {
-		return generatedDomainColdRetainedGatewayProof{}, errGeneratedDomainConstructionRefused
+	if !validStoppedGatewayV1Base(selected.source, selected.journal, observation, false) {
+		reason := generatedDomainColdRetainedGatewayRefusalReason(selected, observation)
+		if reason == "" {
+			return generatedDomainColdRetainedGatewayProof{}, errGeneratedDomainConstructionRefused
+		}
+		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction, reason, errGeneratedDomainConstructionRefused)
+	}
+	if !generatedDomainColdRetainedGatewayCensusMatches(objects, observation) {
+		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdRetainedGatewayFinal,
+			errGeneratedDomainConstructionRefused)
 	}
 
 	result.presence = generatedDomainColdRetainedGatewayPresent
@@ -138,6 +157,27 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 		return generatedDomainColdRetainedGatewayProof{}, err
 	}
 	return result, nil
+}
+
+// generatedDomainColdRetainedGatewayRefusalReason classifies an already-refused
+// stopped V1 proof. The original journal remains the sole acceptance input; the
+// local copy cannot escape this function or contribute to an accepted proof.
+func generatedDomainColdRetainedGatewayRefusalReason(selected generatedDomainColdRetainedGatewayAuthority,
+	observation gatewayV2DockerObservation,
+) generatedDomainConstructionReason {
+	digest, err := gatewayV1ObservedIdentityDigest(observation)
+	if err != nil {
+		return generatedDomainConstructionReasonColdRetainedGatewayPolicy
+	}
+	copied := selected.journal
+	copied.Source.IdentityDigest = digest
+	if !validStoppedGatewayV1Base(selected.source, copied, observation, false) {
+		return generatedDomainConstructionReasonColdRetainedGatewayPolicy
+	}
+	if digest != selected.journal.Source.IdentityDigest {
+		return generatedDomainConstructionReasonColdRetainedGatewayDigest
+	}
+	return ""
 }
 
 // generatedDomainColdActiveNativeV1Expectation recognizes only the exact
