@@ -71,17 +71,130 @@ func TestGeneratedRouteCompletionReplayAndLostAcknowledgement(t *testing.T) {
 	fixture := newGeneratedRouteAccountingFixtureOnDatabase(t, db)
 	retirement := activateGeneratedRouteAccountingFixture(t, fixture)
 	fault.armed.Store(true)
-	if err := retirement.Complete(context.Background()); !errors.Is(err, lost) || fault.hits.Load() != 1 {
+	if err := retirement.Complete(context.Background()); err != nil || fault.hits.Load() != 1 {
 		t.Fatalf("lost acknowledgement hits=%d error=%v", fault.hits.Load(), err)
 	}
 	assertGeneratedRouteCompletionState(t, db, retirement.state.receipt, 1)
-	if err := retirement.Complete(context.Background()); err != nil {
-		t.Fatalf("lost acknowledgement replay: %v", err)
-	}
 	if fault.hits.Load() != 1 || fault.writes.Load() != 1 {
 		t.Fatalf("lost acknowledgement hits=%d writes=%d", fault.hits.Load(), fault.writes.Load())
 	}
 	assertGeneratedRouteCompletionState(t, db, retirement.state.receipt, 1)
+}
+
+func TestGeneratedRouteCompletionCommitReadbackBoundaries(t *testing.T) {
+	t.Run("confirmed rollback retains the original commit error", func(t *testing.T) {
+		fixture, retirement := newGeneratedRouteAccountingHandoffFixture(t)
+		if _, err := fixture.database().Exec(`CREATE TABLE unit3c_completion_commit_fault(
+			id TEXT PRIMARY KEY, missing_app TEXT NOT NULL,
+			FOREIGN KEY(missing_app) REFERENCES applications(id) DEFERRABLE INITIALLY DEFERRED)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.database().Exec(`CREATE TRIGGER unit3c_completion_commit_fault_insert
+			AFTER INSERT ON generated_route_completion_receipts
+			BEGIN INSERT INTO unit3c_completion_commit_fault(id,missing_app)
+			VALUES(NEW.activation_receipt_id,'unit3c-missing-app'); END`); err != nil {
+			t.Fatal(err)
+		}
+		err := retirement.Complete(context.Background())
+		if !errors.Is(err, deploymentexecution.ErrUnavailable) ||
+			!strings.Contains(err.Error(), "FOREIGN KEY constraint failed") {
+			t.Fatalf("rolled-back completion error=%v", err)
+		}
+		assertGeneratedRouteCompletionAbsent(t, fixture.database(), retirement.state.receipt)
+		var faults int
+		if err := fixture.database().QueryRow(`SELECT COUNT(*) FROM unit3c_completion_commit_fault`).
+			Scan(&faults); err != nil || faults != 0 {
+			t.Fatalf("rolled-back commit fault rows=%d error=%v", faults, err)
+		}
+	})
+
+	t.Run("cancelled readback retains the original commit error", func(t *testing.T) {
+		lost := errors.New("test route completion acknowledgement lost before cancelled readback")
+		ctx, cancel := context.WithCancel(context.Background())
+		fault := &generatedRouteAccountingLostAckFault{
+			target: "generated_route_completion_receipts", cause: lost, afterCommit: cancel,
+		}
+		db := openGeneratedRouteAccountingLostAckDatabase(t, fault)
+		fixture := newGeneratedRouteAccountingFixtureOnDatabase(t, db)
+		retirement := activateGeneratedRouteAccountingFixture(t, fixture)
+		fault.armed.Store(true)
+		err := retirement.Complete(ctx)
+		if !errors.Is(err, context.Canceled) || !errors.Is(err, lost) || fault.hits.Load() != 1 {
+			t.Fatalf("cancelled readback hits=%d error=%v", fault.hits.Load(), err)
+		}
+		assertGeneratedRouteCompletionState(t, db, retirement.state.receipt, 1)
+	})
+
+	t.Run("live ledger drift retains the original commit error", func(t *testing.T) {
+		lost := errors.New("test route completion acknowledgement lost before ledger readback")
+		fault := &generatedRouteAccountingLostAckFault{
+			target: "generated_route_completion_receipts", cause: lost,
+		}
+		db := openGeneratedRouteAccountingLostAckDatabase(t, fault)
+		fixture := newGeneratedRouteAccountingFixtureOnDatabase(t, db)
+		retirement := activateGeneratedRouteAccountingFixture(t, fixture)
+		fault.afterCommit = func() {
+			mutateGeneratedRouteCompletionAccounting(t, retirement,
+				func(operation *candidateAccountingHandoffOperation) {
+					operation.successor[0].charge.owner = candidateAccountingCandidate
+				})
+		}
+		defer mutateGeneratedRouteCompletionAccounting(t, retirement,
+			func(operation *candidateAccountingHandoffOperation) {
+				operation.successor[0].charge.owner = candidateAccountingRouteActive
+			})
+		fault.armed.Store(true)
+		err := retirement.Complete(context.Background())
+		if !errors.Is(err, lost) || fault.hits.Load() != 1 {
+			t.Fatalf("ledger-drifted readback hits=%d error=%v", fault.hits.Load(), err)
+		}
+		assertGeneratedRouteCompletionState(t, db, retirement.state.receipt, 1)
+	})
+}
+
+func TestGeneratedRouteCompletionCommitReadbackEventIntegrity(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		eventCount int
+		mutate     func(*testing.T, *sql.DB, string)
+	}{{
+		name: "missing canonical event", eventCount: 0,
+		mutate: func(t *testing.T, db *sql.DB, jobID string) {
+			t.Helper()
+			if _, err := db.Exec(`DELETE FROM job_events WHERE job_id=? AND code='job_succeeded'`,
+				jobID); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}, {
+		name: "duplicate canonical event", eventCount: 2,
+		mutate: func(t *testing.T, db *sql.DB, jobID string) {
+			t.Helper()
+			if _, err := db.Exec(`INSERT INTO job_events(
+				job_id,sequence,attempt,timestamp,level,phase,code,message
+			) SELECT job_id,(SELECT COALESCE(MAX(sequence),0)+1 FROM job_events WHERE job_id=?),
+				attempt,timestamp,level,phase,code,message FROM job_events
+				WHERE job_id=? AND code='job_succeeded'`, jobID, jobID); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, retirement := newGeneratedRouteAccountingHandoffFixture(t)
+			if err := retirement.Complete(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			operation, candidate, accounting, input := generatedRouteCompletionReadbackProof(t, retirement)
+			test.mutate(t, fixture.database(), input.CurrentJobID)
+			assertGeneratedRouteCompletionState(t, fixture.database(), retirement.state.receipt,
+				test.eventCount)
+			if err := operation.readCommittedCompletion(context.Background(), candidate, accounting, input); err == nil {
+				t.Fatal("noncanonical completion event passed commit readback")
+			}
+			assertGeneratedRouteCompletionState(t, fixture.database(), retirement.state.receipt,
+				test.eventCount)
+		})
+	}
 }
 
 func TestGeneratedRouteCompletionAuthorityAndCancellationRefusals(t *testing.T) {
@@ -369,7 +482,7 @@ func TestGeneratedRouteCompletionLifetimeAndProofLoss(t *testing.T) {
 		default:
 		}
 		releaseCommit()
-		if err := <-completed; !errors.Is(err, lost) {
+		if err := <-completed; err != nil {
 			t.Fatalf("completion result=%v", err)
 		}
 		select {
@@ -382,6 +495,29 @@ func TestGeneratedRouteCompletionLifetimeAndProofLoss(t *testing.T) {
 			t.Fatalf("post-leave completion=%v", err)
 		}
 	})
+}
+
+func generatedRouteCompletionReadbackProof(t *testing.T,
+	retirement *GeneratedPredecessorRetirement,
+) (*generatedRouteCompletionOperation, *generatedCandidateExecutionState,
+	*candidateAccountingHandoffOperation, generatedruntimestate.RouteCompletionInput,
+) {
+	t.Helper()
+	operation := retirement.state.completion
+	if operation == nil {
+		t.Fatal("completion operation is absent")
+	}
+	accounting, err := operation.handoff.completionAccountingProof(operation.handoffFact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate := retirement.state.execution.candidate.state
+	claim := candidate.pins.claim
+	return operation, candidate, accounting, generatedruntimestate.RouteCompletionInput{
+		Activation: operation.state.receipt, AccountingHandoff: operation.handoffFact,
+		CurrentJobID: claim.JobID(), CurrentWorkerAttempt: claim.Attempt(),
+		CompletedAt: operation.completedAt,
+	}
 }
 
 func newGeneratedRouteEmptyPredecessorCompletionFixture(t *testing.T) (
@@ -448,7 +584,7 @@ func assertGeneratedRouteCompletionAbsent(t *testing.T, db *sql.DB,
 		t.Fatalf("completion state runtime=%s main=%s job=%s/%s",
 			runtimePhase, mainStatus, jobStatus, jobPhase)
 	}
-	assertGeneratedRouteCompletionCounts(t, db, activation, 0)
+	assertGeneratedRouteCompletionCounts(t, db, activation, 0, 0)
 }
 
 func assertGeneratedRouteCompletionState(t *testing.T, db *sql.DB,
@@ -468,11 +604,11 @@ func assertGeneratedRouteCompletionState(t *testing.T, db *sql.DB,
 		t.Fatalf("completion state runtime=%s main=%s job=%s/%s",
 			runtimePhase, mainStatus, jobStatus, jobPhase)
 	}
-	assertGeneratedRouteCompletionCounts(t, db, activation, eventCount)
+	assertGeneratedRouteCompletionCounts(t, db, activation, 1, eventCount)
 }
 
 func assertGeneratedRouteCompletionCounts(t *testing.T, db *sql.DB,
-	activation generatedruntimestate.RouteActivationReceipt, eventCount int,
+	activation generatedruntimestate.RouteActivationReceipt, receiptCount, eventCount int,
 ) {
 	t.Helper()
 	var receipts, events int
@@ -484,12 +620,8 @@ func assertGeneratedRouteCompletionCounts(t *testing.T, db *sql.DB,
 		WHERE job_id=? AND code='job_succeeded'`, activation.CreatorJobID).Scan(&events); err != nil {
 		t.Fatal(err)
 	}
-	wantReceipts := 0
-	if eventCount > 0 {
-		wantReceipts = 1
-	}
-	if receipts != wantReceipts || events != eventCount {
+	if receipts != receiptCount || events != eventCount {
 		t.Fatalf("completion facts receipts=%d events=%d want=%d/%d",
-			receipts, events, wantReceipts, eventCount)
+			receipts, events, receiptCount, eventCount)
 	}
 }
