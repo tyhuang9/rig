@@ -207,24 +207,12 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 		return jobs.ExecutionResult{}, e.failMain(ctx, deployment, "internal_error")
 	}
 	if runtimeDeployment.Phase == generatedruntimestate.PhaseSucceeded {
-		// A controller can stop after committing runtime success but before
-		// completing its deployment and job rows. Only finish the same pinned
-		// deployment while its durable active head still names this candidate.
-		head, headErr := e.state.Active(ctx, deployment.AppID)
-		if headErr != nil {
-			e.observeRoutePauseError(ctx, routePauseStageRuntimeSuccessHead, headErr)
-			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
-		}
-		if head.DeploymentID != deployment.ID || head.ReleaseID != deployment.ReleaseID || head.Slot != runtimeDeployment.CandidateSlot {
-			e.observeRoutePause(ctx, routePauseStageRuntimeSuccessHead, routePauseCauseActiveHeadMismatch)
-			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
-		}
-		if deployment.Status != deployments.Succeeded {
-			if _, err := e.deployments.Transition(ctx, deployment.AppID, deployment.ID, deployments.Succeeded, ""); err != nil {
-				return jobs.ExecutionResult{}, executionError("internal_error")
-			}
-		}
-		return jobs.ExecutionResult{CompletionCode: "deployment_completed"}, nil
+		// A succeeded runtime without the live receipt-owned retirement handle
+		// cannot authorize completion or replay. Cross-process reconstruction is
+		// deliberately closed until the separate proof-recovery contract exists.
+		err = deployments.ErrGeneratedCandidateRetirementUnavailable
+		e.observeRoutePauseError(ctx, routePauseStagePreviousRetirement, err)
+		return waitingFor(jobs.PauseRouteReconciliationRequired), nil
 	}
 	if runtimeDeployment.Phase == generatedruntimestate.PhaseFailed || runtimeDeployment.Phase == generatedruntimestate.PhaseCancelled {
 		return jobs.ExecutionResult{}, executionError("apply_failed")
@@ -416,15 +404,13 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 			if retirement == nil {
 				err = deployments.ErrGeneratedCandidateRetirementUnavailable
 			} else {
-				err = e.retirePrevious(ctx, retirement)
-				if err == nil {
-					// Unit 1 deliberately stops before accounting handoff and atomic
-					// completion. Keep the deployment Draining at the existing pause.
-					err = deployments.ErrGeneratedCandidateRetirementUnavailable
-				}
+				err = e.completePrevious(ctx, retirement)
 			}
-			e.observeRoutePauseError(ctx, routePauseStagePreviousRetirement, err)
-			return waitingFor(jobs.PauseRouteReconciliationRequired), nil
+			if err != nil {
+				e.observeRoutePauseError(ctx, routePauseStagePreviousRetirement, err)
+				return waitingFor(jobs.PauseRouteReconciliationRequired), nil
+			}
+			return jobs.ExecutionResult{CompletionCode: "deployment_completed"}, nil
 
 		default:
 			return jobs.ExecutionResult{}, e.fail(ctx, deployment, runtimeDeployment, "internal_error", generatedruntimestate.DiagnosticInternalError)

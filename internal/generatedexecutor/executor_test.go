@@ -599,6 +599,20 @@ func (r *recordingPredecessorRetirement) Retire(ctx context.Context) (generatedr
 	return receipt, err
 }
 
+func (r *recordingPredecessorRetirement) Complete(ctx context.Context) error {
+	r.owner.retirementCalls++
+	if r.owner.retirementBlock != nil {
+		r.owner.retirementErr = r.owner.retirementBlock
+		return r.owner.retirementBlock
+	}
+	if r.owner.retirementContext != nil {
+		ctx = r.owner.retirementContext(ctx)
+	}
+	err := r.delegate.Complete(ctx)
+	r.owner.retirementErr = err
+	return err
+}
+
 func (r *recordingPredecessorRetirement) Leave() { r.delegate.Leave() }
 
 type fakePredecessorRetirement struct {
@@ -610,6 +624,11 @@ type fakePredecessorRetirement struct {
 func (f *fakePredecessorRetirement) Retire(context.Context) (generatedruntimestate.PredecessorRetirementReceipt, error) {
 	f.calls++
 	return generatedruntimestate.PredecessorRetirementReceipt{}, f.err
+}
+
+func (f *fakePredecessorRetirement) Complete(context.Context) error {
+	f.calls++
+	return f.err
 }
 
 func (f *fakePredecessorRetirement) Leave() { f.left = true }
@@ -994,62 +1013,37 @@ func TestGeneratedExecutorUsesReviewedPinsOnSuccessfulDeployment(t *testing.T) {
 	}
 }
 
-func TestGeneratedExecutorFinalizesCommittedRuntimeAfterRestart(t *testing.T) {
+func TestGeneratedExecutorReceiptlessSucceededRuntimeRemainsClosed(t *testing.T) {
 	for _, test := range []struct {
-		name             string
-		invalidateHead   bool
-		alreadyFinalized bool
-		migration        bool
-		wantDisposition  string
-		wantStatus       deployments.Status
+		name           string
+		invalidateHead bool
 	}{
-		{name: "matching committed head after interrupted finalization", wantStatus: deployments.Succeeded},
-		{name: "completed migration after interrupted finalization", migration: true, wantStatus: deployments.Succeeded},
-		{name: "deployment already finalized", alreadyFinalized: true, wantStatus: deployments.Succeeded},
-		{name: "head no longer matches", invalidateHead: true, wantDisposition: jobs.PauseRouteReconciliationRequired, wantStatus: deployments.WaitingHealth},
+		{name: "completed deployment"},
+		{name: "active head mismatch", invalidateHead: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			var fixture *sealedExecutorFixture
-			if test.migration {
-				fixture = newSealedExecutorFixtureWithMigration(t)
-			} else {
-				fixture = newSealedExecutorFixture(t)
+			fixture := newSealedExecutorFixture(t)
+			first, err := fixture.execute()
+			if err != nil || first.CompletionCode != "deployment_completed" {
+				t.Fatalf("first result=%+v err=%v", first, err)
 			}
-			if !test.alreadyFinalized {
-				fixture.deployments.transitionErrStatus = deployments.Succeeded
-				fixture.deployments.transitionErr = errors.New("final deployment acknowledgement unavailable")
-			}
-			if _, err := fixture.execute(); test.alreadyFinalized && err != nil {
-				t.Fatal(err)
-			} else if !test.alreadyFinalized && err == nil {
-				t.Fatal("interrupted finalization unexpectedly succeeded")
-			}
-			if fixture.runtimeDeployment(t).Phase != generatedruntimestate.PhaseSucceeded {
-				t.Fatal("runtime did not commit success")
-			}
-			if test.migration && (fixture.runtimeDeployment(t).MigrationState != generatedruntimestate.MigrationSucceeded || len(fixture.migrations.requests) != 1 || fixture.runner.createCalls != 2 || fixture.runner.startCalls != 2) {
-				t.Fatalf("migration did not complete once before restart: runtime=%+v migrations=%d creates=%d starts=%d", fixture.runtimeDeployment(t), len(fixture.migrations.requests), fixture.runner.createCalls, fixture.runner.startCalls)
-			}
-			fixture.deployments.transitionErr = nil
 			if test.invalidateHead {
 				fixture.state.activeOverride = &generatedruntimestate.ActiveHead{AppID: fixture.app.ID, DeploymentID: uuid.NewString(), ReleaseID: fixture.release.ID, Slot: string(generatedruntime.SlotBlue), Generation: 2}
 			}
+			fixture.deployments.transitionErrStatus = deployments.Succeeded
+			fixture.deployments.transitionErr = errors.New("generic success transition must remain unused")
 			builds, switches, removals := fixture.compiler.calls, len(fixture.routes.requests), fixture.runtime.stopCalls
-			migrationRuns, creates, starts, processRemovals := len(fixture.migrations.requests), fixture.runner.createCalls, fixture.runner.startCalls, fixture.runner.removeCalls
+			creates, starts, processRemovals := fixture.runner.createCalls, fixture.runner.startCalls, fixture.runner.removeCalls
 			result, err := fixture.execute()
 			deployment := fixture.deployment(t)
-			if err != nil || result.PauseDisposition != test.wantDisposition || deployment.Status != test.wantStatus {
-				t.Fatalf("finalize result=%+v err=%v deployment=%+v", result, err, deployment)
-			}
-			if test.wantStatus == deployments.Succeeded && result.CompletionCode != "deployment_completed" {
-				t.Fatalf("finalization did not report completion: %+v", result)
+			if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired ||
+				result.CompletionCode != "" || deployment.Status != deployments.Succeeded {
+				t.Fatalf("receiptless replay result=%+v err=%v deployment=%+v", result, err, deployment)
 			}
 			if fixture.compiler.calls != builds || len(fixture.routes.requests) != switches || fixture.runtime.stopCalls != removals ||
-				len(fixture.migrations.requests) != migrationRuns || fixture.runner.createCalls != creates || fixture.runner.startCalls != starts || fixture.runner.removeCalls != processRemovals {
-				t.Fatal("finalization replay built, migrated, switched, or removed a runtime resource")
-			}
-			if test.migration && fixture.runtimeDeployment(t).MigrationState != generatedruntimestate.MigrationSucceeded {
-				t.Fatal("finalization replay changed completed migration evidence")
+				fixture.runner.createCalls != creates || fixture.runner.startCalls != starts || fixture.runner.removeCalls != processRemovals ||
+				generatedExecutorCompletionReceiptCount(t, fixture) != 1 || generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID) != 1 {
+				t.Fatal("receiptless replay changed resources or durable completion facts")
 			}
 		})
 	}
@@ -1147,14 +1141,6 @@ func TestGeneratedExecutorRepositoryFailuresPreserveDurableTerminalState(t *test
 			wantTerminal: true,
 			code:         "internal_error",
 		},
-		{
-			name: "deployment success transition",
-			inject: func(fixture *sealedExecutorFixture) {
-				fixture.deployments.transitionErrStatus = deployments.Succeeded
-				fixture.deployments.transitionErr = errors.New("deployment transition storage unavailable")
-			},
-			code: "internal_error",
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1167,11 +1153,7 @@ func TestGeneratedExecutorRepositoryFailuresPreserveDurableTerminalState(t *test
 			}
 			deployment := fixture.deployment(t)
 			runtimeDeployment := fixture.runtimeDeployment(t)
-			if test.name == "deployment success transition" {
-				if runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || deployment.Status != deployments.WaitingHealth {
-					t.Fatalf("recoverable finalization state: runtime=%+v deployment=%+v", runtimeDeployment, deployment)
-				}
-			} else if test.wantTerminal && (runtimeDeployment.Phase != generatedruntimestate.PhaseFailed || deployment.Status != deployments.Failed || deployment.DiagnosticCode != "internal_error") {
+			if test.wantTerminal && (runtimeDeployment.Phase != generatedruntimestate.PhaseFailed || deployment.Status != deployments.Failed || deployment.DiagnosticCode != "internal_error") {
 				t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 			} else if !test.wantTerminal && (runtimeDeployment.Phase == generatedruntimestate.PhaseFailed || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled) {
 				t.Fatalf("storage uncertainty terminalized candidate boundary: runtime=%+v deployment=%+v", runtimeDeployment, deployment)
@@ -1180,31 +1162,41 @@ func TestGeneratedExecutorRepositoryFailuresPreserveDurableTerminalState(t *test
 	}
 }
 
-func TestGeneratedExecutorFinalAdvanceFailureRetainsRecoverableRuntimeState(t *testing.T) {
+func TestGeneratedExecutorCompletionPrecommitFailureRetainsReceiptsAndCapacity(t *testing.T) {
 	fixture := newSealedExecutorFixture(t)
-	fixture.state.advanceErrTo = generatedruntimestate.PhaseSucceeded
-	fixture.state.advanceErr = errors.New("runtime state storage unavailable")
+	fixture.capacity.SetCapacity(128<<20, 128<<20)
+	checkCompetitor := fixture.capacityCompetitor(t)
+	if _, err := fixture.db.Exec(`CREATE TRIGGER generated_executor_completion_receipt_fault
+		BEFORE INSERT ON generated_route_completion_receipts
+		BEGIN SELECT RAISE(ABORT, 'generated completion receipt unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := fixture.execute()
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining {
-		t.Fatalf("runtime phase=%q want recoverable %q", runtimeDeployment.Phase, generatedruntimestate.PhaseDraining)
+	runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
+	var jobStatus string
+	var jobAttempt int
+	if err := fixture.db.QueryRow(`SELECT status,attempt FROM jobs WHERE id=?`, fixture.job.ID).Scan(&jobStatus, &jobAttempt); err != nil {
+		t.Fatal(err)
 	}
-	if deployment := fixture.deployment(t); deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
-		t.Fatalf("deployment became terminal: %+v", deployment)
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		deployment.Status != deployments.WaitingHealth || jobStatus != string(jobs.Running) || jobAttempt != fixture.claim.Attempt() ||
+		generatedExecutorActivationReceiptCount(t, fixture) != 1 ||
+		generatedExecutorRetirementReceiptCount(t, fixture) != 1 ||
+		generatedExecutorAccountingHandoffReceiptCount(t, fixture) != 1 ||
+		generatedExecutorCompletionReceiptCount(t, fixture) != 0 ||
+		generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID) != 0 ||
+		fixture.routes.retirementCalls != 1 || fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 {
+		t.Fatalf("runtime=%+v deployment=%+v job=%s/%d activation=%d retirement=%d accounting=%d completion=%d events=%d calls=%d stops=%d/%d/%d",
+			runtimeDeployment, deployment, jobStatus, jobAttempt, generatedExecutorActivationReceiptCount(t, fixture),
+			generatedExecutorRetirementReceiptCount(t, fixture), generatedExecutorAccountingHandoffReceiptCount(t, fixture),
+			generatedExecutorCompletionReceiptCount(t, fixture), generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID),
+			fixture.routes.retirementCalls, fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
 	}
-
-	fixture.state.advanceErr = nil
-	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	result, err = fixture.execute()
-	if runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t); err != nil || result.CompletionCode != "deployment_completed" || runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || deployment.Status != deployments.Succeeded {
-		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, runtimeDeployment, deployment)
-	}
-	if fixture.authorization.calls != 1 {
-		t.Fatalf("draining retry requested replacement capacity: authorization calls=%d", fixture.authorization.calls)
-	}
+	checkCompetitor(true)
 }
 
 func TestGeneratedExecutorDistinguishesPlanStorageAndValidationFailures(t *testing.T) {
@@ -1821,36 +1813,121 @@ func generatedExecutorRetirementReceiptCount(t *testing.T, fixture *sealedExecut
 	return count
 }
 
-func TestGeneratedExecutorImmediateRetirementRecordsReceiptAndKeepsCompletionClosed(t *testing.T) {
-	fixture := newSealedExecutorFixture(t)
+func generatedExecutorAccountingHandoffReceiptCount(t *testing.T, fixture *sealedExecutorFixture) int {
+	t.Helper()
+	var count int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
 
-	result, err := fixture.execute()
-	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || result.CompletionCode != "" {
-		t.Fatalf("result=%+v err=%v", result, err)
+func generatedExecutorCompletionReceiptCount(t *testing.T, fixture *sealedExecutorFixture) int {
+	t.Helper()
+	var count int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM generated_route_completion_receipts`).Scan(&count); err != nil {
+		t.Fatal(err)
 	}
-	runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
-	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
-		deployment.Status == deployments.Succeeded || deployment.Status == deployments.Failed ||
-		fixture.routes.delegateCalls != 1 || len(fixture.routes.requests) != 1 ||
-		generatedExecutorActivationReceiptCount(t, fixture) != 1 ||
-		generatedExecutorRetirementReceiptCount(t, fixture) != 1 ||
-		fixture.routes.retirementCalls != 1 || fixture.routes.retirementErr != nil {
-		t.Fatalf("runtime=%+v deployment=%+v route calls=%d/%d activation=%+v activation error=%v activation receipts=%d retirement receipts=%d retirement calls=%d error=%v",
-			runtimeDeployment, deployment, fixture.routes.delegateCalls, len(fixture.routes.requests),
-			fixture.routes.lastActivation.deployment, fixture.routes.lastErr,
-			generatedExecutorActivationReceiptCount(t, fixture), generatedExecutorRetirementReceiptCount(t, fixture),
-			fixture.routes.retirementCalls, fixture.routes.retirementErr)
+	return count
+}
+
+func generatedExecutorCompletionEventCount(t *testing.T, fixture *sealedExecutorFixture, jobID string) int {
+	t.Helper()
+	var count int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM job_events WHERE job_id=? AND code='job_succeeded'`, jobID).Scan(&count); err != nil {
+		t.Fatal(err)
 	}
-	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 {
-		t.Fatalf("empty-predecessor retirement reached legacy effects: runtime stops=%d docker stops=%d removals=%d",
-			fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
+	return count
+}
+
+func requireGeneratedExecutorCompletionAuthority(t *testing.T, fixture *sealedExecutorFixture, deploymentID, jobID string, attempt int) {
+	t.Helper()
+	var actualJobID string
+	var actualAttempt int
+	if err := fixture.db.QueryRow(`SELECT current_job_id,current_worker_attempt
+		FROM generated_route_completion_receipts WHERE successor_deployment_id=?`, deploymentID).
+		Scan(&actualJobID, &actualAttempt); err != nil {
+		t.Fatal(err)
 	}
-	if fixture.routes.lastActivation.retirement == nil {
-		t.Fatal("immediate route activation did not retain its retirement handle")
+	if actualJobID != jobID || actualAttempt != attempt {
+		t.Fatalf("completion authority job=%s attempt=%d want=%s/%d", actualJobID, actualAttempt, jobID, attempt)
 	}
-	if _, err := fixture.routes.lastActivation.retirement.Retire(context.Background()); !errors.Is(err, deploymentexecution.ErrScopeUnavailable) {
-		t.Fatalf("executor return leaked a live retirement handle: %v", err)
-	}
+}
+
+func TestGeneratedExecutorReceiptOwnedCompletion(t *testing.T) {
+	t.Run("empty predecessor", func(t *testing.T) {
+		fixture := newSealedExecutorFixture(t)
+		fixture.capacity.SetCapacity(128<<20, 128<<20)
+		checkCompetitor := fixture.capacityCompetitor(t)
+
+		result, err := fixture.execute()
+		if err != nil || result.CompletionCode != "deployment_completed" || result.PauseDisposition != "" {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
+		if runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || deployment.Status != deployments.Succeeded ||
+			fixture.routes.delegateCalls != 1 || len(fixture.routes.requests) != 1 ||
+			generatedExecutorActivationReceiptCount(t, fixture) != 1 || generatedExecutorRetirementReceiptCount(t, fixture) != 1 ||
+			generatedExecutorAccountingHandoffReceiptCount(t, fixture) != 1 || generatedExecutorCompletionReceiptCount(t, fixture) != 1 ||
+			generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID) != 1 ||
+			fixture.routes.retirementCalls != 1 || fixture.routes.retirementErr != nil ||
+			fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 {
+			t.Fatalf("runtime=%+v deployment=%+v routes=%d/%d receipts=%d/%d/%d/%d events=%d retirement=%d/%v stops=%d/%d/%d",
+				runtimeDeployment, deployment, fixture.routes.delegateCalls, len(fixture.routes.requests),
+				generatedExecutorActivationReceiptCount(t, fixture), generatedExecutorRetirementReceiptCount(t, fixture),
+				generatedExecutorAccountingHandoffReceiptCount(t, fixture), generatedExecutorCompletionReceiptCount(t, fixture),
+				generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID), fixture.routes.retirementCalls,
+				fixture.routes.retirementErr, fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
+		}
+		if fixture.routes.lastActivation.retirement == nil {
+			t.Fatal("completed route activation did not retain its closed retirement handle")
+		}
+		if _, err := fixture.routes.lastActivation.retirement.Retire(context.Background()); !errors.Is(err, deploymentexecution.ErrScopeUnavailable) {
+			t.Fatalf("executor return leaked a live retirement handle: %v", err)
+		}
+		requireGeneratedExecutorCompletionAuthority(t, fixture, deployment.ID, fixture.job.ID, fixture.job.Attempt)
+		checkCompetitor(true)
+	})
+
+	t.Run("distinct second deployment with full predecessor", func(t *testing.T) {
+		fixture := newSealedExecutorFixture(t)
+		fixture.capacity.SetCapacity(256<<20, 256<<20)
+		checkCompetitor := fixture.capacityCompetitor(t)
+		first, err := fixture.execute()
+		if err != nil || first.CompletionCode != "deployment_completed" {
+			t.Fatalf("first result=%+v err=%v", first, err)
+		}
+		firstDeploymentID, firstJobID := fixture.deployment(t).ID, fixture.job.ID
+		fixture.nextDeployment(t)
+		secondJobID := fixture.job.ID
+
+		result, err := fixture.execute()
+		if err != nil || result.CompletionCode != "deployment_completed" || result.PauseDisposition != "" {
+			t.Fatalf("replacement result=%+v err=%v", result, err)
+		}
+		previous, getErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, firstDeploymentID)
+		if getErr != nil || len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentStopped {
+			t.Fatalf("retired predecessor=%+v err=%v", previous, getErr)
+		}
+		runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
+		if runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || deployment.Status != deployments.Succeeded ||
+			deployment.ID == firstDeploymentID || secondJobID == firstJobID ||
+			generatedExecutorActivationReceiptCount(t, fixture) != 2 || generatedExecutorRetirementReceiptCount(t, fixture) != 2 ||
+			generatedExecutorAccountingHandoffReceiptCount(t, fixture) != 2 || generatedExecutorCompletionReceiptCount(t, fixture) != 2 ||
+			generatedExecutorCompletionEventCount(t, fixture, firstJobID) != 1 || generatedExecutorCompletionEventCount(t, fixture, secondJobID) != 1 ||
+			fixture.routes.retirementCalls != 2 || fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 1 || fixture.runner.removeCalls != 1 {
+			t.Fatalf("runtime=%+v deployment=%+v distinct=%s/%s receipts=%d/%d/%d/%d events=%d/%d retirement=%d stops=%d/%d/%d",
+				runtimeDeployment, deployment, firstDeploymentID, deployment.ID,
+				generatedExecutorActivationReceiptCount(t, fixture), generatedExecutorRetirementReceiptCount(t, fixture),
+				generatedExecutorAccountingHandoffReceiptCount(t, fixture), generatedExecutorCompletionReceiptCount(t, fixture),
+				generatedExecutorCompletionEventCount(t, fixture, firstJobID), generatedExecutorCompletionEventCount(t, fixture, secondJobID),
+				fixture.routes.retirementCalls, fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
+		}
+		requireGeneratedExecutorCompletionAuthority(t, fixture, deployment.ID, secondJobID, fixture.job.Attempt)
+		checkCompetitor(false)
+		fixture.capacity.SetCapacity(128<<20, 128<<20)
+		checkCompetitor(true)
+	})
 }
 
 func TestGeneratedExecutorPostActivationProofLossRemainsClosedWithoutRepublishingRoute(t *testing.T) {
@@ -2120,114 +2197,6 @@ func TestGeneratedExecutorReceiptOwnedRetirementOwnsSingleDrainWaitAndCancellati
 			executorDrainCalls, fixture.routes.retirementCalls, fixture.routes.retirementErr,
 			fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls,
 			runtimeDeployment, generatedExecutorRetirementReceiptCount(t, fixture))
-	}
-}
-
-func TestGeneratedExecutorRetriesOldSlotCleanupWithoutTerminalizingDeployment(t *testing.T) {
-	fixture := newSealedExecutorFixture(t)
-	if _, err := fixture.execute(); err != nil {
-		t.Fatal(err)
-	}
-	oldDeploymentID := fixture.deployment(t).ID
-	fixture.nextDeployment(t)
-	fixture.routes.requests = nil
-	fixture.executor.waitDrain = func(context.Context, time.Duration) error { return nil }
-
-	result, err := fixture.execute()
-	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
-		t.Fatalf("result=%+v err=%v", result, err)
-	}
-	runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
-	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
-		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
-	}
-	if previous, getErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); getErr != nil || len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
-		t.Fatalf("previous slot=%+v", previous)
-	}
-
-	fixture.authorization.err = ErrInsufficientReplacementCapacity
-	result, err = fixture.execute()
-	runtimeDeployment, deployment = fixture.runtimeDeployment(t), fixture.deployment(t)
-	if err != nil || result.PauseDisposition != jobs.PauseRouteReconciliationRequired || runtimeDeployment.Phase != generatedruntimestate.PhaseDraining || deployment.Status == deployments.Succeeded {
-		t.Fatalf("retry result=%+v err=%v runtime=%+v deployment=%+v", result, err, runtimeDeployment, deployment)
-	}
-	if fixture.runtime.stopCalls != 2 || fixture.runner.stopCalls != 0 {
-		t.Fatalf("legacy cleanup attempts=%d physical stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
-	}
-	if fixture.authorization.calls != 1 {
-		t.Fatalf("draining retry requested replacement capacity: authorization calls=%d", fixture.authorization.calls)
-	}
-	if previous, _ := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); previous.Components[0].State != generatedruntimestate.ComponentDraining {
-		t.Fatalf("previous slot=%+v", previous)
-	}
-}
-
-func TestGeneratedExecutorStopsPreviousSlotOnlyAfterDrainCompletes(t *testing.T) {
-	fixture := newSealedExecutorFixture(t)
-	if _, err := fixture.execute(); err != nil {
-		t.Fatal(err)
-	}
-	oldDeploymentID := fixture.deployment(t).ID
-	fixture.nextDeployment(t)
-	fixture.routes.requests = nil
-	drainEntered := make(chan struct{})
-	releaseDrain := make(chan struct{})
-	fixture.executor.waitDrain = func(ctx context.Context, _ time.Duration) error {
-		close(drainEntered)
-		select {
-		case <-releaseDrain:
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-
-	testContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	type outcome struct {
-		result jobs.ExecutionResult
-		err    error
-	}
-	completed := make(chan outcome, 1)
-	go func() {
-		result, err := fixture.execute()
-		completed <- outcome{result: result, err: err}
-	}()
-
-	drainReleased := false
-	release := func() {
-		if !drainReleased {
-			close(releaseDrain)
-			drainReleased = true
-		}
-	}
-	defer release()
-	select {
-	case <-drainEntered:
-	case <-testContext.Done():
-		t.Fatalf("executor did not enter drain: %v", testContext.Err())
-	}
-	if previous, getErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); getErr != nil || len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
-		t.Fatalf("previous slot=%+v", previous)
-	}
-	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
-		t.Fatalf("old slot stopped before drain completed: legacy=%d physical=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
-	}
-
-	release()
-	select {
-	case execution := <-completed:
-		if execution.err != nil || execution.result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
-			t.Fatalf("result=%+v err=%v", execution.result, execution.err)
-		}
-	case <-testContext.Done():
-		t.Fatalf("executor did not complete after drain release: %v", testContext.Err())
-	}
-	if fixture.runtime.stopCalls != 1 || fixture.runner.stopCalls != 0 {
-		t.Fatalf("legacy refusal calls=%d physical stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
-	}
-	if previous, _ := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID); len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentDraining {
-		t.Fatalf("previous slot=%+v", previous)
 	}
 }
 

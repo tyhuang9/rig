@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedruntime"
@@ -25,59 +24,6 @@ func TestGeneratedExecutorRoutePauseAttribution(t *testing.T) {
 		result, err := fixture.execute(context.Background(), fixture.deploymentJob(), fixture.reporter)
 		requireRoutePauseResult(t, result, err)
 		requireRoutePauseRecord(t, logs, routePauseStageRuntimeBegin, routePauseCauseDeploymentInProgress)
-	})
-
-	t.Run("committed runtime head mismatch", func(t *testing.T) {
-		fixture := newSealedExecutorFixture(t)
-		logs := attachRoutePauseTestLogger(fixture.executor)
-		fixture.deployments.transitionErrStatus = deployments.Succeeded
-		fixture.deployments.transitionErr = errors.New("final deployment acknowledgement unavailable")
-		if _, err := fixture.execute(); err == nil {
-			t.Fatal("initial finalization unexpectedly succeeded")
-		}
-		fixture.deployments.transitionErr = nil
-		fixture.state.activeOverride = &generatedruntimestate.ActiveHead{
-			AppID: fixture.app.ID, DeploymentID: testActorID, ReleaseID: fixture.release.ID,
-			Slot: string(generatedruntime.SlotBlue), Generation: 2,
-		}
-
-		result, err := fixture.execute()
-		requireRoutePauseResult(t, result, err)
-		requireRoutePauseRecord(t, logs, routePauseStageRuntimeSuccessHead, routePauseCauseActiveHeadMismatch)
-	})
-
-	t.Run("committed runtime head read error", func(t *testing.T) {
-		fixture := newSealedExecutorFixture(t)
-		logs := attachRoutePauseTestLogger(fixture.executor)
-		fixture.deployments.transitionErrStatus = deployments.Succeeded
-		fixture.deployments.transitionErr = errors.New("final deployment acknowledgement unavailable")
-		if _, err := fixture.execute(); err == nil {
-			t.Fatal("initial finalization unexpectedly succeeded")
-		}
-		fixture.deployments.transitionErr = nil
-		fixture.executor.state = routePauseActiveErrorState{
-			runtimeState: fixture.state,
-			err:          generatedruntimestate.ErrInvalidState,
-		}
-		builds, switches, legacyStops := fixture.compiler.calls, len(fixture.routes.requests), fixture.runtime.stopCalls
-		creates, starts := fixture.runner.createCalls, fixture.runner.startCalls
-		physicalStops, removals := fixture.runner.stopCalls, fixture.runner.removeCalls
-
-		result, err := fixture.execute()
-		requireRoutePauseResult(t, result, err)
-		requireRoutePauseRecord(t, logs, routePauseStageRuntimeSuccessHead, routePauseCauseInvalidState)
-		if fixture.compiler.calls != builds || len(fixture.routes.requests) != switches || fixture.runtime.stopCalls != legacyStops ||
-			fixture.runner.createCalls != creates || fixture.runner.startCalls != starts ||
-			fixture.runner.stopCalls != physicalStops || fixture.runner.removeCalls != removals {
-			t.Fatalf("head read pause performed effects: builds=%d/%d switches=%d/%d legacy stops=%d/%d creates=%d/%d starts=%d/%d physical stops=%d/%d removals=%d/%d",
-				fixture.compiler.calls, builds, len(fixture.routes.requests), switches, fixture.runtime.stopCalls, legacyStops,
-				fixture.runner.createCalls, creates, fixture.runner.startCalls, starts, fixture.runner.stopCalls, physicalStops,
-				fixture.runner.removeCalls, removals)
-		}
-		runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
-		if runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded || deployment.Status != deployments.WaitingHealth {
-			t.Fatalf("head read pause changed durable state: runtime=%+v deployment=%+v", runtimeDeployment, deployment)
-		}
 	})
 
 	t.Run("gateway readiness during route switch", func(t *testing.T) {
@@ -103,35 +49,38 @@ func TestGeneratedExecutorRoutePauseAttribution(t *testing.T) {
 			t.Fatalf("durable activation runtime=%+v delegate calls=%d", runtime, fixture.routes.delegateCalls)
 		}
 	})
+}
 
-	t.Run("receipt owned predecessor retirement", func(t *testing.T) {
+func TestGeneratedExecutorCompletionRoutePauseAttribution(t *testing.T) {
+	t.Run("receiptless succeeded runtime", func(t *testing.T) {
 		fixture := newSealedExecutorFixture(t)
 		logs := attachRoutePauseTestLogger(fixture.executor)
-		if _, err := fixture.execute(); err != nil {
-			t.Fatal(err)
+		result, err := fixture.execute()
+		if err != nil || result.CompletionCode != "deployment_completed" || logs.Len() != 0 {
+			t.Fatalf("first result=%+v err=%v logs=%s", result, err, logs.String())
 		}
-		fixture.nextDeployment(t)
-		fixture.routes.requests = nil
-		fixture.executor.waitDrain = func(context.Context, time.Duration) error { return nil }
+		builds, switches, legacyStops := fixture.compiler.calls, len(fixture.routes.requests), fixture.runtime.stopCalls
+		creates, starts, physicalStops, removals := fixture.runner.createCalls, fixture.runner.startCalls, fixture.runner.stopCalls, fixture.runner.removeCalls
+
+		result, err = fixture.execute()
+		requireRoutePauseResult(t, result, err)
+		requireRoutePauseRecord(t, logs, routePauseStagePreviousRetirement, routePauseCauseRetirementUnavailable)
+		if fixture.compiler.calls != builds || len(fixture.routes.requests) != switches || fixture.runtime.stopCalls != legacyStops ||
+			fixture.runner.createCalls != creates || fixture.runner.startCalls != starts ||
+			fixture.runner.stopCalls != physicalStops || fixture.runner.removeCalls != removals {
+			t.Fatal("receiptless replay performed runtime effects")
+		}
+	})
+
+	t.Run("receipt owned completion refusal", func(t *testing.T) {
+		const secret = "token=do-not-disclose /private/path"
+		fixture := newSealedExecutorFixture(t)
+		logs := attachRoutePauseTestLogger(fixture.executor)
+		fixture.routes.retirementBlock = errors.Join(errors.New(secret), deployments.ErrGeneratedCandidateRetirementUnavailable)
 
 		result, err := fixture.execute()
 		requireRoutePauseResult(t, result, err)
 		requireRoutePauseRecord(t, logs, routePauseStagePreviousRetirement, routePauseCauseRetirementUnavailable)
-		if fixture.runtime.stopCalls != 1 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 {
-			t.Fatalf("retirement guard attempts=%d physical stops=%d removals=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
-		}
-	})
-
-	t.Run("final runtime advance", func(t *testing.T) {
-		const secret = "token=do-not-disclose /private/path"
-		fixture := newSealedExecutorFixture(t)
-		logs := attachRoutePauseTestLogger(fixture.executor)
-		fixture.state.advanceErrTo = generatedruntimestate.PhaseSucceeded
-		fixture.state.advanceErr = errors.New(secret)
-
-		result, err := fixture.execute()
-		requireRoutePauseResult(t, result, err)
-		requireRoutePauseRecord(t, logs, routePauseStageRuntimeSuccessAdvance, routePauseCauseUnknown)
 		if strings.Contains(logs.String(), secret) || strings.Contains(logs.String(), "/private/path") {
 			t.Fatalf("route pause log exposed raw error: %s", logs.String())
 		}
