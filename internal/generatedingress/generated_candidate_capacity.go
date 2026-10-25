@@ -249,7 +249,16 @@ type candidateAccountingHandoffEntry struct {
 	receipt   *candidateReceiptTombstone
 	epoch     uint64
 	lease     *generatedcapacity.Lease
+	release   candidateAccountingReleaseState
 }
+
+type candidateAccountingReleaseState uint8
+
+const (
+	candidateAccountingReleasePending candidateAccountingReleaseState = iota
+	candidateAccountingReleaseStarted
+	candidateAccountingReleaseComplete
+)
 
 // candidateAccountingHandoffOperation owns no release authority. Unit 2B
 // records only the complete in-process ownership transfer while every exact
@@ -264,6 +273,7 @@ type candidateAccountingHandoffOperation struct {
 	successor        []candidateAccountingHandoffEntry
 	predecessor      []candidateAccountingHandoffEntry
 	gatewayUnlocked  bool
+	closed           bool
 }
 
 // candidateReceiptSnapshot is read-only evidence. It exposes no transition or
@@ -550,6 +560,9 @@ func (o *candidateAccountingHandoffOperation) markGatewayUnlocked() error {
 	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if o.closed {
+		return errCandidateCapacityStale
+	}
 	unlock := lockCandidateAccountingGroups(o.successorGroup, o.predecessorGroup)
 	defer unlock()
 
@@ -577,6 +590,115 @@ func (o *candidateAccountingHandoffOperation) markGatewayUnlocked() error {
 	}
 	o.gatewayUnlocked = true
 	return nil
+}
+
+// releasePredecessorOnce returns only the fixed predecessor shares after the
+// owning route operation has proved and released its first gateway exclusion.
+// Progress is retained on each exact entry so a retry can never infer release
+// from a nil lease or invoke the opaque raw lease twice.
+func (o *candidateAccountingHandoffOperation) releasePredecessorOnce() error {
+	if o == nil || o.ledger == nil || o.successorGroup == nil || len(o.successor) == 0 {
+		return errCandidateCapacityInvalid
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed || !o.gatewayUnlocked {
+		return errCandidateCapacityStale
+	}
+
+	unlock := lockCandidateAccountingGroups(o.successorGroup, o.predecessorGroup)
+	for _, entry := range o.successor {
+		if !validCandidateAccountingEntryLocked(entry, o.successorGroup,
+			candidateAccountingRouteActive, candidatePhysicalHandedToRoute) {
+			unlock()
+			o.closed = true
+			return errCandidateCapacityStale
+		}
+	}
+	pending := make([]int, 0, len(o.predecessor))
+	for index := range o.predecessor {
+		entry := &o.predecessor[index]
+		switch entry.release {
+		case candidateAccountingReleasePending:
+			if !validCandidateAccountingEntryLocked(*entry, o.predecessorGroup,
+				candidateAccountingPredecessorRetiring, candidatePhysicalConfirmedAbsent) {
+				unlock()
+				o.closed = true
+				return errCandidateCapacityStale
+			}
+			entry.release = candidateAccountingReleaseStarted
+			pending = append(pending, index)
+		case candidateAccountingReleaseComplete:
+			if !validCandidateAccountingReleasedEntryLocked(*entry, o.predecessorGroup) {
+				unlock()
+				o.closed = true
+				return errCandidateCapacityStale
+			}
+		default:
+			unlock()
+			o.closed = true
+			return errCandidateCapacityStale
+		}
+	}
+	unlock()
+
+	for _, index := range pending {
+		entry := &o.predecessor[index]
+		entry.lease.Release()
+		o.predecessorGroup.mu.Lock()
+		if !validCandidateAccountingEntryLocked(*entry, o.predecessorGroup,
+			candidateAccountingPredecessorRetiring, candidatePhysicalConfirmedAbsent) {
+			o.predecessorGroup.mu.Unlock()
+			o.closed = true
+			return errCandidateCapacityStale
+		}
+		entry.charge.state = candidateChargeReleased
+		entry.charge.owner = candidateAccountingPredecessorRetired
+		entry.charge.refs = 0
+		entry.charge.logicallyRetired = true
+		entry.charge.lease = nil
+		entry.release = candidateAccountingReleaseComplete
+		o.predecessorGroup.changed.Broadcast()
+		o.predecessorGroup.mu.Unlock()
+	}
+	return nil
+}
+
+// validateFinalState proves the exact terminal accounting projection without
+// acquiring capacity or deriving authority from tombstones.
+func (o *candidateAccountingHandoffOperation) validateFinalState() error {
+	if o == nil || o.ledger == nil || o.successorGroup == nil || len(o.successor) == 0 {
+		return errCandidateCapacityInvalid
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.closed || !o.gatewayUnlocked {
+		return errCandidateCapacityStale
+	}
+	unlock := lockCandidateAccountingGroups(o.successorGroup, o.predecessorGroup)
+	defer unlock()
+	for _, entry := range o.successor {
+		if !validCandidateAccountingEntryLocked(entry, o.successorGroup,
+			candidateAccountingRouteActive, candidatePhysicalHandedToRoute) {
+			return errCandidateCapacityStale
+		}
+	}
+	for _, entry := range o.predecessor {
+		if entry.release != candidateAccountingReleaseComplete ||
+			!validCandidateAccountingReleasedEntryLocked(entry, o.predecessorGroup) {
+			return errCandidateCapacityStale
+		}
+	}
+	return nil
+}
+
+func (o *candidateAccountingHandoffOperation) close() {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.closed = true
+	o.mu.Unlock()
 }
 
 func validateCandidateAccountingSuccessorLocked(
@@ -686,6 +808,21 @@ func validCandidateAccountingEntryLocked(entry candidateAccountingHandoffEntry,
 	}
 	word := entry.receipt.state.Load()
 	return word&candidateReceiptUnquiesced == 0 && candidatePhysicalFromWord(word) == physical
+}
+
+func validCandidateAccountingReleasedEntryLocked(entry candidateAccountingHandoffEntry,
+	group *candidateCapacityGroup,
+) bool {
+	if group == nil || entry.component == nil || group.byName[entry.component.name] != entry.component ||
+		entry.component.charge != entry.charge || entry.charge == nil || entry.charge.epoch != entry.epoch ||
+		entry.lease == nil || entry.charge.lease != nil || entry.charge.state != candidateChargeReleased ||
+		entry.charge.owner != candidateAccountingPredecessorRetired || !entry.charge.explicitRetained ||
+		!entry.charge.logicallyRetired || entry.component.receipt != entry.receipt || entry.receipt == nil {
+		return false
+	}
+	word := entry.receipt.state.Load()
+	return word&candidateReceiptUnquiesced == 0 &&
+		candidatePhysicalFromWord(word) == candidatePhysicalConfirmedAbsent
 }
 
 func lockCandidateAccountingGroups(successor, predecessor *candidateCapacityGroup) func() {

@@ -35,6 +35,7 @@ type generatedPredecessorRetirementState struct {
 	successorPolicies   map[string]candidatePolicy
 	predecessorPolicies map[string]candidatePolicy
 	retired             *generatedruntimestate.PredecessorRetirementReceipt
+	accounting          *generatedRouteAccountingHandoffOperation
 }
 
 func (e *GeneratedRouteExecution) mintPredecessorRetirement(ctx context.Context,
@@ -163,11 +164,16 @@ func (r *GeneratedPredecessorRetirement) Leave() {
 		state.changed.Wait()
 	}
 	state.left = true
+	accounting := state.accounting
+	state.accounting = nil
 	state.execution = nil
 	state.successorPolicies = nil
 	state.predecessorPolicies = nil
 	state.changed.Broadcast()
 	state.mu.Unlock()
+	if accounting != nil {
+		accounting.close()
+	}
 }
 
 // Retire removes the exact fixed predecessor roster. It retains all capacity

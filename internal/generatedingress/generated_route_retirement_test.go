@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
@@ -93,6 +94,76 @@ func TestGeneratedRouteReceiptOwnedPredecessorRetirement(t *testing.T) {
 			t.Fatal("closed alias reached predecessor effects")
 		}
 	})
+}
+
+func TestGeneratedRouteAccountingHandoffEmptyPredecessor(t *testing.T) {
+	migration, _ := newGeneratedRouteCanonicalMigration(t)
+	owner, _ := newGeneratedRouteSequentialCandidateOwnerForMigration(t, migration)
+	execution, identity := prepareGeneratedRouteSequentialCandidate(t, owner)
+
+	manager, runner, routeRunner := newGeneratedRoutePredecessorManagerFixture(t)
+	runner.appID = migration.guarded.appID
+	runner.network = identity.NetworkName
+	runner.endpoint = generatedRouteEndpoint(identity)
+	routeRunner.endpoints[identity.ContainerID] = generatedRouteEndpointSnapshot{
+		appID: migration.guarded.appID, endpoint: generatedRouteEndpoint(identity),
+		slot: generatedidentity.Slot(identity.Slot),
+	}
+	authority, err := newGeneratedRouteAuthority(manager, owner.authority, owner.authority.stores)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed, err := authority.Pin(migration.guarded.context, execution,
+		generatedRouteRequest(migration.guarded.appID, identity))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sealed.predecessorRoster) != 0 {
+		t.Fatalf("initial deployment predecessor roster=%#v", sealed.predecessorRoster)
+	}
+	_, retirement, err := sealed.ActivateWithPredecessorRetirement(migration.guarded.context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(retirement.Leave)
+	retired, err := retirement.Retire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired.ComponentCount != 0 || retired.PredecessorDeploymentID != "" {
+		t.Fatalf("empty predecessor retirement=%#v", retired)
+	}
+	ledger := owner.authority.ledger
+	ledger.mu.Lock()
+	group := ledger.groups[candidateCapacityGroupKey{
+		appID: migration.guarded.appID, deploymentID: migration.request.DeploymentID,
+	}]
+	ledger.mu.Unlock()
+	if group == nil {
+		t.Fatal("empty predecessor successor accounting group is absent")
+	}
+	group.mu.Lock()
+	charge := group.byName["api"].charge
+	group.mu.Unlock()
+	if charge == nil {
+		t.Fatal("empty predecessor successor charge is absent")
+	}
+	lease, epoch := charge.lease, charge.epoch
+	receipt, err := retirement.completeAccountingHandoff(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.PredecessorComponentCount != 0 || receipt.PredecessorDeploymentID != "" ||
+		receipt.SuccessorComponentCount != 1 || receipt.SuccessorDeploymentID != migration.request.DeploymentID {
+		t.Fatalf("empty predecessor handoff=%#v", receipt)
+	}
+	if charge.lease != lease || charge.epoch != epoch || charge.owner != candidateAccountingRouteActive ||
+		charge.state != candidateChargeActive || charge.logicallyRetired {
+		t.Fatalf("empty predecessor successor charge=%+v", charge)
+	}
+	if replay, err := retirement.completeAccountingHandoff(context.Background()); err != nil || replay != receipt {
+		t.Fatalf("empty predecessor replay=%#v error=%v", replay, err)
+	}
 }
 
 func TestGeneratedRouteReceiptOwnedPredecessorRetirementStickyEntrypoints(t *testing.T) {
