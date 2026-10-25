@@ -71,6 +71,8 @@ const (
 	generatedDomainConstructionReasonColdOwnership                 generatedDomainConstructionReason = "cold_ownership"
 	generatedDomainConstructionReasonColdHead                      generatedDomainConstructionReason = "cold_head"
 	generatedDomainConstructionReasonColdGroupAttestation          generatedDomainConstructionReason = "cold_group_attestation"
+	generatedDomainConstructionReasonColdGroupStructure            generatedDomainConstructionReason = "cold_group_structure"
+	generatedDomainConstructionReasonColdGroupGatewaySelection     generatedDomainConstructionReason = "cold_group_gateway_selection"
 	generatedDomainConstructionReasonColdGroupImageAttestation     generatedDomainConstructionReason = "cold_group_image_attestation"
 	generatedDomainConstructionReasonColdGroupContainerAttestation generatedDomainConstructionReason = "cold_group_container_attestation"
 	generatedDomainConstructionReasonColdGroupNetworkAttestation   generatedDomainConstructionReason = "cold_group_network_attestation"
@@ -83,6 +85,12 @@ const (
 	generatedDomainConstructionReasonColdGroupMissingImage         generatedDomainConstructionReason = "cold_group_missing_image"
 	generatedDomainConstructionReasonColdGroupMissingNetwork       generatedDomainConstructionReason = "cold_group_missing_network"
 	generatedDomainConstructionReasonColdGroupGatewayAttestation   generatedDomainConstructionReason = "cold_group_gateway_attestation"
+	generatedDomainConstructionReasonColdRetainedGatewaySelection  generatedDomainConstructionReason = "cold_retained_gateway_selection"
+	generatedDomainConstructionReasonColdRetainedGatewayTriple     generatedDomainConstructionReason = "cold_retained_gateway_triple"
+	generatedDomainConstructionReasonColdRetainedGatewayRead       generatedDomainConstructionReason = "cold_retained_gateway_read"
+	generatedDomainConstructionReasonColdRetainedGatewayPolicy     generatedDomainConstructionReason = "cold_retained_gateway_policy"
+	generatedDomainConstructionReasonColdRetainedGatewayDigest     generatedDomainConstructionReason = "cold_retained_gateway_protected_digest"
+	generatedDomainConstructionReasonColdRetainedGatewayFinal      generatedDomainConstructionReason = "cold_retained_gateway_final_consistency"
 	generatedDomainConstructionReasonColdManifest                  generatedDomainConstructionReason = "cold_manifest"
 	generatedDomainConstructionReasonLock                          generatedDomainConstructionReason = "lock"
 	generatedDomainConstructionReasonRelease                       generatedDomainConstructionReason = "release"
@@ -206,6 +214,8 @@ func validGeneratedDomainConstructionReason(reason generatedDomainConstructionRe
 		generatedDomainConstructionReasonColdOwnership,
 		generatedDomainConstructionReasonColdHead,
 		generatedDomainConstructionReasonColdGroupAttestation,
+		generatedDomainConstructionReasonColdGroupStructure,
+		generatedDomainConstructionReasonColdGroupGatewaySelection,
 		generatedDomainConstructionReasonColdGroupImageAttestation,
 		generatedDomainConstructionReasonColdGroupContainerAttestation,
 		generatedDomainConstructionReasonColdGroupNetworkAttestation,
@@ -218,6 +228,12 @@ func validGeneratedDomainConstructionReason(reason generatedDomainConstructionRe
 		generatedDomainConstructionReasonColdGroupMissingImage,
 		generatedDomainConstructionReasonColdGroupMissingNetwork,
 		generatedDomainConstructionReasonColdGroupGatewayAttestation,
+		generatedDomainConstructionReasonColdRetainedGatewaySelection,
+		generatedDomainConstructionReasonColdRetainedGatewayTriple,
+		generatedDomainConstructionReasonColdRetainedGatewayRead,
+		generatedDomainConstructionReasonColdRetainedGatewayPolicy,
+		generatedDomainConstructionReasonColdRetainedGatewayDigest,
+		generatedDomainConstructionReasonColdRetainedGatewayFinal,
 		generatedDomainConstructionReasonColdManifest,
 		generatedDomainConstructionReasonLock,
 		generatedDomainConstructionReasonRelease,
