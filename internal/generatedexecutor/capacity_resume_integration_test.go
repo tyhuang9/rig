@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -377,7 +378,7 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 	runtime := &sealedRuntimeEngine{engine: engine}
 	routes := &fakeRoutes{events: &events, delegate: generatedRouteController{authority: domainFixture.domain.Routes()}}
 	migrations := &fakeMigrations{events: &events}
-	boundExecutor, err := newExecutor(applicationStore, materializer, configurations, deploymentRepository, plans, compiler, artifactRepository, runtimeState, runtime, authorization, routes, migrations, Options{})
+	boundExecutor, err := newExecutor(applicationStore, materializer, configurations, deploymentRepository, plans, compiler, artifactRepository, runtimeState, runtime, authorization, routes, migrations, Options{DrainPeriod: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,20 +403,63 @@ func newCapacityResumeFixture(t *testing.T) *capacityResumeFixture {
 func (f *capacityResumeFixture) runUntilJob(t *testing.T, id string, status jobs.Status) jobs.Job {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
+	iterationReleased := make(chan error, 1)
+	allowWorkerReturn := make(chan struct{})
+	var releaseOnce sync.Once
+	var unblockOnce sync.Once
+	unblockWorker := func() {
+		unblockOnce.Do(func() {
+			close(allowWorkerReturn)
+		})
+	}
+	admission := func(parent context.Context) (context.Context, func() error, error) {
+		admitted, release, err := f.admission(parent)
+		if err != nil {
+			return nil, nil, err
+		}
+		return admitted, func() error {
+			first := false
+			releaseOnce.Do(func() { first = true })
+			if !first {
+				return errors.New("capacity resume admission release repeated")
+			}
+			releaseErr := release()
+			iterationReleased <- releaseErr
+			<-allowWorkerReturn
+			return releaseErr
+		}, nil
+	}
 	done := make(chan error, 1)
-	go func() { done <- f.jobs.RunWorkerWithScopedAdmission(ctx, f.executor, f.admission) }()
-	defer func() {
+	go func() { done <- f.jobs.RunWorkerWithScopedAdmission(ctx, f.executor, admission) }()
+	stopped := false
+	stopWorker := func() {
+		if stopped {
+			return
+		}
+		stopped = true
 		cancel()
+		unblockWorker()
 		select {
 		case err := <-done:
 			if err != nil {
 				t.Errorf("worker stopped: %v", err)
 			}
 		case <-time.After(5 * time.Second):
-			t.Error("worker did not stop")
+			t.Fatal("worker did not stop")
 		}
-	}()
-	return f.waitForJob(t, id, status)
+	}
+	defer stopWorker()
+	job := f.waitForJob(t, id, status)
+	select {
+	case releaseErr := <-iterationReleased:
+		if releaseErr != nil {
+			t.Errorf("release deployment effects admission: %v", releaseErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker iteration did not release deployment effects")
+	}
+	stopWorker()
+	return job
 }
 
 func (f *capacityResumeFixture) waitForJob(t *testing.T, id string, status jobs.Status) jobs.Job {
