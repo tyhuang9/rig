@@ -2,12 +2,76 @@ package generatedingress
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/hostd/hostd/internal/appaccess"
 )
+
+type liveGatewayRebindDataVolumeReplayDriver struct {
+	managerGatewayRebindStageDataVolumeDriver
+	createCalls int
+}
+
+func (d *liveGatewayRebindDataVolumeReplayDriver) create(context.Context,
+	gatewayRebindProtectedIntent,
+) (string, error) {
+	d.createCalls++
+	return "", errors.New("data-volume replay attempted volume creation")
+}
+
+func TestLiveGatewayRebindSuccessorDataVolumeReplayChild(t *testing.T) {
+	runLiveGatewayRebindStoppedStageReplayChildProcess(t, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindDataVolumeReplayTest, successMarker: liveGatewayRebindDataVolumeReplayMarker,
+	}, func(child *liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome {
+		before, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if err != nil || len(before.Intents) != 1 || len(before.Progress) != 5 ||
+			before.Intents[0].Intent.OperationID != child.value.OperationID ||
+			before.Progress[4].Record.OperationID != child.value.OperationID ||
+			before.Progress[4].Record.Sequence != 5 || before.Progress[4].Record.Stage == nil ||
+			before.Progress[4].Record.Stage.Network == nil || before.Progress[4].Record.Stage.ConfigVolume == nil ||
+			before.Progress[4].Record.Stage.DataVolume == nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "data-volume replay child did not select exact sequence-five source"}
+		}
+		beforeBytes, err := readLiveGatewayRebindStoppedStageProgressBytes(before)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "read data-volume replay protected history bytes"}
+		}
+		intent := before.Intents[0].Intent
+		stage := *before.Progress[4].Record.Stage
+		driver := &liveGatewayRebindDataVolumeReplayDriver{
+			managerGatewayRebindStageDataVolumeDriver: managerGatewayRebindStageDataVolumeDriver{manager: child.manager},
+		}
+		beforePhysical, err := driver.inspect(child.ctx, intent)
+		if err != nil || !validGatewayRebindStageDataVolumeObservation(intent, beforePhysical,
+			stage.Network.ID, *stage.ConfigVolume, stage.DataVolume) {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"physical", "inspect exact data-volume replay source"}
+		}
+		reads := liveGatewayRebindStageProductionReads(child.manager)
+		if err := child.manager.stageGatewayRebindSuccessorDataVolumeWithDriver(child.ctx, child.repository,
+			reads, child.manager.inspectGatewayRebindDocker, driver, time.Now().UTC(), nil); err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"replay", "production data-volume replay rejected exact sequence-five source"}
+		}
+		if driver.createCalls != 0 {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"create", "data-volume replay dispatched a volume create"}
+		}
+		after, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		afterBytes, bytesErr := readLiveGatewayRebindStoppedStageProgressBytes(after)
+		if err != nil || bytesErr != nil || !reflect.DeepEqual(before, after) ||
+			!reflect.DeepEqual(beforeBytes, afterBytes) {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "data-volume replay changed protected history"}
+		}
+		afterPhysical, err := driver.inspect(child.ctx, intent)
+		if err != nil || !reflect.DeepEqual(beforePhysical, afterPhysical) ||
+			!validGatewayRebindStageDataVolumeObservation(intent, afterPhysical,
+				stage.Network.ID, *stage.ConfigVolume, stage.DataVolume) {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"physical", "data-volume replay changed exact Docker identity"}
+		}
+		return liveGatewayRebindStoppedStageReplayChildOutcome{}
+	})
+}
 
 // TestLiveGatewayRebindSuccessorDataVolumeStage proves the third private
 // successor effect on a disposable default-local Linux Docker daemon.
@@ -216,28 +280,22 @@ func TestLiveGatewayRebindSuccessorDataVolumeStage(t *testing.T) {
 		!reflect.DeepEqual(createdDelta.DockerPrefixes, configDelta.DockerPrefixes) {
 		t.Fatal("data-volume creation changed the successor network, config volume, or Linux host delta")
 	}
-	restarted, err := New(fixture.runner, fixture.ingress.options)
-	if err != nil {
-		t.Fatal("restart generated ingress manager before data-volume replay")
-	}
-	restartReads := liveGatewayRebindStageProductionReads(restarted)
-	if err := restarted.stageGatewayRebindSuccessorDataVolume(fixture.ctx, repository, restartReads,
-		restarted.inspectGatewayRebindDocker, baseTime.Add(5*time.Nanosecond), nil); err != nil {
-		failLiveIngress(t, "replay live rebind successor data volume", err)
-	}
-	replayedHistory, err := restarted.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	runLiveGatewayRebindStoppedStageReplayChildWithPair(t, fixture, intent, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindDataVolumeReplayTest, successMarker: liveGatewayRebindDataVolumeReplayMarker,
+	})
+	replayedHistory, err := fixture.ingress.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	if err != nil || !reflect.DeepEqual(boundHistory, replayedHistory) ||
 		!reflect.DeepEqual(boundBytes, liveGatewayRebindProgressBytes(t, replayedHistory)) {
 		t.Fatal("live data-volume replay changed protected records or bytes")
 	}
-	replayedDriver := managerGatewayRebindStageDataVolumeDriver{manager: restarted}
+	replayedDriver := managerGatewayRebindStageDataVolumeDriver{manager: fixture.ingress}
 	replayed, err := replayedDriver.inspect(fixture.ctx, intent)
 	if err != nil || !reflect.DeepEqual(physical, replayed) ||
 		!validGatewayRebindStageDataVolumeObservation(intent, replayed, networkID, *configBinding, dataBinding) {
 		t.Fatal("live data-volume replay changed exact Docker identity")
 	}
 	replayedDelta, err := readGatewayRebindStageDataVolumePhysicalObservation(
-		fixture.ctx, restartReads, replayedDriver, intent, networkID, *configBinding, dataBinding)
+		fixture.ctx, reads, replayedDriver, intent, networkID, *configBinding, dataBinding)
 	if err != nil || !reflect.DeepEqual(createdDelta, replayedDelta) {
 		t.Fatal("live data-volume replay changed the physical host observation")
 	}
