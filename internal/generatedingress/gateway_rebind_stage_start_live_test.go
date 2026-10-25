@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"reflect"
 	"strings"
@@ -21,6 +22,22 @@ type liveGatewayRebindStageStartDriver struct {
 	failProof     bool
 	failed        bool
 	injectedReady bool
+}
+
+type liveGatewayRebindStageStartNoEffectDriver struct {
+	managerGatewayRebindStageStartDriver
+	startCalls int
+	stopCalls  int
+}
+
+func (d *liveGatewayRebindStageStartNoEffectDriver) start(context.Context, string) error {
+	d.startCalls++
+	return errors.New("stage-start replay attempted a Docker start")
+}
+
+func (d *liveGatewayRebindStageStartNoEffectDriver) stop(context.Context, string) error {
+	d.stopCalls++
+	return errors.New("stage-start replay attempted a Docker stop")
 }
 
 func (d *liveGatewayRebindStageStartDriver) start(ctx context.Context, id string) error {
@@ -57,6 +74,109 @@ func TestLiveGatewayRebindSuccessorStageStartLostAcknowledgmentAdopts(t *testing
 
 func TestLiveGatewayRebindSuccessorStageStartProofFailureWithdraws(t *testing.T) {
 	liveGatewayRebindSuccessorStageStart(t, "proof-failure")
+}
+
+func TestLiveGatewayRebindSuccessorStageStartAdoptionChild(t *testing.T) {
+	runLiveGatewayRebindStoppedStageReplayChildProcess(t, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStageStartAdoptionTest, successMarker: liveGatewayRebindStageStartAdoptionMarker,
+	}, func(child *liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome {
+		before, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if err != nil || len(before.Intents) != 1 || len(before.Progress) != 9 ||
+			before.Intents[0].Intent.OperationID != child.value.OperationID ||
+			before.Progress[8].Record.OperationID != child.value.OperationID ||
+			before.Progress[8].Record.Sequence != 9 || before.Progress[8].Record.Stage == nil ||
+			before.Progress[8].Record.Stage.StageStartIntent == nil || before.Progress[5].Record.Stage == nil ||
+			before.Progress[5].Record.Stage.StageContainer == nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "stage-start adoption child did not select exact sequence-nine source"}
+		}
+		beforeBytes, err := readLiveGatewayRebindStoppedStageProgressBytes(before)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "read stage-start adoption protected history bytes"}
+		}
+		intent := before.Intents[0].Intent
+		startBinding := *before.Progress[8].Record.Stage.StageStartIntent
+		containerBinding := before.Progress[5].Record.Stage.StageContainer
+		driver := &liveGatewayRebindStageStartNoEffectDriver{
+			managerGatewayRebindStageStartDriver: managerGatewayRebindStageStartDriver{manager: child.manager},
+		}
+		if !proveGatewayRebindStagePublication(child.ctx, startBinding, containerBinding.ID,
+			driver.hostProbe, driver.containerProbe) {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"physical", "stage-start adoption child did not select the running published stage"}
+		}
+		if err := child.manager.startGatewayRebindSuccessorStageWithDriver(child.ctx, child.repository,
+			liveGatewayRebindStageProductionReads(child.manager), child.manager.inspectGatewayRebindDocker,
+			driver, time.Now().UTC(), nil); err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"replay", "production stage-start adoption rejected exact sequence-nine source"}
+		}
+		if driver.startCalls != 0 || driver.stopCalls != 0 {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"create", "stage-start adoption dispatched a Docker effect"}
+		}
+		after, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		afterBytes, bytesErr := readLiveGatewayRebindStoppedStageProgressBytes(after)
+		if err != nil || bytesErr != nil || len(after.Progress) != 10 || len(afterBytes) != len(beforeBytes)+1 ||
+			!reflect.DeepEqual(beforeBytes, afterBytes[:len(beforeBytes)]) ||
+			after.Progress[9].Record.Stage == nil || after.Progress[9].Record.Stage.StageServing == nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "stage-start adoption changed protected history unexpectedly"}
+		}
+		serving := *after.Progress[9].Record.Stage.StageServing
+		if after.Progress[9].Record.PreviousDigest != before.Progress[8].Record.Digest ||
+			!validGatewayRebindStageServingBinding(intent, before.Progress[8].Record, serving) ||
+			!proveGatewayRebindStagePublication(child.ctx, startBinding, containerBinding.ID,
+				driver.hostProbe, driver.containerProbe) {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"receipt", "stage-start adoption did not retain exact sequence-ten publication"}
+		}
+		return liveGatewayRebindStoppedStageReplayChildOutcome{}
+	})
+}
+
+func TestLiveGatewayRebindSuccessorStageStartReplayChild(t *testing.T) {
+	runLiveGatewayRebindStoppedStageReplayChildProcess(t, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStageStartReplayTest, successMarker: liveGatewayRebindStageStartReplayMarker,
+	}, func(child *liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome {
+		before, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if err != nil || len(before.Intents) != 1 || len(before.Progress) != 10 ||
+			before.Intents[0].Intent.OperationID != child.value.OperationID ||
+			before.Progress[9].Record.OperationID != child.value.OperationID ||
+			before.Progress[9].Record.Sequence != 10 || before.Progress[9].Record.Stage == nil ||
+			before.Progress[9].Record.Stage.StageServing == nil || before.Progress[8].Record.Stage == nil ||
+			before.Progress[8].Record.Stage.StageStartIntent == nil || before.Progress[5].Record.Stage == nil ||
+			before.Progress[5].Record.Stage.StageContainer == nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"source", "stage-start replay child did not select exact sequence-ten source"}
+		}
+		beforeBytes, err := readLiveGatewayRebindStoppedStageProgressBytes(before)
+		if err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "read stage-start replay protected history bytes"}
+		}
+		intent := before.Intents[0].Intent
+		startBinding := *before.Progress[8].Record.Stage.StageStartIntent
+		containerBinding := before.Progress[5].Record.Stage.StageContainer
+		driver := &liveGatewayRebindStageStartNoEffectDriver{
+			managerGatewayRebindStageStartDriver: managerGatewayRebindStageStartDriver{manager: child.manager},
+		}
+		physical, inspectErr := driver.inspect(child.ctx, intent)
+		if inspectErr != nil || !validGatewayRebindRunningStageContainerObservation(intent,
+			*before.Progress[9].Record.Stage, physical) ||
+			!proveGatewayRebindStagePublication(child.ctx, startBinding, containerBinding.ID,
+				driver.hostProbe, driver.containerProbe) {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"physical", "stage-start replay child did not select exact running publication"}
+		}
+		if err := child.manager.startGatewayRebindSuccessorStageWithDriver(child.ctx, child.repository,
+			liveGatewayRebindStageProductionReads(child.manager), child.manager.inspectGatewayRebindDocker,
+			driver, time.Now().UTC(), nil); err != nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"replay", "production stage-start replay rejected exact sequence-ten source"}
+		}
+		if driver.startCalls != 0 || driver.stopCalls != 0 {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"create", "stage-start replay dispatched a Docker effect"}
+		}
+		after, err := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		afterBytes, bytesErr := readLiveGatewayRebindStoppedStageProgressBytes(after)
+		if err != nil || bytesErr != nil || !reflect.DeepEqual(beforeBytes, afterBytes) ||
+			len(after.Progress) != 10 || after.Progress[9].Record.Stage == nil ||
+			after.Progress[9].Record.Stage.StageServing == nil {
+			return liveGatewayRebindStoppedStageReplayChildOutcome{"history", "stage-start replay changed protected history unexpectedly"}
+		}
+		return liveGatewayRebindStoppedStageReplayChildOutcome{}
+	})
 }
 
 func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
@@ -275,10 +395,9 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
 	}
 	acting := fixture.ingress
 	if mode == "lost-ack" {
-		acting, err = New(fixture.runner, fixture.ingress.options)
-		if err != nil {
-			t.Fatal("restart Manager after lost Docker acknowledgment")
-		}
+		runLiveGatewayRebindStoppedStageReplayChildWithPair(t, fixture, intent, liveGatewayRebindStoppedStageReplayPair{
+			testName: liveGatewayRebindStageStartAdoptionTest, successMarker: liveGatewayRebindStageStartAdoptionMarker,
+		})
 	}
 	actingDriver := driver
 	if acting != fixture.ingress {
@@ -287,8 +406,11 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
 		}
 	}
 	actingReads := liveGatewayRebindStageProductionReads(acting)
-	startErr := acting.startGatewayRebindSuccessorStageWithDriver(fixture.ctx, repository, actingReads,
-		acting.inspectGatewayRebindDocker, actingDriver, baseTime.Add(9*time.Nanosecond), nil)
+	var startErr error
+	if mode != "lost-ack" {
+		startErr = acting.startGatewayRebindSuccessorStageWithDriver(fixture.ctx, repository, actingReads,
+			acting.inspectGatewayRebindDocker, actingDriver, baseTime.Add(9*time.Nanosecond), nil)
+	}
 	if mode == "proof-failure" {
 		if startErr == nil || !driver.failed || !driver.injectedReady || driver.startCalls != 1 || driver.stopCalls != 1 ||
 			candidateMayBeLive(startErr) {
@@ -309,9 +431,7 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
 		if startErr != nil {
 			failLiveIngress(t, "start or adopt exact live successor stage", startErr)
 		}
-		if (mode != "lost-ack" && driver.startCalls != 1) ||
-			(mode == "lost-ack" && (driver.startCalls != 1 || actingDriver.startCalls != 0)) ||
-			actingDriver.stopCalls != 0 {
+		if driver.startCalls != 1 || driver.stopCalls != 0 {
 			t.Fatalf("unexpected Docker start/stop calls: original=%d adoption=%d stops=%d",
 				driver.startCalls, actingDriver.startCalls, actingDriver.stopCalls)
 		}
@@ -340,21 +460,11 @@ func liveGatewayRebindSuccessorStageStart(t *testing.T, mode string,
 				actingDriver.hostProbe, actingDriver.containerProbe) {
 			t.Fatal("real Docker stage did not retain exact runtime and selected-address publication")
 		}
-		replayed, restartErr := New(fixture.runner, fixture.ingress.options)
-		if restartErr != nil {
-			t.Fatal("restart Manager before sequence-ten replay")
-		}
-		replayDriver := &liveGatewayRebindStageStartDriver{
-			managerGatewayRebindStageStartDriver: managerGatewayRebindStageStartDriver{manager: replayed},
-		}
-		if err := replayed.startGatewayRebindSuccessorStageWithDriver(fixture.ctx, repository,
-			liveGatewayRebindStageProductionReads(replayed), replayed.inspectGatewayRebindDocker,
-			replayDriver, baseTime.Add(10*time.Nanosecond), nil); err != nil {
-			failLiveIngress(t, "fresh-Manager replay exact serving stage", err)
-		}
-		replayedHistory, scanErr := replayed.scanGatewayRebindProtectedIntentHistoryLocked(nil)
-		if scanErr != nil || !reflect.DeepEqual(boundBytes, liveGatewayRebindProgressBytes(t, replayedHistory)) ||
-			replayDriver.startCalls != 0 || replayDriver.stopCalls != 0 {
+		runLiveGatewayRebindStoppedStageReplayChildWithPair(t, fixture, intent, liveGatewayRebindStoppedStageReplayPair{
+			testName: liveGatewayRebindStageStartReplayTest, successMarker: liveGatewayRebindStageStartReplayMarker,
+		})
+		replayedHistory, scanErr := fixture.ingress.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+		if scanErr != nil || !reflect.DeepEqual(boundBytes, liveGatewayRebindProgressBytes(t, replayedHistory)) {
 			t.Fatal("fresh-Manager replay changed sequence ten or dispatched another Docker effect")
 		}
 		for _, checkpoint := range afterServing {

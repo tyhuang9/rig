@@ -94,6 +94,7 @@ jobs:
       matrix:
         suite:
           - gateway-v2
+          - rebind-history-heavy
           - rebind-history
           - rebind-startup-runtime
           - rebind-recovery

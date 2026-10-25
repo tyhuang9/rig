@@ -24,14 +24,68 @@ import (
 )
 
 const (
-	liveGatewayRebindStoppedStageReplayEnvironment = "RIG_TEST_STOPPED_STAGE_REPLAY_CHILD"
-	liveGatewayRebindStoppedStageReplayTest        = "TestLiveGatewayRebindStoppedStageContainerReplayChild"
-	liveGatewayRebindStoppedStageReplayPurpose     = "hostd/test/generated-ingress/stopped-stage-replay/v1"
-	liveGatewayRebindStoppedStageReplayMarker      = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_OK:sequence=6:no-create"
-	liveGatewayRebindStoppedStageFailurePrefix     = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_FAILED:"
-	liveGatewayRebindStoppedStageManifestLimit     = 8 << 10
-	liveGatewayRebindStoppedStageOutputLimit       = 64 << 10
+	liveGatewayRebindStoppedStageReplayEnvironment         = "RIG_TEST_STOPPED_STAGE_REPLAY_CHILD"
+	liveGatewayRebindStoppedStageReplayTest                = "TestLiveGatewayRebindStoppedStageContainerReplayChild"
+	liveGatewayRebindStoppedStageReplayPurpose             = "hostd/test/generated-ingress/stopped-stage-replay/v1"
+	liveGatewayRebindStoppedStageReplayMarker              = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_OK:sequence=6:no-create"
+	liveGatewayRebindDataVolumeReplayTest                  = "TestLiveGatewayRebindSuccessorDataVolumeReplayChild"
+	liveGatewayRebindDataVolumeReplayMarker                = "GATEWAY_REBIND_DATA_VOLUME_REPLAY_OK:sequence=5:no-create"
+	liveGatewayRebindStageConfigAdoptionTest               = "TestLiveGatewayRebindSuccessorStageConfigCopyAdoptionChild"
+	liveGatewayRebindStageConfigAdoptionMarker             = "GATEWAY_REBIND_STAGE_CONFIG_ADOPTION_OK:sequence=8:no-copy"
+	liveGatewayRebindStageConfigReplayTest                 = "TestLiveGatewayRebindSuccessorStageConfigCopyReplayChild"
+	liveGatewayRebindStageConfigReplayMarker               = "GATEWAY_REBIND_STAGE_CONFIG_REPLAY_OK:sequence=8:no-copy"
+	liveGatewayRebindFinalConfigAdoptionTest               = "TestLiveGatewayRebindSuccessorFinalConfigCopyAdoptionChild"
+	liveGatewayRebindFinalConfigAdoptionMarker             = "GATEWAY_REBIND_FINAL_CONFIG_ADOPTION_OK:sequence=12:no-copy"
+	liveGatewayRebindFinalConfigReplayTest                 = "TestLiveGatewayRebindSuccessorFinalConfigCopyReplayChild"
+	liveGatewayRebindFinalConfigReplayMarker               = "GATEWAY_REBIND_FINAL_CONFIG_REPLAY_OK:sequence=12:no-copy"
+	liveGatewayRebindStageStartAdoptionTest                = "TestLiveGatewayRebindSuccessorStageStartAdoptionChild"
+	liveGatewayRebindStageStartAdoptionMarker              = "GATEWAY_REBIND_STAGE_START_ADOPTION_OK:sequence=10:no-start"
+	liveGatewayRebindStageStartReplayTest                  = "TestLiveGatewayRebindSuccessorStageStartReplayChild"
+	liveGatewayRebindStageStartReplayMarker                = "GATEWAY_REBIND_STAGE_START_REPLAY_OK:sequence=10:no-start"
+	liveGatewayRebindStoppedStageCancellationTest          = "TestGatewayRebindStoppedStageReplayCancellationChild"
+	liveGatewayRebindStoppedStageCancellationStartedMarker = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_CANCEL_STARTED"
+	liveGatewayRebindStoppedStageCancellationSuccessMarker = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_CANCEL_OK"
+	liveGatewayRebindStoppedStageFailurePrefix             = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_FAILED:"
+	liveGatewayRebindStoppedStageManifestLimit             = 8 << 10
+	liveGatewayRebindStoppedStageOutputLimit               = 64 << 10
 )
+
+type liveGatewayRebindStoppedStageReplayPair struct {
+	testName      string
+	successMarker string
+}
+
+func liveGatewayRebindStoppedStageReplayPairAllowed(pair liveGatewayRebindStoppedStageReplayPair) bool {
+	switch pair {
+	case liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStoppedStageReplayTest, successMarker: liveGatewayRebindStoppedStageReplayMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindDataVolumeReplayTest, successMarker: liveGatewayRebindDataVolumeReplayMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStageConfigAdoptionTest, successMarker: liveGatewayRebindStageConfigAdoptionMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStageConfigReplayTest, successMarker: liveGatewayRebindStageConfigReplayMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindFinalConfigAdoptionTest, successMarker: liveGatewayRebindFinalConfigAdoptionMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindFinalConfigReplayTest, successMarker: liveGatewayRebindFinalConfigReplayMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStageStartAdoptionTest, successMarker: liveGatewayRebindStageStartAdoptionMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStageStartReplayTest, successMarker: liveGatewayRebindStageStartReplayMarker,
+	}:
+		return true
+	default:
+		return false
+	}
+}
+
+func liveGatewayRebindStoppedStageReplayPairAllowedForLaunch(pair liveGatewayRebindStoppedStageReplayPair) bool {
+	return liveGatewayRebindStoppedStageReplayPairAllowed(pair) || pair == (liveGatewayRebindStoppedStageReplayPair{
+		testName:      liveGatewayRebindStoppedStageCancellationTest,
+		successMarker: liveGatewayRebindStoppedStageCancellationSuccessMarker,
+	})
+}
 
 type liveGatewayRebindStoppedStageReplayManifest struct {
 	Version               int    `json:"version"`
@@ -78,6 +132,28 @@ func (c *liveGatewayRebindStoppedStageOutputCapture) result() ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]byte(nil), c.body...), c.overflow
+}
+
+type liveGatewayRebindStoppedStageCancellationOutputWriter struct {
+	capture  *liveGatewayRebindStoppedStageOutputCapture
+	marker   []byte
+	ready    chan<- struct{}
+	notified bool
+}
+
+func (w *liveGatewayRebindStoppedStageCancellationOutputWriter) Write(body []byte) (int, error) {
+	written, err := w.capture.Write(body)
+	if !w.notified {
+		captured, _ := w.capture.result()
+		if bytes.Contains(captured, w.marker) {
+			select {
+			case w.ready <- struct{}{}:
+			default:
+			}
+			w.notified = true
+		}
+	}
+	return written, err
 }
 
 func (d *liveGatewayRebindStoppedStageReplayDriver) create(context.Context,
@@ -268,7 +344,52 @@ func liveGatewayRebindStoppedStageChildEnvironment(manifest string) []string {
 	return values
 }
 
+func liveGatewayRebindStoppedStageReplayChildCommand(ctx context.Context,
+	pair liveGatewayRebindStoppedStageReplayPair, manifest string,
+) (*exec.Cmd, error) {
+	if !liveGatewayRebindStoppedStageReplayPairAllowedForLaunch(pair) {
+		return nil, errors.New("unknown stopped-stage replay selector and marker pair")
+	}
+	command := exec.CommandContext(ctx, os.Args[0],
+		"-test.run=^"+pair.testName+"$", "-test.count=1", "-test.v", "-test.timeout=10m")
+	command.Env = liveGatewayRebindStoppedStageChildEnvironment(manifest)
+	return command, nil
+}
+
+func TestGatewayRebindStoppedStageReplayCancellationChild(t *testing.T) {
+	path := os.Getenv(liveGatewayRebindStoppedStageReplayEnvironment)
+	if path == "" {
+		t.Skip("stopped-stage cancellation child requires a parent-owned manifest")
+	}
+	body, err := os.ReadFile(path)
+	if err != nil || len(body) == 0 || len(body) > liveGatewayRebindStoppedStageManifestLimit {
+		failLiveGatewayRebindStoppedStageChild(t, "manifest", "read stopped-stage cancellation manifest")
+	}
+	var value liveGatewayRebindStoppedStageReplayManifest
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&value) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		failLiveGatewayRebindStoppedStageChild(t, "manifest", "decode stopped-stage cancellation manifest")
+	}
+	if _, err := readLiveGatewayRebindStoppedStageReplayManifest(path, value.DockerExecutable); err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "manifest", "validate stopped-stage cancellation manifest")
+	}
+	fmt.Println(liveGatewayRebindStoppedStageCancellationStartedMarker)
+	select {}
+}
+
 func liveGatewayRebindStoppedStageChildCompleted(output []byte) bool {
+	return liveGatewayRebindStoppedStageChildCompletedForPair(output, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStoppedStageReplayTest, successMarker: liveGatewayRebindStoppedStageReplayMarker,
+	})
+}
+
+func liveGatewayRebindStoppedStageChildCompletedForPair(output []byte,
+	pair liveGatewayRebindStoppedStageReplayPair,
+) bool {
+	if !liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
+		return false
+	}
 	if len(output) == 0 || len(output) > liveGatewayRebindStoppedStageOutputLimit {
 		return false
 	}
@@ -279,15 +400,35 @@ func liveGatewayRebindStoppedStageChildCompleted(output []byte) bool {
 	markerCount := 0
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(string(line))
-		if trimmed == liveGatewayRebindStoppedStageReplayMarker {
+		if trimmed == pair.successMarker {
 			markerCount++
-		} else if strings.Contains(trimmed, "GATEWAY_REBIND_STOPPED_STAGE_REPLAY") {
+		} else if strings.Contains(trimmed, liveGatewayRebindStoppedStageFailurePrefix) ||
+			liveGatewayRebindStoppedStageReplayMarkerNamespaceContains(trimmed) {
 			return false
 		}
 	}
 	return markerCount == 1 &&
-		bytes.Contains(output, []byte("--- PASS: "+liveGatewayRebindStoppedStageReplayTest+" ")) &&
+		bytes.Contains(output, []byte("--- PASS: "+pair.testName+" ")) &&
 		!bytes.Contains(output, []byte("--- FAIL:")) && !bytes.Contains(output, []byte("--- SKIP:"))
+}
+
+func liveGatewayRebindStoppedStageReplayMarkerNamespaceContains(line string) bool {
+	for _, marker := range []string{
+		liveGatewayRebindStoppedStageReplayMarker,
+		liveGatewayRebindDataVolumeReplayMarker,
+		liveGatewayRebindStageConfigAdoptionMarker,
+		liveGatewayRebindStageConfigReplayMarker,
+		liveGatewayRebindFinalConfigAdoptionMarker,
+		liveGatewayRebindFinalConfigReplayMarker,
+		liveGatewayRebindStageStartAdoptionMarker,
+		liveGatewayRebindStageStartReplayMarker,
+		liveGatewayRebindStoppedStageCancellationSuccessMarker,
+	} {
+		if strings.Contains(line, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func liveGatewayRebindStoppedStageChildFailure(output []byte) string {
@@ -357,7 +498,18 @@ func equalGatewayRebindStageContainerSnapshot(intent gatewayRebindProtectedInten
 func runLiveGatewayRebindStoppedStageReplayChild(t *testing.T, fixture *liveGatewayV2Fixture,
 	intent gatewayRebindProtectedIntent,
 ) {
+	runLiveGatewayRebindStoppedStageReplayChildWithPair(t, fixture, intent, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindStoppedStageReplayTest, successMarker: liveGatewayRebindStoppedStageReplayMarker,
+	})
+}
+
+func runLiveGatewayRebindStoppedStageReplayChildWithPair(t *testing.T, fixture *liveGatewayV2Fixture,
+	intent gatewayRebindProtectedIntent, pair liveGatewayRebindStoppedStageReplayPair,
+) {
 	t.Helper()
+	if !liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
+		t.Fatal("unknown stopped-stage replay selector and marker pair")
+	}
 	control, err := os.MkdirTemp(fixture.root, "stopped-stage-replay-")
 	if err != nil || os.Chmod(control, 0o700) != nil {
 		t.Fatal("create private stopped-stage replay control directory")
@@ -373,17 +525,92 @@ func runLiveGatewayRebindStoppedStageReplayChild(t *testing.T, fixture *liveGate
 	if err != nil {
 		t.Fatal("write private stopped-stage replay manifest")
 	}
-	command := exec.CommandContext(fixture.ctx, os.Args[0],
-		"-test.run=^"+liveGatewayRebindStoppedStageReplayTest+"$", "-test.count=1", "-test.v", "-test.timeout=10m")
-	command.Env = liveGatewayRebindStoppedStageChildEnvironment(manifest)
+	command, err := liveGatewayRebindStoppedStageReplayChildCommand(fixture.ctx, pair, manifest)
+	if err != nil {
+		t.Fatal("create stopped-stage replay child command")
+	}
 	capture := &liveGatewayRebindStoppedStageOutputCapture{}
 	command.Stdout, command.Stderr = capture, capture
 	runErr := command.Run()
 	output, overflow := capture.result()
-	if runErr != nil || overflow || !liveGatewayRebindStoppedStageChildCompleted(output) {
+	if runErr != nil || overflow || !liveGatewayRebindStoppedStageChildCompletedForPair(output, pair) {
 		t.Fatalf("fresh-process stopped-stage replay did not complete its exact closed protocol: stage=%s",
 			liveGatewayRebindStoppedStageChildFailure(output))
 	}
+}
+
+type liveGatewayRebindStoppedStageReplayChildProcess struct {
+	ctx        context.Context
+	value      liveGatewayRebindStoppedStageReplayManifest
+	repository *appaccess.Repository
+	manager    *Manager
+}
+
+type liveGatewayRebindStoppedStageReplayChildOutcome struct {
+	stage   string
+	message string
+}
+
+func runLiveGatewayRebindStoppedStageReplayChildProcess(t *testing.T,
+	pair liveGatewayRebindStoppedStageReplayPair,
+	run func(*liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome,
+) {
+	t.Helper()
+	if !liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
+		failLiveGatewayRebindStoppedStageChild(t, "environment", "unknown stopped-stage replay selector and marker pair")
+	}
+	path := os.Getenv(liveGatewayRebindStoppedStageReplayEnvironment)
+	if path == "" {
+		t.Skip("stopped-stage replay child requires a parent-owned manifest")
+	}
+	if os.Getenv("RIG_RUN_LIVE_GATEWAY_V2") != "1" || runtime.GOOS != "linux" ||
+		os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
+		failLiveGatewayRebindStoppedStageChild(t, "environment",
+			"stopped-stage replay child requires explicit local Linux Docker permission")
+	}
+	docker, err := exec.LookPath("docker")
+	if err == nil {
+		docker, err = filepath.Abs(docker)
+	}
+	value, manifestErr := readLiveGatewayRebindStoppedStageReplayManifest(path, docker)
+	if err != nil || manifestErr != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "manifest", "read exact private stopped-stage replay manifest")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+	db, err := database.Open(value.DataRoot)
+	if err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "database", "open real SQLite for stopped-stage replay")
+	}
+	databaseOpen := true
+	defer func() {
+		if databaseOpen {
+			_ = db.Close()
+		}
+	}()
+	repository := appaccess.New(db)
+	runner := &runtimeprocess.ExecRunner{}
+	manager, err := New(runner, Options{
+		DataRoot: value.DataRoot, WorkingDirectory: value.WorkingDirectory,
+		DockerExecutable: value.DockerExecutable, DockerConfigDirectory: value.DockerConfigDirectory,
+		HostPort: value.HostPort, CommandTimeout: 45 * time.Second, PullTimeout: 5 * time.Minute,
+		OutputLimit: liveDockerOutputLimit, RebindFenceCheck: repository.CheckGatewayRebindFence,
+		RebindCurrentStateRepository: repository,
+	})
+	if err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "manager", "construct fresh-process stopped-stage replay manager")
+	}
+	outcome := run(&liveGatewayRebindStoppedStageReplayChildProcess{
+		ctx: ctx, value: value, repository: repository, manager: manager,
+	})
+	if outcome.stage != "" {
+		failLiveGatewayRebindStoppedStageChild(t, outcome.stage, outcome.message)
+	}
+	if err := db.Close(); err != nil {
+		failLiveGatewayRebindStoppedStageChild(t, "database", "close stopped-stage replay database")
+	}
+	databaseOpen = false
+	fmt.Println(pair.successMarker)
 }
 
 func TestLiveGatewayRebindStoppedStageContainerReplayChild(t *testing.T) {
@@ -520,6 +747,33 @@ func newLiveGatewayRebindStoppedStageManifestFixture(t *testing.T) (
 }
 
 func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
+	t.Run("finite selector marker pairing", func(t *testing.T) {
+		known := []liveGatewayRebindStoppedStageReplayPair{
+			{testName: liveGatewayRebindStoppedStageReplayTest, successMarker: liveGatewayRebindStoppedStageReplayMarker},
+			{testName: liveGatewayRebindDataVolumeReplayTest, successMarker: liveGatewayRebindDataVolumeReplayMarker},
+			{testName: liveGatewayRebindStageConfigAdoptionTest, successMarker: liveGatewayRebindStageConfigAdoptionMarker},
+			{testName: liveGatewayRebindStageConfigReplayTest, successMarker: liveGatewayRebindStageConfigReplayMarker},
+			{testName: liveGatewayRebindFinalConfigAdoptionTest, successMarker: liveGatewayRebindFinalConfigAdoptionMarker},
+			{testName: liveGatewayRebindFinalConfigReplayTest, successMarker: liveGatewayRebindFinalConfigReplayMarker},
+			{testName: liveGatewayRebindStageStartAdoptionTest, successMarker: liveGatewayRebindStageStartAdoptionMarker},
+			{testName: liveGatewayRebindStageStartReplayTest, successMarker: liveGatewayRebindStageStartReplayMarker},
+		}
+		for _, pair := range known {
+			if !liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
+				t.Fatalf("known selector-marker pair was refused: %+v", pair)
+			}
+		}
+		for _, pair := range []liveGatewayRebindStoppedStageReplayPair{
+			{testName: liveGatewayRebindDataVolumeReplayTest, successMarker: liveGatewayRebindStageConfigReplayMarker},
+			{testName: "TestLiveGatewayRebindUnknownReplayChild", successMarker: liveGatewayRebindDataVolumeReplayMarker},
+			{testName: liveGatewayRebindFinalConfigReplayTest, successMarker: "GATEWAY_REBIND_UNKNOWN_OK"},
+		} {
+			if liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
+				t.Fatalf("crossed or unknown selector-marker pair was accepted: %+v", pair)
+			}
+		}
+	})
+
 	t.Run("exact private manifest", func(t *testing.T) {
 		value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
 		path := filepath.Join(value.ControlDirectory, "manifest.json")
@@ -686,6 +940,94 @@ func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
 		body, overflow := capture.result()
 		if !overflow || len(body) != liveGatewayRebindStoppedStageOutputLimit {
 			t.Fatal("bounded stopped-stage child capture did not retain a closed overflow state")
+		}
+	})
+	t.Run("new marker pair requires its exact child pass", func(t *testing.T) {
+		pair := liveGatewayRebindStoppedStageReplayPair{
+			testName: liveGatewayRebindDataVolumeReplayTest, successMarker: liveGatewayRebindDataVolumeReplayMarker,
+		}
+		pass := "=== RUN   " + pair.testName + "\n" + pair.successMarker + "\n--- PASS: " + pair.testName + " (0.01s)\nPASS\n"
+		if !liveGatewayRebindStoppedStageChildCompletedForPair([]byte(pass), pair) {
+			t.Fatal("exact new selector-marker child pass was rejected")
+		}
+		crossed := pass + liveGatewayRebindStageConfigReplayMarker + "\n"
+		if liveGatewayRebindStoppedStageChildCompletedForPair([]byte(crossed), pair) {
+			t.Fatal("selected child pass with another replay marker was accepted")
+		}
+		tainted := pass + pair.successMarker + ":tainted\n"
+		if liveGatewayRebindStoppedStageChildCompletedForPair([]byte(tainted), pair) {
+			t.Fatal("selected child pass with a tainted replay marker was accepted")
+		}
+	})
+	t.Run("cancellation child is observed and reaped", func(t *testing.T) {
+		value, docker := newLiveGatewayRebindStoppedStageManifestFixture(t)
+		manifest, err := writeLiveGatewayRebindStoppedStageReplayManifest(value, docker)
+		if err != nil {
+			t.Fatal("write stopped-stage cancellation manifest")
+		}
+		pair := liveGatewayRebindStoppedStageReplayPair{
+			testName:      liveGatewayRebindStoppedStageCancellationTest,
+			successMarker: liveGatewayRebindStoppedStageCancellationSuccessMarker,
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		command, err := liveGatewayRebindStoppedStageReplayChildCommand(ctx, pair, manifest)
+		if err != nil {
+			t.Fatal("create stopped-stage cancellation child command")
+		}
+		stdoutCapture := &liveGatewayRebindStoppedStageOutputCapture{}
+		stderrCapture := &liveGatewayRebindStoppedStageOutputCapture{}
+		started := make(chan struct{}, 1)
+		command.Stdout = &liveGatewayRebindStoppedStageCancellationOutputWriter{
+			capture: stdoutCapture, marker: []byte(liveGatewayRebindStoppedStageCancellationStartedMarker), ready: started,
+		}
+		command.Stderr = stderrCapture
+		if err := command.Start(); err != nil {
+			t.Fatal("start stopped-stage cancellation child")
+		}
+		waitDone := make(chan error, 1)
+		go func() { waitDone <- command.Wait() }()
+		waitForExit := func() (error, bool) {
+			cancel()
+			select {
+			case waitErr := <-waitDone:
+				return waitErr, true
+			case <-time.After(5 * time.Second):
+				_ = command.Process.Kill()
+				select {
+				case waitErr := <-waitDone:
+					return waitErr, true
+				case <-time.After(5 * time.Second):
+					return nil, false
+				}
+			}
+		}
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			waitErr, reaped := waitForExit()
+			if !reaped {
+				t.Fatal("stopped-stage cancellation child did not report readiness or reap")
+			}
+			t.Fatalf("stopped-stage cancellation child readiness timed out: wait=%v", waitErr)
+		}
+		waitErr, reaped := waitForExit()
+		if !reaped {
+			t.Fatal("stopped-stage cancellation child did not return after cancellation")
+		}
+		if waitErr == nil || command.ProcessState == nil {
+			t.Fatal("stopped-stage cancellation child did not return a cancellation error with a waited process state")
+		}
+		output, outputOverflow := stdoutCapture.result()
+		errorOutput, errorOverflow := stderrCapture.result()
+		if outputOverflow || errorOverflow {
+			t.Fatal("stopped-stage cancellation child output exceeded the bounded capture")
+		}
+		combined := append(append([]byte(nil), output...), errorOutput...)
+		if bytes.Count(combined, []byte(liveGatewayRebindStoppedStageCancellationStartedMarker)) != 1 ||
+			bytes.Contains(combined, []byte(liveGatewayRebindStoppedStageCancellationSuccessMarker)) ||
+			bytes.Contains(combined, []byte("--- PASS: "+pair.testName+" ")) {
+			t.Fatal("stopped-stage cancellation child emitted an invalid completion protocol")
 		}
 	})
 }
