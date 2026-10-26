@@ -172,7 +172,7 @@ def validate_workflow(root: Path, contract: dict[str, Any]) -> None:
     for fragment in (
         "name: Supported hostd rebind crash and recovery matrix\n",
         "needs: [supported-hostd-rebind-crash-matrix]",
-        "if: always()",
+        "if: ${{ !cancelled() }}",
         "MATRIX_RESULT: ${{ needs.supported-hostd-rebind-crash-matrix.result }}",
         "test \"$MATRIX_RESULT\" = success",
     ):

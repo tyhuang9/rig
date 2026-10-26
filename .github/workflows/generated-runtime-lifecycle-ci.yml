@@ -353,7 +353,7 @@ jobs:
 
   generated-runtime-race-gate:
     name: Generated runtime race verification
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     needs: generated-runtime-race
     runs-on: ubuntu-24.04
     timeout-minutes: 2
