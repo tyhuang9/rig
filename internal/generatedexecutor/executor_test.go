@@ -2003,7 +2003,7 @@ func TestGeneratedExecutorRefusesDurablePostActivationWhenPublishedRouteDrifts(t
 	}
 	runtimeDeployment := fixture.runtimeDeployment(t)
 	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
-		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 ||
+		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 0 ||
 		fixture.capacity.ReloadCalls() != reloads+1 || fixture.runtime.stopCalls != 0 ||
 		fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
 		generatedExecutorActivationReceiptCount(t, fixture) != 1 {
@@ -2039,7 +2039,7 @@ func TestGeneratedExecutorDurablePostActivationRejectsFutureWorkerClaim(t *testi
 		t.Fatalf("future worker claim result=%+v err=%v", result, err)
 	}
 	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
-		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 ||
+		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 0 ||
 		fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
 		generatedExecutorActivationReceiptCount(t, fixture) != 1 {
 		t.Fatalf("runtime=%+v delegate=%d attest=%d stops=%d/%d removals=%d receipts=%d",
@@ -2066,7 +2066,7 @@ func TestGeneratedExecutorDurablePostActivationRejectsStaleWorkerClaim(t *testin
 		t.Fatalf("stale worker claim result=%+v err=%v", result, err)
 	}
 	if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
-		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 ||
+		fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 0 ||
 		fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
 		generatedExecutorActivationReceiptCount(t, fixture) != 1 {
 		t.Fatalf("runtime=%+v delegate=%d attest=%d stops=%d/%d removals=%d receipts=%d",
@@ -2082,11 +2082,8 @@ func TestGeneratedExecutorDurablePostActivationRejectsCrossedReceiptLineage(t *t
 		mutate func(*testing.T, *sealedExecutorFixture)
 	}{
 		{name: "zero creator attempt", mutate: func(t *testing.T, fixture *sealedExecutorFixture) {
-			if _, err := fixture.db.Exec(`PRAGMA ignore_check_constraints=ON`); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := fixture.db.Exec(`UPDATE generated_route_activations SET creator_worker_attempt=0`); err != nil {
-				t.Fatal(err)
+			if _, err := fixture.db.Exec(`UPDATE generated_route_activations SET creator_worker_attempt=0`); err == nil {
+				t.Fatal("zero creator attempt bypassed the durable schema constraint")
 			}
 		}},
 		{name: "future creator attempt", mutate: func(t *testing.T, fixture *sealedExecutorFixture) {
@@ -2126,7 +2123,7 @@ func TestGeneratedExecutorDurablePostActivationRejectsCrossedReceiptLineage(t *t
 				t.Fatalf("crossed lineage result=%+v err=%v", result, err)
 			}
 			if runtimeDeployment := fixture.runtimeDeployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
-				fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 1 ||
+				fixture.routes.delegateCalls != 1 || fixture.routes.attestCalls != 0 ||
 				fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
 				generatedExecutorActivationReceiptCount(t, fixture) != 1 {
 				t.Fatalf("runtime=%+v delegate=%d attest=%d stops=%d/%d removals=%d receipts=%d",
