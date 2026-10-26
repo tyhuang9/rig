@@ -47,38 +47,57 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	setupStarted := time.Now()
 	setupCtx, cancelSetup := context.WithTimeout(context.Background(), relayOutageSetupDeadline)
 	defer cancelSetup()
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhasePostgresSetup, relayOutageSetupCheckpointEntered, time.Now)
 	pool, reopenPG := relayOutagePostgres(t, setupCtx, dsn)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhasePostgresSetup, relayOutageSetupCheckpointReturned, time.Now)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseRelayStoreCreate, relayOutageSetupCheckpointEntered, time.Now)
 	relay, err := store.New(pool, store.Options{})
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseRelayStoreCreate, relayOutageSetupCheckpointReturned, time.Now)
 	if err != nil {
 		t.Fatal("create relay store")
 	}
 
 	root := t.TempDir()
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseControllerDBOpen, relayOutageSetupCheckpointEntered, time.Now)
 	db := relayOutageControllerDB(t, root)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseControllerDBOpen, relayOutageSetupCheckpointReturned, time.Now)
 	controllerID, keyID, bindingID := uuid.NewString(), uuid.NewString(), uuid.NewString()
 	privateKey := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x53}, ed25519.SeedSize))
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 	now := time.Now().UTC()
-	relayOutageEnrollRelay(t, setupCtx, relay, now, controllerID, keyID, publicKey)
-	if err = relayOutageSeedController(setupCtx, db.ExecContext, now, controllerID, keyID, bindingID, publicKey); err != nil {
+	relayOutageEnrollRelay(t, setupCtx, setupStarted, relay, now, controllerID, keyID, publicKey)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseControllerSeed, relayOutageSetupCheckpointEntered, time.Now)
+	err = relayOutageSeedController(setupCtx, db.ExecContext, now, controllerID, keyID, bindingID, publicKey)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseControllerSeed, relayOutageSetupCheckpointReturned, time.Now)
+	if err != nil {
 		relayOutageFatalSetupFailure(t, setupCtx, relayOutageSetupFailureControllerSeed, err)
 	}
 	controllerRepository := controllerrelay.NewRepository(db)
 	autoRepository := NewRepository(db)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseAutodeployConfigure, relayOutageSetupCheckpointEntered, time.Now)
 	status, err := autoRepository.Configure(setupCtx, ConfigureRequest{ApplicationID: testApp, ActorUserID: testOwner, ExpectedRevision: 0, Enabled: true}, now)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseAutodeployConfigure, relayOutageSetupCheckpointReturned, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
 
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseServerStart, relayOutageSetupCheckpointEntered, time.Now)
 	handler, server := relayOutageServer(t, relay)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseServerStart, relayOutageSetupCheckpointReturned, time.Now)
 	initialSyncObservation := newRelayOutageInitialSyncObservationRecorder(setupStarted, time.Now)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseSupervisorStart, relayOutageSetupCheckpointEntered, time.Now)
 	firstRun, stopFirst, firstSupervisor := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil, initialSyncObservation)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseSupervisorStart, relayOutageSetupCheckpointReturned, time.Now)
 	firstFixture := relayOutageFirstRunFixture{stopSupervisor: stopFirst, server: server, handler: handler, done: firstRun}
 	t.Cleanup(func() { firstFixture.Stop(t) })
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseInitialSync, relayOutageSetupCheckpointEntered, time.Now)
 	relayOutageWaitInitialSubscriptionSync(t, setupCtx, db, pool, controllerID, status.SubscriptionID, firstSupervisor, initialSyncObservation)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseInitialSync, relayOutageSetupCheckpointReturned, time.Now)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseFirstFixtureStop, relayOutageSetupCheckpointEntered, time.Now)
 	deadlineDiagnostic, deadlineExceeded := relayOutageStopFirstFixtureAndObserveSetupDeadline(setupCtx, setupStarted, func() {
 		firstFixture.Stop(t)
 	}, time.Now)
+	relayOutageLogSetupCheckpoint(t, setupCtx, setupStarted, relayOutageSetupPhaseFirstFixtureStop, relayOutageSetupCheckpointReturned, time.Now)
 	if deadlineExceeded {
 		t.Log(relayOutageFormatSetupDeadlineDiagnostic(deadlineDiagnostic))
 		t.Fatal("initial relay fixture exceeded setup deadline")
@@ -407,6 +426,164 @@ func TestRelayOutageControllerSeedReturnsFirstError(t *testing.T) {
 	if err := relayOutageSeedController(context.Background(), nil, at, "controller", "key", "binding", publicKey); relayOutageClassifySetupFailure(context.Background(), err) != relayOutageSetupFailureOther {
 		t.Fatalf("nil executor error=%v class=%q", err, relayOutageClassifySetupFailure(context.Background(), err))
 	}
+}
+
+func TestRelayOutageSetupCheckpointFormattingIsClosed(t *testing.T) {
+	phases := []relayOutageSetupPhase{
+		relayOutageSetupPhasePostgresSetup,
+		relayOutageSetupPhaseRelayStoreCreate,
+		relayOutageSetupPhaseControllerDBOpen,
+		relayOutageSetupPhaseRelayEnrollmentCreate,
+		relayOutageSetupPhaseRelayEnrollmentClaim,
+		relayOutageSetupPhaseRelayEnrollmentComplete,
+		relayOutageSetupPhaseControllerSeed,
+		relayOutageSetupPhaseAutodeployConfigure,
+		relayOutageSetupPhaseServerStart,
+		relayOutageSetupPhaseSupervisorStart,
+		relayOutageSetupPhaseInitialSync,
+		relayOutageSetupPhaseFirstFixtureStop,
+	}
+	started := time.Unix(1_000, 0)
+	for _, phase := range phases {
+		checkpoint := relayOutageObserveSetupCheckpoint(context.Background(), started, phase, relayOutageSetupCheckpointEntered, func() time.Time { return started })
+		want := fmt.Sprintf("relay_outage_setup_checkpoint phase=%s edge=entered elapsed_ms=0 elapsed_saturated=false context_state=active", phase)
+		if got := relayOutageFormatSetupCheckpoint(checkpoint); got != want {
+			t.Fatalf("phase=%q checkpoint=%+v formatted=%q want=%q", phase, checkpoint, got, want)
+		}
+	}
+
+	t.Run("exact cap is not saturated", func(t *testing.T) {
+		checkpoint := relayOutageObserveSetupCheckpoint(context.Background(), started, relayOutageSetupPhaseInitialSync, relayOutageSetupCheckpointReturned, func() time.Time {
+			return started.Add(relayOutageSetupDeadline)
+		})
+		if checkpoint.elapsedMS != 20_000 || checkpoint.elapsedSaturated || checkpoint.contextState != relayOutageSetupContextActive {
+			t.Fatalf("checkpoint=%+v", checkpoint)
+		}
+	})
+
+	t.Run("over cap is saturated", func(t *testing.T) {
+		checkpoint := relayOutageObserveSetupCheckpoint(context.Background(), started, relayOutageSetupPhaseInitialSync, relayOutageSetupCheckpointReturned, func() time.Time {
+			return started.Add(relayOutageSetupDeadline + time.Nanosecond)
+		})
+		if checkpoint.elapsedMS != 20_000 || !checkpoint.elapsedSaturated || checkpoint.contextState != relayOutageSetupContextActive {
+			t.Fatalf("checkpoint=%+v", checkpoint)
+		}
+	})
+
+	t.Run("context state is sampled directly", func(t *testing.T) {
+		deadlineCtx, cancelDeadline := context.WithDeadline(context.Background(), time.Unix(1, 0))
+		defer cancelDeadline()
+		canceledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		for _, test := range []struct {
+			ctx  context.Context
+			want relayOutageSetupContextState
+		}{{context.Background(), relayOutageSetupContextActive}, {deadlineCtx, relayOutageSetupContextDeadline}, {canceledCtx, relayOutageSetupContextCanceled}} {
+			checkpoint := relayOutageObserveSetupCheckpoint(test.ctx, started, relayOutageSetupPhaseControllerSeed, relayOutageSetupCheckpointReturned, func() time.Time { return started.Add(time.Second) })
+			if checkpoint.contextState != test.want {
+				t.Fatalf("context state=%q want=%q", checkpoint.contextState, test.want)
+			}
+		}
+	})
+
+	for _, invalid := range []relayOutageSetupCheckpoint{
+		{phase: "private", edge: relayOutageSetupCheckpointEntered, contextState: relayOutageSetupContextActive},
+		{phase: relayOutageSetupPhaseControllerSeed, edge: "private", contextState: relayOutageSetupContextActive},
+		{phase: relayOutageSetupPhaseControllerSeed, edge: relayOutageSetupCheckpointEntered, elapsedMS: -1, contextState: relayOutageSetupContextActive},
+		{phase: relayOutageSetupPhaseControllerSeed, edge: relayOutageSetupCheckpointEntered, elapsedMS: 20_001, contextState: relayOutageSetupContextActive},
+		{phase: relayOutageSetupPhaseControllerSeed, edge: relayOutageSetupCheckpointEntered, elapsedMS: 19_999, elapsedSaturated: true, contextState: relayOutageSetupContextActive},
+		{phase: relayOutageSetupPhaseControllerSeed, edge: relayOutageSetupCheckpointEntered, contextState: "private"},
+	} {
+		if got := relayOutageFormatSetupCheckpoint(invalid); got != "" {
+			t.Fatalf("invalid checkpoint=%+v formatted=%q", invalid, got)
+		}
+	}
+}
+
+func TestRelayOutageSetupCheckpointSubprocessProtocolIsClosed(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("locate relay outage checkpoint helper")
+	}
+	wantEntered := "relay_outage_setup_checkpoint phase=controller_db_open edge=entered elapsed_ms=0 elapsed_saturated=false context_state=active"
+	wantReturned := "relay_outage_setup_checkpoint phase=controller_db_open edge=returned elapsed_ms=0 elapsed_saturated=false context_state=active"
+	for _, test := range []struct {
+		mode            string
+		wantSuccess     bool
+		wantRecords     []string
+		wantFailureText string
+	}{{"success", true, []string{wantEntered, wantReturned}, ""}, {"returned_error", false, []string{wantEntered, wantReturned}, "fixed returned setup failure"}, {"nested_fatal", false, []string{wantEntered}, "fixed nested setup failure"}} {
+		t.Run(test.mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			command := exec.CommandContext(ctx, executable, "-test.run=^TestRelayOutageSetupCheckpointSubprocessHelper$", "-test.count=1", "-test.v")
+			command.Env = append(os.Environ(), "RIG_RELAY_SETUP_CHECKPOINT_HELPER="+test.mode)
+			output, runErr := command.CombinedOutput()
+			if ctx.Err() != nil || len(output) > 64*1024 || (runErr == nil) != test.wantSuccess {
+				t.Fatalf("mode=%s context=%v output_bytes=%d success=%t want_success=%t", test.mode, ctx.Err(), len(output), runErr == nil, test.wantSuccess)
+			}
+			text := string(output)
+			if strings.Contains(text, "private returned setup detail") {
+				t.Fatalf("mode=%s leaked private setup detail", test.mode)
+			}
+			passMarkers := 0
+			failMarkers := 0
+			for _, line := range strings.Split(text, "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "--- PASS: TestRelayOutageSetupCheckpointSubprocessHelper (") {
+					passMarkers++
+				}
+				if strings.HasPrefix(line, "--- FAIL: TestRelayOutageSetupCheckpointSubprocessHelper (") {
+					failMarkers++
+				}
+			}
+			if test.wantSuccess {
+				if passMarkers != 1 || failMarkers != 0 || strings.Contains(text, "fixed returned setup failure") || strings.Contains(text, "fixed nested setup failure") {
+					t.Fatalf("mode=%s pass_markers=%d fail_markers=%d unexpected_failure_text=%t", test.mode, passMarkers, failMarkers, strings.Contains(text, "fixed returned setup failure") || strings.Contains(text, "fixed nested setup failure"))
+				}
+			} else if passMarkers != 0 || failMarkers != 1 || !strings.Contains(text, test.wantFailureText) {
+				t.Fatalf("mode=%s pass_markers=%d fail_markers=%d expected_failure_text=%t", test.mode, passMarkers, failMarkers, strings.Contains(text, test.wantFailureText))
+			}
+			records := make([]string, 0, len(test.wantRecords))
+			for _, line := range strings.Split(text, "\n") {
+				if index := strings.Index(line, relayOutageSetupCheckpointPrefix); index >= 0 {
+					records = append(records, strings.TrimSpace(line[index:]))
+				}
+			}
+			if fmt.Sprint(records) != fmt.Sprint(test.wantRecords) {
+				t.Fatalf("mode=%s records=%q want=%q", test.mode, records, test.wantRecords)
+			}
+		})
+	}
+}
+
+func TestRelayOutageSetupCheckpointSubprocessHelper(t *testing.T) {
+	mode := os.Getenv("RIG_RELAY_SETUP_CHECKPOINT_HELPER")
+	if mode == "" {
+		return
+	}
+	started := time.Unix(1_000, 0)
+	now := func() time.Time { return started }
+	relayOutageLogSetupCheckpoint(t, context.Background(), started, relayOutageSetupPhaseControllerDBOpen, relayOutageSetupCheckpointEntered, now)
+	switch mode {
+	case "success":
+		relayOutageLogSetupCheckpoint(t, context.Background(), started, relayOutageSetupPhaseControllerDBOpen, relayOutageSetupCheckpointReturned, now)
+	case "returned_error":
+		err := errors.New("private returned setup detail")
+		relayOutageLogSetupCheckpoint(t, context.Background(), started, relayOutageSetupPhaseControllerDBOpen, relayOutageSetupCheckpointReturned, now)
+		if err != nil {
+			t.Fatal("fixed returned setup failure")
+		}
+	case "nested_fatal":
+		relayOutageSetupCheckpointNestedFatal(t)
+	default:
+		t.Fatal("unknown relay outage checkpoint helper mode")
+	}
+}
+
+func relayOutageSetupCheckpointNestedFatal(t testing.TB) {
+	t.Helper()
+	t.Fatal("fixed nested setup failure")
 }
 
 func TestRelayOutageSetupFailureDiagnosticIsClosedAndSanitized(t *testing.T) {
@@ -882,22 +1059,29 @@ func relayOutageSupervisor(t *testing.T, url string, server *httptest.Server, re
 	return done, cancel, supervisor
 }
 
-func relayOutageEnrollRelay(t *testing.T, ctx context.Context, relay *store.Store, at time.Time, controllerID, keyID string, publicKey ed25519.PublicKey) {
+func relayOutageEnrollRelay(t *testing.T, ctx context.Context, setupStarted time.Time, relay *store.Store, at time.Time, controllerID, keyID string, publicKey ed25519.PublicKey) {
 	t.Helper()
 	stateHash := bytes.Repeat([]byte{0x11}, 32)
+	relayOutageLogSetupCheckpoint(t, ctx, setupStarted, relayOutageSetupPhaseRelayEnrollmentCreate, relayOutageSetupCheckpointEntered, time.Now)
 	enrollmentID, err := relay.CreateEnrollment(ctx, store.EnrollmentInput{
 		ControllerID: controllerID, KeyID: keyID, PublicKey: publicKey, InstallationID: testInstallation, RepositoryID: testRepository,
 		StateHash: stateHash, PollHash: bytes.Repeat([]byte{0x12}, 32), PKCECiphertext: bytes.Repeat([]byte{0x13}, 29), PKCESealNonce: bytes.Repeat([]byte{0x14}, 12), RequestNonce: bytes.Repeat([]byte{0x15}, 32), ExpiresAt: at.Add(10 * time.Minute),
 	})
+	relayOutageLogSetupCheckpoint(t, ctx, setupStarted, relayOutageSetupPhaseRelayEnrollmentCreate, relayOutageSetupCheckpointReturned, time.Now)
 	if err != nil {
 		relayOutageFatalSetupFailure(t, ctx, relayOutageSetupFailureEnrollmentCreate, err)
 	}
+	relayOutageLogSetupCheckpoint(t, ctx, setupStarted, relayOutageSetupPhaseRelayEnrollmentClaim, relayOutageSetupCheckpointEntered, time.Now)
 	claim, err := relay.ClaimEnrollmentState(ctx, stateHash)
+	relayOutageLogSetupCheckpoint(t, ctx, setupStarted, relayOutageSetupPhaseRelayEnrollmentClaim, relayOutageSetupCheckpointReturned, time.Now)
 	if err != nil {
 		relayOutageFatalSetupFailure(t, ctx, relayOutageSetupFailureEnrollmentClaim, err)
 	}
 	claim.Destroy()
-	if err = relay.CompleteEnrollment(ctx, enrollmentID); err != nil {
+	relayOutageLogSetupCheckpoint(t, ctx, setupStarted, relayOutageSetupPhaseRelayEnrollmentComplete, relayOutageSetupCheckpointEntered, time.Now)
+	err = relay.CompleteEnrollment(ctx, enrollmentID)
+	relayOutageLogSetupCheckpoint(t, ctx, setupStarted, relayOutageSetupPhaseRelayEnrollmentComplete, relayOutageSetupCheckpointReturned, time.Now)
+	if err != nil {
 		relayOutageFatalSetupFailure(t, ctx, relayOutageSetupFailureEnrollmentComplete, err)
 	}
 }
@@ -1138,6 +1322,119 @@ func relayOutagePrintableClosedValue(value string) string {
 const relayOutageSetupDeadlineDiagnosticPrefix = "relay_outage_setup_deadline"
 
 const relayOutageSetupFailureDiagnosticPrefix = "relay_outage_setup_failure"
+
+const relayOutageSetupCheckpointPrefix = "relay_outage_setup_checkpoint"
+
+type relayOutageSetupPhase string
+
+const (
+	relayOutageSetupPhasePostgresSetup           relayOutageSetupPhase = "postgres_setup"
+	relayOutageSetupPhaseRelayStoreCreate        relayOutageSetupPhase = "relay_store_create"
+	relayOutageSetupPhaseControllerDBOpen        relayOutageSetupPhase = "controller_db_open"
+	relayOutageSetupPhaseRelayEnrollmentCreate   relayOutageSetupPhase = "relay_enrollment_create"
+	relayOutageSetupPhaseRelayEnrollmentClaim    relayOutageSetupPhase = "relay_enrollment_claim"
+	relayOutageSetupPhaseRelayEnrollmentComplete relayOutageSetupPhase = "relay_enrollment_complete"
+	relayOutageSetupPhaseControllerSeed          relayOutageSetupPhase = "controller_seed"
+	relayOutageSetupPhaseAutodeployConfigure     relayOutageSetupPhase = "autodeploy_configure"
+	relayOutageSetupPhaseServerStart             relayOutageSetupPhase = "server_start"
+	relayOutageSetupPhaseSupervisorStart         relayOutageSetupPhase = "supervisor_start"
+	relayOutageSetupPhaseInitialSync             relayOutageSetupPhase = "initial_sync"
+	relayOutageSetupPhaseFirstFixtureStop        relayOutageSetupPhase = "first_fixture_stop"
+)
+
+type relayOutageSetupCheckpointEdge string
+
+const (
+	relayOutageSetupCheckpointEntered  relayOutageSetupCheckpointEdge = "entered"
+	relayOutageSetupCheckpointReturned relayOutageSetupCheckpointEdge = "returned"
+)
+
+type relayOutageSetupContextState string
+
+const (
+	relayOutageSetupContextActive   relayOutageSetupContextState = "active"
+	relayOutageSetupContextDeadline relayOutageSetupContextState = "deadline"
+	relayOutageSetupContextCanceled relayOutageSetupContextState = "canceled"
+)
+
+type relayOutageSetupCheckpoint struct {
+	phase            relayOutageSetupPhase
+	edge             relayOutageSetupCheckpointEdge
+	elapsedMS        int64
+	elapsedSaturated bool
+	contextState     relayOutageSetupContextState
+}
+
+func relayOutageLogSetupCheckpoint(t testing.TB, ctx context.Context, setupStarted time.Time, phase relayOutageSetupPhase, edge relayOutageSetupCheckpointEdge, now func() time.Time) {
+	t.Helper()
+	diagnostic := relayOutageFormatSetupCheckpoint(relayOutageObserveSetupCheckpoint(ctx, setupStarted, phase, edge, now))
+	if diagnostic == "" {
+		t.Fatal("relay outage setup checkpoint is invalid")
+	}
+	t.Log(diagnostic)
+}
+
+func relayOutageObserveSetupCheckpoint(ctx context.Context, setupStarted time.Time, phase relayOutageSetupPhase, edge relayOutageSetupCheckpointEdge, now func() time.Time) relayOutageSetupCheckpoint {
+	if ctx == nil || now == nil {
+		return relayOutageSetupCheckpoint{phase: phase, edge: edge}
+	}
+	finished := now()
+	elapsed := finished.Sub(setupStarted)
+	saturated := elapsed > relayOutageSetupDeadline
+	state := relayOutageSetupContextActive
+	switch ctx.Err() {
+	case context.DeadlineExceeded:
+		state = relayOutageSetupContextDeadline
+	case context.Canceled:
+		state = relayOutageSetupContextCanceled
+	}
+	return relayOutageSetupCheckpoint{
+		phase:            phase,
+		edge:             edge,
+		elapsedMS:        relayOutageBoundedElapsedMilliseconds(setupStarted, finished),
+		elapsedSaturated: saturated,
+		contextState:     state,
+	}
+}
+
+func relayOutageFormatSetupCheckpoint(checkpoint relayOutageSetupCheckpoint) string {
+	if !relayOutageKnownSetupPhase(checkpoint.phase) || !relayOutageKnownSetupCheckpointEdge(checkpoint.edge) || !relayOutageKnownSetupContextState(checkpoint.contextState) {
+		return ""
+	}
+	limit := int64(relayOutageSetupDeadline / time.Millisecond)
+	if checkpoint.elapsedMS < 0 || checkpoint.elapsedMS > limit || checkpoint.elapsedSaturated && checkpoint.elapsedMS != limit {
+		return ""
+	}
+	return fmt.Sprintf("%s phase=%s edge=%s elapsed_ms=%d elapsed_saturated=%t context_state=%s", relayOutageSetupCheckpointPrefix, checkpoint.phase, checkpoint.edge, checkpoint.elapsedMS, checkpoint.elapsedSaturated, checkpoint.contextState)
+}
+
+func relayOutageKnownSetupPhase(phase relayOutageSetupPhase) bool {
+	switch phase {
+	case relayOutageSetupPhasePostgresSetup,
+		relayOutageSetupPhaseRelayStoreCreate,
+		relayOutageSetupPhaseControllerDBOpen,
+		relayOutageSetupPhaseRelayEnrollmentCreate,
+		relayOutageSetupPhaseRelayEnrollmentClaim,
+		relayOutageSetupPhaseRelayEnrollmentComplete,
+		relayOutageSetupPhaseControllerSeed,
+		relayOutageSetupPhaseAutodeployConfigure,
+		relayOutageSetupPhaseServerStart,
+		relayOutageSetupPhaseSupervisorStart,
+		relayOutageSetupPhaseInitialSync,
+		relayOutageSetupPhaseFirstFixtureStop:
+		return true
+	default:
+		return false
+	}
+}
+
+func relayOutageKnownSetupCheckpointEdge(edge relayOutageSetupCheckpointEdge) bool {
+	return edge == relayOutageSetupCheckpointEntered || edge == relayOutageSetupCheckpointReturned
+}
+
+func relayOutageKnownSetupContextState(state relayOutageSetupContextState) bool {
+	return state == relayOutageSetupContextActive || state == relayOutageSetupContextDeadline || state == relayOutageSetupContextCanceled
+}
 
 type relayOutageSetupFailurePhase string
 

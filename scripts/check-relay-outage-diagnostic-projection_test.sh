@@ -150,6 +150,60 @@ assert_event_rejected "$(event "${prefix}${message}" | jq -c '.Test = "TestUnrel
 
 printf 'relay setup failure projection contract passed: %d accepted, %d rejected\n' "$accepted" "$rejected"
 
+# Setup checkpoints are projected independently on the existing failure path.
+# The emitter controls own sequence and edge cardinality; this contract proves
+# only the closed, anchored grammar of each individual record.
+mapfile -t patterns < <(awk -F "'" '/^[[:space:]]*relay_setup_checkpoint_pattern=/ && NF == 3 { print $2 }' "$workflow")
+mapfile -t filters < <(awk -F "'" 'index($0, "--arg diagnostic_pattern \"$relay_setup_checkpoint_pattern\"") && NF == 3 { print $2 }' "$workflow")
+if (( ${#patterns[@]} != 1 || ${#filters[@]} != 1 )) || [[ -z "${patterns[0]:-}" || -z "${filters[0]:-}" ]]; then
+  printf 'expected exactly one relay setup checkpoint pattern and projection in the workflow\n' >&2
+  exit 1
+fi
+diagnostic_pattern="${patterns[0]}"
+projection_filter="${filters[0]}"
+accepted=0
+rejected=0
+
+checkpoint_prefix='    relay_outage_integration_test.go:81: '
+for phase in postgres_setup relay_store_create controller_db_open relay_enrollment_create relay_enrollment_claim relay_enrollment_complete controller_seed autodeploy_configure server_start supervisor_start initial_sync first_fixture_stop; do
+  checkpoint="relay_outage_setup_checkpoint phase=${phase} edge=entered elapsed_ms=0 elapsed_saturated=false context_state=active"
+  assert_projects \
+    "${checkpoint_prefix}${checkpoint}"$'\n' \
+    "{\"phase\":\"${phase}\",\"edge\":\"entered\",\"elapsed_ms\":0,\"elapsed_saturated\":false,\"context_state\":\"active\"}"
+done
+assert_projects \
+  $'\trelay_outage_integration_test.go:9: relay_outage_setup_checkpoint phase=initial_sync edge=returned elapsed_ms=20000 elapsed_saturated=false context_state=deadline' \
+  '{"phase":"initial_sync","edge":"returned","elapsed_ms":20000,"elapsed_saturated":false,"context_state":"deadline"}'
+assert_projects \
+  'relay_outage_integration_test.go:9: relay_outage_setup_checkpoint phase=first_fixture_stop edge=returned elapsed_ms=20000 elapsed_saturated=true context_state=canceled' \
+  '{"phase":"first_fixture_stop","edge":"returned","elapsed_ms":20000,"elapsed_saturated":true,"context_state":"canceled"}'
+
+checkpoint='relay_outage_setup_checkpoint phase=controller_seed edge=returned elapsed_ms=1 elapsed_saturated=false context_state=active'
+assert_rejects "$checkpoint"
+assert_rejects "other_test.go:81: $checkpoint"
+assert_rejects "relay_outage_integration_test.go:0: $checkpoint"
+assert_rejects "${checkpoint_prefix}${checkpoint/phase=controller_seed/phase=private}"
+assert_rejects "${checkpoint_prefix}${checkpoint/edge=returned/edge=complete}"
+assert_rejects "${checkpoint_prefix}${checkpoint/context_state=active/context_state=unknown}"
+for value in -1 20001 01; do
+  assert_rejects "${checkpoint_prefix}${checkpoint/elapsed_ms=1/elapsed_ms=$value}"
+done
+assert_rejects "${checkpoint_prefix}${checkpoint/elapsed_ms=1 elapsed_saturated=false/elapsed_ms=19999 elapsed_saturated=true}"
+assert_rejects "${checkpoint_prefix}${checkpoint/elapsed_saturated=false/elapsed_saturated=yes}"
+assert_rejects "${checkpoint_prefix}${checkpoint/edge=returned elapsed_ms=1/elapsed_ms=1 edge=returned}"
+assert_rejects "${checkpoint_prefix}${checkpoint} detail=synthetic_sensitive_text"
+assert_rejects "detail=synthetic_sensitive_text ${checkpoint_prefix}${checkpoint}"
+assert_rejects "${checkpoint_prefix}${checkpoint}"$'\nextra'
+assert_rejects $'\n'"${checkpoint_prefix}${checkpoint}"
+assert_rejects "${checkpoint_prefix}${checkpoint}\\n"
+assert_rejects "${checkpoint_prefix}${checkpoint} "
+assert_event_rejected ''
+assert_event_rejected "$(event "${checkpoint_prefix}${checkpoint}" | jq -c '.Action = "fail"')"
+assert_event_rejected "$(event "${checkpoint_prefix}${checkpoint}" | jq -c '.Package = "unrelated/package"')"
+assert_event_rejected "$(event "${checkpoint_prefix}${checkpoint}" | jq -c '.Test = "TestUnrelated"')"
+
+printf 'relay setup checkpoint projection contract passed: %d accepted, %d rejected\n' "$accepted" "$rejected"
+
 # Exercise the exact initial-sync observation grammar and projection. The
 # observer callback elapsed fields are bounded delivery times, not claims about
 # when the underlying supervisor transition occurred.
