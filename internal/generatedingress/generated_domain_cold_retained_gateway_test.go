@@ -1005,27 +1005,128 @@ func TestGeneratedDomainColdRetainedGatewayFinalConsistencyAttribution(t *testin
 	if !generatedDomainRegistryIsolated(t) {
 		return
 	}
-	generatedDomainConstructionCase(t, func(t *testing.T) {
-		fixture, result, observed, expected := generatedDomainRetainedV1ColdAttestationFixture(t)
-		volume := generatedDomainRetainedV1CensusObject(t, observed.docker.objects, "volume", caddyVolumeName)
-		volume.data.mountpoint += "-crossed"
-		before := len(fixture.runner.snapshot())
-		proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), result.manager,
-			result.candidates, observed.docker, expected)
-		assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageColdConstruction,
-			generatedDomainConstructionReason("cold_retained_gateway_final_consistency"),
-			"generated domain construction was refused: stage=cold_construction reason=cold_retained_gateway_final_consistency")
-		if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
-			t.Fatalf("retained final consistency refusal populated proof: %#v", proof)
-		}
-		commands := fixture.runner.snapshot()[before:]
-		for _, command := range commands {
-			if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
-				t.Fatalf("retained final consistency refusal dispatched effect/capacity probe: %#v", command)
-			}
-		}
-		generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+	for _, test := range []struct {
+		name   string
+		reason generatedDomainConstructionReason
+		mutate func(*testing.T, []generatedDomainDockerObject)
+	}{
+		{name: "identity", reason: generatedDomainConstructionReasonColdRetainedGatewayFinalIdentity,
+			mutate: func(t *testing.T, objects []generatedDomainDockerObject) {
+				generatedDomainRetainedV1CensusObject(t, objects, "volume", caddyVolumeName).id = strings.Repeat("f", 64)
+			}},
+		{name: "labels", reason: generatedDomainConstructionReasonColdRetainedGatewayFinalLabels,
+			mutate: func(t *testing.T, objects []generatedDomainDockerObject) {
+				container := generatedDomainRetainedV1CensusObject(t, objects, "container", caddyContainerName)
+				container.labels = cloneStringMap(container.labels)
+				container.labels["io.rig.unexpected-retained-final"] = "v1"
+			}},
+		{name: "projection", reason: generatedDomainConstructionReasonColdRetainedGatewayFinalProjection,
+			mutate: func(t *testing.T, objects []generatedDomainDockerObject) {
+				generatedDomainRetainedV1CensusObject(t, objects, "volume", caddyVolumeName).data.mountpoint += "-crossed"
+			}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture, result, observed, expected := generatedDomainRetainedV1ColdAttestationFixture(t)
+				test.mutate(t, observed.docker.objects)
+				generatedDomainRetainedV1AssertFinalConsistencyRefusal(t, fixture, result, observed, expected, test.reason)
+			})
+		})
+	}
+}
+
+func TestGeneratedDomainColdRetainedGatewayFinalConsistencyFallback(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	t.Run("multiple_families", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			fixture, result, observed, expected := generatedDomainRetainedV1ColdAttestationFixture(t)
+			volume := generatedDomainRetainedV1CensusObject(t, observed.docker.objects, "volume", caddyVolumeName)
+			volume.id = strings.Repeat("f", 64)
+			volume.data.mountpoint += "-crossed"
+			generatedDomainRetainedV1AssertFinalConsistencyRefusal(t, fixture, result, observed, expected,
+				generatedDomainConstructionReasonColdRetainedGatewayFinal)
+		})
 	})
+	t.Run("unconstrained_projection_preserves_label_attribution", func(t *testing.T) {
+		descriptors := generatedDomainNativeV1DockerDescriptors()
+		containerID := strings.Repeat("a", 64)
+		networkID := strings.Repeat("b", 64)
+		objects := make([]generatedDomainDockerObject, len(descriptors))
+		for index, descriptor := range descriptors {
+			objects[index] = generatedDomainDockerObject{kind: descriptor.kind, id: descriptor.id,
+				name: descriptor.name, labels: cloneStringMap(descriptor.labels), data: descriptor.data}
+			objects[index].data.options = cloneStringMap(descriptor.data.options)
+		}
+		objects[0].id = containerID
+		objects[1].id = networkID
+		objects[0].labels["io.rig.unexpected-retained-final"] = "v1"
+		objects[2].data.mountpoint = "/var/lib/docker/volumes/retained-v1/_data"
+		objects[2].data.createdAt = "2026-10-26T00:00:00Z"
+		observation := gatewayV2DockerObservation{V1Container: caddyInspection{ID: containerID}, V1NetworkID: networkID}
+		if generatedDomainColdRetainedGatewayCensusMatches(objects, observation) {
+			t.Fatal("label-refusal fixture unexpectedly satisfies the production matcher")
+		}
+		if got := generatedDomainColdRetainedGatewayFinalReason(objects, observation); got != generatedDomainConstructionReasonColdRetainedGatewayFinalLabels {
+			t.Fatalf("unconstrained projection classifier = %q, want %q", got,
+				generatedDomainConstructionReasonColdRetainedGatewayFinalLabels)
+		}
+	})
+}
+
+func generatedDomainRetainedV1AssertFinalConsistencyRefusal(t *testing.T,
+	fixture generatedDomainRetainedV1ColdFixture, result *generatedDomainConstruction,
+	observed generatedDomainStartupObservation, expected generatedDomainGatewayExpectation,
+	reason generatedDomainConstructionReason,
+) {
+	t.Helper()
+	objects, presence, err := generatedDomainColdRetainedGatewayObjects(observed.docker)
+	if err != nil || presence != generatedDomainColdRetainedGatewayPresent || len(objects) != 3 {
+		t.Fatalf("retained final census objects = %#v presence=%d error=%v", objects, presence, err)
+	}
+	if generatedDomainColdRetainedGatewayCensusMatches(objects, fixture.observation) {
+		t.Fatal("retained final refusal fixture still matches the production census predicate")
+	}
+	if got := generatedDomainColdRetainedGatewayFinalReason(objects, fixture.observation); got != reason {
+		t.Fatalf("retained final refusal reason = %q, want %q", got, reason)
+	}
+	before := len(fixture.runner.snapshot())
+	proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), result.manager,
+		result.candidates, observed.docker, expected)
+	message := "generated domain construction was refused: stage=cold_construction reason=" + string(reason)
+	assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageColdConstruction, reason, message)
+	if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
+		t.Fatalf("retained final consistency refusal populated proof: %#v", proof)
+	}
+	commands := fixture.runner.snapshot()[before:]
+	for _, command := range commands {
+		if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+			t.Fatalf("retained final consistency refusal dispatched effect/capacity probe: %#v", command)
+		}
+	}
+	generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+	generatedDomainRetainedV1AssertFinalReadPrefix(t, commands, fixture.observation, expected)
+}
+
+func generatedDomainRetainedV1AssertFinalReadPrefix(t *testing.T, commands [][]string,
+	observation gatewayV2DockerObservation, expected generatedDomainGatewayExpectation,
+) {
+	t.Helper()
+	selected, ok := generatedDomainColdRetainedGatewaySelectedAuthority(expected)
+	if !ok {
+		t.Fatal("retained final read prefix lacks selected authority")
+	}
+	want := [][]string{
+		{"image", "inspect", "--format", imageInspectFormat, selected.journal.Resources.ImageID},
+		{"container", "inspect", "--format", generatedDomainStartupContainerInspectFormat, observation.V1Container.ID},
+		{"volume", "inspect", "--format", generatedDomainVolumeInspectFormat, caddyVolumeName},
+		{"network", "inspect", "--format", generatedDomainStartupNetworkInspectFormat, observation.V1NetworkID},
+		{"container", "cp", observation.V1Container.ID + ":/config/" + gatewayV2ActiveConfigFile, "-"},
+	}
+	if !reflect.DeepEqual(commands, want) {
+		t.Fatalf("retained final refusal read prefix = %#v, want %#v", commands, want)
+	}
 }
 
 func generatedDomainRetainedV1Observation(t *testing.T,

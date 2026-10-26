@@ -138,7 +138,7 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 	if !generatedDomainColdRetainedGatewayCensusMatches(objects, observation) {
 		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
-			generatedDomainConstructionReasonColdRetainedGatewayFinal,
+			generatedDomainColdRetainedGatewayFinalReason(objects, observation),
 			errGeneratedDomainConstructionRefused)
 	}
 
@@ -301,6 +301,62 @@ func generatedDomainColdRetainedGatewayCensusMatches(objects []generatedDomainDo
 		}
 	}
 	return true
+}
+
+func generatedDomainColdRetainedGatewayFinalReason(objects []generatedDomainDockerObject,
+	observation gatewayV2DockerObservation,
+) generatedDomainConstructionReason {
+	descriptors := generatedDomainNativeV1DockerDescriptors()
+	if len(objects) != 3 || len(descriptors) != 3 ||
+		descriptors[0].kind != "container" || descriptors[1].kind != "network" || descriptors[2].kind != "volume" {
+		return generatedDomainConstructionReasonColdRetainedGatewayFinal
+	}
+	for index := range objects {
+		if objects[index].kind != descriptors[index].kind ||
+			strings.TrimPrefix(objects[index].name, "/") != descriptors[index].name {
+			return generatedDomainConstructionReasonColdRetainedGatewayFinal
+		}
+	}
+	descriptors[0].id = observation.V1Container.ID
+	descriptors[1].id = observation.V1NetworkID
+	descriptors[2].data.mountpoint = observation.V1VolumeIdentity.Mountpoint
+	descriptors[2].data.createdAt = observation.V1VolumeIdentity.CreatedAt
+
+	identityMismatch := objects[0].id != descriptors[0].id ||
+		objects[1].id != descriptors[1].id || objects[2].id != "" ||
+		!generatedDomainCanonicalDockerID(objects[0].id, false) ||
+		!generatedDomainCanonicalDockerID(objects[1].id, false)
+	labelsMismatch := !generatedDomainExactRigLabels(objects[0].labels, descriptors[0].labels) ||
+		!generatedDomainExactRigLabels(objects[1].labels, descriptors[1].labels) ||
+		!validGeneratedDomainNativeV1VolumeLabels(objects[2].labels)
+	projectionMismatch := objects[1].data.driver != descriptors[1].data.driver ||
+		objects[1].data.scope != descriptors[1].data.scope ||
+		!reflect.DeepEqual(objects[1].data.options, descriptors[1].data.options) ||
+		objects[2].data.driver != descriptors[2].data.driver ||
+		objects[2].data.scope != descriptors[2].data.scope ||
+		!reflect.DeepEqual(objects[2].data.options, descriptors[2].data.options) ||
+		descriptors[2].data.mountpoint != "" && objects[2].data.mountpoint != descriptors[2].data.mountpoint ||
+		descriptors[2].data.createdAt != "" && objects[2].data.createdAt != descriptors[2].data.createdAt
+
+	mismatches := 0
+	for _, mismatch := range []bool{identityMismatch, labelsMismatch, projectionMismatch} {
+		if mismatch {
+			mismatches++
+		}
+	}
+	if mismatches != 1 {
+		return generatedDomainConstructionReasonColdRetainedGatewayFinal
+	}
+	switch {
+	case identityMismatch:
+		return generatedDomainConstructionReasonColdRetainedGatewayFinalIdentity
+	case labelsMismatch:
+		return generatedDomainConstructionReasonColdRetainedGatewayFinalLabels
+	case projectionMismatch:
+		return generatedDomainConstructionReasonColdRetainedGatewayFinalProjection
+	default:
+		return generatedDomainConstructionReasonColdRetainedGatewayFinal
+	}
 }
 
 func (proof generatedDomainColdRetainedGatewayProof) accounts(object generatedDomainDockerObject) bool {
