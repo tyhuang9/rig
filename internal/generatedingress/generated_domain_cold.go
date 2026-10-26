@@ -41,6 +41,7 @@ type generatedDomainColdGroup struct {
 type generatedDomainColdManifest struct {
 	groups          []generatedDomainColdManifestGroup
 	retainedGateway generatedDomainColdRetainedGatewayProof
+	retainedV2      generatedDomainColdRetainedV2Proof
 }
 
 type generatedDomainColdManifestGroup struct {
@@ -63,7 +64,8 @@ func sameGeneratedDomainColdManifest(left, right *generatedDomainColdManifest) b
 
 func cloneGeneratedDomainColdManifest(value generatedDomainColdManifest) *generatedDomainColdManifest {
 	result := &generatedDomainColdManifest{groups: make([]generatedDomainColdManifestGroup, len(value.groups)),
-		retainedGateway: cloneGeneratedDomainColdRetainedGatewayProof(value.retainedGateway)}
+		retainedGateway: cloneGeneratedDomainColdRetainedGatewayProof(value.retainedGateway),
+		retainedV2:      cloneGeneratedDomainColdRetainedV2Proof(value.retainedV2)}
 	for index, group := range value.groups {
 		result.groups[index] = group
 		result.groups[index].components = append([]generatedDomainColdManifestComponent(nil), group.components...)
@@ -142,8 +144,9 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 		}
 	}
 	var retainedGateway generatedDomainColdRetainedGatewayProof
-	if err := attestGeneratedDomainColdGroupsWithRetained(ctx, result.manager, result.candidates, observed, groups,
-		&retainedGateway); err != nil {
+	var retainedV2 generatedDomainColdRetainedV2Proof
+	if err := attestGeneratedDomainColdGroupsWithRetainedProofs(ctx, result.manager, result.candidates, observed, groups,
+		&retainedGateway, &retainedV2); err != nil {
 		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdGroupAttestation, err)
@@ -155,6 +158,7 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 			generatedDomainConstructionReasonColdManifest, err)
 	}
 	manifest.retainedGateway = cloneGeneratedDomainColdRetainedGatewayProof(retainedGateway)
+	manifest.retainedV2 = cloneGeneratedDomainColdRetainedV2Proof(retainedV2)
 	return manifest, nil
 }
 
@@ -205,12 +209,14 @@ func reattestGeneratedDomainCold(ctx context.Context, manager *Manager, authorit
 		return err
 	}
 	var retainedGateway generatedDomainColdRetainedGatewayProof
-	if err := attestGeneratedDomainColdGroupsWithRetained(ctx, manager, authority, observed, groups,
-		&retainedGateway); err != nil {
+	var retainedV2 generatedDomainColdRetainedV2Proof
+	if err := attestGeneratedDomainColdGroupsWithRetainedProofs(ctx, manager, authority, observed, groups,
+		&retainedGateway, &retainedV2); err != nil {
 		return err
 	}
 	current, err := snapshotGeneratedDomainColdManifest(authority)
 	current.retainedGateway = cloneGeneratedDomainColdRetainedGatewayProof(retainedGateway)
+	current.retainedV2 = cloneGeneratedDomainColdRetainedV2Proof(retainedV2)
 	if err != nil || !reflect.DeepEqual(expected, current) {
 		return errors.Join(errGeneratedDomainConstructionRefused, err)
 	}
@@ -964,6 +970,17 @@ func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *M
 	observed generatedDomainStartupObservation, groups []generatedDomainColdGroup,
 	retainedGateway *generatedDomainColdRetainedGatewayProof,
 ) error {
+	var retainedV2 generatedDomainColdRetainedV2Proof
+	return attestGeneratedDomainColdGroupsWithRetainedProofs(ctx, manager, authority, observed, groups,
+		retainedGateway, &retainedV2)
+}
+
+func attestGeneratedDomainColdGroupsWithRetainedProofs(ctx context.Context, manager *Manager,
+	authority *GeneratedCandidateAuthority,
+	observed generatedDomainStartupObservation, groups []generatedDomainColdGroup,
+	retainedGateway *generatedDomainColdRetainedGatewayProof,
+	retainedV2Proof *generatedDomainColdRetainedV2Proof,
+) error {
 	type expectedObject struct {
 		name, id string
 		labels   map[string]string
@@ -1088,6 +1105,17 @@ func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *M
 			errGeneratedDomainConstructionRefused)
 	}
 	*retainedGateway = cloneGeneratedDomainColdRetainedGatewayProof(retained)
+	retainedV2, err := attestGeneratedDomainColdRetainedV2(ctx, manager, observed.docker, gateway)
+	if err != nil {
+		return errors.Join(errGeneratedDomainConstructionRefused, err)
+	}
+	if retainedV2Proof == nil {
+		return generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupStructure,
+			errGeneratedDomainConstructionRefused)
+	}
+	*retainedV2Proof = cloneGeneratedDomainColdRetainedV2Proof(retainedV2)
 	seenContainers := make(map[string]struct{}, len(containers))
 	seenImages := make(map[string]struct{}, len(images))
 	seenNetworks := make(map[string]struct{}, len(networks))
@@ -1096,6 +1124,9 @@ func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *M
 			continue
 		}
 		if retained.accounts(object) {
+			continue
+		}
+		if retainedV2.accounts(object) {
 			continue
 		}
 		name := object.name

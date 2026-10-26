@@ -1036,6 +1036,65 @@ type generatedDomainRetainedV1Projection struct {
 	upgradeLineage appaccess.GatewayCurrentLineageRef
 }
 
+// generatedDomainRetainedV2Projection is a store-free projection of the
+// committed native V2 predecessor behind an authenticated current V1 route.
+// It is deliberately separate from the retained V1 projection: either
+// physical envelope may be absent while the other remains present.
+type generatedDomainRetainedV2Projection struct {
+	source         routeState
+	state          gatewayV2RouteState
+	journal        gatewayMigrationJournal
+	upgradeLineage appaccess.GatewayCurrentLineageRef
+	current        gatewayCurrentRouteState
+	terminal       gatewayRebindAttemptTerminalView
+}
+
+func cloneGeneratedDomainRetainedV2Projection(value generatedDomainRetainedV2Projection) generatedDomainRetainedV2Projection {
+	value.source = cloneRouteState(value.source)
+	value.state = cloneGatewayV2RouteState(value.state)
+	value.current = cloneGatewayCurrentRouteState(value.current)
+	switch value.terminal.Format {
+	case gatewayRebindAttemptTerminalLegacyV1:
+		if value.terminal.LegacyReceipt != nil {
+			if terminal, err := newGatewayRebindAttemptTerminalViewLegacy(*value.terminal.LegacyReceipt); err == nil {
+				value.terminal = terminal
+			}
+		}
+	case gatewayRebindAttemptTerminalTypedV2:
+		if value.terminal.TypedReceipt != nil {
+			if terminal, err := newGatewayRebindAttemptTerminalViewV2(*value.terminal.TypedReceipt); err == nil {
+				value.terminal = terminal
+			}
+		}
+	}
+	return value
+}
+
+func generatedDomainRetainedV2ProjectionValid(value *generatedDomainRetainedV2Projection) bool {
+	if value == nil || value.journal.Phase != gatewayPhaseCommitted ||
+		!validGatewayTopologyInputs(value.source, value.state, value.journal) ||
+		!validGatewayCurrentRouteState(value.current) ||
+		value.current.Lineage.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
+		!gatewayRebindAttemptTerminalMatchesLineage(value.terminal, value.current.Lineage) {
+		return false
+	}
+	journalDigest, err := canonicalDigest(value.journal)
+	if err != nil {
+		return false
+	}
+	expected := appaccess.GatewayCurrentLineageRef{
+		Kind:                    appaccess.GatewayRebindSourceGatewayUpgrade,
+		OperationID:             value.state.OperationID,
+		ProfileRevisionID:       value.state.Profile.RevisionID,
+		ProfileRevisionNumber:   value.state.Profile.RevisionNumber,
+		ProfileSpecDigest:       value.state.Profile.SpecDigest,
+		ProtectedGeneration:     value.upgradeLineage.ProtectedGeneration,
+		ProtectedIdentityDigest: value.state.Identity.Digest,
+		ProtectedJournalDigest:  journalDigest,
+	}
+	return validGatewayCurrentLineage(expected) && value.upgradeLineage == expected
+}
+
 func cloneGeneratedDomainRetainedV1Projection(value generatedDomainRetainedV1Projection) generatedDomainRetainedV1Projection {
 	value.source = cloneRouteState(value.source)
 	value.state = cloneGatewayV2RouteState(value.state)
@@ -1097,6 +1156,24 @@ func generatedDomainCurrentV1RetainedProjection(state gatewayCurrentRouteState,
 	return &value, true
 }
 
+func generatedDomainCurrentV1RetainedV2Projection(state gatewayCurrentRouteState,
+	terminal gatewayRebindAttemptTerminalView, history gatewayRebindProtectedIntentHistory,
+) (*generatedDomainRetainedV2Projection, bool) {
+	retained, ok := generatedDomainCurrentV1RetainedProjection(state, terminal, history)
+	if !ok {
+		return nil, false
+	}
+	value := generatedDomainRetainedV2Projection{
+		source: cloneRouteState(retained.source), state: cloneGatewayV2RouteState(retained.state),
+		journal: retained.journal, upgradeLineage: retained.upgradeLineage,
+		current: cloneGatewayCurrentRouteState(state), terminal: terminal,
+	}
+	if !generatedDomainRetainedV2ProjectionValid(&value) {
+		return nil, false
+	}
+	return &value, true
+}
+
 func generatedDomainCurrentGatewayCandidates(database deployments.GeneratedDomainStartupSnapshot,
 	protected generatedDomainProtectedStartupSnapshot, stableOnly bool,
 ) []generatedDomainGatewayExpectation {
@@ -1114,6 +1191,9 @@ func generatedDomainCurrentGatewayCandidates(database deployments.GeneratedDomai
 			stateDigest: state.Digest, currentV1: &state, terminal: &terminalCopy}
 		if retained, ok := generatedDomainCurrentV1RetainedProjection(state, terminal, protected.rebind); ok {
 			candidate.retainedV1 = retained
+		}
+		if retained, ok := generatedDomainCurrentV1RetainedV2Projection(state, terminal, protected.rebind); ok {
+			candidate.retainedV2 = retained
 		}
 		result = append(result, candidate)
 	}
