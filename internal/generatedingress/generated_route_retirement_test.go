@@ -15,6 +15,73 @@ import (
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
+func TestGeneratedRouteRecoveredRetirementPhysicalPrefixRefusesForeignAndRecordedReappearance(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	t.Run("foreign unrecorded configured identity", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			fixture := newGeneratedRouteColdAccountingActivatedFixture(t)
+			beforeProtection := generatedRouteColdAccountingProtection(t, fixture)
+			beforeCommands := fixture.construction.snapshot()
+			beforeStop := fixture.predecessor.count(candidateOwnerStop)
+			beforeRemove := fixture.predecessor.count(candidateOwnerRemove)
+			physical := fixture.process.predecessor.physical[fixture.retiredContainerID]
+			physical.policy.identity.ReceiptID = "foreign-recovered-retirement-receipt"
+			fixture.process.predecessor.physical[fixture.retiredContainerID] = physical
+
+			result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+				fixture.process, fixture.environment, fixture.identity.options)
+			var diagnostic *generatedDomainConstructionDiagnostic
+			if result != nil || !errors.As(err, &diagnostic) || diagnostic == nil ||
+				diagnostic.stage != generatedDomainConstructionStageColdConstruction ||
+				diagnostic.reason != generatedDomainConstructionReasonColdGroupContainerAttestation {
+				t.Fatalf("foreign recovered prefix result=%#v diagnostic=%#v error=%v", result, diagnostic, err)
+			}
+			assertGeneratedRouteColdAccountingActivatedSnapshot(t, fixture)
+			assertGeneratedRouteColdAccountingProtectionUnchanged(t, beforeProtection, fixture)
+			if fixture.predecessor.count(candidateOwnerStop) != beforeStop ||
+				fixture.predecessor.count(candidateOwnerRemove) != beforeRemove ||
+				generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+					generatedRouteColdAccountingCapacityProbeCount(beforeCommands) {
+				t.Fatal("foreign recovered prefix refusal reached effects or capacity")
+			}
+		})
+	})
+
+	t.Run("recorded component reappearance", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			fixture := newGeneratedRouteColdAccountingPartialRetirementFixture(t)
+			beforeProtection := generatedRouteColdAccountingProtection(t, fixture.base)
+			beforeCommands := fixture.base.construction.snapshot()
+			beforeEffects := generatedRouteColdAccountingComponentEffectCounts(fixture.runner,
+				fixture.predecessor)
+			identity := fixture.predecessor[fixture.recordedComponent]
+			physical := fixture.runner.physical[identity.ContainerID]
+			physical.exists = true
+			physical.running = true
+			physical.health = "healthy"
+			fixture.runner.physical[identity.ContainerID] = physical
+
+			result, err := newGeneratedDomainConstruction(context.Background(), fixture.base.identity.stores,
+				fixture.base.process, fixture.base.environment, fixture.base.identity.options)
+			var diagnostic *generatedDomainConstructionDiagnostic
+			if result != nil || !errors.As(err, &diagnostic) || diagnostic == nil ||
+				diagnostic.stage != generatedDomainConstructionStageColdConstruction ||
+				diagnostic.reason != generatedDomainConstructionReasonColdGroupComponentAbsence {
+				t.Fatalf("recorded reappearance result=%#v diagnostic=%#v error=%v", result, diagnostic, err)
+			}
+			assertGeneratedRouteColdAccountingProtectionUnchanged(t, beforeProtection, fixture.base)
+			if !reflect.DeepEqual(beforeEffects,
+				generatedRouteColdAccountingComponentEffectCounts(fixture.runner, fixture.predecessor)) ||
+				generatedRouteColdAccountingCapacityProbeCount(fixture.base.construction.snapshot()) !=
+					generatedRouteColdAccountingCapacityProbeCount(beforeCommands) {
+				t.Fatal("recorded reappearance refusal reached effects or capacity")
+			}
+		})
+	})
+}
+
 func TestGeneratedRouteReceiptOwnedPredecessorRetirement(t *testing.T) {
 	t.Run("exact activation retires fixed predecessor roster and retains accounting", func(t *testing.T) {
 		fixture := newGeneratedRoutePredecessorFixture(t)

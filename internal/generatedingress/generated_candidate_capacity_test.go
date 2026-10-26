@@ -351,6 +351,145 @@ func TestCandidateCapacityRecoveredHandoffTransfersExactDualDebt(t *testing.T) {
 	}
 }
 
+func TestCandidateCapacityRecoveredRetirementHoldsWholeExactDualRoster(t *testing.T) {
+	t.Run("mixed absent and handed predecessor stays atomic through handoff", func(t *testing.T) {
+		ledger, coordinator, tokens, successorSpec, predecessorSpec :=
+			candidateCapacityTestRecoveredRetirementLedger(t)
+		successorGroup := ledger.groups[candidateCapacityGroupKey{appID: successorSpec.appID,
+			deploymentID: successorSpec.deploymentID}]
+		predecessorGroup := ledger.groups[candidateCapacityGroupKey{appID: predecessorSpec.appID,
+			deploymentID: predecessorSpec.deploymentID}]
+		physical := map[string]candidatePhysicalState{
+			"api": candidatePhysicalConfirmedAbsent, "web": candidatePhysicalHandedToRoute,
+		}
+		if rejected, err := ledger.holdRecoveredRetirementHandoff(successorSpec, predecessorSpec,
+			map[string]string{"api": "receipt-new-api", "web": "receipt-new-web"},
+			map[string]string{"api": "receipt-old-api", "web": "receipt-old-web"},
+			map[string]candidatePhysicalState{"api": candidatePhysicalConfirmedAbsent}); !errors.Is(err, errCandidateCapacityInvalid) || rejected != nil ||
+			successorGroup.byName["api"].tokenHeld || predecessorGroup.byName["api"].tokenHeld {
+			t.Fatalf("partial recovered retirement hold=%#v successorHeld=%t predecessorHeld=%t error=%v",
+				rejected, successorGroup.byName["api"].tokenHeld,
+				predecessorGroup.byName["api"].tokenHeld, err)
+		}
+		hold, err := ledger.holdRecoveredRetirementHandoff(successorSpec, predecessorSpec,
+			map[string]string{"api": "receipt-new-api", "web": "receipt-new-web"},
+			map[string]string{"api": "receipt-old-api", "web": "receipt-old-web"}, physical)
+		if err != nil || hold == nil || !hold.validPrepared() || hold.recoveredRetirementComplete() {
+			t.Fatalf("mixed recovered retirement hold=%#v prepared=%t complete=%t error=%v", hold,
+				hold != nil && hold.validPrepared(), hold != nil && hold.recoveredRetirementComplete(), err)
+		}
+		defer hold.leave()
+		if _, err := hold.beginAccountingHandoff(); !errors.Is(err, errCandidatePhysicalTransition) {
+			t.Fatalf("premature recovered handoff error=%v", err)
+		}
+		if err := hold.enterRecoveredRetirementCommand("web", candidateCommandStop); err != nil {
+			t.Fatal(err)
+		}
+		if err := hold.enterRecoveredRetirementCommand("web", candidateCommandStop); !errors.Is(err, errCandidateCommandEntered) {
+			t.Fatalf("duplicate recovered stop error=%v", err)
+		}
+		if err := hold.markRecoveredPredecessorAbsent("web"); err != nil || !hold.recoveredRetirementComplete() {
+			t.Fatalf("recovered predecessor absence complete=%t error=%v", hold.recoveredRetirementComplete(), err)
+		}
+		accounting, err := hold.beginAccountingHandoff()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := accounting.markGatewayUnlocked(); err != nil {
+			t.Fatal(err)
+		}
+		if err := accounting.releasePredecessorOnce(); err != nil || !hold.valid() {
+			t.Fatalf("recovered retirement final valid=%t error=%v", hold.valid(), err)
+		}
+		if coordinator.memory != 20 || coordinator.disk != 20 || len(coordinator.tokens) != 2 ||
+			tokens[0].configured() || tokens[1].configured() || !tokens[2].published() || !tokens[3].published() {
+			t.Fatalf("recovered retirement debt memory=%d disk=%d tokens=%d configured=%t/%t published=%t/%t",
+				coordinator.memory, coordinator.disk, len(coordinator.tokens), tokens[0].configured(),
+				tokens[1].configured(), tokens[2].published(), tokens[3].published())
+		}
+	})
+
+	t.Run("unquiesced command latches the whole recovered operation", func(t *testing.T) {
+		ledger, _, _, successorSpec, predecessorSpec := candidateCapacityTestRecoveredRetirementLedger(t)
+		hold, err := ledger.holdRecoveredRetirementHandoff(successorSpec, predecessorSpec,
+			map[string]string{"api": "receipt-new-api", "web": "receipt-new-web"},
+			map[string]string{"api": "receipt-old-api", "web": "receipt-old-web"},
+			map[string]candidatePhysicalState{"api": candidatePhysicalConfirmedAbsent,
+				"web": candidatePhysicalHandedToRoute})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := hold.enterRecoveredRetirementCommand("web", candidateCommandRemove); err != nil {
+			t.Fatal(err)
+		}
+		hold.latchRecoveredRetirementUnquiesced("web")
+		if hold.validPrepared() || hold.recoveredRetirementComplete() {
+			t.Fatal("unquiesced recovered retirement remained usable")
+		}
+		if err := hold.markRecoveredPredecessorAbsent("web"); !errors.Is(err, errCandidateCapacityStale) {
+			t.Fatalf("unquiesced recovered absence error=%v", err)
+		}
+		if _, err := hold.beginAccountingHandoff(); !errors.Is(err, errCandidateCapacityStale) {
+			t.Fatalf("unquiesced recovered handoff error=%v", err)
+		}
+		hold.leave()
+		for _, group := range []*candidateCapacityGroup{hold.successorGroup, hold.predecessorGroup} {
+			for _, name := range group.components {
+				if group.byName[name].tokenHeld {
+					t.Fatalf("closed recovered retirement retained %s token", name)
+				}
+			}
+		}
+	})
+}
+
+func candidateCapacityTestRecoveredRetirementLedger(t *testing.T) (*candidateCapacityLedger,
+	*generatedDomainCapacityCoordinator, []*generatedDomainCapacityDebtToken, candidateGroupSpec, candidateGroupSpec,
+) {
+	t.Helper()
+	manager, runner := newManagerFixture(t, false)
+	runner.capacityOutput = []byte("50 50\n")
+	coordinator, err := newGeneratedDomainCapacityCoordinator(manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := []generatedcapacity.Limits{{MemoryBytes: 10, DiskBytes: 10}, {MemoryBytes: 10, DiskBytes: 10},
+		{MemoryBytes: 10, DiskBytes: 10}, {MemoryBytes: 10, DiskBytes: 10}}
+	tokens, err := coordinator.installBootstrapBatch(limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.sealBootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	budget, err := generatedcapacity.New(coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := newCandidateCapacityLedger(budget, coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	predecessorSpec := candidateCapacityTestSpec("app-recovered", "deployment-old", "api", "web")
+	successorSpec := candidateCapacityTestSpec("app-recovered", "deployment-new", "api", "web")
+	if err := ledger.seedColdOwnershipWithDebt(predecessorSpec, map[string]candidateColdReceiptSeed{
+		"api": {id: "receipt-old-api", physical: candidatePhysicalConfirmedAbsent},
+		"web": {id: "receipt-old-web", physical: candidatePhysicalHandedToRoute},
+	}, tokens[:2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.seedColdOwnershipWithDebt(successorSpec, map[string]candidateColdReceiptSeed{
+		"api": {id: "receipt-new-api", physical: candidatePhysicalHandedToRoute},
+		"web": {id: "receipt-new-web", physical: candidatePhysicalHandedToRoute},
+	}, tokens[2:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.publishRestoredOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	return ledger, coordinator, tokens, successorSpec, predecessorSpec
+}
+
 func candidateCapacityTestSpec(
 	appID string,
 	deploymentID string,

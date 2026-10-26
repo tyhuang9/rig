@@ -375,7 +375,7 @@ func readGeneratedDomainColdGroups(ctx context.Context, authority *GeneratedCand
 	}
 	for index := range groups {
 		kind, bindHead, selfHead, legacyHead, err := classifyGeneratedDomainColdGroup(
-			groups[index].pins, groups[index].snapshot, groups, observed.database.Runtime.RouteActivations)
+			groups[index].pins, groups[index].snapshot, groups, observed.database)
 		if err != nil {
 			return nil, err
 		}
@@ -704,6 +704,163 @@ func validateGeneratedDomainColdSnapshot(ctx context.Context, stores *deployment
 	return nil
 }
 
+type generatedDomainColdPredecessorRetirementPrefixEvidence struct {
+	activation           generatedruntimestate.GeneratedDomainStartupRouteActivation
+	predecessorGroup     generatedDomainColdGroup
+	predecessorRoster    []generatedruntimestate.RouteActivationComponent
+	componentRetirements map[string]generatedruntimestate.PredecessorRetirementObservation
+}
+
+// generatedDomainColdPredecessorRetirementPrefix recognizes only the exact
+// post-activation prefix before the aggregate predecessor-retirement receipt.
+// Component observations are correlated with the predecessor component state:
+// a recorded member is Stopped and every unrecorded member remains Draining.
+func generatedDomainColdPredecessorRetirementPrefix(database deployments.GeneratedDomainStartupSnapshot,
+	group generatedDomainColdGroup, groups []generatedDomainColdGroup,
+) (generatedDomainColdPredecessorRetirementPrefixEvidence, bool, error) {
+	var result generatedDomainColdPredecessorRetirementPrefixEvidence
+	if group.snapshot.runtime.phase != generatedruntimestate.PhaseDraining ||
+		group.snapshot.observedHead.deploymentID != group.pins.deploymentID ||
+		group.snapshot.observedHead.activationReceiptID == "" {
+		return result, false, nil
+	}
+	for _, component := range group.snapshot.components {
+		if component.state != generatedruntimestate.ComponentActive {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+	}
+	receiptID := group.snapshot.observedHead.activationReceiptID
+	activationCount, relevantActivations := 0, 0
+	for _, value := range database.Runtime.RouteActivations {
+		if value.ReceiptID == receiptID || value.SuccessorDeploymentID == group.pins.deploymentID {
+			relevantActivations++
+		}
+		if value.ReceiptID == receiptID {
+			result.activation, activationCount = value, activationCount+1
+		}
+	}
+	if relevantActivations != 1 || activationCount != 1 ||
+		!generatedDomainColdActivationMatches(group.pins, group.snapshot, groups,
+			database.Runtime.RouteActivations) {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	if result.activation.PredecessorDeploymentID == "" {
+		return result, false, nil
+	}
+	predecessor, found := generatedDomainColdGroupByDeployment(groups,
+		result.activation.PredecessorDeploymentID)
+	if !found || predecessor.snapshot.runtime.phase != generatedruntimestate.PhaseSucceeded ||
+		predecessor.snapshot.main.status != Succeeded {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	result.predecessorGroup = predecessor
+	result.predecessorRoster, found = generatedDomainColdActivationRoster(predecessor.snapshot)
+	if !found || len(result.predecessorRoster) == 0 {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	expected := make(map[string]generatedruntimestate.RouteActivationComponent,
+		len(result.predecessorRoster))
+	states := make(map[string]generatedruntimestate.ComponentState, len(predecessor.snapshot.components))
+	for _, component := range result.predecessorRoster {
+		expected[component.ComponentName] = component
+	}
+	for _, component := range predecessor.snapshot.components {
+		states[component.plan.Name] = component.state
+	}
+	result.componentRetirements = make(map[string]generatedruntimestate.PredecessorRetirementObservation,
+		len(result.predecessorRoster))
+	for _, value := range database.Runtime.PredecessorRetirementComponents {
+		if value.ActivationReceiptID != receiptID &&
+			value.SuccessorDeploymentID != result.activation.SuccessorDeploymentID {
+			continue
+		}
+		want, ok := expected[value.ComponentName]
+		if !ok || value.ActivationReceiptID != receiptID || value.AppID != result.activation.AppID ||
+			value.SuccessorDeploymentID != result.activation.SuccessorDeploymentID ||
+			value.PredecessorDeploymentID != result.activation.PredecessorDeploymentID ||
+			value.CandidateReceiptID != want.CandidateReceiptID || value.ContainerID != want.ContainerID ||
+			value.CandidatePolicyDigest != want.CandidatePolicyDigest || value.ObservedAbsentAt.IsZero() {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		if _, duplicate := result.componentRetirements[value.ComponentName]; duplicate {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		result.componentRetirements[value.ComponentName] = value
+	}
+	for name := range expected {
+		_, recorded := result.componentRetirements[name]
+		if recorded && states[name] != generatedruntimestate.ComponentStopped ||
+			!recorded && states[name] != generatedruntimestate.ComponentDraining {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+	}
+	for _, value := range database.Runtime.PredecessorRetirementReceipts {
+		if value.ActivationReceiptID == receiptID ||
+			value.SuccessorDeploymentID == result.activation.SuccessorDeploymentID {
+			return result, false, nil
+		}
+	}
+	for _, value := range database.Runtime.AccountingHandoffAuthorizations {
+		if value.ActivationReceiptID == receiptID ||
+			value.SuccessorDeploymentID == result.activation.SuccessorDeploymentID {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+	}
+	for _, value := range database.Runtime.AccountingHandoffReceipts {
+		if value.ActivationReceiptID == receiptID ||
+			value.SuccessorDeploymentID == result.activation.SuccessorDeploymentID {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+	}
+	for _, value := range database.Runtime.RouteCompletionReceipts {
+		if value.ActivationReceiptID == receiptID ||
+			value.SuccessorDeploymentID == result.activation.SuccessorDeploymentID {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+	}
+	return result, true, nil
+}
+
+func generatedDomainColdRunningBindingRetainsRetirementPrefix(
+	database deployments.GeneratedDomainStartupSnapshot, groups []generatedDomainColdGroup,
+	operation deployments.GeneratedDomainStartupLifecycleOperation, retained generatedDomainColdGroup,
+) bool {
+	if retained.kind != generatedDomainColdRisky || !retained.snapshot.lifecycleRetained {
+		return false
+	}
+	matches := 0
+	for _, successor := range groups {
+		prefix, found, err := generatedDomainColdPredecessorRetirementPrefix(database, successor, groups)
+		if err != nil || !found || prefix.activation.PredecessorDeploymentID != retained.pins.deploymentID ||
+			successor.pins.applicationID() != operation.AppID {
+			continue
+		}
+		headCount := 0
+		for _, group := range groups {
+			if group.pins.applicationID() == successor.pins.applicationID() &&
+				group.snapshot.observedHead.deploymentID == group.pins.deploymentID {
+				headCount++
+			}
+		}
+		bindingCount := 0
+		for _, binding := range database.LifecycleBindings {
+			if binding.DeploymentJobID != successor.pins.jobID() {
+				continue
+			}
+			bindingCount++
+			if headCount != 1 || binding.AppID != operation.AppID ||
+				binding.Mode != deploymentbinding.ModeRunning || binding.DesiredRevision != operation.DesiredRevision ||
+				binding.AuthorizingOperationID != operation.JobID {
+				return false
+			}
+		}
+		if bindingCount == 1 {
+			matches++
+		}
+	}
+	return matches == 1
+}
+
 // validateGeneratedDomainColdLifecycleRetention is the cold-only exception to
 // fresh candidate admission's blanket lifecycle-retention refusal. Retained
 // operations remain descriptive history. Only the exact operation selected by
@@ -726,7 +883,9 @@ func validateGeneratedDomainColdLifecycleRetention(database deployments.Generate
 		}
 		seenOperations[identity] = struct{}{}
 		group, ok := generatedDomainColdGroupByDeployment(groups, operation.DeploymentID)
-		if !ok || group.pins.applicationID() != operation.AppID || group.kind != generatedDomainColdHistorical {
+		if !ok || group.pins.applicationID() != operation.AppID ||
+			group.kind != generatedDomainColdHistorical &&
+				!generatedDomainColdRunningBindingRetainsRetirementPrefix(database, groups, operation, group) {
 			return errGeneratedDomainConstructionRefused
 		}
 		retained[operation.DeploymentID]++
@@ -920,8 +1079,9 @@ func generatedDomainColdArtifactsMatch(values []deployments.GeneratedDomainStart
 
 func classifyGeneratedDomainColdGroup(pins candidateValidationPins, snapshot candidateAdmissionSnapshot,
 	groups []generatedDomainColdGroup,
-	activations []generatedruntimestate.GeneratedDomainStartupRouteActivation,
+	database deployments.GeneratedDomainStartupSnapshot,
 ) (generatedDomainColdGroupKind, bool, bool, bool, error) {
+	activations := database.Runtime.RouteActivations
 	all := func(states ...generatedruntimestate.ComponentState) bool {
 		allowed := make(map[generatedruntimestate.ComponentState]struct{}, len(states))
 		for _, state := range states {
@@ -985,6 +1145,31 @@ func classifyGeneratedDomainColdGroup(pins candidateValidationPins, snapshot can
 			return generatedDomainColdCurrent, true, true, legacy, nil
 		}
 		if all(generatedruntimestate.ComponentDraining) {
+			return generatedDomainColdRisky, false, false, false, nil
+		}
+		mixedDrainingStopped := false
+		if all(generatedruntimestate.ComponentDraining, generatedruntimestate.ComponentStopped) {
+			seenDraining, seenStopped := false, false
+			for _, component := range snapshot.components {
+				seenDraining = seenDraining || component.state == generatedruntimestate.ComponentDraining
+				seenStopped = seenStopped || component.state == generatedruntimestate.ComponentStopped
+			}
+			mixedDrainingStopped = seenDraining && seenStopped
+		}
+		if mixedDrainingStopped {
+			matched := 0
+			for _, successor := range groups {
+				prefix, found, err := generatedDomainColdPredecessorRetirementPrefix(database, successor, groups)
+				if err != nil {
+					return 0, false, false, false, err
+				}
+				if found && prefix.predecessorGroup.pins.deploymentID == pins.deploymentID {
+					matched++
+				}
+			}
+			if matched != 1 {
+				return 0, false, false, false, errGeneratedDomainConstructionRefused
+			}
 			return generatedDomainColdRisky, false, false, false, nil
 		}
 		if all(generatedruntimestate.ComponentStopped, generatedruntimestate.ComponentFailed) {
@@ -1499,6 +1684,13 @@ func generatedDomainColdDrainingDebtEvidence(database deployments.GeneratedDomai
 func generatedDomainColdDrainingDebtDeployments(database deployments.GeneratedDomainStartupSnapshot,
 	group generatedDomainColdGroup, groups []generatedDomainColdGroup,
 ) ([]string, error) {
+	prefix, pendingRetirement, err := generatedDomainColdPredecessorRetirementPrefix(database, group, groups)
+	if err != nil {
+		return nil, err
+	}
+	if pendingRetirement {
+		return []string{group.pins.deploymentID, prefix.activation.PredecessorDeploymentID}, nil
+	}
 	restored, err := generatedDomainColdDrainingDebtEvidence(database, group, groups)
 	if err != nil || !restored {
 		return nil, err
@@ -1731,6 +1923,9 @@ func attestGeneratedDomainColdGroupsWithRetainedProofs(ctx context.Context, mana
 	retainedGateway *generatedDomainColdRetainedGatewayProof,
 	retainedV2Proof *generatedDomainColdRetainedV2Proof,
 ) error {
+	type retirementComponent struct {
+		deploymentID, component string
+	}
 	type expectedObject struct {
 		name, id string
 		labels   map[string]string
@@ -1738,6 +1933,22 @@ func attestGeneratedDomainColdGroupsWithRetainedProofs(ctx context.Context, mana
 	containers := make(map[string]expectedObject)
 	images := make(map[string]expectedObject)
 	networks := make(map[string]expectedObject)
+	recoverableRetirement := make(map[retirementComponent]struct{})
+	for _, group := range groups {
+		prefix, found, err := generatedDomainColdPredecessorRetirementPrefix(observed.database, group, groups)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		for _, component := range prefix.predecessorRoster {
+			if _, recorded := prefix.componentRetirements[component.ComponentName]; !recorded {
+				recoverableRetirement[retirementComponent{deploymentID: component.DeploymentID,
+					component: component.ComponentName}] = struct{}{}
+			}
+		}
+	}
 	builder, err := attestGeneratedDomainColdBuilder(ctx, manager, authority, observed.docker)
 	if err != nil {
 		return err
@@ -1790,23 +2001,32 @@ func attestGeneratedDomainColdGroupsWithRetainedProofs(ctx context.Context, mana
 				actual, found, err := authority.inspectCandidate(ctx, component.containerID)
 				expectedIdentity := policy.identity
 				expectedIdentity.ContainerID = component.containerID
-				if err != nil || !found || !generatedcontainer.MatchesRunning(actual, expectedIdentity, policy.limits) ||
-					!generatedcontainer.CurrentlyRunning(actual) ||
+				_, recoveredRetirement := recoverableRetirement[retirementComponent{
+					deploymentID: group.pins.deploymentID, component: component.plan.Name}]
+				validPhysical := found && generatedcontainer.MatchesRunning(actual, expectedIdentity, policy.limits) &&
+					generatedcontainer.CurrentlyRunning(actual)
+				if recoveredRetirement {
+					validPhysical = !found || generatedcontainer.MatchesConfigured(actual, expectedIdentity, policy.limits) &&
+						(generatedcontainer.CurrentlyRunning(actual) || candidateRemovableState(actual))
+				}
+				if err != nil || !validPhysical ||
 					(component.state == generatedruntimestate.ComponentHealthy && actual.Health != "healthy") {
 					return generatedDomainConstructionBoundaryDiagnostic(
 						generatedDomainConstructionStageColdConstruction,
 						generatedDomainConstructionReasonColdGroupContainerAttestation,
 						errors.Join(errGeneratedDomainConstructionRefused, err))
 				}
-				container := expectedObject{name: policy.identity.ContainerName,
-					id: component.containerID, labels: candidatePolicyContainerLabels(policy)}
-				if previous, exists := containers[component.containerID]; exists && !reflect.DeepEqual(previous, container) {
-					return generatedDomainConstructionBoundaryDiagnostic(
-						generatedDomainConstructionStageColdConstruction,
-						generatedDomainConstructionReasonColdGroupStructure,
-						errGeneratedDomainConstructionRefused)
+				if found {
+					container := expectedObject{name: policy.identity.ContainerName,
+						id: component.containerID, labels: candidatePolicyContainerLabels(policy)}
+					if previous, exists := containers[component.containerID]; exists && !reflect.DeepEqual(previous, container) {
+						return generatedDomainConstructionBoundaryDiagnostic(
+							generatedDomainConstructionStageColdConstruction,
+							generatedDomainConstructionReasonColdGroupStructure,
+							errGeneratedDomainConstructionRefused)
+					}
+					containers[component.containerID] = container
 				}
-				containers[component.containerID] = container
 				network := expectedObject{name: policy.identity.NetworkName,
 					labels: map[string]string{"io.rig.managed": "generated-runtime-network",
 						"io.rig.application": policy.identity.AppID}}

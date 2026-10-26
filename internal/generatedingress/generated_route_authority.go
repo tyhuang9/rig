@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentexecution"
@@ -18,12 +19,13 @@ import (
 // GeneratedRouteAuthority owns route pinning and atomic activation for the
 // exact Manager and candidate owner published by one GeneratedDomain.
 type GeneratedRouteAuthority struct {
-	self         *GeneratedRouteAuthority
-	manager      *Manager
-	candidates   *GeneratedCandidateAuthority
-	stores       *deployments.GeneratedOwnerStores
-	runtime      *generatedruntimestate.Repository
-	construction *generatedDomainConstruction
+	self                    *GeneratedRouteAuthority
+	manager                 *Manager
+	candidates              *GeneratedCandidateAuthority
+	stores                  *deployments.GeneratedOwnerStores
+	runtime                 *generatedruntimestate.Repository
+	construction            *generatedDomainConstruction
+	waitRecoveredRetirement func(context.Context, time.Duration) error
 }
 
 func newGeneratedRouteAuthority(manager *Manager, candidates *GeneratedCandidateAuthority,
@@ -34,7 +36,8 @@ func newGeneratedRouteAuthority(manager *Manager, candidates *GeneratedCandidate
 		return nil, errors.New("generated route authority configuration is invalid")
 	}
 	result := &GeneratedRouteAuthority{manager: manager, candidates: candidates, stores: stores,
-		runtime: generatedruntimestate.New(stores.Database())}
+		runtime:                 generatedruntimestate.New(stores.Database()),
+		waitRecoveredRetirement: waitGeneratedRouteRecoveredRetirement}
 	result.self = result
 	return result, nil
 }
@@ -49,12 +52,27 @@ func (a *GeneratedRouteAuthority) configured() bool {
 	return a != nil && a.self == a && a.manager != nil && a.candidates != nil && a.stores != nil &&
 		a.stores.Configured() && a.candidates.stores == a.stores &&
 		a.candidates.ledger != nil && a.candidates.heads != nil &&
+		a.waitRecoveredRetirement != nil &&
 		a.runtime != nil && a.runtime.UsesDatabase(a.stores.Database()) &&
 		a.manager.domainView != nil && a.manager.domainView.manager == a.manager &&
 		(a.construction == nil || (a.construction.routes == a &&
 			a.construction.manager == a.manager && a.construction.candidates == a.candidates &&
 			a.construction.reservation != nil && a.construction.domain != nil &&
 			a.construction.domain.construction == a.construction))
+}
+
+func waitGeneratedRouteRecoveredRetirement(ctx context.Context, delay time.Duration) error {
+	if ctx == nil || delay < 0 {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // GeneratedRouteExecution is a one-shot sealed route and activation
