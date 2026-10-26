@@ -352,6 +352,32 @@ type candidateRecoveredCompletionHold struct {
 	lifecycle   *candidateOperationLifecycle
 }
 
+type candidateRecoveredCompletionGuard interface {
+	valid() bool
+	leave()
+}
+
+// candidateRecoveredAccountingHandoffHold pins both exact cold-restored
+// rosters while a fresh worker finishes the already-durable predecessor
+// retirement. It can transition those fixed entries into the existing
+// accounting handoff, but it cannot acquire capacity or replace any token.
+type candidateRecoveredAccountingHandoffHold struct {
+	ledger              *candidateCapacityLedger
+	coordinator         *generatedDomainCapacityCoordinator
+	successorGroup      *candidateCapacityGroup
+	predecessorGroup    *candidateCapacityGroup
+	successorSpec       candidateGroupSpec
+	predecessorSpec     candidateGroupSpec
+	successorReceipts   map[string]string
+	predecessorReceipts map[string]string
+	successorTokens     []candidateRosterToken
+	predecessorTokens   []candidateRosterToken
+	successor           []candidateAccountingHandoffEntry
+	predecessor         []candidateAccountingHandoffEntry
+	accounting          *candidateAccountingHandoffOperation
+	lifecycle           *candidateOperationLifecycle
+}
+
 func newCandidateCapacityLedger(budget *generatedcapacity.Budget,
 	coordinators ...*generatedDomainCapacityCoordinator,
 ) (*candidateCapacityLedger, error) {
@@ -524,6 +550,218 @@ func (l *candidateCapacityLedger) holdRecoveredCompletionRoster(spec candidateGr
 		return nil, errCandidateCapacityStale
 	}
 	return hold, nil
+}
+
+func (l *candidateCapacityLedger) holdRecoveredAccountingHandoff(successorSpec,
+	predecessorSpec candidateGroupSpec, successorReceipts, predecessorReceipts map[string]string,
+) (*candidateRecoveredAccountingHandoffHold, error) {
+	if l == nil || l.budget == nil || l.coordinator == nil {
+		return nil, errCandidateCapacityInvalid
+	}
+	successor, err := normalizeCandidateGroupSpec(successorSpec)
+	if err != nil {
+		return nil, err
+	}
+	predecessor, err := normalizeCandidateGroupSpec(predecessorSpec)
+	if err != nil || successor.appID != predecessor.appID ||
+		successor.deploymentID == predecessor.deploymentID ||
+		len(successorReceipts) != len(successor.components) ||
+		len(predecessorReceipts) != len(predecessor.components) {
+		return nil, errCandidateCapacityInvalid
+	}
+	l.mu.Lock()
+	successorGroup := l.groups[candidateCapacityGroupKey{appID: successor.appID,
+		deploymentID: successor.deploymentID}]
+	predecessorGroup := l.groups[candidateCapacityGroupKey{appID: predecessor.appID,
+		deploymentID: predecessor.deploymentID}]
+	l.mu.Unlock()
+	if successorGroup == nil || predecessorGroup == nil || successorGroup == predecessorGroup {
+		return nil, errCandidateCapacityStale
+	}
+	hold := &candidateRecoveredAccountingHandoffHold{
+		ledger: l, coordinator: l.coordinator, successorGroup: successorGroup,
+		predecessorGroup: predecessorGroup, successorSpec: successor, predecessorSpec: predecessor,
+		successorReceipts:   cloneCandidateReceiptIDs(successorReceipts),
+		predecessorReceipts: cloneCandidateReceiptIDs(predecessorReceipts),
+		successorTokens:     make([]candidateRosterToken, 0, len(successor.components)),
+		predecessorTokens:   make([]candidateRosterToken, 0, len(predecessor.components)),
+		successor:           make([]candidateAccountingHandoffEntry, 0, len(successor.components)),
+		predecessor:         make([]candidateAccountingHandoffEntry, 0, len(predecessor.components)),
+		lifecycle:           &candidateOperationLifecycle{},
+	}
+	unlock := lockCandidateAccountingGroups(successorGroup, predecessorGroup)
+	defer unlock()
+	if !candidateRecoveredAccountingGroupMatchesLocked(successorGroup, successor) ||
+		!candidateRecoveredAccountingGroupMatchesLocked(predecessorGroup, predecessor) {
+		return nil, errCandidateCapacityPinsChanged
+	}
+	for _, value := range []struct {
+		group    *candidateCapacityGroup
+		receipts map[string]string
+		physical candidatePhysicalState
+		entries  *[]candidateAccountingHandoffEntry
+	}{{successorGroup, hold.successorReceipts, candidatePhysicalHandedToRoute,
+		&hold.successor},
+		{predecessorGroup, hold.predecessorReceipts, candidatePhysicalConfirmedAbsent,
+			&hold.predecessor}} {
+		for _, name := range value.group.components {
+			component := value.group.byName[name]
+			entry, ok := candidateRecoveredAccountingEntryLocked(component, value.group,
+				value.receipts[name], value.physical, l.coordinator)
+			if !ok || component.tokenHeld {
+				return nil, errCandidateCapacityStale
+			}
+			*value.entries = append(*value.entries, entry)
+		}
+	}
+	// No generation becomes held until both complete rosters have passed the
+	// same locked validation. A crossed or stale predecessor therefore cannot
+	// strand an otherwise valid successor behind a partial hold.
+	for _, value := range []struct {
+		entries []candidateAccountingHandoffEntry
+		tokens  *[]candidateRosterToken
+	}{{hold.successor, &hold.successorTokens}, {hold.predecessor, &hold.predecessorTokens}} {
+		for _, entry := range value.entries {
+			entry.component.tokenHeld = true
+			entry.component.tokenGeneration++
+			if entry.component.tokenGeneration == 0 {
+				entry.component.tokenGeneration++
+			}
+			*value.tokens = append(*value.tokens, candidateRosterToken{
+				component: entry.component, generation: entry.component.tokenGeneration})
+		}
+	}
+	return hold, nil
+}
+
+func cloneCandidateReceiptIDs(values map[string]string) map[string]string {
+	result := make(map[string]string, len(values))
+	for name, value := range values {
+		result[name] = value
+	}
+	return result
+}
+
+func candidateRecoveredAccountingGroupMatchesLocked(group *candidateCapacityGroup,
+	spec candidateGroupSpec,
+) bool {
+	return group != nil && !group.reserving && group.pins == spec.pins && group.limits == spec.limits &&
+		equalCandidateRoster(group.components, spec.components)
+}
+
+func candidateRecoveredAccountingEntryLocked(component *candidateCapacityComponent,
+	group *candidateCapacityGroup, receiptID string, physical candidatePhysicalState,
+	coordinator *generatedDomainCapacityCoordinator,
+) (candidateAccountingHandoffEntry, bool) {
+	if group == nil || component == nil || group.byName[component.name] != component || receiptID == "" ||
+		component.receipt == nil || component.receipt.id != receiptID || component.charge == nil ||
+		component.charge.state != candidateChargeActive ||
+		component.charge.owner != candidateAccountingRouteActive || !component.charge.receiptRetained ||
+		component.charge.explicitRetained || component.charge.logicallyRetired {
+		return candidateAccountingHandoffEntry{}, false
+	}
+	word := component.receipt.state.Load()
+	debt, restored := component.charge.token.(*generatedDomainCapacityDebtToken)
+	if !restored || debt == nil || debt.owner != coordinator || !debt.published() ||
+		word&candidateReceiptUnquiesced != 0 || candidatePhysicalFromWord(word) != physical {
+		return candidateAccountingHandoffEntry{}, false
+	}
+	return candidateAccountingHandoffEntry{component: component, charge: component.charge,
+		receipt: component.receipt, epoch: component.charge.epoch, token: component.charge.token,
+		lease: component.charge.lease}, true
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) beginAccountingHandoff() (
+	*candidateAccountingHandoffOperation, error,
+) {
+	if h == nil || h.lifecycle == nil || h.lifecycle.done.Load() || h.accounting != nil {
+		return nil, errCandidateCapacityStale
+	}
+	unlock := lockCandidateAccountingGroups(h.successorGroup, h.predecessorGroup)
+	defer unlock()
+	if !h.validPreparedLocked() {
+		return nil, errCandidateCapacityStale
+	}
+	for index := range h.successor {
+		h.successor[index].charge.explicitRetained = true
+		h.successor[index].charge.owner = candidateAccountingTransferring
+	}
+	for index := range h.predecessor {
+		h.predecessor[index].charge.explicitRetained = true
+		h.predecessor[index].charge.owner = candidateAccountingPredecessorRetiring
+	}
+	h.accounting = &candidateAccountingHandoffOperation{ledger: h.ledger,
+		successorGroup: h.successorGroup, predecessorGroup: h.predecessorGroup,
+		successor:   append([]candidateAccountingHandoffEntry(nil), h.successor...),
+		predecessor: append([]candidateAccountingHandoffEntry(nil), h.predecessor...)}
+	return h.accounting, nil
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) validPrepared() bool {
+	if h == nil || h.lifecycle == nil || h.lifecycle.done.Load() || h.accounting != nil {
+		return false
+	}
+	unlock := lockCandidateAccountingGroups(h.successorGroup, h.predecessorGroup)
+	defer unlock()
+	return h.validPreparedLocked()
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) validPreparedLocked() bool {
+	if !candidateRecoveredAccountingGroupMatchesLocked(h.successorGroup, h.successorSpec) ||
+		!candidateRecoveredAccountingGroupMatchesLocked(h.predecessorGroup, h.predecessorSpec) {
+		return false
+	}
+	if _, ok := candidateAccountingTokensLocked(h.successorGroup, h.successorTokens); !ok {
+		return false
+	}
+	if _, ok := candidateAccountingTokensLocked(h.predecessorGroup, h.predecessorTokens); !ok {
+		return false
+	}
+	for _, value := range []struct {
+		entries  []candidateAccountingHandoffEntry
+		group    *candidateCapacityGroup
+		receipts map[string]string
+		physical candidatePhysicalState
+	}{{h.successor, h.successorGroup, h.successorReceipts, candidatePhysicalHandedToRoute},
+		{h.predecessor, h.predecessorGroup, h.predecessorReceipts, candidatePhysicalConfirmedAbsent}} {
+		for _, entry := range value.entries {
+			current, ok := candidateRecoveredAccountingEntryLocked(entry.component, value.group,
+				value.receipts[entry.component.name], value.physical, h.coordinator)
+			if !ok || current.charge != entry.charge || current.receipt != entry.receipt ||
+				current.epoch != entry.epoch || current.token != entry.token || current.lease != entry.lease {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) valid() bool {
+	if h == nil || h.lifecycle == nil || h.lifecycle.done.Load() || h.accounting == nil {
+		return false
+	}
+	unlock := lockCandidateAccountingGroups(h.successorGroup, h.predecessorGroup)
+	_, successorOK := candidateAccountingTokensLocked(h.successorGroup, h.successorTokens)
+	_, predecessorOK := candidateAccountingTokensLocked(h.predecessorGroup, h.predecessorTokens)
+	unlock()
+	return successorOK && predecessorOK && h.accounting.validateFinalState() == nil
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) leave() {
+	if h == nil || h.lifecycle == nil || h.lifecycle.done.Swap(true) {
+		return
+	}
+	unlock := lockCandidateAccountingGroups(h.successorGroup, h.predecessorGroup)
+	for _, token := range append(append([]candidateRosterToken(nil), h.successorTokens...),
+		h.predecessorTokens...) {
+		if token.component != nil && token.component.tokenHeld &&
+			token.component.tokenGeneration == token.generation {
+			token.component.tokenHeld = false
+		}
+	}
+	h.successorGroup.changed.Broadcast()
+	h.predecessorGroup.changed.Broadcast()
+	unlock()
 }
 
 func (h *candidateRecoveredCompletionHold) valid() bool {
@@ -1219,7 +1457,8 @@ func (l *candidateCapacityLedger) seedColdOwnershipWithDebt(spec candidateGroupS
 		seed, found := receipts[name]
 		if !found || seed.id == "" || tokens[index] == nil || tokens[index].owner != l.coordinator ||
 			!tokens[index].configured() ||
-			(seed.physical != candidatePhysicalPresent && seed.physical != candidatePhysicalHandedToRoute) {
+			(seed.physical != candidatePhysicalPresent && seed.physical != candidatePhysicalHandedToRoute &&
+				seed.physical != candidatePhysicalConfirmedAbsent) {
 			return errCandidateCapacityInvalid
 		}
 		if _, duplicate := seenTokens[tokens[index]]; duplicate {

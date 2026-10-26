@@ -261,6 +261,96 @@ func TestCandidateCapacityRestoredPredecessorReleasesExactDebtAndKeepsSuccessorC
 	}
 }
 
+func TestCandidateCapacityRecoveredHandoffTransfersExactDualDebt(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	runner.capacityOutput = []byte("30 30\n")
+	coordinator, err := newGeneratedDomainCapacityCoordinator(manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := coordinator.installBootstrapBatch([]generatedcapacity.Limits{
+		{MemoryBytes: 10, DiskBytes: 10}, {MemoryBytes: 10, DiskBytes: 10},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.sealBootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	budget, err := generatedcapacity.New(coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := newCandidateCapacityLedger(budget, coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	predecessorSpec := candidateCapacityTestSpec("app-recovered", "deployment-old", "web")
+	successorSpec := candidateCapacityTestSpec("app-recovered", "deployment-new", "web")
+	if err := ledger.seedColdOwnershipWithDebt(predecessorSpec, map[string]candidateColdReceiptSeed{
+		"web": {id: "receipt-old", physical: candidatePhysicalConfirmedAbsent},
+	}, tokens[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.seedColdOwnershipWithDebt(successorSpec, map[string]candidateColdReceiptSeed{
+		"web": {id: "receipt-new", physical: candidatePhysicalHandedToRoute},
+	}, tokens[1:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.publishRestoredOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	successorGroup := ledger.groups[candidateCapacityGroupKey{appID: successorSpec.appID,
+		deploymentID: successorSpec.deploymentID}]
+	predecessorGroup := ledger.groups[candidateCapacityGroupKey{appID: predecessorSpec.appID,
+		deploymentID: predecessorSpec.deploymentID}]
+	if rejected, err := ledger.holdRecoveredAccountingHandoff(successorSpec, predecessorSpec,
+		map[string]string{"web": "receipt-new"}, map[string]string{"web": "crossed-receipt"}); !errors.Is(err, errCandidateCapacityStale) || rejected != nil ||
+		successorGroup.byName["web"].tokenHeld || predecessorGroup.byName["web"].tokenHeld {
+		t.Fatalf("crossed recovered hold=%#v successorHeld=%t predecessorHeld=%t error=%v",
+			rejected, successorGroup.byName["web"].tokenHeld,
+			predecessorGroup.byName["web"].tokenHeld, err)
+	}
+	hold, err := ledger.holdRecoveredAccountingHandoff(successorSpec, predecessorSpec,
+		map[string]string{"web": "receipt-new"}, map[string]string{"web": "receipt-old"})
+	if err != nil || !hold.validPrepared() {
+		t.Fatalf("recovered accounting hold=%#v valid=%t error=%v", hold, hold != nil && hold.validPrepared(), err)
+	}
+	defer hold.leave()
+	accounting, err := hold.beginAccountingHandoff()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := accounting.markGatewayUnlocked(); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounting.releasePredecessorOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if err := accounting.releasePredecessorOnce(); err != nil {
+		t.Fatalf("recovered predecessor release replay: %v", err)
+	}
+	if !hold.valid() || coordinator.memory != 10 || coordinator.disk != 10 ||
+		len(coordinator.tokens) != 1 || tokens[0].configured() || !tokens[1].published() {
+		t.Fatalf("recovered accounting final valid=%t memory=%d disk=%d tokens=%d predecessor=%t successor=%t",
+			hold.valid(), coordinator.memory, coordinator.disk, len(coordinator.tokens),
+			tokens[0].configured(), tokens[1].published())
+	}
+	successorCharge := successorGroup.byName["web"].charge
+	predecessorCharge := predecessorGroup.byName["web"].charge
+	if successorCharge.owner != candidateAccountingRouteActive || successorCharge.state != candidateChargeActive ||
+		successorCharge.token != tokens[1] || successorCharge.logicallyRetired ||
+		predecessorCharge.owner != candidateAccountingPredecessorRetired ||
+		predecessorCharge.state != candidateChargeReleased || predecessorCharge.token != nil ||
+		!predecessorCharge.logicallyRetired {
+		t.Fatalf("recovered accounting successor=%+v predecessor=%+v", successorCharge, predecessorCharge)
+	}
+	hold.leave()
+	if hold.valid() || successorGroup.byName["web"].tokenHeld || predecessorGroup.byName["web"].tokenHeld {
+		t.Fatal("closed recovered handoff retained live roster authority")
+	}
+}
+
 func candidateCapacityTestSpec(
 	appID string,
 	deploymentID string,
