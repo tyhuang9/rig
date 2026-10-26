@@ -67,3 +67,73 @@ acceptance is claimed.
 Revert the test change through its PR to restore the previous nested
 process arrangement. There is no production data, schema, authority,
 runtime-resource or immutable-history migration.
+
+## Follow-up: hosted race deadline
+
+The wrapper removal passed the hosted Windows retained partition on the exact
+PR #248 head `e5b5ded1aae368bd2579b5b400f6c6296dd787a6`, synthetic checkout
+`6d6cc22545935c98c5995e958f07b7fca206db11`.
+[Windows job 121547973705](https://github.com/tyhuang9/rig/actions/runs/40315803530/job/121547973705)
+ran the positive case in 74.57 seconds and the two negative cases in 72.61 and
+73.05 seconds. The negative parent took 145.67 seconds. Its raw-log SHA-256 is
+`a83f08506f7c0766a78758e546651dfcab23351afa75dd64fdb1f8b0164ce681`.
+
+Both hosted Linux race partitions still failed those three cases at the
+90-second child deadline:
+
+| Job | Raw-log SHA-256 |
+| --- | --- |
+| [Repository retained race](https://github.com/tyhuang9/rig/actions/runs/40315803531/job/121547973434) | `7acdd8532bb7d65c1e387305b3227b25875a3807f8587a9526e2df0acbeac3ae` |
+| [Generated-runtime retained race](https://github.com/tyhuang9/rig/actions/runs/40315803432/job/121547974537) | `a83ec45cddbb4e29114b190c1b24a66442fe304b5f7f82b83273ff3ff03e26a6` |
+
+All three captured stacks were still executing the authentic A0 fixture's
+`RecoverGatewayRebindStartup` call, before the target assertions. They show
+runnable canonical history/progress validation. No data-race marker was found;
+that does not make either failed race job a pass or establish a deadlock.
+
+The focused follow-up gives only these three fixture cases a 150-second child
+deadline and a three-minute outer command context. Other registry-isolated
+tests retain their 90-second/two-minute defaults. Each case keeps its own fresh
+process, real producer, full proofs, assertions, failure propagation and cleanup.
+Invalid bounds must refuse before process creation. No production deadline,
+race instrumentation, case selector or workflow envelope changes.
+
+Comparable retained parents completed in 98–133 seconds under race
+instrumentation. This supports testing a fixture-specific allowance, but does
+not prove that these three cases will finish within 150 seconds. Adding the
+three extra 60-second child allowances to the observed failed-step durations
+gives conditional projections of 29m26s and 29m39s. These are not worst-case
+bounds: runner performance and other test durations can vary. The enclosing
+32-minute package, 34-minute step and 42-minute job limits remain unchanged.
+
+The follow-up's fresh pinned Windows Go 1.26.7 binary passed the exact two-parent
+selection in 220.250 seconds: isolated child durations were positive 74.02
+seconds, crossed identity 73.14 seconds, and unrelated container 72.99 seconds.
+Both parents and both named
+negative rows passed, with no failure, skip, timeout or stderr output. The
+selection used `-test.v -test.timeout=10m` with the exact two-parent selector,
+the binary's default count of one, and a 660-second outer runner. Each isolated
+child explicitly uses `-test.count=1`. This is local non-race evidence.
+
+The tested source manifest is
+`7bdcf441e88cd4ab254233a5cac5eb6ee12b895cfa08c07a2222b0145f20f741`;
+the fresh binary is
+`18490ac80c76798fb9d23d6e611f9f6c8e262388fad8805f7cc7019d863a5aea`.
+The earlier pre-correction freeze was never executed. The tested version also
+preserves the original wrapper's `t.Helper()` caller attribution.
+
+Final source manifest
+`92dcaa975e694c0fbea8ef0dcc41f107c3e0e0176febc3250e71c765162d0a3d`
+differs only by alignment whitespace on the two new timeout constants. Exact
+inverse replacements bind it to the tested source; no behavior rerun is claimed
+for that formatting-only successor. Final Git LF formatting, diff and source
+stability checks passed, recorded in
+`f809f8b5aef73a0e65f3cf2f4358b522399c8bdf31d99851da60bd614dcb52aa`.
+The earlier formatting output is retained as a failed check. Scoped vet and
+canonical generation passed on the behavior-equivalent tested source.
+
+Hosted acceptance requires both Linux race partitions to pass, with all three
+cases below their child limits and no race report. If the new deadline is
+reached, retain the stack and investigate the measured work before changing
+the allowance again. These local and Windows passes do not substitute for
+that acceptance.

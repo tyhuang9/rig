@@ -307,7 +307,8 @@ func generatedDomainRetainedV2EndpointInspections(physical []candidateOwnerPhysi
 }
 
 func TestGeneratedDomainColdFirstRecoveryAccountsAuthenticatedRetainedNativeV2Predecessor(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
+	if !generatedDomainRegistryIsolatedWithTimeouts(t,
+		generatedDomainRetainedV2FixtureChildTimeout, generatedDomainRetainedV2FixtureOuterTimeout) {
 		return
 	}
 	fixture := newGeneratedDomainRetainedV2A0Fixture(t, nil)
@@ -376,7 +377,8 @@ func TestGeneratedDomainColdFirstRecoveryRefusesInvalidRetainedNativeV2Predecess
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if !generatedDomainRegistryIsolated(t) {
+			if !generatedDomainRegistryIsolatedWithTimeouts(t,
+				generatedDomainRetainedV2FixtureChildTimeout, generatedDomainRetainedV2FixtureOuterTimeout) {
 				return
 			}
 			fixture := newGeneratedDomainRetainedV2A0Fixture(t, test.mutate)
@@ -406,6 +408,8 @@ type generatedDomainRetainedV2ColdProofs struct {
 const (
 	generatedDomainRetainedV2ExpectedV1RestartReads = 5
 	generatedDomainRetainedV2ExpectedV2RestartReads = 4
+	generatedDomainRetainedV2FixtureChildTimeout    = 150 * time.Second
+	generatedDomainRetainedV2FixtureOuterTimeout    = 3 * time.Minute
 )
 
 func generatedDomainRetainedV2AttestColdBoundary(t *testing.T,
