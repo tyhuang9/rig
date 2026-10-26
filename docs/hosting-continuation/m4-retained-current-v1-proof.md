@@ -108,3 +108,68 @@ Revert the compatibility proof through the PR path, preserving immutable
 history and evidence. The earlier implementation will again reject this
 recovered CurrentV1 form. No migration, database provisioning or resource
 cleanup is involved.
+
+## Hosted recovery result and correspondence diagnostics
+
+[PR #243's first A0 run](https://github.com/tyhuang9/rig/actions/runs/40271403317/job/121404806749)
+at 5357344e57969df1effed8d10d797290aaf24da7 passed the earlier retained-selection
+boundary, then failed in first_recovery at
+cold_construction/cold_group_correspondence. The child ran for 431.47 seconds;
+independent fixture cleanup succeeded. Raw log SHA-256:
+266699c641c748bcaa18aa7c3e85e9329f569769dcd50dffeaf18684d163c19f.
+This is progress through construction, but A0 remains unaccepted.
+
+Five different existing refusal sites shared that reason. The follow-up
+assigns each site a fixed reason after its original predicate has failed:
+
+| Failed obligation | Fixed reason |
+| --- | --- |
+| Verify absence of a non-present component | cold_group_component_absence |
+| Match a selected container ID and name | cold_group_container_correspondence |
+| Match a selected network name | cold_group_network_correspondence |
+| Match a selected image and its content ID | cold_group_image_correspondence |
+| Account for the remaining selected object kind | cold_group_other_correspondence |
+
+An absence-verification failure can mean an inspection error or a found
+component. The reason does not assert presence. The original predicates,
+ordering, inspection calls, refusal sentinel and nested causes remain intact.
+The legacy aggregate reason stays in the closed parser for compatibility.
+The hostd projections accept only the enumerated reasons in cold_construction;
+they do not emit object IDs, names, paths, labels or private error text.
+
+These diagnostics identify the refused obligation. They cannot establish the
+responsible object, cross-process physical stability or a safe ownership
+exception. A new authentic hosted A0 run is required before choosing a
+behavioral repair. The separate restart-accounting defect, live-fixture
+composition failures and aggregate race-test timeouts remain open.
+
+### Local diagnostic verification
+
+The final focused evidence covers five ingress parents and one hostd parent.
+The initial fresh binary passed the existing positive roster, crossed-container
+roster and closed diagnostic grammar. Two new fixture controls failed because
+an empty network ID matched an empty builder ID and later refusals already
+carried an absent retained-proof envelope. Those failures remain recorded.
+
+The corrected fresh binary passed both affected ingress parents and all four
+new cases. A fresh hostd binary passed TestLiveHostdRebindClosedDiagnosticControls,
+which exercises both affected hostd projection surfaces and rejection of
+crossed stage/reason pairs. The unchanged passing parents are reused with
+source bindings; this is not a claim that the initial entire run passed.
+No selected case was skipped.
+
+Before retained-proof creation, the control requires an empty proof. Later
+refusals require absent presence, a nonempty digest, nil authority and no
+retained objects; they do not compare exact digest bytes. Each new control
+checks the refusal sentinel and excludes mutating, capacity-probe and
+interactive gateway commands after its measurement point.
+
+Verification used the pinned Windows Go 1.26.7 toolchain, GOTOOLCHAIN=local,
+GOFLAGS=-mod=readonly -p=1 -buildvcs=false and CGO_ENABLED=0. Exact discovery,
+six-file gofmt, scoped ingress and live_docker hostd vet, canonical generation
+and git diff --check passed. Source/security review accepted the frozen
+successor source. Source manifest SHA-256:
+c1b068f88be23bfb1c1ca51bda6a17cec9a1c130e68baf7b8e9cd5daad39f232.
+
+The local controls use simulated Docker responses. They do not replace the
+hosted A0 recovery journey or Linux race checks.
