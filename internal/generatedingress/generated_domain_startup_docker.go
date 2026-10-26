@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"reflect"
 	"sort"
 	"strconv"
@@ -69,6 +70,7 @@ type generatedDomainGatewayExpectation struct {
 	currentV2   *gatewayCurrentRouteStateV2
 	terminal    *gatewayRebindAttemptTerminalView
 	retainedV1  *generatedDomainRetainedV1Projection
+	retainedV2  *generatedDomainRetainedV2Projection
 	names       map[string]map[string]struct{}
 	ids         map[string]map[string]struct{}
 }
@@ -851,8 +853,8 @@ func (r *generatedDomainStartupReader) readDetailedVolume(ctx context.Context, d
 			errors.New("generated domain gateway volume inspection is invalid"))
 	}
 	return volumeInspection{Name: value.Name, Driver: value.Driver, Scope: value.Scope,
-		Options: value.Options, Labels: value.Labels}, gatewayV1VolumeIdentity{Mountpoint: value.Mountpoint,
-		CreatedAt: value.CreatedAt}, nil
+			Options: value.Options, Labels: value.Labels}, gatewayV1VolumeIdentity{Mountpoint: value.Mountpoint,
+			CreatedAt: value.CreatedAt}, nil
 }
 
 func (r *generatedDomainStartupReader) readDetailedNetwork(ctx context.Context, deadline time.Time,
@@ -1506,6 +1508,7 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 	var identity gatewayCurrentIdentity
 	var wanted []byte
 	var token string
+	var applicationOwners map[string]string
 	var err error
 	if expected.currentV1 != nil {
 		state := *expected.currentV1
@@ -1515,6 +1518,7 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 		lineage, profile, networkPlan, identity = state.Lineage, state.Profile, state.Network, state.Identity
 		wanted, err = gatewayCurrentPhysicalConfigBytes(state)
 		token, _ = gatewayCurrentPhysicalProbeToken(state)
+		applicationOwners, _ = gatewayRouteNetworkOwners(gatewayCurrentPhysicalRoutes(state))
 	} else if expected.currentV2 != nil {
 		state := *expected.currentV2
 		if !allowApplicationRoutes && len(state.Apps) != 0 {
@@ -1523,10 +1527,13 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 		lineage, profile, networkPlan, identity = state.Lineage, state.Profile, state.Network, state.Identity
 		wanted, err = gatewayCurrentPhysicalConfigBytesV2(state)
 		token, _ = gatewayCurrentPhysicalProbeTokenV2(state)
+		if projection, projectionErr := projectGatewayCurrentStateV2(state); projectionErr == nil {
+			applicationOwners = projection.NetworkOwners
+		}
 	} else {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway state is unavailable")
 	}
-	if err != nil || identity.Rebind == nil || !validSHA256(token) {
+	if err != nil || applicationOwners == nil || identity.Rebind == nil || !validSHA256(token) {
 		clear(wanted)
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway expectation is invalid")
 	}
@@ -1559,16 +1566,18 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 	if err != nil {
 		return generatedDomainGatewayAttestation{}, err
 	}
+	applications, err := r.readCurrentApplicationNetworks(ctx, deadline, snapshot, container, applicationOwners)
+	if err != nil {
+		return generatedDomainGatewayAttestation{}, err
+	}
 	facts := gatewayFinalOwnershipFacts{Lineage: lineage, Terminal: terminal, Network: networkPlan,
 		LocalHostPort: r.options.HostPort}
 	if !validGatewayPinnedImage(image, true) || !container.Running ||
 		!gatewayFinalOwnershipContainerMatches(facts, container, runtime) ||
 		!gatewayFinalOwnershipVolumeMatches(facts, config, configID, terminal.Resources.ConfigVolume, gatewayV2ConfigVolumeRole) ||
 		!gatewayFinalOwnershipVolumeMatches(facts, data, dataID, terminal.Resources.DataVolume, gatewayV2DataVolumeRole) ||
-		!gatewayFinalOwnershipIngressMatches(facts, ingress, ingressID) || len(container.Networks) != 1 ||
-		len(runtime.ConfiguredNetworks) != 1 || container.Networks[final.IngressNetwork] == nil ||
-		runtime.ConfiguredNetworks[final.IngressNetwork].NetworkID != ingressID ||
-		container.Networks[final.IngressNetwork].IPAddress != networkPlan.ContainerIPv4 {
+		!gatewayFinalOwnershipIngressMatches(facts, ingress, ingressID) ||
+		!generatedDomainCurrentStartupNetworksMatch(*final, networkPlan, container, runtime, ingressID, applications) {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway static identity is invalid")
 	}
 	restart, err := r.readRestartConfig(ctx, deadline, container.ID, final.ActiveConfigFilename)
@@ -1590,6 +1599,84 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 	}
 	return generatedDomainGatewayAttestation{kind: expected.kind, operationID: lineage.OperationID,
 		protectedGeneration: lineage.ProtectedGeneration, stateDigest: expected.stateDigest, exact: true}, nil
+}
+
+func (r *generatedDomainStartupReader) readCurrentApplicationNetworks(ctx context.Context, deadline time.Time,
+	snapshot generatedDomainDockerStartupSnapshot, container caddyInspection, owners map[string]string,
+) ([]gatewayRebindHandoverApplicationNetwork, error) {
+	names := make([]string, 0, len(owners))
+	for name := range owners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	result := make([]gatewayRebindHandoverApplicationNetwork, 0, len(names))
+	identities := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		object, found := generatedDomainObjectByName(snapshot, "network", name)
+		if !found {
+			return nil, errors.New("generated domain current application network is incomplete")
+		}
+		network, id, err := r.readDetailedNetwork(ctx, deadline, object.id)
+		if err != nil || !validApplicationNetwork(network.identity(), owners[name]) ||
+			!validGatewayApplicationNetworkMembership(network, container, name) {
+			return nil, errors.Join(errors.New("generated domain current application network is invalid"), err)
+		}
+		if _, duplicate := identities[id]; duplicate {
+			return nil, errors.New("generated domain current application network identity is duplicated")
+		}
+		identities[id] = struct{}{}
+		result = append(result, gatewayRebindHandoverApplicationNetwork{Name: name, ID: id})
+	}
+	return result, nil
+}
+
+func generatedDomainCurrentStartupNetworksMatch(final gatewayRebindSuccessorIdentity,
+	plan gatewayV2NetworkPlan, container caddyInspection, runtime gatewayContainerRuntime, ingressID string,
+	applications []gatewayRebindHandoverApplicationNetwork,
+) bool {
+	expected := map[string]string{final.IngressNetwork: ingressID}
+	if !validContainerID(ingressID) || normalizeID(ingressID) != ingressID {
+		return false
+	}
+	for _, application := range applications {
+		if application.Name == "" || application.Name == final.IngressNetwork ||
+			!validContainerID(application.ID) || normalizeID(application.ID) != application.ID {
+			return false
+		}
+		if previous, duplicate := expected[application.Name]; duplicate && previous != application.ID {
+			return false
+		}
+		expected[application.Name] = application.ID
+	}
+	if len(expected) != len(applications)+1 || len(runtime.ConfiguredNetworks) != len(expected) ||
+		len(container.Networks) != len(expected) {
+		return false
+	}
+	for name, id := range expected {
+		configured, configuredFound := runtime.ConfiguredNetworks[name]
+		attachment := container.Networks[name]
+		priority := 0
+		if name == final.IngressNetwork {
+			priority = caddyGatewayPriority
+		}
+		address, addressErr := netip.ParseAddr(configured.IPAddress)
+		if !configuredFound || attachment == nil || configured.NetworkID != id ||
+			!validContainerID(configured.EndpointID) || addressErr != nil || !address.Is4() ||
+			address.IsUnspecified() || address.IsMulticast() || attachment.IPAddress != configured.IPAddress ||
+			configured.GwPriority != priority || attachment.GwPriority != priority ||
+			configured.IPv6Gateway != "" || attachment.IPv6Gateway != "" {
+			return false
+		}
+		if name == final.IngressNetwork {
+			if configured.IPAMConfig == nil || configured.IPAMConfig.IPv4Address != plan.ContainerIPv4 ||
+				configured.IPAMConfig.IPv6Address != "" || configured.IPAddress != plan.ContainerIPv4 {
+				return false
+			}
+		} else if configured.IPAMConfig != nil && *configured.IPAMConfig != (gatewayV2ConfiguredIPAM{}) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *generatedDomainStartupReader) attestCurrentV2Upgrade(ctx context.Context, deadline time.Time,
