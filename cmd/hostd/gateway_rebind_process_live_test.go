@@ -539,6 +539,47 @@ func liveHostdRebindWaitReady(t *testing.T, fixture *liveHostdGatewayRebindFixtu
 	return marker
 }
 
+type liveHostdRebindReadyPhase string
+
+const (
+	liveHostdRebindReadyPhaseInitial       liveHostdRebindReadyPhase = "initial"
+	liveHostdRebindReadyPhaseFirstRecovery liveHostdRebindReadyPhase = "first_recovery"
+	liveHostdRebindReadyPhaseThirdNormal   liveHostdRebindReadyPhase = "third_normal"
+)
+
+func validLiveHostdRebindReadyPhase(phase liveHostdRebindReadyPhase) bool {
+	switch phase {
+	case liveHostdRebindReadyPhaseInitial,
+		liveHostdRebindReadyPhaseFirstRecovery,
+		liveHostdRebindReadyPhaseThirdNormal:
+		return true
+	default:
+		return false
+	}
+}
+
+func liveHostdRebindReadyPhaseError(phase liveHostdRebindReadyPhase, err error) error {
+	if !validLiveHostdRebindReadyPhase(phase) || err == nil {
+		return errors.New("full hostd child readiness phase is invalid")
+	}
+	return fmt.Errorf("full hostd child phase=%s readiness: %w", phase, err)
+}
+
+func liveHostdRebindWaitReadyPhase(t *testing.T, fixture *liveHostdGatewayRebindFixture,
+	child *liveHostdRebindChild, phase liveHostdRebindReadyPhase,
+) liveHostdRebindReadyMarker {
+	t.Helper()
+	if !validLiveHostdRebindReadyPhase(phase) {
+		t.Fatal("full hostd child readiness phase is invalid")
+	}
+	deadline, hasDeadline := t.Deadline()
+	marker, err := liveHostdRebindWaitReadyResult(fixture, child, deadline, hasDeadline)
+	if err != nil {
+		t.Fatal(liveHostdRebindReadyPhaseError(phase, err))
+	}
+	return marker
+}
+
 func liveHostdRebindWaitReadyResult(fixture *liveHostdGatewayRebindFixture,
 	child *liveHostdRebindChild, deadline time.Time, hasDeadline bool,
 ) (liveHostdRebindReadyMarker, error) {
