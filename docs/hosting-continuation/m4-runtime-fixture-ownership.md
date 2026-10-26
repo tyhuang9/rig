@@ -134,7 +134,8 @@ They ran with an anchored selector, `-test.count=1`, `-test.v` and
 `-test.timeout=10m`. Formatting, scoped vet and canonical generation
 checks also passed.
 
-The follow-up source manifest SHA-256 is
+The Gateway V2 follow-up, published at
+`2c94e8193ef584b4ead40f1bac12c5c3359f3ce8`, has source manifest SHA-256
 `b0836830ed71e539b66fc8d874917cd190b55682531088e4709ef1ef5fdf0288`;
 its binary SHA-256 is
 `63f63303b2bd22ac27daf0cdead747b0432d4393c485267e5a0e11b17a615608`.
@@ -147,6 +148,61 @@ The live parents and children were discovered, not executed locally.
 Both real Docker journeys remain pending hosted verification. The earlier
 52 passes above describe the original published source and are not added
 to the follow-up's 45-pass count.
+
+## Cross-store proposal replay follow-up
+
+[PR #245's cross-store proposal job](https://github.com/tyhuang9/rig/actions/runs/40302965729/job/121505057798)
+failed after 64.70 seconds with the fixed message `open real manager with
+the repository rebind fence`. Its raw log SHA-256 is
+`f2c7f75c4f994c457cafed4221c8dcfa78752bdd6969dfd284b7b33530d62b9a`.
+The underlying diagnostic is not exposed by that output.
+
+The proposal test is unchanged at `2c94e819`. It constructs a source
+fixture that already owns a repository-bound gateway Manager, then calls
+`New` against the same namespace and replaces its Manager. It later calls
+`New` again in the same process for a purported fresh replay. Both paths
+conflict with the retained domain ownership contract. Removing only the
+first construction would leave an invalid restart check.
+
+The bounded follow-up uses the fixture's original owned Manager for
+parent inspection and a genuine child process for proposal replay. The
+new child mode uses the existing private manifest and input validator,
+an exact selector, bounded output, closed markers and process cleanup.
+Existing prepared-claim crash modes retain their behavior.
+
+The child must reconstruct the proposal from validated expected input,
+create one fresh Manager and compare the complete inspection. Both
+processes preserve SQL authority, runtime heads, application access,
+protected routes/history, gateway state/journal and source Docker
+identity. The original LAN/loopback roster, provenance, open-fence and
+absence-of-intent assertions remain required. Proposal inspection must
+not forward an application request or dispatch a mutation command.
+
+On 2026-10-26, fresh pinned Windows Go 1.26.7 compilation and exact
+four-selector discovery passed. The executed selection was
+`^TestLiveGatewayRebindCrossStoreProposalReplayProtocolIsClosed$`, with
+`-test.count=1 -test.v -test.timeout=5m`. It produced 26 unique passes:
+one parent and 25 nested tests, with no failures or skips. These cover
+private manifest round-trip, malformed and tainted input refusal, exact
+child output, and cancellation/reaping. Formatting, scoped vet and the
+canonical generation check passed; the source stayed unchanged.
+
+The final source manifest SHA-256 is
+`f089eca46a15adb6dfdb45fbfb9a044078c91ef433dd3eee5bad887de7359416`;
+the test binary SHA-256 is
+`cd14e11db90881f86834dc767f2fca7c0b7b1452f1b8f401be721e25fdc2e5fb`.
+Source/security review found no blocking issue. Earlier attempts are
+retained: one stopped at an incomplete fixture before the protocol;
+another exposed validation before reconstruction of the derived roster
+digest omitted by JSON. The final decoder reconstructs that digest and
+then performs full validation. Exact inspection equality is retained,
+with no timestamp normalization or approval reconstruction.
+
+Actual hosted proposal replay remains required. Local protocol checks
+cannot establish fresh Manager construction or Docker observations and
+do not newly execute completed-domain ownership refusal. The earlier
+52-pass and 45-pass results belong to their respective published source
+versions and are not added to this follow-up's 26-pass count.
 
 ## Rollback
 
