@@ -1095,9 +1095,29 @@ func liveHostdRebindKnownRoutePausePair(stage, cause string) bool {
 	case "route_switch":
 		return cause == "gateway_readiness_failed" || stateCause
 	case "previous_retirement":
-		return cause == "retirement_unavailable" || cause == "candidate_cleanup_failed" || stateCause
+		return cause == "retirement_unavailable" || cause == "candidate_cleanup_failed" || stateCause ||
+			liveHostdRebindKnownPreviousRetirementIdentityCause(cause)
 	case "runtime_success_advance":
 		return stateCause
+	default:
+		return false
+	}
+}
+
+func liveHostdRebindKnownPreviousRetirementIdentityCause(cause string) bool {
+	switch cause {
+	case "invalid_claim",
+		"invalid_configuration",
+		"scope_unavailable",
+		"authority_stale",
+		"authority_invalid",
+		"authority_unresolved",
+		"identity_lost",
+		"stage_invalid",
+		"positive_fence",
+		"storage_unavailable",
+		"route_unresolved":
+		return true
 	default:
 		return false
 	}
