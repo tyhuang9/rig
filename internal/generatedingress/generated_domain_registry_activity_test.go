@@ -29,6 +29,14 @@ const generatedDomainRegistryCaseEnvironment = "RIG_GENERATED_DOMAIN_REGISTRY_CA
 // registry.
 func generatedDomainRegistryIsolated(t *testing.T) bool {
 	t.Helper()
+	return generatedDomainRegistryIsolatedWithTimeouts(t, 90*time.Second, 2*time.Minute)
+}
+
+func generatedDomainRegistryIsolatedWithTimeouts(t *testing.T, childTimeout, outerTimeout time.Duration) bool {
+	t.Helper()
+	if childTimeout <= 0 || childTimeout%time.Second != 0 || outerTimeout <= childTimeout {
+		t.Fatalf("invalid isolated registry timeouts: child=%s outer=%s", childTimeout, outerTimeout)
+	}
 	if os.Getenv(generatedDomainRegistryCaseEnvironment) == t.Name() {
 		return true
 	}
@@ -36,10 +44,11 @@ func generatedDomainRegistryIsolated(t *testing.T) bool {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commandContext, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	commandContext, cancel := context.WithTimeout(context.Background(), outerTimeout)
 	defer cancel()
 	command := exec.CommandContext(commandContext, executable,
-		"-test.run", "^"+regexp.QuoteMeta(t.Name())+"$", "-test.count=1", "-test.v", "-test.timeout=90s")
+		"-test.run", "^"+regexp.QuoteMeta(t.Name())+"$", "-test.count=1", "-test.v",
+		fmt.Sprintf("-test.timeout=%ds", childTimeout/time.Second))
 	command.Env = append(os.Environ(), generatedDomainRegistryCaseEnvironment+"="+t.Name())
 	output, err := command.CombinedOutput()
 	if err != nil {
