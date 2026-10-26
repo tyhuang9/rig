@@ -273,6 +273,44 @@ func TestGeneratedDomainRegistryLinearizesConstructionRosterAndFullPublication(t
 	}
 }
 
+func TestGeneratedDomainRegistryPublishesOneSealedCapacityGraphWithConstruction(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	fixture := newGeneratedDomainStableConstructionFixture(t)
+	result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+		fixture.runner, fixture.environment, fixture.identity.options)
+	if err != nil || result == nil || result.capacity == nil || result.candidates == nil ||
+		result.candidates.ledger == nil {
+		t.Fatalf("stable construction result=%#v error=%v", result, err)
+	}
+	if result.candidates.coordinator != result.capacity ||
+		result.candidates.ledger.coordinator != result.capacity {
+		t.Fatal("published construction split its coordinator identity")
+	}
+	result.capacity.mu.Lock()
+	phase, borrows, memory, disk, tokens := result.capacity.phase, result.capacity.borrows,
+		result.capacity.memory, result.capacity.disk, len(result.capacity.tokens)
+	result.capacity.mu.Unlock()
+	if phase != generatedDomainCapacityPublished || borrows != 0 || memory != 0 || disk != 0 || tokens != 0 {
+		t.Fatalf("published empty graph phase=%d borrows=%d memory=%d disk=%d tokens=%d",
+			phase, borrows, memory, disk, tokens)
+	}
+	joined, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+		fixture.runner, fixture.environment, fixture.identity.options)
+	if err != nil || joined != result || joined.capacity != result.capacity || joined.candidates != result.candidates {
+		t.Fatalf("joined construction=%p want=%p error=%v", joined, result, err)
+	}
+	result.capacity.mu.Lock()
+	phase, borrows, memory, disk, tokens = result.capacity.phase, result.capacity.borrows,
+		result.capacity.memory, result.capacity.disk, len(result.capacity.tokens)
+	result.capacity.mu.Unlock()
+	if phase != generatedDomainCapacityPublished || borrows != 0 || memory != 0 || disk != 0 || tokens != 0 {
+		t.Fatalf("join changed published graph phase=%d borrows=%d memory=%d disk=%d tokens=%d",
+			phase, borrows, memory, disk, tokens)
+	}
+}
+
 func TestGeneratedDomainLegacyConstructionTightensExistingIngressProtection(t *testing.T) {
 	if !generatedDomainRegistryIsolated(t) {
 		return

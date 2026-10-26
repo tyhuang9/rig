@@ -55,6 +55,15 @@ func (a *GeneratedCandidateAuthority) ReserveRetainedCapacity(ctx context.Contex
 		!candidatePolicyText(operationID, 256) || stoppedCount < 1 || stoppedCount > 2 {
 		return nil, generatedcapacity.ErrInvalidCount
 	}
+	var borrow *generatedDomainCapacityBorrow
+	if a.coordinator != nil {
+		var borrowErr error
+		borrow, borrowErr = a.coordinator.borrowAcquire()
+		if borrowErr != nil {
+			return nil, borrowErr
+		}
+		defer borrow.release()
+	}
 	leases, err := a.budget.Acquire(ctx, generatedcapacity.Limits{
 		MemoryBytes: uint64(a.options.MemoryBytes),
 		DiskBytes:   a.options.ReplacementDiskBytes,

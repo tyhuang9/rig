@@ -67,6 +67,200 @@ func candidateCapacityTestLedger(
 	return ledger, budget, source
 }
 
+func TestCandidateCapacityRestoredDebtRequiresExactPublishedTokenGraph(t *testing.T) {
+	newLedger := func(t *testing.T, components ...string) (*candidateCapacityLedger,
+		*generatedDomainCapacityCoordinator, []*generatedDomainCapacityDebtToken, candidateGroupSpec,
+	) {
+		t.Helper()
+		manager, _ := newManagerFixture(t, false)
+		coordinator, err := newGeneratedDomainCapacityCoordinator(manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		limits := make([]generatedcapacity.Limits, len(components))
+		for index := range limits {
+			limits[index] = generatedcapacity.Limits{MemoryBytes: 10, DiskBytes: 10}
+		}
+		tokens, err := coordinator.installBootstrapBatch(limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := &candidateCapacityTestSource{snapshot: generatedcapacity.Snapshot{
+			MemoryAvailableBytes: 100, DiskAvailableBytes: 100,
+		}}
+		budget, err := generatedcapacity.New(source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ledger, err := newCandidateCapacityLedger(budget, coordinator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ledger, coordinator, tokens, candidateCapacityTestSpec("app-restored", "deployment-restored", components...)
+	}
+	receipts := func(components ...string) map[string]candidateColdReceiptSeed {
+		result := make(map[string]candidateColdReceiptSeed, len(components))
+		for _, component := range components {
+			result[component] = candidateColdReceiptSeed{id: "receipt-" + component,
+				physical: candidatePhysicalHandedToRoute}
+		}
+		return result
+	}
+
+	t.Run("pending graph refuses consumers until exact publication", func(t *testing.T) {
+		ledger, coordinator, tokens, spec := newLedger(t, "api", "web")
+		if err := ledger.seedColdOwnershipWithDebt(spec, receipts("api", "web"), tokens); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ledger.enterRetirementRoster(spec.appID, spec.deploymentID,
+			map[string]string{"api": "receipt-api", "web": "receipt-web"}); !errors.Is(err, errCandidateReceiptMismatch) {
+			t.Fatalf("pending retirement error=%v", err)
+		}
+		if reservation, err := ledger.reserve(context.Background(), spec); reservation != nil ||
+			!errors.Is(err, errCandidateCapacityStale) {
+			t.Fatalf("pending ordinary reserve=%#v error=%v", reservation, err)
+		}
+		if err := coordinator.sealBootstrap(); err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.publishRestoredOwnership(); err != nil {
+			t.Fatal(err)
+		}
+		operation, err := ledger.enterRetirementRoster(spec.appID, spec.deploymentID,
+			map[string]string{"api": "receipt-api", "web": "receipt-web"})
+		if err != nil || operation == nil {
+			t.Fatalf("published retirement operation=%#v error=%v", operation, err)
+		}
+		operation.leave()
+		for _, token := range tokens {
+			if !token.published() {
+				t.Fatal("published graph contains an unpublished token")
+			}
+		}
+	})
+
+	t.Run("partial crossed duplicate and alias inputs refuse atomically", func(t *testing.T) {
+		for _, test := range []struct {
+			name   string
+			mutate func([]*generatedDomainCapacityDebtToken) []*generatedDomainCapacityDebtToken
+			rows   map[string]candidateColdReceiptSeed
+		}{
+			{name: "partial roster", rows: receipts("api")},
+			{name: "duplicate token alias", rows: receipts("api", "web"),
+				mutate: func(tokens []*generatedDomainCapacityDebtToken) []*generatedDomainCapacityDebtToken {
+					return []*generatedDomainCapacityDebtToken{tokens[0], tokens[0]}
+				}},
+			{name: "crossed coordinator", rows: receipts("api", "web"),
+				mutate: func(tokens []*generatedDomainCapacityDebtToken) []*generatedDomainCapacityDebtToken {
+					manager, _ := newManagerFixture(t, false)
+					foreign, err := newGeneratedDomainCapacityCoordinator(manager)
+					if err != nil {
+						t.Fatal(err)
+					}
+					other, err := foreign.installBootstrapBatch([]generatedcapacity.Limits{{MemoryBytes: 10, DiskBytes: 10}})
+					if err != nil {
+						t.Fatal(err)
+					}
+					return []*generatedDomainCapacityDebtToken{tokens[0], other[0]}
+				}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				ledger, coordinator, tokens, spec := newLedger(t, "api", "web")
+				if test.mutate != nil {
+					tokens = test.mutate(tokens)
+				}
+				if err := ledger.seedColdOwnershipWithDebt(spec, test.rows, tokens); !errors.Is(err, errCandidateCapacityInvalid) {
+					t.Fatalf("invalid restored graph error=%v", err)
+				}
+				ledger.mu.Lock()
+				groups := len(ledger.groups)
+				ledger.mu.Unlock()
+				if groups != 0 || coordinator.memory != 20 || coordinator.disk != 20 || len(coordinator.tokens) != 2 {
+					t.Fatalf("refusal mutated graph: groups=%d memory=%d disk=%d tokens=%d",
+						groups, coordinator.memory, coordinator.disk, len(coordinator.tokens))
+				}
+			})
+		}
+	})
+}
+
+func TestCandidateCapacityRestoredPredecessorReleasesExactDebtAndKeepsSuccessorCharge(t *testing.T) {
+	manager, runner := newManagerFixture(t, false)
+	runner.capacityOutput = []byte("30 30\n")
+	coordinator, err := newGeneratedDomainCapacityCoordinator(manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := coordinator.installBootstrapBatch([]generatedcapacity.Limits{{MemoryBytes: 10, DiskBytes: 10}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.sealBootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	budget, err := generatedcapacity.New(coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := newCandidateCapacityLedger(budget, coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	predecessorSpec := candidateCapacityTestSpec("app-1", "deployment-old", "web")
+	predecessorReceipts := map[string]candidateColdReceiptSeed{"web": {
+		id: "receipt-old", physical: candidatePhysicalHandedToRoute,
+	}}
+	if err := ledger.seedColdOwnershipWithDebt(predecessorSpec, predecessorReceipts, tokens); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.publishRestoredOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	predecessor, err := ledger.enterRetirementRoster(predecessorSpec.appID, predecessorSpec.deploymentID,
+		map[string]string{"web": "receipt-old"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer predecessor.leave()
+	if err := predecessor.markConfirmedAbsentRetained("web"); err != nil {
+		t.Fatal(err)
+	}
+
+	successorSpec := candidateCapacityTestSpec("app-1", "deployment-new", "web")
+	successorReservation, successor, _ := candidateCapacityTestHandedRoster(t, ledger, successorSpec, "successor")
+	defer successor.leave()
+	successorCharge := successor.group.byName["web"].charge
+	successorLease := successorCharge.lease
+	if successorLease == nil {
+		t.Fatal("successor has no raw capacity charge")
+	}
+	handoff, err := ledger.beginAccountingHandoff(successor, predecessor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handoff.markGatewayUnlocked(); err != nil {
+		t.Fatal(err)
+	}
+	successor.leave()
+	if err := successorReservation.release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := handoff.releasePredecessorOnce(); err != nil {
+		t.Fatal(err)
+	}
+	if err := handoff.releasePredecessorOnce(); err != nil {
+		t.Fatalf("predecessor release replay: %v", err)
+	}
+	if coordinator.memory != 0 || coordinator.disk != 0 || len(coordinator.tokens) != 0 || tokens[0].configured() {
+		t.Fatalf("restored predecessor debt remains: memory=%d disk=%d tokens=%d configured=%t",
+			coordinator.memory, coordinator.disk, len(coordinator.tokens), tokens[0].configured())
+	}
+	if successorCharge.token == nil || successorCharge.lease != successorLease ||
+		successorCharge.owner != candidateAccountingRouteActive || successorCharge.state != candidateChargeActive {
+		t.Fatalf("restored predecessor release changed successor charge=%+v", successorCharge)
+	}
+}
+
 func candidateCapacityTestSpec(
 	appID string,
 	deploymentID string,

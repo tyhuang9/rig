@@ -22,6 +22,7 @@ type generatedDomainConstruction struct {
 	reservation *generatedDomainReservation
 	manager     *Manager
 	budget      *generatedcapacity.Budget
+	capacity    *generatedDomainCapacityCoordinator
 	candidates  *GeneratedCandidateAuthority
 	routes      *GeneratedRouteAuthority
 	domain      *GeneratedDomain
@@ -103,7 +104,7 @@ func newGeneratedDomainConstruction(
 		if !completed {
 			resultErr = generatedDomainConstructionBoundaryDiagnostic(
 				generatedDomainConstructionStageManifest, generatedDomainConstructionReasonManifest, resultErr)
-			failGeneratedDomainConstruction(reservation, resultErr)
+			failGeneratedDomainConstruction(reservation, result, resultErr)
 			result = nil
 		}
 	}()
@@ -345,6 +346,9 @@ func constructGeneratedDomainStable(
 		generatedDomainStartupStable); err != nil {
 		return nil, err
 	}
+	if err := result.capacity.sealBootstrap(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -502,6 +506,9 @@ func constructGeneratedDomainEmpty(
 		generatedDomainStartupStable); err != nil {
 		return nil, err
 	}
+	if err := result.capacity.sealBootstrap(); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
@@ -565,12 +572,16 @@ func assembleGeneratedDomainOwners(
 	input generatedDomainReservationInput,
 	manager *Manager,
 ) (*generatedDomainConstruction, error) {
-	budget, err := generatedcapacity.New(manager)
+	capacity, err := newGeneratedDomainCapacityCoordinator(manager)
+	if err != nil {
+		return nil, err
+	}
+	budget, err := generatedcapacity.New(capacity)
 	if err != nil {
 		return nil, err
 	}
 	candidates, err := newGeneratedCandidateAuthorityConcrete(input.stores, input.runner, input.environment,
-		budget, generatedDomainCandidateOptions(input.options))
+		budget, generatedDomainCandidateOptions(input.options), capacity)
 	if err != nil {
 		return nil, err
 	}
@@ -579,7 +590,7 @@ func assembleGeneratedDomainOwners(
 		return nil, err
 	}
 	result := &generatedDomainConstruction{reservation: reservation, manager: manager,
-		budget: budget, candidates: candidates, routes: routes}
+		budget: budget, capacity: capacity, candidates: candidates, routes: routes}
 	result.domain = &GeneratedDomain{construction: result}
 	return result, nil
 }
@@ -588,7 +599,8 @@ func validGeneratedDomainConstructionResult(reservation *generatedDomainReservat
 	result *generatedDomainConstruction,
 ) bool {
 	if reservation == nil || result == nil || result.reservation != reservation || result.manager == nil ||
-		result.budget == nil || !result.budget.Configured() || result.candidates == nil ||
+		result.budget == nil || !result.budget.Configured() || result.capacity == nil || result.candidates == nil ||
+		result.candidates.coordinator != result.capacity ||
 		result.routes == nil || !result.routes.configuredFor(result) || result.domain == nil ||
 		result.domain.construction != result || result.manifest == nil ||
 		!sameGeneratedDomainColdManifest(result.cold, result.manifest.cold) {

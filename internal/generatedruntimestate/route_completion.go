@@ -246,6 +246,43 @@ func readRouteCompletionReceiptTx(ctx context.Context, tx *sql.Tx,
 	return value, true, nil
 }
 
+func readGeneratedDomainStartupRouteCompletionReceipts(ctx context.Context, tx *sql.Tx) (
+	[]RouteCompletionReceipt, error,
+) {
+	rows, err := tx.QueryContext(ctx, `SELECT activation_receipt_id,app_id,successor_deployment_id,
+		creator_job_id,creator_worker_attempt,current_job_id,current_worker_attempt,
+		completion_code,completed_at FROM generated_route_completion_receipts
+		ORDER BY activation_receipt_id`)
+	if err != nil {
+		return nil, err
+	}
+	result := []RouteCompletionReceipt{}
+	for rows.Next() {
+		var value RouteCompletionReceipt
+		var completedAt string
+		if err := rows.Scan(&value.ActivationReceiptID, &value.AppID, &value.SuccessorDeploymentID,
+			&value.CreatorJobID, &value.CreatorWorkerAttempt, &value.CurrentJobID,
+			&value.CurrentWorkerAttempt, &value.CompletionCode, &completedAt); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		value.CompletedAt, err = parseTime(completedAt)
+		if err != nil || !validRouteCompletionReceipt(value) {
+			_ = rows.Close()
+			return nil, errors.Join(ErrInvalidState, err)
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func validRouteCompletionReceipt(value RouteCompletionReceipt) bool {
 	return canonicalUUID(value.ActivationReceiptID) && canonicalUUID(value.AppID) &&
 		canonicalUUID(value.SuccessorDeploymentID) && canonicalUUID(value.CreatorJobID) &&

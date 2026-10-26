@@ -51,6 +51,8 @@ type GeneratedDomainStartupSnapshot struct {
 	GeneratedDeployments    []GeneratedDomainStartupDeployment
 	Artifacts               []GeneratedDomainStartupArtifact
 	LifecycleOperationCount int64
+	LifecycleOperations     []GeneratedDomainStartupLifecycleOperation
+	LifecycleBindings       []GeneratedDomainStartupLifecycleBinding
 	UnresolvedLifecycleApps []string
 }
 
@@ -65,6 +67,28 @@ type GeneratedDomainStartupDeployment struct {
 	DeploymentPlanRevisionNumber      int64
 	ActualConfigurationRevisionID     string
 	ActualConfigurationRevisionNumber int64
+	JobStatus                         string
+	JobPhase                          string
+	JobAttempt                        int
+	CanonicalSuccessEventCount        int
+	SuccessEventCount                 int
+	CanonicalSuccessEventAt           time.Time
+}
+
+type GeneratedDomainStartupLifecycleOperation struct {
+	AppID           string
+	JobID           string
+	DeploymentID    string
+	DesiredRevision int64
+	Complete        bool
+}
+
+type GeneratedDomainStartupLifecycleBinding struct {
+	DeploymentJobID        string
+	AppID                  string
+	DesiredRevision        int64
+	Mode                   deploymentbinding.Mode
+	AuthorizingOperationID string
 }
 
 type GeneratedDomainStartupArtifact struct {
@@ -286,13 +310,16 @@ func (s *GeneratedOwnerStores) generatedDomainStartupSnapshotTx(ctx context.Cont
 	if err != nil {
 		return GeneratedDomainStartupSnapshot{}, err
 	}
-	operationCount, unresolvedApps, err := readGeneratedDomainStartupLifecycle(ctx, tx, s.database)
+	operations, bindings, unresolvedApps, err := readGeneratedDomainStartupLifecycle(ctx, tx, s.database,
+		generatedDeployments)
 	if err != nil {
 		return GeneratedDomainStartupSnapshot{}, err
 	}
 	return GeneratedDomainStartupSnapshot{
 		Gateway: gateway, Runtime: runtimeSnapshot, GeneratedDeployments: generatedDeployments, Artifacts: artifacts,
-		LifecycleOperationCount: operationCount, UnresolvedLifecycleApps: unresolvedApps,
+		LifecycleOperationCount: int64(len(operations)), LifecycleOperations: operations,
+		LifecycleBindings:       bindings,
+		UnresolvedLifecycleApps: unresolvedApps,
 	}, nil
 }
 
@@ -304,7 +331,15 @@ func readGeneratedDomainStartupDeployments(ctx context.Context, tx *sql.Tx) ([]G
 		COALESCE(r.id,''),COALESCE(r.app_id,''),COALESCE(r.deployment_plan_revision_id,''),
 		COALESCE(r.deployment_plan_revision_number,0),COALESCE(p.id,''),COALESCE(p.app_id,''),
 		COALESCE(p.revision_number,0),COALESCE(p.strategy,''),COALESCE(c.id,''),COALESCE(c.app_id,''),
-		COALESCE(c.revision_number,0)
+		COALESCE(c.revision_number,0),COALESCE(j.status,''),COALESCE(j.phase,''),COALESCE(j.attempt,0),
+		(SELECT COUNT(*) FROM job_events e WHERE e.job_id=j.id AND e.attempt=j.attempt
+		 AND e.level='info' AND e.phase='succeeded' AND e.code='job_succeeded'
+		 AND e.message='Deployment completed'),
+		(SELECT COUNT(*) FROM job_events e WHERE e.job_id=j.id AND e.attempt=j.attempt
+		 AND e.code='job_succeeded'),
+		COALESCE((SELECT e.timestamp FROM job_events e WHERE e.job_id=j.id AND e.attempt=j.attempt
+		 AND e.level='info' AND e.phase='succeeded' AND e.code='job_succeeded'
+		 AND e.message='Deployment completed' ORDER BY e.sequence LIMIT 1),'')
 		FROM deployments d
 		LEFT JOIN applications a ON a.id=d.app_id
 		LEFT JOIN jobs j ON j.id=d.job_id
@@ -327,16 +362,26 @@ func readGeneratedDomainStartupDeployments(ctx context.Context, tx *sql.Tx) ([]G
 		var planNumber int64
 		var configurationID, configurationApp string
 		var configurationNumber int64
+		var canonicalEventAt string
 		if err := rows.Scan(&value.ID, &value.AppID, &value.JobID, &value.ReleaseID, &value.Status, &initialized,
 			&value.DeploymentPlanRevisionID, &value.DeploymentPlanRevisionNumber,
 			&value.ActualConfigurationRevisionID, &value.ActualConfigurationRevisionNumber,
 			&applicationID, &jobID, &jobResourceType, &jobResourceID, &releaseID, &releaseApp,
 			&releasePlan, &releasePlanNumber, &planID, &planApp, &planNumber, &planStrategy,
-			&configurationID, &configurationApp, &configurationNumber); err != nil {
+			&configurationID, &configurationApp, &configurationNumber, &value.JobStatus, &value.JobPhase,
+			&value.JobAttempt, &value.CanonicalSuccessEventCount, &value.SuccessEventCount,
+			&canonicalEventAt); err != nil {
 			_ = rows.Close()
 			return nil, err
 		}
 		value.ProvenanceInitialized = initialized == 1
+		if canonicalEventAt != "" {
+			value.CanonicalSuccessEventAt, err = time.Parse(time.RFC3339Nano, canonicalEventAt)
+			if err != nil {
+				_ = rows.Close()
+				return nil, ErrInvalidDeployment
+			}
+		}
 		configurationValid := value.ActualConfigurationRevisionID == "" && value.ActualConfigurationRevisionNumber == 0
 		if value.ActualConfigurationRevisionID != "" {
 			configurationValid = canonicalGeneratedDomainUUID(value.ActualConfigurationRevisionID) &&
@@ -464,38 +509,39 @@ func generatedDomainArtifactFailureDiagnostic(value string) bool {
 	}
 }
 
-func readGeneratedDomainStartupLifecycle(ctx context.Context, tx *sql.Tx, db *sql.DB) (int64, []string, error) {
-	type lifecycleOperation struct {
-		appID    string
-		jobID    string
-		revision int64
-	}
-	rows, err := tx.QueryContext(ctx, `SELECT app_id,job_id,desired_revision
+func readGeneratedDomainStartupLifecycle(ctx context.Context, tx *sql.Tx, db *sql.DB,
+	deployments []GeneratedDomainStartupDeployment,
+) (
+	[]GeneratedDomainStartupLifecycleOperation, []GeneratedDomainStartupLifecycleBinding, []string, error,
+) {
+	rows, err := tx.QueryContext(ctx, `SELECT app_id,job_id,deployment_id,desired_revision
 		FROM application_lifecycle_operations ORDER BY app_id,desired_revision,job_id`)
 	if err != nil {
-		return 0, nil, err
+		return nil, nil, nil, err
 	}
-	operations := []lifecycleOperation{}
+	operations := []GeneratedDomainStartupLifecycleOperation{}
 	apps := map[string]struct{}{}
 	for rows.Next() {
-		var operation lifecycleOperation
-		if err := rows.Scan(&operation.appID, &operation.jobID, &operation.revision); err != nil {
+		var operation GeneratedDomainStartupLifecycleOperation
+		if err := rows.Scan(&operation.AppID, &operation.JobID, &operation.DeploymentID,
+			&operation.DesiredRevision); err != nil {
 			_ = rows.Close()
-			return 0, nil, err
+			return nil, nil, nil, err
 		}
-		if !canonicalGeneratedDomainUUID(operation.appID) || !canonicalGeneratedDomainUUID(operation.jobID) || operation.revision < 1 {
+		if !canonicalGeneratedDomainUUID(operation.AppID) || !canonicalGeneratedDomainUUID(operation.JobID) ||
+			!canonicalGeneratedDomainUUID(operation.DeploymentID) || operation.DesiredRevision < 1 {
 			_ = rows.Close()
-			return 0, nil, deploymentbinding.ErrInvalidBinding
+			return nil, nil, nil, deploymentbinding.ErrInvalidBinding
 		}
 		operations = append(operations, operation)
-		apps[operation.appID] = struct{}{}
+		apps[operation.AppID] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return 0, nil, err
+		return nil, nil, nil, err
 	}
 	if err := rows.Close(); err != nil {
-		return 0, nil, err
+		return nil, nil, nil, err
 	}
 
 	missingCurrent := map[string]struct{}{}
@@ -505,38 +551,57 @@ func readGeneratedDomainStartupLifecycle(ctx context.Context, tx *sql.Tx, db *sq
 		 ON current.app_id=h.app_id AND current.desired_revision=h.revision_number
 		WHERE h.revision_number>0 ORDER BY h.app_id`)
 	if err != nil {
-		return 0, nil, err
+		return nil, nil, nil, err
 	}
 	for headRows.Next() {
 		var appID, currentJobID string
 		var revision int64
 		if err := headRows.Scan(&appID, &revision, &currentJobID); err != nil {
 			_ = headRows.Close()
-			return 0, nil, err
+			return nil, nil, nil, err
 		}
 		if !canonicalGeneratedDomainUUID(appID) || revision < 1 {
 			_ = headRows.Close()
-			return 0, nil, deploymentbinding.ErrInvalidBinding
+			return nil, nil, nil, deploymentbinding.ErrInvalidBinding
 		}
 		if currentJobID == "" {
 			missingCurrent[appID] = struct{}{}
 		} else if !canonicalGeneratedDomainUUID(currentJobID) {
 			_ = headRows.Close()
-			return 0, nil, deploymentbinding.ErrInvalidBinding
+			return nil, nil, nil, deploymentbinding.ErrInvalidBinding
 		}
 	}
 	if err := headRows.Err(); err != nil {
 		_ = headRows.Close()
-		return 0, nil, err
+		return nil, nil, nil, err
 	}
 	if err := headRows.Close(); err != nil {
-		return 0, nil, err
+		return nil, nil, nil, err
 	}
 
 	repository := applifecycle.New(db)
 	validator, err := applifecycle.NewDeploymentBindingValidator(repository)
 	if err != nil || !validator.ConfiguredFor(db) {
-		return 0, nil, deploymentbinding.ErrInvalidConfiguration
+		return nil, nil, nil, deploymentbinding.ErrInvalidConfiguration
+	}
+	bindingRepository, err := deploymentbinding.New(db, validator)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	bindings := make([]GeneratedDomainStartupLifecycleBinding, 0, len(deployments))
+	for _, deployment := range deployments {
+		binding, err := bindingRepository.ReadTx(ctx, tx, deployment.JobID)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if binding.JobID() != deployment.JobID || binding.ApplicationID() != deployment.AppID {
+			return nil, nil, nil, deploymentbinding.ErrInvalidBinding
+		}
+		bindings = append(bindings, GeneratedDomainStartupLifecycleBinding{
+			DeploymentJobID: binding.JobID(), AppID: binding.ApplicationID(),
+			DesiredRevision: binding.DesiredRevision(), Mode: binding.Mode(),
+			AuthorizingOperationID: binding.AuthorizingLifecycleJobID(),
+		})
 	}
 	appIDs := make([]string, 0, len(apps))
 	for appID := range apps {
@@ -547,7 +612,7 @@ func readGeneratedDomainStartupLifecycle(ctx context.Context, tx *sql.Tx, db *sq
 	for _, appID := range appIDs {
 		value, err := validator.UnresolvedHistoryTx(ctx, tx, appID)
 		if err != nil {
-			return 0, nil, err
+			return nil, nil, nil, err
 		}
 		if value {
 			unresolved[appID] = struct{}{}
@@ -555,17 +620,26 @@ func readGeneratedDomainStartupLifecycle(ctx context.Context, tx *sql.Tx, db *sq
 	}
 	for _, operation := range operations {
 		completion, err := validator.CurrentOperationTx(ctx, tx, deploymentbinding.OperationRef{
-			ApplicationID: operation.appID, OperationID: operation.jobID, DesiredRevision: operation.revision,
+			ApplicationID: operation.AppID, OperationID: operation.JobID, DesiredRevision: operation.DesiredRevision,
 		})
 		if err != nil {
-			return 0, nil, err
+			return nil, nil, nil, err
 		}
 		switch completion {
 		case deploymentbinding.CompletionComplete:
+			operation.Complete = true
+			for index := range operations {
+				if operations[index].AppID == operation.AppID && operations[index].JobID == operation.JobID &&
+					operations[index].DeploymentID == operation.DeploymentID &&
+					operations[index].DesiredRevision == operation.DesiredRevision {
+					operations[index].Complete = true
+					break
+				}
+			}
 		case deploymentbinding.CompletionIncomplete:
-			unresolved[operation.appID] = struct{}{}
+			unresolved[operation.AppID] = struct{}{}
 		default:
-			return 0, nil, deploymentbinding.ErrInvalidBinding
+			return nil, nil, nil, deploymentbinding.ErrInvalidBinding
 		}
 	}
 	result := make([]string, 0, len(unresolved))
@@ -573,7 +647,7 @@ func readGeneratedDomainStartupLifecycle(ctx context.Context, tx *sql.Tx, db *sq
 		result = append(result, appID)
 	}
 	sort.Strings(result)
-	return int64(len(operations)), result, nil
+	return operations, bindings, result, nil
 }
 
 func canonicalGeneratedDomainUUID(value string) bool {

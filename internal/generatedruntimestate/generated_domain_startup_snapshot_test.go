@@ -22,11 +22,15 @@ func TestGeneratedDomainStartupSnapshotTxTreatsHistoricalApplicationsAsEmpty(t *
 		t.Fatal(err)
 	}
 	if snapshot.ActiveHeads == nil || snapshot.Deployments == nil || snapshot.Components == nil ||
-		snapshot.CandidateIntents == nil {
+		snapshot.CandidateIntents == nil || snapshot.RouteActivations == nil ||
+		snapshot.AccountingHandoffAuthorizations == nil || snapshot.AccountingHandoffReceipts == nil ||
+		snapshot.RouteCompletionReceipts == nil {
 		t.Fatal("empty snapshot contains nil slices")
 	}
 	if len(snapshot.ActiveHeads) != 0 || len(snapshot.Deployments) != 0 ||
-		len(snapshot.Components) != 0 || len(snapshot.CandidateIntents) != 0 {
+		len(snapshot.Components) != 0 || len(snapshot.CandidateIntents) != 0 ||
+		len(snapshot.RouteActivations) != 0 || len(snapshot.AccountingHandoffAuthorizations) != 0 ||
+		len(snapshot.AccountingHandoffReceipts) != 0 || len(snapshot.RouteCompletionReceipts) != 0 {
 		t.Fatalf("ordinary history reported generated runtime state: %#v", snapshot)
 	}
 }
@@ -235,6 +239,42 @@ func TestGeneratedDomainStartupSnapshotTxReadsCandidateIntentsIndependently(t *t
 				receiptCount, receiptCountAfter, changesBefore, changesAfter)
 		}
 	})
+}
+
+func TestGeneratedDomainStartupSnapshotTxReadsCompleteAccountingChainIndependently(t *testing.T) {
+	fixture, input := newRouteCompletionFixture(t)
+	fixture.commit(t, func(tx *sql.Tx) error {
+		if _, _, err := fixture.repository.RecordGeneratedRouteSucceededTx(context.Background(), tx, input); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE deployments SET status='succeeded',finished_at=?
+			WHERE id=? AND status='waiting_health'`, timestamp(input.CompletedAt),
+			input.Activation.SuccessorDeploymentID); err != nil {
+			return err
+		}
+		_, changed, err := fixture.repository.RecordRouteCompletionReceiptTx(context.Background(), tx, input)
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errors.New("completion receipt was not inserted")
+		}
+		return nil
+	})
+
+	snapshot, err := generatedDomainSnapshotForTest(t, fixture.repository, fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.RouteActivations) != 1 || snapshot.RouteActivations[0].ReceiptID != input.Activation.ReceiptID ||
+		len(snapshot.AccountingHandoffAuthorizations) != 1 ||
+		snapshot.AccountingHandoffAuthorizations[0].ActivationReceiptID != input.Activation.ReceiptID ||
+		len(snapshot.AccountingHandoffReceipts) != 1 ||
+		snapshot.AccountingHandoffReceipts[0] != input.AccountingHandoff ||
+		len(snapshot.RouteCompletionReceipts) != 1 ||
+		!routeCompletionReceiptMatchesInput(snapshot.RouteCompletionReceipts[0], input) {
+		t.Fatalf("complete accounting snapshot=%#v", snapshot)
+	}
 }
 
 func TestGeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPartialResult(t *testing.T) {

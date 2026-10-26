@@ -793,15 +793,28 @@ func completeGeneratedDomainConstruction(reservation *generatedDomainReservation
 		!validActivity {
 		return deploymentexecution.ErrInvalidConfiguration
 	}
+	if result.capacity == nil || result.candidates == nil || result.candidates.ledger == nil ||
+		result.candidates.ledger.publishRestoredOwnership() != nil {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
 	state.construction = result
 	state.constructionPhase = generatedDomainConstructionComplete
 	close(state.constructionDone)
 	return nil
 }
 
-func failGeneratedDomainConstruction(reservation *generatedDomainReservation, err error) {
+func failGeneratedDomainConstruction(reservation *generatedDomainReservation,
+	result *generatedDomainConstruction, err error,
+) {
 	if reservation == nil {
 		return
+	}
+	if result != nil && result.capacity != nil {
+		_ = result.capacity.abortUnpublished(func() {
+			if result.candidates != nil && result.candidates.ledger != nil {
+				result.candidates.ledger.abandonUnpublished()
+			}
+		})
 	}
 	if err == nil {
 		err = deploymentexecution.ErrInvalidConfiguration
