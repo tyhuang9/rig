@@ -148,6 +148,8 @@ type GeneratedDomainStartupSnapshot struct {
 	Components                      []GeneratedDomainStartupComponent
 	CandidateIntents                []GeneratedDomainStartupCandidateIntent
 	RouteActivations                []GeneratedDomainStartupRouteActivation
+	PredecessorRetirementComponents []PredecessorRetirementObservation
+	PredecessorRetirementReceipts   []PredecessorRetirementReceipt
 	AccountingHandoffAuthorizations []RouteAccountingHandoffAuthorization
 	AccountingHandoffReceipts       []RouteAccountingHandoffReceipt
 	RouteCompletionReceipts         []RouteCompletionReceipt
@@ -228,6 +230,14 @@ func (r *Repository) GeneratedDomainStartupSnapshotTx(ctx context.Context, tx *s
 	if err != nil {
 		return GeneratedDomainStartupSnapshot{}, err
 	}
+	retirementComponents, err := readGeneratedDomainStartupPredecessorRetirementObservations(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	retirementReceipts, err := readGeneratedDomainStartupPredecessorRetirementReceipts(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
 	authorizations, err := readGeneratedDomainStartupAccountingHandoffAuthorizations(ctx, tx)
 	if err != nil {
 		return GeneratedDomainStartupSnapshot{}, err
@@ -242,9 +252,85 @@ func (r *Repository) GeneratedDomainStartupSnapshotTx(ctx context.Context, tx *s
 	}
 	return GeneratedDomainStartupSnapshot{
 		ActiveHeads: heads, Deployments: deployments, Components: components, CandidateIntents: intents,
-		RouteActivations: activations, AccountingHandoffAuthorizations: authorizations,
+		RouteActivations: activations, PredecessorRetirementComponents: retirementComponents,
+		PredecessorRetirementReceipts: retirementReceipts, AccountingHandoffAuthorizations: authorizations,
 		AccountingHandoffReceipts: handoffs, RouteCompletionReceipts: completions,
 	}, nil
+}
+
+func readGeneratedDomainStartupPredecessorRetirementObservations(ctx context.Context, tx *sql.Tx) (
+	[]PredecessorRetirementObservation, error,
+) {
+	rows, err := tx.QueryContext(ctx, `SELECT activation_receipt_id,app_id,successor_deployment_id,
+		predecessor_deployment_id,component_name,candidate_receipt_id,container_id,
+		candidate_policy_digest,observed_absent_at
+		FROM generated_route_predecessor_retirements
+		ORDER BY app_id,successor_deployment_id,activation_receipt_id,component_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []PredecessorRetirementObservation{}
+	for rows.Next() {
+		var value PredecessorRetirementObservation
+		var stamp string
+		if err := rows.Scan(&value.ActivationReceiptID, &value.AppID, &value.SuccessorDeploymentID,
+			&value.PredecessorDeploymentID, &value.ComponentName, &value.CandidateReceiptID,
+			&value.ContainerID, &value.CandidatePolicyDigest, &stamp); err != nil {
+			return nil, err
+		}
+		value.ObservedAbsentAt, err = parseTime(stamp)
+		if err != nil || !validGeneratedDomainStartupPredecessorRetirementObservation(value) {
+			return nil, errors.Join(ErrInvalidState, err)
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func readGeneratedDomainStartupPredecessorRetirementReceipts(ctx context.Context, tx *sql.Tx) (
+	[]PredecessorRetirementReceipt, error,
+) {
+	rows, err := tx.QueryContext(ctx, `SELECT activation_receipt_id,app_id,successor_deployment_id,
+		predecessor_deployment_id,predecessor_roster_digest,component_count,retired_at
+		FROM generated_route_predecessor_retirement_receipts
+		ORDER BY app_id,successor_deployment_id,activation_receipt_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []PredecessorRetirementReceipt{}
+	for rows.Next() {
+		var value PredecessorRetirementReceipt
+		var stamp string
+		if err := rows.Scan(&value.ActivationReceiptID, &value.AppID, &value.SuccessorDeploymentID,
+			&value.PredecessorDeploymentID, &value.PredecessorRosterDigest,
+			&value.ComponentCount, &stamp); err != nil {
+			return nil, err
+		}
+		value.RetiredAt, err = parseTime(stamp)
+		if err != nil || !validGeneratedDomainStartupPredecessorRetirementReceipt(value) {
+			return nil, errors.Join(ErrInvalidState, err)
+		}
+		result = append(result, value)
+	}
+	return result, rows.Err()
+}
+
+func validGeneratedDomainStartupPredecessorRetirementObservation(value PredecessorRetirementObservation) bool {
+	return canonicalUUID(value.ActivationReceiptID) && canonicalUUID(value.AppID) &&
+		canonicalUUID(value.SuccessorDeploymentID) && canonicalUUID(value.PredecessorDeploymentID) &&
+		validText(value.ComponentName, 256) && canonicalUUID(value.CandidateReceiptID) &&
+		lowerHex(value.ContainerID, 64) && lowerHex(value.CandidatePolicyDigest, 64) &&
+		!value.ObservedAbsentAt.IsZero()
+}
+
+func validGeneratedDomainStartupPredecessorRetirementReceipt(value PredecessorRetirementReceipt) bool {
+	return canonicalUUID(value.ActivationReceiptID) && canonicalUUID(value.AppID) &&
+		canonicalUUID(value.SuccessorDeploymentID) && lowerHex(value.PredecessorRosterDigest, 64) &&
+		!value.RetiredAt.IsZero() &&
+		((value.PredecessorDeploymentID == "" && value.ComponentCount == 0) ||
+			(canonicalUUID(value.PredecessorDeploymentID) && value.ComponentCount > 0))
 }
 
 func readGeneratedDomainStartupActiveHeads(ctx context.Context, tx *sql.Tx) ([]GeneratedDomainStartupActiveHead, error) {

@@ -103,15 +103,20 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 			generatedDomainConstructionReasonColdGroupAttestation, err)
 	}
 
-	// Classify every completed Current from the same typed startup snapshot and
-	// install its configured debt as one closed bootstrap batch. No Budget
-	// snapshot is available until the whole batch and its ledger tokens exist.
+	// Classify every completed Current and every exact interrupted Draining
+	// handoff from the same typed startup snapshot, then install their configured
+	// debt as one closed bootstrap batch. No Budget snapshot is available until
+	// the whole batch and its ledger tokens exist.
 	var debtLimits []generatedcapacity.Limits
 	for index := range groups {
-		if groups[index].kind != generatedDomainColdCurrent {
-			continue
+		var restore bool
+		var evidenceErr error
+		switch groups[index].kind {
+		case generatedDomainColdCurrent:
+			restore, evidenceErr = generatedDomainColdCurrentDebtEvidence(observed.database, groups[index], groups)
+		case generatedDomainColdRisky:
+			restore, evidenceErr = generatedDomainColdDrainingDebtEvidence(observed.database, groups[index], groups)
 		}
-		restore, evidenceErr := generatedDomainColdCurrentDebtEvidence(observed.database, groups[index], groups)
 		if evidenceErr != nil {
 			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
 				generatedDomainConstructionStageColdConstruction,
@@ -169,7 +174,7 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 	}
 	for index := range groups {
 		group := &groups[index]
-		if group.kind != generatedDomainColdRisky {
+		if group.kind != generatedDomainColdRisky || group.restoredDebt {
 			continue
 		}
 		spec := generatedDomainColdGroupSpec(result.candidates, *group)
@@ -1295,6 +1300,185 @@ func generatedDomainColdAuthorizerLineage(groups []generatedDomainColdGroup,
 		cursor = predecessor
 	}
 	return false
+}
+
+// generatedDomainColdDrainingDebtEvidence recognizes only the durable prefix
+// after predecessor retirement and the private accounting handoff have both
+// completed, but before route completion advances the deployment from
+// Draining. Earlier valid prefixes keep the existing Risky raw-reservation
+// behavior. Once a relevant row is present, crossed or non-prefix evidence is
+// refused rather than treated as absence.
+func generatedDomainColdDrainingDebtEvidence(database deployments.GeneratedDomainStartupSnapshot,
+	group generatedDomainColdGroup, groups []generatedDomainColdGroup,
+) (bool, error) {
+	if group.kind != generatedDomainColdRisky || group.snapshot.runtime.phase != generatedruntimestate.PhaseDraining ||
+		group.snapshot.observedHead.deploymentID != group.pins.deploymentID ||
+		group.snapshot.observedHead.activationReceiptID == "" {
+		return false, nil
+	}
+	for _, component := range group.snapshot.components {
+		if component.state != generatedruntimestate.ComponentActive {
+			return false, errGeneratedDomainConstructionRefused
+		}
+	}
+	receiptID := group.snapshot.observedHead.activationReceiptID
+	var activation generatedruntimestate.GeneratedDomainStartupRouteActivation
+	activationCount, relevantActivationCount := 0, 0
+	for _, value := range database.Runtime.RouteActivations {
+		if value.ReceiptID == receiptID || value.SuccessorDeploymentID == group.pins.deploymentID {
+			relevantActivationCount++
+		}
+		if value.ReceiptID == receiptID {
+			activation, activationCount = value, activationCount+1
+		}
+	}
+	if relevantActivationCount != 1 || activationCount != 1 ||
+		!generatedDomainColdActivationMatches(group.pins, group.snapshot, groups,
+			database.Runtime.RouteActivations) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+
+	predecessorRoster := []generatedruntimestate.RouteActivationComponent{}
+	if activation.PredecessorDeploymentID != "" {
+		predecessor, ok := generatedDomainColdGroupByDeployment(groups, activation.PredecessorDeploymentID)
+		if !ok {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		predecessorRoster, ok = generatedDomainColdActivationRoster(predecessor.snapshot)
+		if !ok {
+			return false, errGeneratedDomainConstructionRefused
+		}
+	}
+	expectedPredecessor := make(map[string]generatedruntimestate.RouteActivationComponent, len(predecessorRoster))
+	for _, component := range predecessorRoster {
+		expectedPredecessor[component.ComponentName] = component
+	}
+
+	observations := make(map[string]generatedruntimestate.PredecessorRetirementObservation,
+		len(predecessorRoster))
+	claimed := 0
+	for _, value := range database.Runtime.PredecessorRetirementComponents {
+		if value.ActivationReceiptID != receiptID && value.SuccessorDeploymentID != activation.SuccessorDeploymentID {
+			continue
+		}
+		claimed++
+		expected, ok := expectedPredecessor[value.ComponentName]
+		if !ok || value.ActivationReceiptID != receiptID || value.AppID != activation.AppID ||
+			value.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
+			value.PredecessorDeploymentID != activation.PredecessorDeploymentID ||
+			value.CandidateReceiptID != expected.CandidateReceiptID ||
+			value.ContainerID != expected.ContainerID ||
+			value.CandidatePolicyDigest != expected.CandidatePolicyDigest || value.ObservedAbsentAt.IsZero() {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		if _, duplicate := observations[value.ComponentName]; duplicate {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		observations[value.ComponentName] = value
+	}
+
+	var retirement generatedruntimestate.PredecessorRetirementReceipt
+	retirementCount := 0
+	for _, value := range database.Runtime.PredecessorRetirementReceipts {
+		if value.ActivationReceiptID != receiptID && value.SuccessorDeploymentID != activation.SuccessorDeploymentID {
+			continue
+		}
+		claimed++
+		if value.ActivationReceiptID != receiptID || value.AppID != activation.AppID ||
+			value.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
+			value.PredecessorDeploymentID != activation.PredecessorDeploymentID ||
+			value.PredecessorRosterDigest != activation.PredecessorRosterDigest ||
+			value.ComponentCount != len(predecessorRoster) || value.RetiredAt.IsZero() {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		retirement, retirementCount = value, retirementCount+1
+	}
+	if retirementCount > 1 {
+		return false, errGeneratedDomainConstructionRefused
+	}
+
+	var authorization generatedruntimestate.RouteAccountingHandoffAuthorization
+	authorizationCount := 0
+	for _, value := range database.Runtime.AccountingHandoffAuthorizations {
+		if value.ActivationReceiptID != receiptID && value.SuccessorDeploymentID != activation.SuccessorDeploymentID {
+			continue
+		}
+		claimed++
+		if value.ActivationReceiptID != receiptID || value.AppID != activation.AppID ||
+			value.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
+			value.PredecessorDeploymentID != activation.PredecessorDeploymentID ||
+			value.CandidateRosterDigest != activation.CandidateRosterDigest ||
+			value.PredecessorRosterDigest != activation.PredecessorRosterDigest ||
+			value.SuccessorComponentCount != len(group.snapshot.components) ||
+			value.PredecessorComponentCount != len(predecessorRoster) || value.AuthorizedAt.IsZero() {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		authorization, authorizationCount = value, authorizationCount+1
+	}
+	if authorizationCount > 1 {
+		return false, errGeneratedDomainConstructionRefused
+	}
+
+	var handoff generatedruntimestate.RouteAccountingHandoffReceipt
+	handoffCount := 0
+	for _, value := range database.Runtime.AccountingHandoffReceipts {
+		if value.ActivationReceiptID != receiptID && value.SuccessorDeploymentID != activation.SuccessorDeploymentID {
+			continue
+		}
+		claimed++
+		if value.ActivationReceiptID != receiptID || value.AppID != activation.AppID ||
+			value.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
+			value.PredecessorDeploymentID != activation.PredecessorDeploymentID ||
+			value.CandidateRosterDigest != activation.CandidateRosterDigest ||
+			value.PredecessorRosterDigest != activation.PredecessorRosterDigest ||
+			value.SuccessorComponentCount != len(group.snapshot.components) ||
+			value.PredecessorComponentCount != len(predecessorRoster) || value.HandedOffAt.IsZero() {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		handoff, handoffCount = value, handoffCount+1
+	}
+	if handoffCount > 1 {
+		return false, errGeneratedDomainConstructionRefused
+	}
+
+	for _, value := range database.Runtime.RouteCompletionReceipts {
+		if value.ActivationReceiptID == receiptID || value.SuccessorDeploymentID == activation.SuccessorDeploymentID {
+			return false, errGeneratedDomainConstructionRefused
+		}
+	}
+	if claimed == 0 {
+		return false, nil
+	}
+	if retirementCount == 0 {
+		if authorizationCount != 0 || handoffCount != 0 {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		return false, nil
+	}
+	if len(observations) != len(predecessorRoster) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+	for _, observation := range observations {
+		if observation.ObservedAbsentAt.After(retirement.RetiredAt) {
+			return false, errGeneratedDomainConstructionRefused
+		}
+	}
+	if authorizationCount == 0 {
+		if handoffCount != 0 {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		return false, nil
+	}
+	if retirement.RetiredAt.After(authorization.AuthorizedAt) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+	if handoffCount == 0 {
+		return false, nil
+	}
+	if authorization.AuthorizedAt.After(handoff.HandedOffAt) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+	return true, nil
 }
 
 // generatedDomainColdCurrentDebtEvidence classifies only the independently

@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -171,6 +172,156 @@ func TestGeneratedDomainRestartAccountingCompletedCurrentSupportsDistinctReplace
 		}
 		assertGeneratedRouteCompletionState(t, fixture.identity.database, retirement.state.receipt, 1)
 	})
+}
+
+func TestGeneratedDomainRestartAccountingInterruptedDrainingRestoresConfiguredDebt(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	generatedDomainConstructionCase(t, func(t *testing.T) {
+		fixture := newGeneratedRouteColdAccountingDrainingFixture(t)
+		assertGeneratedRouteColdAccountingDrainingSnapshot(t, fixture)
+		beforeProtection := generatedRouteColdAccountingProtection(t, fixture)
+		beforeCommands := fixture.construction.snapshot()
+		beforeStop := fixture.predecessor.count(candidateOwnerStop)
+		beforeRemove := fixture.predecessor.count(candidateOwnerRemove)
+
+		result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+			fixture.process, fixture.environment, fixture.identity.options)
+		if err != nil {
+			var diagnostic *generatedDomainConstructionDiagnostic
+			if result != nil || !errors.As(err, &diagnostic) || diagnostic == nil ||
+				diagnostic.stage != generatedDomainConstructionStageColdConstruction ||
+				diagnostic.reason != generatedDomainConstructionReasonColdReservation {
+				t.Fatalf("interrupted Draining cold construction result=%#v diagnostic=%#v error=%v", result,
+					diagnostic, err)
+			}
+			assertGeneratedRouteColdAccountingDrainingSnapshot(t, fixture)
+			assertGeneratedRouteColdAccountingProtectionUnchanged(t, beforeProtection, fixture)
+			if fixture.predecessor.count(candidateOwnerStop) != beforeStop ||
+				fixture.predecessor.count(candidateOwnerRemove) != beforeRemove {
+				t.Fatal("interrupted Draining cold refusal reached predecessor effects")
+			}
+			if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+				generatedRouteColdAccountingCapacityProbeCount(beforeCommands)+1 {
+				t.Fatal("interrupted Draining target refusal did not make exactly one fresh capacity acquisition")
+			}
+			t.Fatalf("interrupted Draining cold construction reached the expected reservation refusal: %v", err)
+		}
+		if result == nil || result.candidates == nil || result.routes == nil {
+			t.Fatalf("interrupted Draining cold construction result=%#v", result)
+		}
+		assertGeneratedRouteColdAccountingRestoredCurrent(t, result, fixture)
+		assertGeneratedRouteColdAccountingDrainingSnapshot(t, fixture)
+		assertGeneratedRouteColdAccountingProtectionUnchanged(t, beforeProtection, fixture)
+		if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+			generatedRouteColdAccountingCapacityProbeCount(beforeCommands) {
+			t.Fatal("interrupted Draining cold reconstruction acquired a fresh capacity share")
+		}
+		if fixture.predecessor.count(candidateOwnerStop) != beforeStop ||
+			fixture.predecessor.count(candidateOwnerRemove) != beforeRemove {
+			t.Fatal("interrupted Draining cold reconstruction replayed predecessor effects")
+		}
+	})
+}
+
+type generatedRouteColdAccountingProtectionSnapshot struct {
+	database  gatewayRebindFixtureDatabaseSnapshot
+	history   gatewayHistorySnapshot
+	protected generatedDomainProtectedStartupSnapshot
+}
+
+func generatedRouteColdAccountingProtection(t *testing.T,
+	fixture generatedRouteColdAccountingFixture,
+) generatedRouteColdAccountingProtectionSnapshot {
+	t.Helper()
+	database, err := snapshotGatewayRebindFixtureDatabase(context.Background(), fixture.identity.database)
+	if err != nil {
+		t.Fatalf("read interrupted Draining SQL snapshot: %v", err)
+	}
+	store, err := newStateStore(fixture.identity.dataRoot)
+	if err != nil {
+		t.Fatalf("open interrupted Draining protected store: %v", err)
+	}
+	history, err := readGatewayHistorySnapshotPolicy(store, true, true)
+	if err != nil {
+		t.Fatalf("read interrupted Draining protected history: %v", err)
+	}
+	protected, err := readGeneratedDomainProtectedStartup(context.Background(), fixture.identity.options.DataRoot)
+	if err != nil {
+		t.Fatalf("read interrupted Draining protected startup: %v", err)
+	}
+	return generatedRouteColdAccountingProtectionSnapshot{database: database, history: history,
+		protected: protected}
+}
+
+func assertGeneratedRouteColdAccountingProtectionUnchanged(t *testing.T,
+	before generatedRouteColdAccountingProtectionSnapshot, fixture generatedRouteColdAccountingFixture,
+) {
+	t.Helper()
+	after := generatedRouteColdAccountingProtection(t, fixture)
+	databaseSame := reflect.DeepEqual(before.database, after.database)
+	historySame := sameGatewayHistorySnapshot(before.history, after.history)
+	protectedSame := sameGeneratedDomainProtectedStartup(before.protected, after.protected)
+	if !databaseSame || !historySame || !protectedSame {
+		t.Fatalf("interrupted Draining cold construction changed protected state: database=%t history=%t protected=%t",
+			databaseSame, historySame, protectedSame)
+	}
+}
+
+func generatedRouteColdAccountingCapacityProbeCount(commands [][]string) int {
+	count := 0
+	for _, command := range commands {
+		if len(command) == 6 && command[0] == "container" && command[1] == "exec" &&
+			command[3] == "sh" && command[4] == "-c" && command[5] == capacityProbeCommand {
+			count++
+		}
+	}
+	return count
+}
+
+func assertGeneratedRouteColdAccountingDrainingSnapshot(t *testing.T,
+	fixture generatedRouteColdAccountingFixture,
+) {
+	t.Helper()
+	db := fixture.identity.database
+	count := func(query string, arguments ...any) int {
+		t.Helper()
+		var value int
+		if err := db.QueryRow(query, arguments...).Scan(&value); err != nil {
+			t.Fatalf("read interrupted Draining durable count: %v", err)
+		}
+		return value
+	}
+	receiptID := fixture.firstReceipt.ReceiptID
+	intents := count(`SELECT COUNT(*) FROM generated_candidate_intents WHERE id=?`, fixture.componentReceipt)
+	activations := count(`SELECT COUNT(*) FROM generated_route_activations WHERE id=?`, receiptID)
+	retirementComponents := count(`SELECT COUNT(*) FROM generated_route_predecessor_retirements
+		WHERE activation_receipt_id=?`, receiptID)
+	retirementReceipts := count(`SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	authorizations := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations
+		WHERE activation_receipt_id=?`, receiptID)
+	handoffs := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	completions := count(`SELECT COUNT(*) FROM generated_route_completion_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	state, err := generatedruntimestate.New(db).Get(context.Background(), fixture.migration.guarded.appID,
+		fixture.migration.request.DeploymentID)
+	if err != nil || state.Phase != generatedruntimestate.PhaseDraining ||
+		intents != 1 || activations != 1 || retirementComponents != 1 || retirementReceipts != 1 ||
+		authorizations != 1 || handoffs != 1 || completions != 0 {
+		t.Fatalf("interrupted Draining state phase=%s receipts=%d/%d/%d/%d/%d/%d/%d error=%v",
+			state.Phase, intents, activations, retirementComponents, retirementReceipts, authorizations, handoffs,
+			completions, err)
+	}
+	componentState := ""
+	if err := db.QueryRow(`SELECT state FROM generated_runtime_components
+		WHERE deployment_id=? AND component_name=?`, fixture.migration.request.DeploymentID,
+		fixture.componentName).Scan(&componentState); err != nil ||
+		componentState != string(generatedruntimestate.ComponentActive) {
+		t.Fatalf("interrupted Draining component state=%q error=%v", componentState, err)
+	}
 }
 
 func assertGeneratedRouteColdAccountingRestoredCurrent(t *testing.T, result *generatedDomainConstruction,
@@ -362,6 +513,7 @@ type generatedRouteColdAccountingFixture struct {
 	process               *generatedRouteColdAccountingRunner
 	routes                *generatedRoutePredecessorRunner
 	predecessor           *candidateOwnerRunner
+	construction          *generatedDomainConstructionRunner
 	environment           *candidateFactoryEnvironment
 	firstReceipt          generatedruntimestate.RouteActivationReceipt
 	componentName         string
@@ -450,6 +602,16 @@ func candidateOwnerPhysicalMatches(physical candidateOwnerPhysical, kind candida
 }
 
 func newGeneratedRouteColdAccountingFixture(t *testing.T) generatedRouteColdAccountingFixture {
+	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, true)
+}
+
+func newGeneratedRouteColdAccountingDrainingFixture(t *testing.T) generatedRouteColdAccountingFixture {
+	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, false)
+}
+
+func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
+	complete bool,
+) generatedRouteColdAccountingFixture {
 	t.Helper()
 	identity := newGeneratedDomainIdentityFixture(t)
 	migration, jobService := newGeneratedRouteCanonicalMigrationOnDatabase(t, identity.database,
@@ -542,8 +704,21 @@ func newGeneratedRouteColdAccountingFixture(t *testing.T) generatedRouteColdAcco
 		t.Fatalf("activate lifecycle-bound Current retirement=%#v error=%v", secondRetirement, err)
 	}
 	t.Cleanup(secondRetirement.Leave)
-	if err := secondRetirement.Complete(context.Background()); err != nil {
-		t.Fatalf("complete lifecycle-bound Current: %v", err)
+	if complete {
+		if err := secondRetirement.Complete(context.Background()); err != nil {
+			t.Fatalf("complete lifecycle-bound Current: %v", err)
+		}
+	} else {
+		if retired, err := secondRetirement.Retire(context.Background()); err != nil ||
+			retired.ActivationReceiptID != secondRetirement.state.receipt.ReceiptID ||
+			retired.SuccessorDeploymentID != secondMigration.request.DeploymentID {
+			t.Fatalf("retire interrupted Draining predecessor=%#v error=%v", retired, err)
+		}
+		handoff, err := secondRetirement.completeAccountingHandoff(context.Background())
+		if err != nil || handoff.ActivationReceiptID != secondRetirement.state.receipt.ReceiptID ||
+			handoff.SuccessorDeploymentID != secondMigration.request.DeploymentID {
+			t.Fatalf("complete interrupted Draining accounting handoff=%#v error=%v", handoff, err)
+		}
 	}
 	firstReceipt := secondRetirement.state.receipt
 	secondRetirement.Leave()
@@ -611,12 +786,19 @@ func newGeneratedRouteColdAccountingFixture(t *testing.T) generatedRouteColdAcco
 	identity.options.HostPort = journal.Source.LocalHostPort
 	cold := &generatedDomainConstructionRunner{roster: candidateRunner, delegate: &generatedDomainRecoveryCensusRunner{
 		daemonID: "generated-domain-cold-accounting", objects: objects, imageID: observation.Image.ID, gateway: gateway}}
+	if !complete {
+		if identity.options.MemoryBytes <= 1 || identity.options.ReplacementDiskBytes == 0 {
+			t.Fatal("interrupted Draining fixture has invalid capacity limits")
+		}
+		cold.capacity = []byte(fmt.Sprintf("%d %d\n", identity.options.MemoryBytes-1,
+			identity.options.ReplacementDiskBytes))
+	}
 	builder.runner = &generatedDomainTwoComponentRouteRunner{delegate: cold, builder: &builder.physical}
 	process := &generatedRouteColdAccountingRunner{cold: builder.runner,
 		predecessor: candidateRunner, predecessorPhysical: physicalCandidate}
 
 	return generatedRouteColdAccountingFixture{identity: identity, migration: migration, jobs: jobService,
-		process: process, routes: physicalRoutes, predecessor: owner.runner,
+		process: process, routes: physicalRoutes, predecessor: owner.runner, construction: cold,
 		environment: &candidateFactoryEnvironment{path: t.TempDir()}, firstReceipt: firstReceipt,
 		componentName: physicalCandidate.policy.identity.Component, componentReceipt: candidateIdentity.ReceiptID,
 		lifecycleDeploymentID: firstHead.DeploymentID}

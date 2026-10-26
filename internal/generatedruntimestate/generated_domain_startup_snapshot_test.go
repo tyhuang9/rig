@@ -23,13 +23,15 @@ func TestGeneratedDomainStartupSnapshotTxTreatsHistoricalApplicationsAsEmpty(t *
 	}
 	if snapshot.ActiveHeads == nil || snapshot.Deployments == nil || snapshot.Components == nil ||
 		snapshot.CandidateIntents == nil || snapshot.RouteActivations == nil ||
+		snapshot.PredecessorRetirementComponents == nil || snapshot.PredecessorRetirementReceipts == nil ||
 		snapshot.AccountingHandoffAuthorizations == nil || snapshot.AccountingHandoffReceipts == nil ||
 		snapshot.RouteCompletionReceipts == nil {
 		t.Fatal("empty snapshot contains nil slices")
 	}
 	if len(snapshot.ActiveHeads) != 0 || len(snapshot.Deployments) != 0 ||
 		len(snapshot.Components) != 0 || len(snapshot.CandidateIntents) != 0 ||
-		len(snapshot.RouteActivations) != 0 || len(snapshot.AccountingHandoffAuthorizations) != 0 ||
+		len(snapshot.RouteActivations) != 0 || len(snapshot.PredecessorRetirementComponents) != 0 ||
+		len(snapshot.PredecessorRetirementReceipts) != 0 || len(snapshot.AccountingHandoffAuthorizations) != 0 ||
 		len(snapshot.AccountingHandoffReceipts) != 0 || len(snapshot.RouteCompletionReceipts) != 0 {
 		t.Fatalf("ordinary history reported generated runtime state: %#v", snapshot)
 	}
@@ -267,6 +269,11 @@ func TestGeneratedDomainStartupSnapshotTxReadsCompleteAccountingChainIndependent
 		t.Fatal(err)
 	}
 	if len(snapshot.RouteActivations) != 1 || snapshot.RouteActivations[0].ReceiptID != input.Activation.ReceiptID ||
+		len(snapshot.PredecessorRetirementComponents) != 0 ||
+		len(snapshot.PredecessorRetirementReceipts) != 1 ||
+		snapshot.PredecessorRetirementReceipts[0].ActivationReceiptID != input.Activation.ReceiptID ||
+		snapshot.PredecessorRetirementReceipts[0].PredecessorDeploymentID != "" ||
+		snapshot.PredecessorRetirementReceipts[0].ComponentCount != 0 ||
 		len(snapshot.AccountingHandoffAuthorizations) != 1 ||
 		snapshot.AccountingHandoffAuthorizations[0].ActivationReceiptID != input.Activation.ReceiptID ||
 		len(snapshot.AccountingHandoffReceipts) != 1 ||
@@ -274,6 +281,299 @@ func TestGeneratedDomainStartupSnapshotTxReadsCompleteAccountingChainIndependent
 		len(snapshot.RouteCompletionReceipts) != 1 ||
 		!routeCompletionReceiptMatchesInput(snapshot.RouteCompletionReceipts[0], input) {
 		t.Fatalf("complete accounting snapshot=%#v", snapshot)
+	}
+}
+
+func TestGeneratedDomainStartupSnapshotTxReadsSortedPredecessorRetirementRowsIndependently(t *testing.T) {
+	components := []string{"worker", "api"}
+	fixture := newCandidateFixture(t, components)
+	ctx := context.Background()
+	prepare := func(candidate *candidateFixture) []RouteActivationComponent {
+		t.Helper()
+		for _, component := range components {
+			input := candidate.input(component)
+			candidate.commit(t, func(tx *sql.Tx) error { return candidate.repository.BeginCandidateTx(ctx, tx, input) })
+			candidate.commit(t, func(tx *sql.Tx) error {
+				return candidate.repository.RecordCandidateCreatedTx(ctx, tx, candidate.appID, candidate.deploymentID,
+					component, input.ReceiptID, input.ContainerName, candidate.containerIDs[component])
+			})
+		}
+		candidate.commit(t, func(tx *sql.Tx) error {
+			return candidate.repository.FinishCandidateStartingTx(ctx, tx, candidate.appID, candidate.deploymentID)
+		})
+		for _, component := range components {
+			input := candidate.input(component)
+			candidate.commit(t, func(tx *sql.Tx) error {
+				return candidate.repository.RecordCandidateHealthyTx(ctx, tx, candidate.appID, candidate.deploymentID,
+					component, input.ReceiptID, candidate.containerIDs[component])
+			})
+		}
+		candidate.commit(t, func(tx *sql.Tx) error {
+			return candidate.repository.FinishCandidateHealthTx(ctx, tx, candidate.appID, candidate.deploymentID)
+		})
+		roster, err := candidate.repository.RouteActivationRoster(ctx, candidate.appID, candidate.deploymentID,
+			ComponentHealthy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return roster
+	}
+	activate := func(candidate *candidateFixture, candidateRoster, predecessorRoster []RouteActivationComponent,
+		generation int64, predecessor RouteActivationReceipt,
+	) RouteActivationReceipt {
+		t.Helper()
+		activation := RouteActivationReceipt{
+			ReceiptID: uuid.NewString(), AppID: candidate.appID,
+			SuccessorDeploymentID: candidate.deploymentID, SuccessorReleaseID: candidate.releaseID,
+			SuccessorSlot: "blue", SuccessorGeneration: generation,
+			CreatorJobID: candidate.jobID, CreatorWorkerAttempt: candidate.jobAttempt,
+			CandidateRosterDigest:     predecessorRetirementRosterDigest(candidateRoster),
+			PredecessorRosterDigest:   predecessorRetirementRosterDigest(predecessorRoster),
+			RouteIntentDigest:         strings.Repeat("4", 64),
+			CommittedRouteProofDigest: strings.Repeat("5", 64), ActivatedAt: candidate.now,
+		}
+		if generation > 1 {
+			activation.SuccessorSlot = "green"
+			activation.PredecessorDeploymentID = predecessor.SuccessorDeploymentID
+			activation.PredecessorReleaseID = predecessor.SuccessorReleaseID
+			activation.PredecessorSlot = predecessor.SuccessorSlot
+			activation.PredecessorGeneration = predecessor.SuccessorGeneration
+			activation.PredecessorActivationReceiptID = predecessor.ReceiptID
+		}
+		candidate.commit(t, func(tx *sql.Tx) error {
+			stamp := timestamp(activation.ActivatedAt)
+			if _, err := tx.Exec(`INSERT INTO generated_route_activations(
+				id,app_id,successor_deployment_id,successor_release_id,successor_slot,successor_generation,
+				predecessor_deployment_id,predecessor_release_id,predecessor_slot,predecessor_generation,
+				predecessor_activation_receipt_id,creator_job_id,creator_worker_attempt,candidate_roster_digest,
+				predecessor_roster_digest,route_intent_digest,committed_route_proof_digest,activated_at
+			) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, activation.ReceiptID, activation.AppID,
+				activation.SuccessorDeploymentID, activation.SuccessorReleaseID, activation.SuccessorSlot,
+				activation.SuccessorGeneration, activation.PredecessorDeploymentID,
+				activation.PredecessorReleaseID, activation.PredecessorSlot,
+				activation.PredecessorGeneration, activation.PredecessorActivationReceiptID,
+				activation.CreatorJobID, activation.CreatorWorkerAttempt, activation.CandidateRosterDigest,
+				activation.PredecessorRosterDigest, activation.RouteIntentDigest,
+				activation.CommittedRouteProofDigest, stamp); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE generated_runtime_active_heads
+				SET deployment_id=?,release_id=?,slot=?,generation=?,activation_receipt_id=?,updated_at=?
+				WHERE app_id=? AND generation=?`, candidate.deploymentID, candidate.releaseID,
+				activation.SuccessorSlot, generation, activation.ReceiptID, stamp, candidate.appID, generation-1); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE generated_runtime_components SET state='active',updated_at=?
+				WHERE deployment_id=? AND state='healthy'`, stamp, candidate.deploymentID); err != nil {
+				return err
+			}
+			_, err := tx.Exec(`UPDATE generated_runtime_deployments SET phase='draining',updated_at=?
+				WHERE deployment_id=? AND phase='switching_route'`, stamp, candidate.deploymentID)
+			return err
+		})
+		return activation
+	}
+
+	firstRoster := prepare(fixture)
+	firstActivation := activate(fixture, firstRoster, nil, 1, RouteActivationReceipt{})
+	var firstRetirement PredecessorRetirementReceipt
+	fixture.commit(t, func(tx *sql.Tx) error {
+		value, changed, err := fixture.repository.RecordPredecessorRetirementReceiptTx(ctx, tx,
+			firstActivation, nil, fixture.now.Add(time.Second))
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errors.New("empty predecessor retirement aggregate was not inserted")
+		}
+		firstRetirement = value
+		return nil
+	})
+	var firstAuthorization RouteAccountingHandoffAuthorization
+	fixture.commit(t, func(tx *sql.Tx) error {
+		value, changed, err := fixture.repository.RecordRouteAccountingHandoffAuthorizationTx(ctx, tx,
+			firstActivation, firstRetirement, firstRoster, nil, fixture.now.Add(2*time.Second))
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errors.New("first accounting handoff authorization was not inserted")
+		}
+		firstAuthorization = value
+		return nil
+	})
+	var firstHandoff RouteAccountingHandoffReceipt
+	fixture.commit(t, func(tx *sql.Tx) error {
+		value, changed, err := fixture.repository.RecordRouteAccountingHandoffReceiptTx(ctx, tx,
+			firstAuthorization, fixture.now.Add(3*time.Second))
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errors.New("first accounting handoff receipt was not inserted")
+		}
+		firstHandoff = value
+		return nil
+	})
+	fixture.commit(t, func(tx *sql.Tx) error {
+		input := RouteCompletionInput{
+			Activation: firstActivation, AccountingHandoff: firstHandoff,
+			CurrentJobID: firstActivation.CreatorJobID, CurrentWorkerAttempt: firstActivation.CreatorWorkerAttempt,
+			CompletedAt: fixture.now.Add(4 * time.Second),
+		}
+		if _, changed, err := fixture.repository.RecordGeneratedRouteSucceededTx(ctx, tx, input); err != nil {
+			return err
+		} else if !changed {
+			return errors.New("first generated route did not advance to succeeded")
+		}
+		result, err := tx.Exec(`UPDATE deployments SET status='succeeded',finished_at=?
+			WHERE id=? AND status='waiting_health'`, timestamp(input.CompletedAt), firstActivation.SuccessorDeploymentID)
+		if err != nil {
+			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return errors.Join(errors.New("first main deployment did not advance to succeeded"), err)
+		}
+		if _, changed, err := fixture.repository.RecordRouteCompletionReceiptTx(ctx, tx, input); err != nil {
+			return err
+		} else if !changed {
+			return errors.New("first route completion receipt was not inserted")
+		}
+		result, err = tx.Exec(`UPDATE jobs SET status='succeeded',phase='succeeded',updated_at=?
+			WHERE id=? AND status='running'`, timestamp(input.CompletedAt), firstActivation.CreatorJobID)
+		if err != nil {
+			return err
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return errors.Join(errors.New("first deployment job did not advance to succeeded"), err)
+		}
+		return nil
+	})
+	successor := *fixture
+	successor.now = fixture.now.Add(time.Hour)
+	successor.jobID, successor.deploymentID = uuid.NewString(), uuid.NewString()
+	successor.jobAttempt = fixture.jobAttempt + 1
+	successor.artifactIDs = map[string]string{}
+	successor.artifactAttempts = map[string]int64{}
+	successor.receiptIDs = map[string]string{}
+	successor.containerNames = map[string]string{}
+	successor.containerIDs = map[string]string{}
+	stamp := timestamp(successor.now)
+	successor.exec(t, `INSERT INTO jobs(
+		id,type,resource_type,resource_id,status,phase,attempt,requested_by,input_json,created_at,started_at,updated_at
+	) VALUES(?,'deploy','application',?,'running','running',?,?,'{}',?,?,?)`,
+		successor.jobID, successor.appID, successor.jobAttempt, successor.actorID, stamp, stamp, stamp)
+	successor.exec(t, `INSERT INTO deployments(
+		id,app_id,release_id,job_id,status,started_at,configuration_mode,actual_configuration_revision_id,
+		actual_configuration_revision_number,provenance_initialized,runtime_strategy,
+		deployment_plan_revision_id,deployment_plan_revision_number
+	) VALUES(?,?,?,?,'applying',?,'current',?,2,1,'generated_node',?,1)`, successor.deploymentID,
+		successor.appID, successor.releaseID, successor.jobID, stamp, successor.configurationID, successor.planID)
+	successor.exec(t, `INSERT INTO generated_runtime_deployments(
+		deployment_id,app_id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,
+		candidate_slot,previous_active_deployment_id,previous_active_slot,phase,migration_state,created_at,updated_at
+	) VALUES(?,?,?,?,1,'green',?,?,'preflight','not_required',?,?)`, successor.deploymentID,
+		successor.appID, successor.releaseID, successor.planID, fixture.deploymentID, "blue", stamp, stamp)
+	for index, component := range components {
+		artifactID := uuid.NewString()
+		successor.artifactIDs[component] = artifactID
+		successor.artifactAttempts[component] = int64(index + 10)
+		successor.receiptIDs[component] = uuid.NewString()
+		successor.containerNames[component] = "rig-successor-" + component
+		successor.containerIDs[component] = strings.Repeat(string(rune('8'+index)), 64)
+		successor.exec(t, `INSERT INTO generated_image_artifacts(
+			id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,
+			compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at
+		) VALUES(?,?,?,?,?,'candidate-test',?,?,?,'ready',?,?,?)`, artifactID, successor.releaseID,
+			successor.planID, 1, component, strings.Repeat(string(rune('e'+index)), 64),
+			successor.artifactAttempts[component], "sha256:"+strings.Repeat(string(rune('e'+index)), 64), stamp, stamp, stamp)
+		successor.exec(t, `INSERT INTO generated_runtime_components(
+			deployment_id,component_name,slot,image_artifact_id,state,created_at,updated_at
+		) VALUES(?,?,'green',?,'image_ready',?,?)`, successor.deploymentID, component, artifactID, stamp, stamp)
+	}
+	successor.exec(t, `UPDATE generated_runtime_deployments SET phase='building',updated_at=? WHERE deployment_id=?`,
+		stamp, successor.deploymentID)
+	successor.exec(t, `UPDATE generated_runtime_deployments SET phase='starting_candidate',updated_at=? WHERE deployment_id=?`,
+		stamp, successor.deploymentID)
+	successorRoster := prepare(&successor)
+	secondActivation := activate(&successor, successorRoster, firstRoster, 2, firstActivation)
+	for index := len(firstRoster) - 1; index >= 0; index-- {
+		component := firstRoster[index]
+		fixture.commit(t, func(tx *sql.Tx) error {
+			_, changed, err := fixture.repository.RecordPredecessorRetirementComponentTx(ctx, tx,
+				secondActivation, component, successor.now.Add(time.Duration(index)*time.Second))
+			if err != nil {
+				return err
+			}
+			if !changed {
+				return errors.New("predecessor retirement component was not inserted")
+			}
+			return nil
+		})
+	}
+	partial, err := generatedDomainSnapshotForTest(t, fixture.repository, fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(partial.PredecessorRetirementComponents) != 2 ||
+		partial.PredecessorRetirementComponents[0].ComponentName != "api" ||
+		partial.PredecessorRetirementComponents[1].ComponentName != "worker" ||
+		len(partial.PredecessorRetirementReceipts) != 1 ||
+		partial.PredecessorRetirementReceipts[0].ActivationReceiptID != firstActivation.ReceiptID {
+		t.Fatalf("partial retirement snapshot=%#v", partial)
+	}
+	for index, observed := range partial.PredecessorRetirementComponents {
+		expected := firstRoster[index]
+		if observed.ActivationReceiptID != secondActivation.ReceiptID || observed.AppID != fixture.appID ||
+			observed.SuccessorDeploymentID != successor.deploymentID ||
+			observed.PredecessorDeploymentID != fixture.deploymentID ||
+			observed.ComponentName != expected.ComponentName ||
+			observed.CandidateReceiptID != expected.CandidateReceiptID || observed.ContainerID != expected.ContainerID ||
+			observed.CandidatePolicyDigest != expected.CandidatePolicyDigest || observed.ObservedAbsentAt.IsZero() {
+			t.Fatalf("retirement component %d=%#v expected=%#v", index, observed, expected)
+		}
+	}
+	fixture.commit(t, func(tx *sql.Tx) error {
+		_, changed, err := fixture.repository.RecordPredecessorRetirementReceiptTx(ctx, tx,
+			secondActivation, firstRoster, successor.now.Add(time.Minute))
+		if err != nil {
+			return err
+		}
+		if !changed {
+			return errors.New("predecessor retirement aggregate was not inserted")
+		}
+		return nil
+	})
+	complete, err := generatedDomainSnapshotForTest(t, fixture.repository, fixture.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondRetirement *PredecessorRetirementReceipt
+	for index := range complete.PredecessorRetirementReceipts {
+		value := &complete.PredecessorRetirementReceipts[index]
+		if index > 0 {
+			previous := complete.PredecessorRetirementReceipts[index-1]
+			if previous.AppID > value.AppID ||
+				(previous.AppID == value.AppID && previous.SuccessorDeploymentID > value.SuccessorDeploymentID) ||
+				(previous.AppID == value.AppID && previous.SuccessorDeploymentID == value.SuccessorDeploymentID &&
+					previous.ActivationReceiptID > value.ActivationReceiptID) {
+				t.Fatalf("retirement receipts are not sorted: %#v", complete.PredecessorRetirementReceipts)
+			}
+		}
+		if value.ActivationReceiptID == secondActivation.ReceiptID {
+			if secondRetirement != nil {
+				t.Fatalf("duplicate second retirement receipt: %#v", complete.PredecessorRetirementReceipts)
+			}
+			secondRetirement = value
+		}
+	}
+	if len(complete.PredecessorRetirementComponents) != 2 ||
+		!reflect.DeepEqual(complete.PredecessorRetirementComponents, partial.PredecessorRetirementComponents) ||
+		len(complete.PredecessorRetirementReceipts) != 2 ||
+		secondRetirement == nil || secondRetirement.PredecessorDeploymentID != fixture.deploymentID ||
+		secondRetirement.PredecessorRosterDigest != secondActivation.PredecessorRosterDigest ||
+		secondRetirement.ComponentCount != 2 || secondRetirement.RetiredAt.IsZero() {
+		t.Fatalf("complete retirement snapshot=%#v", complete)
 	}
 }
 
