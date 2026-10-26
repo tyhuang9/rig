@@ -55,6 +55,7 @@ type routeController interface {
 		generatedruntime.RouteSwitchRequest, generatedruntimestate.Deployment,
 	) (routeActivation, error)
 	attestPublished(context.Context, deploymentexecution.Claim, string) error
+	completeRecovered(context.Context, deploymentexecution.Claim, string) error
 }
 
 type generatedRouteController struct {
@@ -82,6 +83,15 @@ func (c generatedRouteController) attestPublished(ctx context.Context, claim dep
 		return errors.New("generated route authority is unavailable")
 	}
 	return c.authority.AttestPublished(ctx, claim, deploymentID)
+}
+
+func (c generatedRouteController) completeRecovered(ctx context.Context,
+	claim deploymentexecution.Claim, deploymentID string,
+) error {
+	if c.authority == nil {
+		return errors.New("generated route authority is unavailable")
+	}
+	return c.authority.CompleteRecovered(ctx, claim, deploymentID)
 }
 
 func NewExecutor(
@@ -402,7 +412,7 @@ func (e *Executor) ExecuteBound(ctx context.Context, job jobs.Job, claim deploym
 
 		case generatedruntimestate.PhaseDraining:
 			if retirement == nil {
-				err = deployments.ErrGeneratedCandidateRetirementUnavailable
+				err = e.routes.completeRecovered(ctx, claim, runtimeDeployment.DeploymentID)
 			} else {
 				err = e.completePrevious(ctx, retirement)
 			}

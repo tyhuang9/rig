@@ -592,6 +592,7 @@ func assembleGeneratedDomainOwners(
 	result := &generatedDomainConstruction{reservation: reservation, manager: manager,
 		budget: budget, capacity: capacity, candidates: candidates, routes: routes}
 	result.domain = &GeneratedDomain{construction: result}
+	routes.construction = result
 	return result, nil
 }
 

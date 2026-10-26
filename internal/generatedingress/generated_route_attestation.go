@@ -20,9 +20,46 @@ func (a *GeneratedRouteAuthority) AttestPublished(ctx context.Context, claim dep
 	if !a.configured() || ctx == nil || claim.ApplicationID() == "" || !validAppID(deploymentID) {
 		return deploymentexecution.ErrInvalidConfiguration
 	}
+	return a.attestGeneratedRoute(ctx, claim, deploymentID, generatedruntimestate.PhaseDraining, nil,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return a.stores.ExecutionGuard().CheckPublishedRouteAttestationTx(ctx, tx, claim, deploymentID)
+		})
+}
+
+func (a *GeneratedRouteAuthority) readPublishedRouteAttestation(ctx context.Context, claim deploymentexecution.Claim, deploymentID string) (routeRecord, error) {
+	return a.readGeneratedRouteAttestation(ctx, claim, deploymentID, generatedruntimestate.PhaseDraining, nil,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return a.stores.ExecutionGuard().CheckPublishedRouteAttestationTx(ctx, tx, claim, deploymentID)
+		})
+}
+
+type generatedRouteAttestationGuard func(context.Context, *sql.Tx) error
+
+func (a *GeneratedRouteAuthority) attestRecoveredRouteCompletion(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	activation generatedruntimestate.RouteActivationReceipt,
+	completion generatedruntimestate.RouteCompletionReceipt,
+) error {
+	if pinned == nil || activation.ReceiptID == "" || completion.ActivationReceiptID != activation.ReceiptID {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
+	return a.attestGeneratedRoute(ctx, claim, activation.SuccessorDeploymentID,
+		generatedruntimestate.PhaseSucceeded, &activation, func(_ context.Context, tx *sql.Tx) error {
+			return pinned.CheckGeneratedRouteCompletionReplayTx(tx, claim, activation, completion)
+		})
+}
+
+func (a *GeneratedRouteAuthority) attestGeneratedRoute(ctx context.Context, claim deploymentexecution.Claim,
+	deploymentID string, phase generatedruntimestate.Phase,
+	activation *generatedruntimestate.RouteActivationReceipt, guard generatedRouteAttestationGuard,
+) error {
+	if guard == nil {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
 	appID := claim.ApplicationID()
 	return a.manager.WithObservation(ctx, appID, func(observationContext context.Context, observation Observation) error {
-		expected, err := a.readPublishedRouteAttestation(observationContext, claim, deploymentID)
+		expected, err := a.readGeneratedRouteAttestation(observationContext, claim, deploymentID,
+			phase, activation, guard)
 		if err != nil {
 			return err
 		}
@@ -33,13 +70,19 @@ func (a *GeneratedRouteAuthority) AttestPublished(ctx context.Context, claim dep
 	})
 }
 
-func (a *GeneratedRouteAuthority) readPublishedRouteAttestation(ctx context.Context, claim deploymentexecution.Claim, deploymentID string) (routeRecord, error) {
+func (a *GeneratedRouteAuthority) readGeneratedRouteAttestation(ctx context.Context,
+	claim deploymentexecution.Claim, deploymentID string, expectedPhase generatedruntimestate.Phase,
+	expectedActivation *generatedruntimestate.RouteActivationReceipt, guard generatedRouteAttestationGuard,
+) (routeRecord, error) {
 	tx, err := a.stores.Database().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return routeRecord{}, err
 	}
 	defer tx.Rollback()
-	if err := a.stores.ExecutionGuard().CheckPublishedRouteAttestationTx(ctx, tx, claim, deploymentID); err != nil {
+	if guard == nil {
+		return routeRecord{}, deploymentexecution.ErrInvalidConfiguration
+	}
+	if err := guard(ctx, tx); err != nil {
 		return routeRecord{}, publishedRouteAttestationError(err)
 	}
 	appID := claim.ApplicationID()
@@ -51,7 +94,8 @@ func (a *GeneratedRouteAuthority) readPublishedRouteAttestation(ctx context.Cont
 	if err != nil || receipt.AppID != appID || receipt.SuccessorDeploymentID != deploymentID ||
 		receipt.SuccessorReleaseID != head.ReleaseID || receipt.SuccessorSlot != head.Slot ||
 		receipt.SuccessorGeneration != head.Generation || receipt.CreatorJobID != claim.JobID() ||
-		receipt.CreatorWorkerAttempt < 1 || receipt.CreatorWorkerAttempt > claim.Attempt() {
+		receipt.CreatorWorkerAttempt < 1 || receipt.CreatorWorkerAttempt > claim.Attempt() ||
+		expectedActivation != nil && receipt != *expectedActivation {
 		return routeRecord{}, publishedRouteAttestationError(err)
 	}
 	var releaseID, planID, slot, previousDeploymentID, previousSlot, deploymentJobID string
@@ -67,7 +111,7 @@ func (a *GeneratedRouteAuthority) readPublishedRouteAttestation(ctx context.Cont
 		Scan(&releaseID, &planID, &planNumber, &slot, &previousDeploymentID, &previousSlot, &phase, &deploymentJobID)
 	if err != nil || releaseID != receipt.SuccessorReleaseID || slot != receipt.SuccessorSlot ||
 		previousDeploymentID != receipt.PredecessorDeploymentID || previousSlot != receipt.PredecessorSlot ||
-		phase != generatedruntimestate.PhaseDraining || deploymentJobID != claim.JobID() {
+		phase != expectedPhase || deploymentJobID != claim.JobID() {
 		return routeRecord{}, publishedRouteAttestationError(err)
 	}
 	roster, err := readGeneratedRouteActivationRosterTx(ctx, tx, deploymentID, generatedruntimestate.ComponentActive)
@@ -76,7 +120,7 @@ func (a *GeneratedRouteAuthority) readPublishedRouteAttestation(ctx context.Cont
 		generatedRouteActivationRosterDigest(canonicalRoster) != receipt.CandidateRosterDigest {
 		return routeRecord{}, publishedRouteAttestationError(err)
 	}
-	if err := a.stores.ExecutionGuard().CheckPublishedRouteAttestationTx(ctx, tx, claim, deploymentID); err != nil {
+	if err := guard(ctx, tx); err != nil {
 		return routeRecord{}, publishedRouteAttestationError(err)
 	}
 	if err := tx.Commit(); err != nil {

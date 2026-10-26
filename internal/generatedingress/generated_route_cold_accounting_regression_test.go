@@ -9,15 +9,19 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hostd/hostd/internal/applifecycle"
 	"github.com/hostd/hostd/internal/deploymentbinding"
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
+	"github.com/hostd/hostd/internal/generatedrecovery"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
@@ -276,6 +280,232 @@ func TestGeneratedDomainRestartAccountingInterruptedDrainingRestoresConfiguredDe
 	})
 }
 
+func TestGeneratedDomainRestartAccountingInterruptedDrainingClaimsFreshWorkerWithoutSecondShare(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	generatedDomainConstructionCase(t, func(t *testing.T) {
+		fixture := newGeneratedRouteColdAccountingDrainingFixture(t)
+		assertGeneratedRouteColdAccountingDrainingSnapshot(t, fixture)
+		beforeConstructionCommands := fixture.construction.snapshot()
+		beforeStop := fixture.predecessor.count(candidateOwnerStop)
+		beforeRemove := fixture.predecessor.count(candidateOwnerRemove)
+
+		result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+			fixture.process, fixture.environment, fixture.identity.options)
+		if err != nil || result == nil || result.candidates == nil || result.routes == nil || result.cold == nil {
+			t.Fatalf("interrupted Draining cold construction result=%#v error=%v", result, err)
+		}
+		assertGeneratedRouteColdAccountingRestoredCurrent(t, result, fixture)
+		assertGeneratedRouteColdAccountingDrainingSnapshot(t, fixture)
+		if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+			generatedRouteColdAccountingCapacityProbeCount(beforeConstructionCommands) {
+			t.Fatal("interrupted Draining cold reconstruction acquired a fresh capacity share")
+		}
+		fixture.process.setRoutes(fixture.routes)
+
+		beforeWorker := generatedRouteColdAccountingProtection(t, fixture)
+		var beforeStatus, beforePhase string
+		var beforeAttempt int
+		if err := fixture.identity.database.QueryRow(`SELECT status,phase,attempt FROM jobs WHERE id=?`,
+			fixture.migration.claim.JobID()).Scan(&beforeStatus, &beforePhase, &beforeAttempt); err != nil {
+			t.Fatalf("read interrupted Draining worker before recovery: %v", err)
+		}
+		recovered, err := generatedrecovery.RecoverRuntime(context.Background(), fixture.identity.database,
+			time.Now().UTC(), fixture.migration.bindings)
+		if err != nil || recovered.Jobs.RequeuedGenerated != 1 {
+			t.Fatalf("recover interrupted Draining worker: result=%+v error=%v", recovered, err)
+		}
+
+		var claimed jobs.Job
+		var claimedProofErr error
+		runGeneratedColdBoundaryWorker(t, fixture.jobs,
+			generatedColdBoundaryExecutor(func(ctx context.Context, job jobs.Job, _ jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+				claimed = job
+				observed, observeErr := inspectGeneratedDomainStartupObservation(ctx, fixture.identity.stores,
+					fixture.process, fixture.identity.options)
+				if observeErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim startup observation: %w", observeErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				if attestErr := reattestGeneratedDomainCold(ctx, result.manager, result.candidates,
+					observed, *result.cold); attestErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim cold manifest: %w", attestErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				binding, bindingErr := fixture.migration.bindings.Read(ctx, job.ID)
+				if bindingErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim deployment binding: %w", bindingErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				claim, claimErr := deploymentexecution.NewClaim(binding, job.ID, job.ResourceID, job.Attempt)
+				if claimErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim execution claim: %w", claimErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				groups, groupsErr := readGeneratedDomainColdGroups(ctx, result.candidates, observed)
+				if groupsErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim cold groups: %w", groupsErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				evidence, evidenceErr := recoveredRouteCompletionEvidence(observed, groups, claim,
+					fixture.migration.request.DeploymentID)
+				if evidenceErr != nil || evidence.replay {
+					claimedProofErr = fmt.Errorf("post-claim completion evidence replay=%t: %w",
+						evidence.replay, evidenceErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				if completionErr := result.routes.CompleteRecovered(ctx, claim,
+					fixture.migration.request.DeploymentID); completionErr != nil {
+					claimedProofErr = fmt.Errorf("complete recovered route: %w", completionErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				postCompletionContext, cancelPostCompletion := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
+				defer cancelPostCompletion()
+				if strictErr := result.routes.AttestPublished(postCompletionContext, claim,
+					fixture.migration.request.DeploymentID); !errors.Is(strictErr,
+					deploymentexecution.ErrAuthorityStale) {
+					claimedProofErr = fmt.Errorf("succeeded route passed strict Draining attestation: %v", strictErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				driftProtection := generatedRouteColdAccountingProtection(t, fixture)
+				driftStop := fixture.predecessor.count(candidateOwnerStop)
+				driftRemove := fixture.predecessor.count(candidateOwnerRemove)
+				served := append([]byte(nil), fixture.routes.liveConfig...)
+				fixture.routes.liveConfig = []byte(`{}`)
+				changedRouteErr := result.routes.CompleteRecovered(postCompletionContext, claim,
+					fixture.migration.request.DeploymentID)
+				fixture.routes.liveConfig = served
+				if !IsCode(changedRouteErr, DiagnosticIngressDrift) {
+					claimedProofErr = fmt.Errorf("changed served route replay error=%v", changedRouteErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				assertGeneratedRouteColdAccountingProtectionUnchanged(t, driftProtection, fixture)
+				if fixture.predecessor.count(candidateOwnerStop) != driftStop ||
+					fixture.predecessor.count(candidateOwnerRemove) != driftRemove {
+					claimedProofErr = errors.New("changed served route replay performed predecessor effects")
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				if replayErr := result.routes.CompleteRecovered(postCompletionContext, claim,
+					fixture.migration.request.DeploymentID); replayErr != nil {
+					claimedProofErr = fmt.Errorf("replay recovered route completion: %w", replayErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				crossed, crossedErr := deploymentexecution.NewClaim(binding, job.ID, job.ResourceID, job.Attempt+1)
+				if crossedErr != nil {
+					claimedProofErr = fmt.Errorf("construct crossed recovered claim: %w", crossedErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				if crossedErr := result.routes.CompleteRecovered(postCompletionContext, crossed,
+					fixture.migration.request.DeploymentID); !errors.Is(crossedErr, deploymentexecution.ErrIdentityLost) {
+					claimedProofErr = fmt.Errorf("crossed recovered claim error=%v", crossedErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				if readbackErr := assertGeneratedRouteColdAccountingRecoveredReadback(postCompletionContext, result, claim,
+					evidence); readbackErr != nil {
+					claimedProofErr = fmt.Errorf("recovered completion readback: %w", readbackErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				return jobs.ExecutionResult{CompletionCode: "deployment_completed"}, nil
+			}), fixture.migration.claim.JobID(), jobs.Succeeded,
+			fixture.identity.options.WorkingDirectory, func() string {
+				return boundedErrorText(claimedProofErr)
+			})
+		if claimedProofErr != nil {
+			t.Fatalf("fresh interrupted Draining worker proof: %v", claimedProofErr)
+		}
+		if claimed.ID != fixture.migration.claim.JobID() || claimed.ResourceID != fixture.migration.guarded.appID ||
+			claimed.Attempt != beforeAttempt+1 {
+			t.Fatalf("fresh interrupted Draining worker=%+v before=%s/%s/%d", claimed,
+				beforeStatus, beforePhase, beforeAttempt)
+		}
+		var afterStatus, afterPhase, afterPause string
+		var afterAttempt int
+		if err := fixture.identity.database.QueryRow(`SELECT status,phase,COALESCE(pause_disposition,''),attempt
+			FROM jobs WHERE id=?`, fixture.migration.claim.JobID()).
+			Scan(&afterStatus, &afterPhase, &afterPause, &afterAttempt); err != nil {
+			t.Fatalf("read interrupted Draining worker after execution: %v", err)
+		}
+		if afterStatus != string(jobs.Succeeded) || afterPhase != string(jobs.Succeeded) ||
+			afterPause != "" || afterAttempt != beforeAttempt+1 {
+			t.Fatalf("fresh interrupted Draining worker status=%s/%s/%s/%d", afterStatus, afterPhase,
+				afterPause, afterAttempt)
+		}
+		assertGeneratedRouteColdAccountingRestoredCurrent(t, result, fixture)
+		assertGeneratedRouteCompletionState(t, fixture.identity.database, fixture.firstReceipt, 1)
+		assertGeneratedRouteColdAccountingCompletionDelta(t, beforeWorker, fixture)
+		if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+			generatedRouteColdAccountingCapacityProbeCount(beforeConstructionCommands) {
+			t.Fatal("fresh interrupted Draining worker acquired a second capacity share")
+		}
+		if fixture.predecessor.count(candidateOwnerStop) != beforeStop ||
+			fixture.predecessor.count(candidateOwnerRemove) != beforeRemove {
+			t.Fatal("fresh interrupted Draining worker replayed predecessor effects")
+		}
+	})
+}
+
+func assertGeneratedRouteColdAccountingRecoveredReadback(ctx context.Context,
+	result *generatedDomainConstruction, claim deploymentexecution.Claim,
+	evidence generatedRecoveredRouteCompletionEvidence,
+) error {
+	if result == nil || result.candidates == nil || result.routes == nil {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
+	hold, err := result.candidates.ledger.holdRecoveredCompletionRoster(
+		generatedDomainColdGroupSpec(result.candidates, evidence.group), evidence.receipts)
+	if err != nil {
+		return err
+	}
+	pinned, err := result.routes.stores.ExecutionGuard().PinScope(ctx)
+	if err != nil {
+		hold.leave()
+		return err
+	}
+	defer pinned.Leave()
+	activation, err := result.routes.readRecoveredRouteActivation(ctx, evidence.activation)
+	if err != nil {
+		hold.leave()
+		return err
+	}
+	tx, err := result.routes.stores.Database().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		hold.leave()
+		return err
+	}
+	completion, found, err := result.routes.runtime.ReadRouteCompletionReceiptTx(ctx, tx,
+		activation.ReceiptID)
+	if err != nil || !found {
+		_ = tx.Rollback()
+		hold.leave()
+		return errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	if err := tx.Commit(); err != nil {
+		hold.leave()
+		return err
+	}
+	input := generatedruntimestate.RouteCompletionInput{Activation: activation,
+		AccountingHandoff: evidence.handoff, CurrentJobID: claim.JobID(),
+		CurrentWorkerAttempt: claim.Attempt(), CompletedAt: completion.CompletedAt}
+	if err := result.routes.readRecoveredCompletion(ctx, pinned, claim, evidence, hold, input); err != nil {
+		hold.leave()
+		return err
+	}
+	crossedInput := input
+	crossedInput.Activation.ReceiptID = evidence.activation.PredecessorActivationReceiptID
+	if err := result.routes.readRecoveredCompletion(ctx, pinned, claim, evidence, hold,
+		crossedInput); !errors.Is(err, deploymentexecution.ErrIdentityLost) {
+		hold.leave()
+		return fmt.Errorf("crossed recovered completion receipt error=%v", err)
+	}
+	hold.leave()
+	if err := result.routes.readRecoveredCompletion(ctx, pinned, claim, evidence, hold,
+		input); !errors.Is(err, deploymentexecution.ErrIdentityLost) {
+		return fmt.Errorf("closed recovered completion hold error=%v", err)
+	}
+	return nil
+}
+
 type generatedRouteColdAccountingProtectionSnapshot struct {
 	database  gatewayRebindFixtureDatabaseSnapshot
 	history   gatewayHistorySnapshot
@@ -318,6 +548,221 @@ func assertGeneratedRouteColdAccountingProtectionUnchanged(t *testing.T,
 		t.Fatalf("interrupted Draining cold construction changed protected state: database=%t history=%t protected=%t",
 			databaseSame, historySame, protectedSame)
 	}
+}
+
+func assertGeneratedRouteColdAccountingCompletionDelta(t *testing.T,
+	before generatedRouteColdAccountingProtectionSnapshot, fixture generatedRouteColdAccountingFixture,
+) {
+	t.Helper()
+	after := generatedRouteColdAccountingProtection(t, fixture)
+	generatedRouteColdAccountingValidateCompletionTerminal(t, fixture)
+	beforeTables := generatedRouteColdAccountingCompletionTables(t, before.database.Tables, fixture, false)
+	afterTables := generatedRouteColdAccountingCompletionTables(t, after.database.Tables, fixture, true)
+	databaseSame := reflect.DeepEqual(before.database.Schema, after.database.Schema) &&
+		reflect.DeepEqual(beforeTables, afterTables)
+	historySame := sameGatewayHistorySnapshot(before.history, after.history)
+	protectedSame := sameGeneratedDomainProtectedStartup(before.protected, after.protected)
+	if !databaseSame || !historySame || !protectedSame {
+		t.Fatalf("fresh interrupted Draining completion changed non-target state: database=%t history=%t protected=%t",
+			databaseSame, historySame, protectedSame)
+	}
+}
+
+func generatedRouteColdAccountingValidateCompletionTerminal(t *testing.T,
+	fixture generatedRouteColdAccountingFixture,
+) {
+	t.Helper()
+	db := fixture.identity.database
+	var completionAt string
+	if err := db.QueryRow(`SELECT completed_at FROM generated_route_completion_receipts
+		WHERE activation_receipt_id=? AND app_id=? AND successor_deployment_id=?
+		  AND current_job_id=?`, fixture.firstReceipt.ReceiptID, fixture.migration.guarded.appID,
+		fixture.migration.request.DeploymentID, fixture.migration.claim.JobID()).Scan(&completionAt); err != nil ||
+		completionAt == "" {
+		t.Fatalf("read exact recovered completion receipt: completed=%q error=%v", completionAt, err)
+	}
+	var jobStatus, jobPhase, jobCheckpoint, jobUpdated, jobStarted, jobFinished string
+	var jobProgress, jobAttempt int
+	var jobErrorCode, jobErrorDetail, jobPause sql.NullString
+	if err := db.QueryRow(`SELECT status,phase,progress_percent,attempt,checkpoint_json,error_code,error_detail,
+		updated_at,COALESCE(started_at,''),COALESCE(finished_at,''),pause_disposition FROM jobs WHERE id=?`,
+		fixture.migration.claim.JobID()).Scan(&jobStatus, &jobPhase, &jobProgress, &jobAttempt,
+		&jobCheckpoint, &jobErrorCode, &jobErrorDetail, &jobUpdated, &jobStarted, &jobFinished,
+		&jobPause); err != nil || jobStatus != string(jobs.Succeeded) || jobPhase != string(jobs.Succeeded) ||
+		jobProgress != 100 || jobAttempt < 2 || jobCheckpoint != `{"phase":"succeeded"}` ||
+		jobErrorCode.Valid || jobErrorDetail.Valid || jobPause.Valid || jobUpdated != completionAt ||
+		jobStarted == "" || jobFinished != completionAt {
+		t.Fatalf("recovered completion job=%s/%s/%d/%d checkpoint=%q errors=%v/%v pause=%v "+
+			"timestamps=%q/%q/%q completion=%q error=%v", jobStatus, jobPhase, jobProgress, jobAttempt,
+			jobCheckpoint, jobErrorCode, jobErrorDetail, jobPause, jobUpdated, jobStarted, jobFinished,
+			completionAt, err)
+	}
+	var deploymentStatus, deploymentStarted, deploymentFinished string
+	var failureCode, failureSummary, diagnosticCode sql.NullString
+	if err := db.QueryRow(`SELECT status,COALESCE(started_at,''),COALESCE(finished_at,''),
+		failure_code,failure_summary,diagnostic_code FROM deployments WHERE id=? AND app_id=? AND job_id=?`,
+		fixture.migration.request.DeploymentID, fixture.migration.guarded.appID,
+		fixture.migration.claim.JobID()).Scan(&deploymentStatus, &deploymentStarted, &deploymentFinished,
+		&failureCode, &failureSummary, &diagnosticCode); err != nil || deploymentStatus != "succeeded" ||
+		deploymentStarted == "" || deploymentFinished != completionAt || failureCode.Valid ||
+		failureSummary.Valid || diagnosticCode.Valid {
+		t.Fatalf("recovered completion deployment=%s timestamps=%q/%q diagnostics=%v/%v/%v error=%v",
+			deploymentStatus, deploymentStarted, deploymentFinished, failureCode, failureSummary,
+			diagnosticCode, err)
+	}
+	var runtimePhase, runtimeUpdated, runtimeFinished string
+	var runtimeDiagnostic sql.NullString
+	if err := db.QueryRow(`SELECT phase,updated_at,COALESCE(finished_at,''),diagnostic_code
+		FROM generated_runtime_deployments WHERE deployment_id=? AND app_id=?`,
+		fixture.migration.request.DeploymentID, fixture.migration.guarded.appID).
+		Scan(&runtimePhase, &runtimeUpdated, &runtimeFinished, &runtimeDiagnostic); err != nil ||
+		runtimePhase != string(generatedruntimestate.PhaseSucceeded) || runtimeUpdated != completionAt ||
+		runtimeFinished != completionAt || runtimeDiagnostic.Valid {
+		t.Fatalf("recovered completion runtime=%s timestamps=%q/%q diagnostic=%v error=%v",
+			runtimePhase, runtimeUpdated, runtimeFinished, runtimeDiagnostic, err)
+	}
+}
+
+func generatedRouteColdAccountingCompletionTables(t *testing.T,
+	tables map[string][][]gatewayRebindFixtureCell, fixture generatedRouteColdAccountingFixture, after bool,
+) map[string][][]gatewayRebindFixtureCell {
+	t.Helper()
+	result := make(map[string][][]gatewayRebindFixtureCell, len(tables))
+	for table, rows := range tables {
+		columns, err := gatewayRebindFixtureColumns(context.Background(), fixture.identity.database, table)
+		if err != nil {
+			t.Fatalf("read %s columns for completion comparison: %v", table, err)
+		}
+		column := make(map[string]int, len(columns))
+		for index, name := range columns {
+			column[name] = index
+		}
+		completionEvents := map[int]struct{}{}
+		if after && table == "job_events" {
+			completionEvents = generatedRouteColdAccountingCompletionEventIndexes(t, rows, column, fixture)
+		}
+		for rowIndex, source := range rows {
+			row := append([]gatewayRebindFixtureCell(nil), source...)
+			switch table {
+			case "jobs":
+				if generatedRouteColdAccountingRowValue(row, column, "id") == fixture.migration.claim.JobID() {
+					generatedRouteColdAccountingNormalizeColumns(t, row, column, "jobs",
+						"status", "phase", "progress_percent", "attempt", "checkpoint_json", "error_code",
+						"error_detail", "updated_at", "started_at", "finished_at", "pause_disposition")
+				}
+			case "deployments":
+				if generatedRouteColdAccountingRowValue(row, column, "id") == fixture.migration.request.DeploymentID {
+					generatedRouteColdAccountingNormalizeColumns(t, row, column, "deployments",
+						"status", "started_at", "finished_at", "failure_code", "failure_summary", "diagnostic_code")
+				}
+			case "generated_runtime_deployments":
+				if generatedRouteColdAccountingRowValue(row, column, "deployment_id") == fixture.migration.request.DeploymentID {
+					generatedRouteColdAccountingNormalizeColumns(t, row, column, "generated_runtime_deployments",
+						"phase", "diagnostic_code", "updated_at", "finished_at")
+				}
+			case "job_events":
+				if _, completionEvent := completionEvents[rowIndex]; completionEvent {
+					continue
+				}
+			case "generated_route_completion_receipts":
+				if generatedRouteColdAccountingRowValue(row, column, "activation_receipt_id") ==
+					fixture.firstReceipt.ReceiptID {
+					if after {
+						continue
+					}
+					t.Fatal("completion receipt existed before recovered completion")
+				}
+			}
+			result[table] = append(result[table], row)
+		}
+	}
+	return result
+}
+
+func generatedRouteColdAccountingRowValue(row []gatewayRebindFixtureCell,
+	columns map[string]int, name string,
+) string {
+	index, exists := columns[name]
+	if !exists || index < 0 || index >= len(row) {
+		return ""
+	}
+	return row[index].Value
+}
+
+func generatedRouteColdAccountingNormalizeColumns(t *testing.T, row []gatewayRebindFixtureCell,
+	columns map[string]int, table string, names ...string,
+) {
+	t.Helper()
+	for _, name := range names {
+		index, exists := columns[name]
+		if !exists || index < 0 || index >= len(row) {
+			t.Fatalf("completion comparison missing %s.%s", table, name)
+		}
+		row[index] = gatewayRebindFixtureCell{Type: "normalized", Value: name}
+	}
+}
+
+func generatedRouteColdAccountingCompletionEventIndexes(t *testing.T,
+	rows [][]gatewayRebindFixtureCell, column map[string]int, fixture generatedRouteColdAccountingFixture,
+) map[int]struct{} {
+	t.Helper()
+	type expectedEvent struct {
+		level, phase, code, message, metadata string
+		attempt                               int
+	}
+	var finalAttempt int
+	if err := fixture.identity.database.QueryRow(`SELECT attempt FROM jobs WHERE id=?`,
+		fixture.migration.claim.JobID()).Scan(&finalAttempt); err != nil || finalAttempt < 2 {
+		t.Fatalf("read recovered completion attempt: attempt=%d error=%v", finalAttempt, err)
+	}
+	expected := []expectedEvent{
+		{"warn", "queued", "daemon_restarted", "Generated deployment requeued because hostd restarted", `{}`, finalAttempt - 1},
+		{"info", "assigned", "job_assigned", "Job assigned", `{}`, finalAttempt},
+		{"info", "validate", "phase_started", "Job phase started", `{}`, finalAttempt},
+		{"info", "succeeded", "job_succeeded", "Deployment completed", `{}`, finalAttempt},
+	}
+	type indexedEvent struct {
+		index    int
+		sequence int
+		value    expectedEvent
+	}
+	var target []indexedEvent
+	for index, row := range rows {
+		if generatedRouteColdAccountingRowValue(row, column, "job_id") != fixture.migration.claim.JobID() {
+			continue
+		}
+		sequence, sequenceErr := strconv.Atoi(generatedRouteColdAccountingRowValue(row, column, "sequence"))
+		attempt, attemptErr := strconv.Atoi(generatedRouteColdAccountingRowValue(row, column, "attempt"))
+		if sequenceErr != nil || attemptErr != nil ||
+			generatedRouteColdAccountingRowValue(row, column, "timestamp") == "" {
+			t.Fatalf("recovered completion event identity index=%d sequenceErr=%v attemptErr=%v", index,
+				sequenceErr, attemptErr)
+		}
+		target = append(target, indexedEvent{index: index, sequence: sequence, value: expectedEvent{
+			level:    generatedRouteColdAccountingRowValue(row, column, "level"),
+			phase:    generatedRouteColdAccountingRowValue(row, column, "phase"),
+			code:     generatedRouteColdAccountingRowValue(row, column, "code"),
+			message:  generatedRouteColdAccountingRowValue(row, column, "message"),
+			metadata: generatedRouteColdAccountingRowValue(row, column, "metadata_json"), attempt: attempt,
+		}})
+	}
+	if len(target) < len(expected) {
+		t.Fatalf("recovered completion target events=%d want at least %d", len(target), len(expected))
+	}
+	appended := target[len(target)-len(expected):]
+	var actual []expectedEvent
+	indexes := make(map[int]struct{}, len(appended))
+	for index, event := range appended {
+		actual = append(actual, event.value)
+		indexes[event.index] = struct{}{}
+		if index > 0 && event.sequence != appended[index-1].sequence+1 {
+			t.Fatalf("recovered completion event sequences=%+v", appended)
+		}
+	}
+	if !reflect.DeepEqual(actual, expected) {
+		t.Fatalf("recovered completion events=%+v want=%+v", actual, expected)
+	}
+	return indexes
 }
 
 func generatedRouteColdAccountingCapacityProbeCount(commands [][]string) int {
@@ -620,6 +1065,7 @@ type generatedRouteColdAccountingFixture struct {
 type generatedRouteColdAccountingRunner struct {
 	mu                  sync.RWMutex
 	cold                runtimeprocess.CommandRunner
+	routes              *generatedRoutePredecessorRunner
 	predecessor         *generatedRouteCandidateRunner
 	predecessorPhysical candidateOwnerPhysical
 	candidate           *candidateOwnerRunner
@@ -637,6 +1083,12 @@ func (r *generatedRouteColdAccountingRunner) setDelegate(delegate runtimeprocess
 	r.mu.Unlock()
 }
 
+func (r *generatedRouteColdAccountingRunner) setRoutes(routes *generatedRoutePredecessorRunner) {
+	r.mu.Lock()
+	r.routes = routes
+	r.mu.Unlock()
+}
+
 func (r *generatedRouteColdAccountingRunner) Run(ctx context.Context,
 	request runtimeprocess.CommandRequest,
 ) (runtimeprocess.CommandResult, error) {
@@ -645,6 +1097,7 @@ func (r *generatedRouteColdAccountingRunner) Run(ctx context.Context,
 	predecessor := r.predecessor
 	predecessorPhysical := r.predecessorPhysical
 	delegate := r.cold
+	routes := r.routes
 	r.mu.RUnlock()
 	kind := candidateOwnerKind(request)
 	if kind != "" {
@@ -659,7 +1112,76 @@ func (r *generatedRouteColdAccountingRunner) Run(ctx context.Context,
 			return predecessor.Run(ctx, request)
 		}
 	}
+	if generatedRouteColdAccountingRouteCommand(routes, request.Args) {
+		return routes.Run(ctx, request)
+	}
 	return delegate.Run(ctx, request)
+}
+
+func generatedRouteColdAccountingRouteCommand(routes *generatedRoutePredecessorRunner, args []string) bool {
+	if routes == nil || routes.ingressRunner == nil || len(args) < 3 {
+		return false
+	}
+	target := args[len(args)-1]
+	switch {
+	case len(args) == 5 && args[0] == "image" && args[1] == "inspect" &&
+		args[2] == "--format" && args[3] == imageInspectFormat:
+		return target == caddyImage
+	case len(args) == 5 && args[0] == "volume" && args[1] == "inspect" &&
+		args[2] == "--format" && args[3] == volumeInspectFormat:
+		return target == caddyVolumeName
+	case len(args) == 5 && args[0] == "network" && args[1] == "inspect" && args[2] == "--format":
+		if target == caddyNetworkName {
+			return args[3] == networkInspectFormat || args[3] == "json"
+		}
+		if args[3] != networkInspectFormat {
+			return false
+		}
+		for _, endpoint := range routes.endpoints {
+			if target == endpoint.endpoint.NetworkName {
+				return true
+			}
+		}
+	case len(args) == 5 && args[0] == "container" && args[1] == "inspect" &&
+		args[2] == "--format":
+		if target == caddyContainerName && args[3] == caddyInspectFormat {
+			return true
+		}
+		_, exists := routes.endpoints[target]
+		return exists && args[3] == endpointInspectFormat
+	case args[0] == "container" && args[1] == "exec":
+		if len(args) < 4 || !generatedRouteColdAccountingRouteExec(args, routes) {
+			return false
+		}
+		for id := range routes.ingressContainers {
+			if normalizeID(args[2]) == normalizeID(id) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func generatedRouteColdAccountingRouteExec(args []string, routes *generatedRoutePredecessorRunner) bool {
+	if reflect.DeepEqual(args[3:], []string{
+		"curl", "--silent", "--show-error", "--fail", "--max-time", "10", "http://127.0.0.1:2019/config/",
+	}) {
+		return true
+	}
+	if len(args) != 21 || !reflect.DeepEqual(args[3:20], []string{
+		"curl", "--disable", "--silent", "--head", "--output", "/dev/null", "--write-out", "%{http_code}",
+		"--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2",
+	}) {
+		return false
+	}
+	for _, endpoint := range routes.endpoints {
+		address := endpoint.endpoint.NetworkAlias + "." + endpoint.endpoint.NetworkName + ":" +
+			strconv.FormatUint(uint64(endpoint.endpoint.InternalPort), 10)
+		if args[20] == "http://"+address+"/" {
+			return true
+		}
+	}
+	return false
 }
 
 func candidateOwnerRunnerMatches(runner *candidateOwnerRunner, kind candidateOwnerCommandKind,

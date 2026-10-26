@@ -339,6 +339,19 @@ type candidateRetiringCharge struct {
 	token     candidateCapacityChargeToken
 }
 
+// candidateRecoveredCompletionHold pins the complete restored RouteActive
+// roster while a cold-only completion transaction is in flight. It owns no
+// capacity and cannot retire, release, or replace a charge.
+type candidateRecoveredCompletionHold struct {
+	group       *candidateCapacityGroup
+	coordinator *generatedDomainCapacityCoordinator
+	spec        candidateGroupSpec
+	receipts    map[string]string
+	tokens      []candidateRosterToken
+	entries     []candidateAccountingHandoffEntry
+	lifecycle   *candidateOperationLifecycle
+}
+
 func newCandidateCapacityLedger(budget *generatedcapacity.Budget,
 	coordinators ...*generatedDomainCapacityCoordinator,
 ) (*candidateCapacityLedger, error) {
@@ -436,6 +449,168 @@ func (l *candidateCapacityLedger) enterRetirementRoster(appID, deploymentID stri
 		operation.byName[name] = component
 	}
 	return operation, nil
+}
+
+func (l *candidateCapacityLedger) holdRecoveredCompletionRoster(spec candidateGroupSpec,
+	receipts map[string]string,
+) (*candidateRecoveredCompletionHold, error) {
+	if l == nil || l.budget == nil || l.coordinator == nil {
+		return nil, errCandidateCapacityInvalid
+	}
+	normalized, err := normalizeCandidateGroupSpec(spec)
+	if err != nil || len(receipts) != len(normalized.components) {
+		return nil, errCandidateCapacityInvalid
+	}
+	key := candidateCapacityGroupKey{appID: normalized.appID, deploymentID: normalized.deploymentID}
+	l.mu.Lock()
+	group := l.groups[key]
+	l.mu.Unlock()
+	if group == nil {
+		return nil, errCandidateCapacityStale
+	}
+	hold := &candidateRecoveredCompletionHold{
+		group: group, coordinator: l.coordinator, spec: normalized,
+		receipts:  make(map[string]string, len(receipts)),
+		tokens:    make([]candidateRosterToken, 0, len(normalized.components)),
+		entries:   make([]candidateAccountingHandoffEntry, 0, len(normalized.components)),
+		lifecycle: &candidateOperationLifecycle{},
+	}
+	group.mu.Lock()
+	if group.reserving || group.pins != normalized.pins || group.limits != normalized.limits ||
+		!equalCandidateRoster(group.components, normalized.components) {
+		group.mu.Unlock()
+		return nil, errCandidateCapacityPinsChanged
+	}
+	for _, name := range group.components {
+		component := group.byName[name]
+		receiptID := receipts[name]
+		if component == nil || receiptID == "" || component.receipt == nil || component.receipt.id != receiptID ||
+			component.charge == nil || component.charge.state != candidateChargeActive ||
+			component.charge.owner != candidateAccountingRouteActive || !component.charge.receiptRetained ||
+			component.charge.explicitRetained ||
+			component.charge.logicallyRetired || component.tokenHeld {
+			group.mu.Unlock()
+			return nil, errCandidateCapacityStale
+		}
+		word := component.receipt.state.Load()
+		debt, restored := component.charge.token.(*generatedDomainCapacityDebtToken)
+		if !restored || debt == nil || debt.owner != l.coordinator ||
+			!candidateCapacityChargeTokenPublished(component.charge.token) ||
+			word&candidateReceiptUnquiesced != 0 ||
+			candidatePhysicalFromWord(word) != candidatePhysicalHandedToRoute {
+			group.mu.Unlock()
+			return nil, errCandidateCapacityStale
+		}
+	}
+	for _, name := range group.components {
+		component := group.byName[name]
+		component.tokenHeld = true
+		component.tokenGeneration++
+		if component.tokenGeneration == 0 {
+			component.tokenGeneration++
+		}
+		hold.receipts[name] = receipts[name]
+		hold.tokens = append(hold.tokens, candidateRosterToken{
+			component: component, generation: component.tokenGeneration,
+		})
+		hold.entries = append(hold.entries, candidateAccountingHandoffEntry{
+			component: component, charge: component.charge, receipt: component.receipt,
+			epoch: component.charge.epoch, token: component.charge.token, lease: component.charge.lease,
+		})
+	}
+	group.mu.Unlock()
+	if !hold.valid() {
+		hold.leave()
+		return nil, errCandidateCapacityStale
+	}
+	return hold, nil
+}
+
+func (h *candidateRecoveredCompletionHold) valid() bool {
+	if h == nil || h.lifecycle == nil || h.lifecycle.done.Load() || h.group == nil || h.coordinator == nil ||
+		len(h.tokens) == 0 || len(h.tokens) != len(h.entries) || len(h.tokens) != len(h.receipts) {
+		return false
+	}
+	h.group.mu.Lock()
+	if h.group.reserving || h.group.pins != h.spec.pins || h.group.limits != h.spec.limits ||
+		!equalCandidateRoster(h.group.components, h.spec.components) {
+		h.group.mu.Unlock()
+		return false
+	}
+	tokens, ok := candidateAccountingTokensLocked(h.group, h.tokens)
+	if !ok || len(tokens) != len(h.entries) {
+		h.group.mu.Unlock()
+		return false
+	}
+	debts := make([]*generatedDomainCapacityDebtToken, 0, len(h.entries))
+	for _, entry := range h.entries {
+		if entry.component == nil || entry.receipt == nil {
+			h.group.mu.Unlock()
+			return false
+		}
+		debt, restored := entry.token.(*generatedDomainCapacityDebtToken)
+		if !restored || debt == nil || debt.owner != h.coordinator ||
+			h.receipts[entry.component.name] != entry.receipt.id ||
+			!validCandidateRecoveredCompletionEntryLocked(entry, h.group) {
+			h.group.mu.Unlock()
+			return false
+		}
+		debts = append(debts, debt)
+	}
+	h.group.mu.Unlock()
+
+	h.coordinator.mu.Lock()
+	defer h.coordinator.mu.Unlock()
+	if h.coordinator.phase != generatedDomainCapacityPublished {
+		return false
+	}
+	seen := make(map[*generatedDomainCapacityDebtToken]struct{}, len(debts))
+	for _, debt := range debts {
+		if debt.owner != h.coordinator || !debt.active || debt.limits != h.spec.limits {
+			return false
+		}
+		if _, found := h.coordinator.tokens[debt]; !found {
+			return false
+		}
+		if _, duplicate := seen[debt]; duplicate {
+			return false
+		}
+		seen[debt] = struct{}{}
+	}
+	return true
+}
+
+func validCandidateRecoveredCompletionEntryLocked(entry candidateAccountingHandoffEntry,
+	group *candidateCapacityGroup,
+) bool {
+	if group == nil || entry.component == nil || group.byName[entry.component.name] != entry.component ||
+		entry.component.charge != entry.charge || entry.charge == nil || entry.charge.epoch != entry.epoch ||
+		entry.charge.token != entry.token || !candidateCapacityChargeTokenPublished(entry.token) ||
+		!candidateAccountingTokenLeaseMatches(entry.token, entry.charge.lease, entry.lease, true) ||
+		entry.charge.state != candidateChargeActive ||
+		entry.charge.owner != candidateAccountingRouteActive || !entry.charge.receiptRetained ||
+		entry.charge.explicitRetained || entry.charge.logicallyRetired ||
+		entry.component.receipt != entry.receipt || entry.receipt == nil {
+		return false
+	}
+	word := entry.receipt.state.Load()
+	return word&candidateReceiptUnquiesced == 0 &&
+		candidatePhysicalFromWord(word) == candidatePhysicalHandedToRoute
+}
+
+func (h *candidateRecoveredCompletionHold) leave() {
+	if h == nil || h.lifecycle == nil || h.lifecycle.done.Swap(true) || h.group == nil {
+		return
+	}
+	h.group.mu.Lock()
+	for _, token := range h.tokens {
+		if token.component != nil && token.component.tokenHeld &&
+			token.component.tokenGeneration == token.generation {
+			token.component.tokenHeld = false
+		}
+	}
+	h.group.changed.Broadcast()
+	h.group.mu.Unlock()
 }
 
 func candidateAccountingOwnerCanBecomePredecessor(owner candidateAccountingOwner) bool {
