@@ -19,7 +19,12 @@ confirmed cancelled at 00:32:38 UTC; none is counted as passed acceptance.
 ## Change and failure behavior
 
 The aggregate jobs in generated-runtime lifecycle, GitHub deployment, hosting
-gateway v2, and Windows controller workflows now use `${{ !cancelled() }}`.
+gateway v2, and Windows controller workflows now use this condition:
+
+```yaml
+if: ${{ !cancelled() }}
+```
+
 The hosting workflow's existing contract checker expects the new condition.
 
 For a workflow that has not been cancelled, the status function allows each
