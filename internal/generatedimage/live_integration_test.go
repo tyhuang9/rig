@@ -159,7 +159,7 @@ func runLiveGeneratedImageCompilerMode(t *testing.T, manual bool, mode string) {
 		LogFiles: runtimeOptions.Limits.LogFiles, ReplacementDiskBytes: runtimeOptions.ReplacementDiskBytes,
 	})
 	if err != nil {
-		t.Fatal("construct live generated domain")
+		t.Fatalf("construct live generated domain: %v", err)
 	}
 
 	workspace := t.TempDir()
