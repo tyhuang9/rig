@@ -9,7 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
+	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
@@ -100,6 +102,13 @@ func TestGeneratedExecutorCompletionRoutePauseAttribution(t *testing.T) {
 }
 
 func TestGeneratedExecutorRoutePauseCauseClassification(t *testing.T) {
+	var nilIngress *generatedingress.Error
+	routeUnresolved := func() error {
+		return &generatedingress.Error{Code: generatedingress.DiagnosticRouteUnresolved}
+	}
+	unrelatedIngress := func() error {
+		return &generatedingress.Error{Code: generatedingress.DiagnosticValidationFailed}
+	}
 	for _, test := range []struct {
 		name string
 		err  error
@@ -114,6 +123,37 @@ func TestGeneratedExecutorRoutePauseCauseClassification(t *testing.T) {
 		{name: "invalid state", err: generatedruntimestate.ErrInvalidState, want: routePauseCauseInvalidState},
 		{name: "invalid transition", err: generatedruntimestate.ErrInvalidTransition, want: routePauseCauseInvalidTransition},
 		{name: "state conflict", err: generatedruntimestate.ErrConflict, want: routePauseCauseStateConflict},
+		{name: "deployment execution canceled", err: deploymentexecution.ErrCanceled, want: routePauseCauseCanceled},
+		{name: "invalid claim", err: deploymentexecution.ErrInvalidClaim, want: routePauseCauseInvalidClaim},
+		{name: "invalid configuration", err: deploymentexecution.ErrInvalidConfiguration, want: routePauseCauseInvalidConfiguration},
+		{name: "scope unavailable", err: deploymentexecution.ErrScopeUnavailable, want: routePauseCauseScopeUnavailable},
+		{name: "authority stale", err: deploymentexecution.ErrAuthorityStale, want: routePauseCauseAuthorityStale},
+		{name: "authority invalid", err: deploymentexecution.ErrAuthorityInvalid, want: routePauseCauseAuthorityInvalid},
+		{name: "authority unresolved", err: deploymentexecution.ErrAuthorityUnresolved, want: routePauseCauseAuthorityUnresolved},
+		{name: "identity lost", err: deploymentexecution.ErrIdentityLost, want: routePauseCauseIdentityLost},
+		{name: "stage invalid", err: deploymentexecution.ErrStageInvalid, want: routePauseCauseStageInvalid},
+		{name: "positive fence", err: deploymentexecution.ErrPositiveFence, want: routePauseCausePositiveFence},
+		{name: "storage unavailable", err: deploymentexecution.ErrUnavailable, want: routePauseCauseStorageUnavailable},
+		{name: "route unresolved", err: routeUnresolved(), want: routePauseCauseRouteUnresolved},
+		{name: "typed nil ingress is unknown", err: nilIngress, want: routePauseCauseUnknown},
+		{name: "unrelated ingress before route", err: errors.Join(unrelatedIngress(), routeUnresolved()), want: routePauseCauseRouteUnresolved},
+		{name: "route before unrelated ingress", err: errors.Join(routeUnresolved(), unrelatedIngress()), want: routePauseCauseRouteUnresolved},
+		{name: "typed nil before route", err: errors.Join(nilIngress, routeUnresolved()), want: routePauseCauseRouteUnresolved},
+		{name: "route before typed nil", err: errors.Join(routeUnresolved(), nilIngress), want: routePauseCauseRouteUnresolved},
+		{name: "identity wins storage", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrUnavailable), want: routePauseCauseIdentityLost},
+		{name: "identity wins storage reverse", err: errors.Join(deploymentexecution.ErrUnavailable, deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityLost},
+		{name: "duplicate identity remains identity", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityLost},
+		{name: "distinct identities are unknown", err: errors.Join(deploymentexecution.ErrAuthorityInvalid, deploymentexecution.ErrIdentityLost), want: routePauseCauseUnknown},
+		{name: "distinct identities reverse are unknown", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrAuthorityInvalid), want: routePauseCauseUnknown},
+		{name: "distinct identities with storage are unknown", err: errors.Join(deploymentexecution.ErrAuthorityInvalid, deploymentexecution.ErrUnavailable, deploymentexecution.ErrIdentityLost), want: routePauseCauseUnknown},
+		{name: "route and identity are unknown", err: errors.Join(routeUnresolved(), deploymentexecution.ErrIdentityLost), want: routePauseCauseUnknown},
+		{name: "route and identity reverse are unknown", err: errors.Join(deploymentexecution.ErrIdentityLost, routeUnresolved()), want: routePauseCauseUnknown},
+		{name: "route wins storage", err: errors.Join(routeUnresolved(), deploymentexecution.ErrUnavailable), want: routePauseCauseRouteUnresolved},
+		{name: "route wins storage reverse", err: errors.Join(deploymentexecution.ErrUnavailable, routeUnresolved()), want: routePauseCauseRouteUnresolved},
+		{name: "old state cause wins identity", err: errors.Join(deploymentexecution.ErrIdentityLost, generatedruntimestate.ErrConflict), want: routePauseCauseStateConflict},
+		{name: "canceled wins identity", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrCanceled), want: routePauseCauseCanceled},
+		{name: "context deadline wins deployment cancellation", err: errors.Join(deploymentexecution.ErrCanceled, context.DeadlineExceeded), want: routePauseCauseDeadlineExceeded},
+		{name: "unapproved sealed cause does not fall through", err: errors.Join(routeSwitchError{cause: routePauseCauseRetirementUnavailable}, deploymentexecution.ErrIdentityLost), want: routePauseCauseUnknown},
 		{name: "unmatched", err: errors.New("token=do-not-disclose /private/path"), want: routePauseCauseUnknown},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -167,6 +207,37 @@ func TestGeneratedExecutorRoutePauseDiagnosticControls(t *testing.T) {
 		requireRoutePauseRecord(t, logs, routePauseStageRuntimeBegin, routePauseCauseUnknown)
 	})
 
+	t.Run("retirement identities are previous retirement only", func(t *testing.T) {
+		causes := []routePauseCause{
+			routePauseCauseInvalidClaim,
+			routePauseCauseInvalidConfiguration,
+			routePauseCauseScopeUnavailable,
+			routePauseCauseAuthorityStale,
+			routePauseCauseAuthorityInvalid,
+			routePauseCauseAuthorityUnresolved,
+			routePauseCauseIdentityLost,
+			routePauseCauseStageInvalid,
+			routePauseCausePositiveFence,
+			routePauseCauseStorageUnavailable,
+			routePauseCauseRouteUnresolved,
+		}
+		stages := []routePauseStage{
+			routePauseStageRuntimeBegin,
+			routePauseStageRuntimeSuccessHead,
+			routePauseStageRouteSwitch,
+			routePauseStagePreviousRetirement,
+			routePauseStageRuntimeSuccessAdvance,
+		}
+		for _, cause := range causes {
+			for _, stage := range stages {
+				want := stage == routePauseStagePreviousRetirement
+				if got := knownRoutePausePair(stage, cause); got != want {
+					t.Fatalf("known pair stage=%q cause=%q got=%t want=%t", stage, cause, got, want)
+				}
+			}
+		}
+	})
+
 	t.Run("unknown stage is omitted", func(t *testing.T) {
 		executor := &Executor{}
 		logs := attachRoutePauseTestLogger(executor)
@@ -179,6 +250,68 @@ func TestGeneratedExecutorRoutePauseDiagnosticControls(t *testing.T) {
 	t.Run("nil logger preserves no-op", func(t *testing.T) {
 		(&Executor{}).observeRoutePause(context.Background(), routePauseStageRuntimeBegin, routePauseCauseDeploymentInProgress)
 	})
+}
+
+func TestGeneratedExecutorPreviousRetirementIntegrityRoutePauseAttribution(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want routePauseCause
+	}{
+		{name: "identity lost", err: deploymentexecution.ErrIdentityLost, want: routePauseCauseIdentityLost},
+		{name: "scope unavailable", err: deploymentexecution.ErrScopeUnavailable, want: routePauseCauseScopeUnavailable},
+		{name: "route unresolved", err: &generatedingress.Error{Code: generatedingress.DiagnosticRouteUnresolved}, want: routePauseCauseRouteUnresolved},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requirePreviousRetirementPauseAttribution(t, test.err, test.want)
+		})
+	}
+}
+
+func TestGeneratedExecutorPreviousRetirementAvailabilityRoutePauseAttribution(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want routePauseCause
+	}{
+		{name: "storage unavailable", err: deploymentexecution.ErrUnavailable, want: routePauseCauseStorageUnavailable},
+		{name: "unmatched", err: errors.New("unmatched retirement boundary"), want: routePauseCauseUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requirePreviousRetirementPauseAttribution(t, test.err, test.want)
+		})
+	}
+}
+
+func requirePreviousRetirementPauseAttribution(t *testing.T, refusal error, want routePauseCause) {
+	t.Helper()
+	const secret = "token=do-not-disclose /private/path"
+	fixture := newSealedExecutorFixture(t)
+	fixture.capacity.SetCapacity(128<<20, 128<<20)
+	checkCompetitor := fixture.capacityCompetitor(t)
+	logs := attachRoutePauseTestLogger(fixture.executor)
+	blocked := errors.Join(errors.New(secret), refusal)
+	fixture.routes.retirementBlock = blocked
+
+	result, err := fixture.execute()
+	requireRoutePauseResult(t, result, err)
+	requireRoutePauseRecord(t, logs, routePauseStagePreviousRetirement, want)
+	runtimeDeployment := fixture.runtimeDeployment(t)
+	if fixture.routes.lastActivation.retirement == nil || fixture.routes.retirementCalls != 1 ||
+		!errors.Is(fixture.routes.retirementErr, refusal) ||
+		fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 ||
+		runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		generatedExecutorRetirementReceiptCount(t, fixture) != 0 {
+		t.Fatalf("retirement=%d/%v handle=%t stopped=%d docker=%d/%d runtime=%+v receipts=%d",
+			fixture.routes.retirementCalls, fixture.routes.retirementErr,
+			fixture.routes.lastActivation.retirement != nil, fixture.runtime.stopCalls,
+			fixture.runner.stopCalls, fixture.runner.removeCalls, runtimeDeployment,
+			generatedExecutorRetirementReceiptCount(t, fixture))
+	}
+	if strings.Contains(logs.String(), secret) || strings.Contains(logs.String(), "/private/path") {
+		t.Fatalf("route pause log exposed raw error: %s", logs.String())
+	}
+	checkCompetitor(true)
 }
 
 type routePauseFailingWriter struct{}

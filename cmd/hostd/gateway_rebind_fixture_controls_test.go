@@ -155,6 +155,19 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		return `{"msg":"generated route reconciliation paused","route_pause_stage":"` + stage +
 			`","route_pause_cause":"` + cause + `","error":"/private/path ` + secret + `"}`
 	}
+	retirementIdentityCauses := []string{
+		"invalid_claim",
+		"invalid_configuration",
+		"scope_unavailable",
+		"authority_stale",
+		"authority_invalid",
+		"authority_unresolved",
+		"identity_lost",
+		"stage_invalid",
+		"positive_fence",
+		"storage_unavailable",
+		"route_unresolved",
+	}
 	t.Run("route pause closed classifier", func(t *testing.T) {
 		for _, test := range []struct {
 			name        string
@@ -163,11 +176,15 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 			wantStartup string
 		}{
 			{name: "known retirement refusal", stderr: routeRecord("previous_retirement", "retirement_unavailable"), want: "previous_retirement/retirement_unavailable"},
+			{name: "known retirement identity", stderr: routeRecord("previous_retirement", "identity_lost"), want: "previous_retirement/identity_lost"},
 			{name: "unknown ancillary object is discarded", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"previous_retirement","route_pause_cause":"retirement_unavailable","ancillary":{"error":"` + secret + `"}}`, want: "previous_retirement/retirement_unavailable"},
+			{name: "retirement identity ancillary object is discarded", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"previous_retirement","route_pause_cause":"route_unresolved","ancillary":{"error":"` + secret + `"}}`, want: "previous_retirement/route_unresolved"},
 			{name: "newest valid pause wins", stderr: routeRecord("route_switch", "unknown") + "\n" + routeRecord("runtime_success_advance", "state_conflict"), want: "runtime_success_advance/state_conflict"},
+			{name: "newest valid retirement identity wins", stderr: routeRecord("previous_retirement", "identity_lost") + "\n" + routeRecord("previous_retirement", "scope_unavailable"), want: "previous_retirement/scope_unavailable"},
 			{name: "startup and route pause coexist", stderr: knownRuntime + "\n" + routeRecord("previous_retirement", "retirement_unavailable"), want: "previous_retirement/retirement_unavailable", wantStartup: "runtime_composition"},
 			{name: "unknown stage", stderr: routeRecord("forged-stage", "unknown")},
 			{name: "invalid stage cause pair", stderr: routeRecord("runtime_begin", "retirement_unavailable")},
+			{name: "invalid stage identity pair", stderr: routeRecord("route_switch", "identity_lost")},
 			{name: "unknown message", stderr: `{"msg":"forged route pause","route_pause_stage":"previous_retirement","route_pause_cause":"retirement_unavailable","error":"` + secret + `"}`},
 			{name: "malformed JSON", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"previous_retirement","route_pause_cause":"retirement_unavailable"`},
 			{name: "non-string stage", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":42,"route_pause_cause":"unknown","error":"` + secret + `"}`},
@@ -214,13 +231,20 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 			"runtime_begin":           {"unknown", "deployment_in_progress"},
 			"runtime_success_head":    {"unknown", "active_head_mismatch", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"},
 			"route_switch":            {"unknown", "gateway_readiness_failed", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"},
-			"previous_retirement":     {"unknown", "retirement_unavailable", "candidate_cleanup_failed", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"},
+			"previous_retirement":     append([]string{"unknown", "retirement_unavailable", "candidate_cleanup_failed", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"}, retirementIdentityCauses...),
 			"runtime_success_advance": {"unknown", "canceled", "deadline_exceeded", "state_not_found", "invalid_state", "invalid_transition", "state_conflict"},
 		}
 		for stage, causes := range pairs {
 			for _, cause := range causes {
 				if got := liveHostdRebindRoutePauseDiagnosticCode(routeRecord(stage, cause)); got != stage+"/"+cause {
 					t.Fatalf("route pause classifier=%q want %s/%s", got, stage, cause)
+				}
+			}
+		}
+		for _, cause := range retirementIdentityCauses {
+			for _, stage := range []string{"runtime_begin", "runtime_success_head", "route_switch", "runtime_success_advance"} {
+				if got := liveHostdRebindRoutePauseDiagnosticCode(routeRecord(stage, cause)); got != "" {
+					t.Fatalf("wrong-stage route pause classifier=%q stage=%s cause=%s", got, stage, cause)
 				}
 			}
 		}
