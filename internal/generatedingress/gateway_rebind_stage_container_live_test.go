@@ -42,6 +42,10 @@ const (
 	liveGatewayRebindStageStartAdoptionMarker              = "GATEWAY_REBIND_STAGE_START_ADOPTION_OK:sequence=10:no-start"
 	liveGatewayRebindStageStartReplayTest                  = "TestLiveGatewayRebindSuccessorStageStartReplayChild"
 	liveGatewayRebindStageStartReplayMarker                = "GATEWAY_REBIND_STAGE_START_REPLAY_OK:sequence=10:no-start"
+	liveGatewayRebindRuntimeCommitReplayTest               = "TestLiveGatewayRebindRuntimeCommitReplayChild"
+	liveGatewayRebindRuntimeCommitReplayMarker             = "GATEWAY_REBIND_RUNTIME_COMMIT_REPLAY_OK:no-effects"
+	liveGatewayRebindRuntimeRollbackReplayTest             = "TestLiveGatewayRebindRuntimeRollbackReplayChild"
+	liveGatewayRebindRuntimeRollbackReplayMarker           = "GATEWAY_REBIND_RUNTIME_ROLLBACK_REPLAY_OK:no-effects"
 	liveGatewayRebindStoppedStageCancellationTest          = "TestGatewayRebindStoppedStageReplayCancellationChild"
 	liveGatewayRebindStoppedStageCancellationStartedMarker = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_CANCEL_STARTED"
 	liveGatewayRebindStoppedStageCancellationSuccessMarker = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_CANCEL_OK"
@@ -73,6 +77,10 @@ func liveGatewayRebindStoppedStageReplayPairAllowed(pair liveGatewayRebindStoppe
 		testName: liveGatewayRebindStageStartAdoptionTest, successMarker: liveGatewayRebindStageStartAdoptionMarker,
 	}, liveGatewayRebindStoppedStageReplayPair{
 		testName: liveGatewayRebindStageStartReplayTest, successMarker: liveGatewayRebindStageStartReplayMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindRuntimeCommitReplayTest, successMarker: liveGatewayRebindRuntimeCommitReplayMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayRebindRuntimeRollbackReplayTest, successMarker: liveGatewayRebindRuntimeRollbackReplayMarker,
 	}:
 		return true
 	default:
@@ -422,6 +430,8 @@ func liveGatewayRebindStoppedStageReplayMarkerNamespaceContains(line string) boo
 		liveGatewayRebindFinalConfigReplayMarker,
 		liveGatewayRebindStageStartAdoptionMarker,
 		liveGatewayRebindStageStartReplayMarker,
+		liveGatewayRebindRuntimeCommitReplayMarker,
+		liveGatewayRebindRuntimeRollbackReplayMarker,
 		liveGatewayRebindStoppedStageCancellationSuccessMarker,
 	} {
 		if strings.Contains(line, marker) {
@@ -506,8 +516,14 @@ func runLiveGatewayRebindStoppedStageReplayChild(t *testing.T, fixture *liveGate
 func runLiveGatewayRebindStoppedStageReplayChildWithPair(t *testing.T, fixture *liveGatewayV2Fixture,
 	intent gatewayRebindProtectedIntent, pair liveGatewayRebindStoppedStageReplayPair,
 ) {
+	runLiveGatewayRebindStoppedStageReplayChildForOperationWithPair(t, fixture, intent.OperationID, pair)
+}
+
+func runLiveGatewayRebindStoppedStageReplayChildForOperationWithPair(t *testing.T,
+	fixture *liveGatewayV2Fixture, operationID string, pair liveGatewayRebindStoppedStageReplayPair,
+) {
 	t.Helper()
-	if !liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
+	if !liveGatewayRebindStoppedStageReplayPairAllowed(pair) || !validCanonicalUUID(operationID) {
 		t.Fatal("unknown stopped-stage replay selector and marker pair")
 	}
 	control, err := os.MkdirTemp(fixture.root, "stopped-stage-replay-")
@@ -519,7 +535,7 @@ func runLiveGatewayRebindStoppedStageReplayChildWithPair(t *testing.T, fixture *
 		FixtureRoot: fixture.root, ControlDirectory: control,
 		DataRoot: fixture.stateRoot, WorkingDirectory: fixture.ingress.options.WorkingDirectory,
 		DockerExecutable: fixture.docker, DockerConfigDirectory: fixture.dockerConfig,
-		OperationID: intent.OperationID, HostPort: fixture.ingress.options.HostPort,
+		OperationID: operationID, HostPort: fixture.ingress.options.HostPort,
 	}
 	manifest, err := writeLiveGatewayRebindStoppedStageReplayManifest(value, fixture.docker)
 	if err != nil {
@@ -551,8 +567,17 @@ type liveGatewayRebindStoppedStageReplayChildOutcome struct {
 	message string
 }
 
+type liveGatewayRebindStoppedStageRunnerFactory func(runtimeprocess.CommandRunner) runtimeprocess.CommandRunner
+
 func runLiveGatewayRebindStoppedStageReplayChildProcess(t *testing.T,
 	pair liveGatewayRebindStoppedStageReplayPair,
+	run func(*liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome,
+) {
+	runLiveGatewayRebindStoppedStageReplayChildProcessWithRunner(t, pair, nil, run)
+}
+
+func runLiveGatewayRebindStoppedStageReplayChildProcessWithRunner(t *testing.T,
+	pair liveGatewayRebindStoppedStageReplayPair, runnerFactory liveGatewayRebindStoppedStageRunnerFactory,
 	run func(*liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome,
 ) {
 	t.Helper()
@@ -589,7 +614,14 @@ func runLiveGatewayRebindStoppedStageReplayChildProcess(t *testing.T,
 		}
 	}()
 	repository := appaccess.New(db)
-	runner := &runtimeprocess.ExecRunner{}
+	baseRunner := runtimeprocess.CommandRunner(&runtimeprocess.ExecRunner{})
+	runner := baseRunner
+	if runnerFactory != nil {
+		runner = runnerFactory(baseRunner)
+	}
+	if runner == nil {
+		failLiveGatewayRebindStoppedStageChild(t, "manager", "construct stopped-stage replay runner")
+	}
 	manager, err := New(runner, Options{
 		DataRoot: value.DataRoot, WorkingDirectory: value.WorkingDirectory,
 		DockerExecutable: value.DockerExecutable, DockerConfigDirectory: value.DockerConfigDirectory,
@@ -747,6 +779,48 @@ func newLiveGatewayRebindStoppedStageManifestFixture(t *testing.T) (
 }
 
 func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
+	t.Run("completed generated domain retains sole manager ownership", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			ctx := context.Background()
+			fixture := newGeneratedDomainStableConstructionFixture(t)
+			construction, err := newGeneratedDomainConstruction(ctx, fixture.identity.stores, fixture.runner,
+				fixture.environment, fixture.identity.options)
+			if err != nil || construction == nil || construction.domain == nil || construction.manager == nil ||
+				construction.domain.Gateway() != construction.manager {
+				t.Fatal("complete one generated-domain owner")
+			}
+			published := construction.domain
+			manager := construction.manager
+			beforeDatabase, databaseErr := fixture.identity.stores.GeneratedDomainStartupSnapshot(ctx)
+			beforeProtected, protectedErr := readGeneratedDomainProtectedStartup(ctx, fixture.identity.dataRoot)
+			beforeRoute, routeErr := manager.store.load()
+			beforeCommands := len(fixture.runner.snapshot())
+			if databaseErr != nil || protectedErr != nil || routeErr != nil {
+				t.Fatal("read completed generated-domain ownership evidence")
+			}
+
+			second, secondErr := New(fixture.runner, manager.options)
+			afterCommands := fixture.runner.snapshot()
+			if second != nil || !IsCode(secondErr, DiagnosticRouteUnresolved) ||
+				len(afterCommands) != beforeCommands {
+				t.Fatal("ordinary second manager did not refuse the completed generated-domain owner")
+			}
+
+			afterDatabase, databaseErr := fixture.identity.stores.GeneratedDomainStartupSnapshot(ctx)
+			afterProtected, protectedErr := readGeneratedDomainProtectedStartup(ctx, fixture.identity.dataRoot)
+			afterRoute, routeErr := manager.store.load()
+			joined, joinErr := newGeneratedDomainConstruction(ctx, fixture.identity.stores, fixture.runner,
+				fixture.environment, fixture.identity.options)
+			if databaseErr != nil || protectedErr != nil || routeErr != nil || joinErr != nil || joined != construction ||
+				joined.domain != published || published.Gateway() != manager ||
+				!reflect.DeepEqual(beforeDatabase, afterDatabase) ||
+				!sameGeneratedDomainProtectedStartup(beforeProtected, afterProtected) ||
+				!reflect.DeepEqual(beforeRoute, afterRoute) {
+				t.Fatal("refused second manager changed completed generated-domain ownership or protected evidence")
+			}
+		})
+	})
+
 	t.Run("finite selector marker pairing", func(t *testing.T) {
 		known := []liveGatewayRebindStoppedStageReplayPair{
 			{testName: liveGatewayRebindStoppedStageReplayTest, successMarker: liveGatewayRebindStoppedStageReplayMarker},
@@ -757,6 +831,8 @@ func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
 			{testName: liveGatewayRebindFinalConfigReplayTest, successMarker: liveGatewayRebindFinalConfigReplayMarker},
 			{testName: liveGatewayRebindStageStartAdoptionTest, successMarker: liveGatewayRebindStageStartAdoptionMarker},
 			{testName: liveGatewayRebindStageStartReplayTest, successMarker: liveGatewayRebindStageStartReplayMarker},
+			{testName: liveGatewayRebindRuntimeCommitReplayTest, successMarker: liveGatewayRebindRuntimeCommitReplayMarker},
+			{testName: liveGatewayRebindRuntimeRollbackReplayTest, successMarker: liveGatewayRebindRuntimeRollbackReplayMarker},
 		}
 		for _, pair := range known {
 			if !liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
@@ -767,6 +843,8 @@ func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
 			{testName: liveGatewayRebindDataVolumeReplayTest, successMarker: liveGatewayRebindStageConfigReplayMarker},
 			{testName: "TestLiveGatewayRebindUnknownReplayChild", successMarker: liveGatewayRebindDataVolumeReplayMarker},
 			{testName: liveGatewayRebindFinalConfigReplayTest, successMarker: "GATEWAY_REBIND_UNKNOWN_OK"},
+			{testName: liveGatewayRebindRuntimeCommitReplayTest, successMarker: liveGatewayRebindRuntimeRollbackReplayMarker},
+			{testName: liveGatewayRebindRuntimeRollbackReplayTest, successMarker: liveGatewayRebindRuntimeCommitReplayMarker},
 		} {
 			if liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
 				t.Fatalf("crossed or unknown selector-marker pair was accepted: %+v", pair)

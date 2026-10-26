@@ -95,24 +95,20 @@ type liveGatewayRebindRuntimeFixture struct {
 func newLiveGatewayRebindRuntimeFixture(t *testing.T) liveGatewayRebindRuntimeFixture {
 	t.Helper()
 	requireLiveGatewayRebindRuntime(t)
-	source := newLiveGatewayRebindSourceFixture(t, liveGatewayRebindRuntimeEnvironment)
-	options := source.fixture.ingress.options
-	options.RebindFenceCheck = source.repository.CheckGatewayRebindFence
-	options.RebindCurrentStateRepository = source.repository
-	diagnosticRunner := &liveGatewayRebindRuntimeDiagnosticRunner{runner: source.fixture.runner}
-	manager, err := New(diagnosticRunner, options)
-	if err != nil {
-		t.Fatal("open typed runtime manager")
+	diagnosticRunner := &liveGatewayRebindRuntimeDiagnosticRunner{runner: &runtimeprocess.ExecRunner{}}
+	source := newLiveGatewayRebindSourceFixtureWithRunner(t, liveGatewayRebindRuntimeEnvironment, diagnosticRunner)
+	manager := source.fixture.ingress
+	if manager == nil || source.fixture.authority == nil || source.fixture.authority.domain == nil ||
+		manager != source.fixture.authority.domain.Gateway() || source.fixture.runner != diagnosticRunner ||
+		manager.runner != diagnosticRunner {
+		t.Fatal("typed runtime fixture did not retain its one domain-owned manager and construction runner")
 	}
-	rebind, current := newGatewayRebindRuntimeDrivers(manager)
+	rebind, _ := newGatewayRebindRuntimeDrivers(manager)
 	diagnosticStage := &liveGatewayRebindRuntimeTypedStageDiagnosticDriver{
 		delegate: rebind.stage,
 	}
 	rebind.stage = diagnosticStage
 	diagnosticDriver := &liveGatewayRebindRuntimeRollbackDriver{managerGatewayRebindCrossStoreDriver: rebind}
-	manager.gatewayRebindCrossStoreDriver = diagnosticDriver
-	manager.gatewayCurrentPhysicalDriver = current
-	source.fixture.ingress = manager
 	inspection, err := manager.InspectGatewayRebindProposal(source.fixture.ctx, source.repository, GatewayRebindProposalInput{
 		OperationID:                    source.proposal.Spec.OperationID,
 		SuccessorProfileRevisionID:     source.proposal.Spec.SuccessorProfileRevisionID,
@@ -770,6 +766,82 @@ func (d *liveGatewayRebindRuntimeRollbackDriver) appendValidatedProgress(ctx con
 	return nil
 }
 
+func liveGatewayRebindRuntimeReplayPair(rollback bool) liveGatewayRebindStoppedStageReplayPair {
+	if rollback {
+		return liveGatewayRebindStoppedStageReplayPair{
+			testName:      liveGatewayRebindRuntimeRollbackReplayTest,
+			successMarker: liveGatewayRebindRuntimeRollbackReplayMarker,
+		}
+	}
+	return liveGatewayRebindStoppedStageReplayPair{
+		testName:      liveGatewayRebindRuntimeCommitReplayTest,
+		successMarker: liveGatewayRebindRuntimeCommitReplayMarker,
+	}
+}
+
+func TestLiveGatewayRebindRuntimeCommitReplayChild(t *testing.T) {
+	liveGatewayRebindRuntimeReplayChild(t, false)
+}
+
+func TestLiveGatewayRebindRuntimeRollbackReplayChild(t *testing.T) {
+	liveGatewayRebindRuntimeReplayChild(t, true)
+}
+
+func liveGatewayRebindRuntimeReplayChild(t *testing.T, rollback bool) {
+	pair := liveGatewayRebindRuntimeReplayPair(rollback)
+	var replayRunner *liveGatewayRebindRuntimeReplayRunner
+	runLiveGatewayRebindStoppedStageReplayChildProcessWithRunner(t, pair,
+		func(base runtimeprocess.CommandRunner) runtimeprocess.CommandRunner {
+			replayRunner = &liveGatewayRebindRuntimeReplayRunner{runner: base}
+			return replayRunner
+		}, func(child *liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome {
+			beforeFiles, err := readGatewayHistorySnapshotMode(child.manager.store, true)
+			if err != nil {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "history", message: "read protected runtime history before replay"}
+			}
+			beforeSQL, err := child.repository.GatewayRebindRecoverySnapshot(child.ctx)
+			beforeHistory, historyErr := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+			wantDisposition, wantLastPhase, wantProgress := appaccess.GatewayRebindDispositionCommit,
+				gatewayRebindProgressHandoverCommitted, 17
+			if rollback {
+				wantDisposition, wantLastPhase, wantProgress = appaccess.GatewayRebindDispositionAbort,
+					gatewayRebindProgressHandoverRolledBack, 18
+			}
+			if err != nil || historyErr != nil || beforeSQL.CurrentSource == nil || beforeSQL.Active != nil ||
+				len(beforeHistory.IntentsV2) != 1 || len(beforeHistory.Checkpoints) != 1 ||
+				len(beforeHistory.TerminalsV2) != 1 || len(beforeHistory.Progress) != wantProgress ||
+				beforeHistory.IntentsV2[0].Intent.OperationID != child.value.OperationID ||
+				beforeHistory.TerminalsV2[0].Receipt.Disposition != wantDisposition ||
+				beforeHistory.Progress[len(beforeHistory.Progress)-1].Record.Phase != wantLastPhase {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "source", message: "select exact terminal runtime replay source"}
+			}
+			terminalDigest := beforeHistory.TerminalsV2[0].Receipt.Digest
+			recovery, diagnostic, recoveryErr := liveGatewayRebindRuntimeRecoverWithDiagnostic(
+				child.ctx, child.manager, child.repository)
+			diagnosticMatches := diagnostic.Wrapped && diagnostic.RecoveryEntries == 1
+			if !rollback {
+				diagnosticMatches = diagnostic.committedCurrentSucceeded()
+			}
+			if recoveryErr != nil || recovery.Recovered || !recovery.FenceReleased ||
+				recovery.SelectedCurrentAuthority == nil ||
+				*recovery.SelectedCurrentAuthority != *beforeSQL.CurrentSource ||
+				(rollback && recovery.CurrentAttestationDigest != "") ||
+				(!rollback && !validSHA256(recovery.CurrentAttestationDigest)) || !diagnosticMatches {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "replay", message: "fresh-process runtime recovery refused exact terminal authority"}
+			}
+			afterHistory, historyErr := child.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+			afterSQL, sqlErr := child.repository.GatewayRebindRecoverySnapshot(child.ctx)
+			afterFiles, filesErr := readGatewayHistorySnapshotMode(child.manager.store, true)
+			if replayRunner == nil || historyErr != nil || sqlErr != nil || filesErr != nil ||
+				!reflect.DeepEqual(beforeSQL, afterSQL) || !sameGatewayHistorySnapshot(beforeFiles, afterFiles) ||
+				len(replayRunner.effects) != 0 || len(afterHistory.TerminalsV2) != 1 ||
+				afterHistory.TerminalsV2[0].Receipt.Digest != terminalDigest {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "history", message: "fresh-process runtime replay changed immutable evidence or dispatched an effect"}
+			}
+			return liveGatewayRebindStoppedStageReplayChildOutcome{}
+		})
+}
+
 func TestLiveGatewayRebindRuntimeCommitAndReplay(t *testing.T) {
 	liveGatewayRebindRuntimeJourney(t, false)
 }
@@ -819,14 +891,14 @@ func liveGatewayRebindRuntimeJourney(t *testing.T, rollback bool) {
 	if rollback {
 		driver := f.diagnosticDriver
 		driver.requireSequence17Refusal()
-		result, err = f.manager.commitGatewayRebind(ctx, repository, f.input)
+		result, err = f.manager.commitGatewayRebindWithDriver(ctx, repository, f.input, f.diagnosticDriver)
 		refused, _, _ := driver.diagnosticSnapshot()
 		if err != nil || !refused {
 			liveGatewayRebindRuntimeLogFailure(t, f, err)
 			t.Fatalf("force exact pre-sequence17 rollback: refused=%t err=%v", refused, err)
 		}
 	} else {
-		result, err = f.manager.commitGatewayRebind(ctx, repository, f.input)
+		result, err = f.manager.commitGatewayRebindWithDriver(ctx, repository, f.input, f.diagnosticDriver)
 		if err != nil {
 			liveGatewayRebindRuntimeLogFailure(t, f, err)
 			failLiveIngress(t, "commit typed runtime rebind", err)
@@ -903,15 +975,7 @@ func liveGatewayRebindRuntimeJourney(t *testing.T, rollback bool) {
 		t.Fatal("selected LAN authority or withdrawn listener is wrong")
 	}
 
-	options := f.manager.options
-	replayRunner := &liveGatewayRebindRuntimeReplayRunner{runner: fixture.runner}
-	fresh, err := New(replayRunner, options)
-	if err != nil {
-		t.Fatal("open fresh runtime manager")
-	}
-	rebind, current := newGatewayRebindRuntimeDrivers(fresh)
-	fresh.gatewayRebindCrossStoreDriver, fresh.gatewayCurrentPhysicalDriver = rebind, current
-	beforeReplayHistory, err := readGatewayHistorySnapshotMode(fresh.store, true)
+	beforeReplayHistory, err := readGatewayHistorySnapshotMode(f.manager.store, true)
 	if err != nil {
 		t.Fatal("read complete protected history before fresh recovery")
 	}
@@ -919,29 +983,18 @@ func liveGatewayRebindRuntimeJourney(t *testing.T, rollback bool) {
 	if err != nil {
 		t.Fatal("read SQL before fresh recovery")
 	}
-	recovery, recoveryDiagnostic, err := liveGatewayRebindRuntimeRecoverWithDiagnostic(ctx, fresh, repository)
-	authorityMatches := recovery.SelectedCurrentAuthority != nil && *recovery.SelectedCurrentAuthority == *afterSQL.CurrentSource
-	diagnosticMatches := recoveryDiagnostic.Wrapped && recoveryDiagnostic.RecoveryEntries == 1
-	if !rollback {
-		diagnosticMatches = recoveryDiagnostic.committedCurrentSucceeded()
-	}
-	if err != nil || recovery.Recovered || !recovery.FenceReleased || recovery.SelectedCurrentAuthority == nil ||
-		*recovery.SelectedCurrentAuthority != *afterSQL.CurrentSource || (rollback && recovery.CurrentAttestationDigest != "") ||
-		(!rollback && !validSHA256(recovery.CurrentAttestationDigest)) || !diagnosticMatches {
-		t.Fatalf("fresh typed runtime recovery refused: error=%t recovered=%t fence_released=%t authority_selected=%t authority_matches=%t rollback_attestation_empty=%t commit_attestation_valid=%t diagnostic=%s",
-			err != nil, recovery.Recovered, recovery.FenceReleased, recovery.SelectedCurrentAuthority != nil, authorityMatches,
-			recovery.CurrentAttestationDigest == "", validSHA256(recovery.CurrentAttestationDigest), recoveryDiagnostic)
-	}
-	afterReplay, historyErr := fresh.scanGatewayRebindProtectedIntentHistoryLocked(nil)
+	runLiveGatewayRebindStoppedStageReplayChildForOperationWithPair(t, fixture,
+		f.inspection.Spec.OperationID, liveGatewayRebindRuntimeReplayPair(rollback))
+	afterReplay, historyErr := f.manager.scanGatewayRebindProtectedIntentHistoryLocked(nil)
 	afterReplaySQL, sqlErr := repository.GatewayRebindRecoverySnapshot(ctx)
-	afterReplayHistory, filesErr := readGatewayHistorySnapshotMode(fresh.store, true)
+	afterReplayHistory, filesErr := readGatewayHistorySnapshotMode(f.manager.store, true)
 	if historyErr != nil || sqlErr != nil || !reflect.DeepEqual(beforeReplaySQL, afterReplaySQL) ||
 		filesErr != nil || !sameGatewayHistorySnapshot(beforeReplayHistory, afterReplayHistory) ||
-		len(replayRunner.effects) != 0 || len(afterReplay.TerminalsV2) != 1 ||
+		len(afterReplay.TerminalsV2) != 1 ||
 		afterReplay.TerminalsV2[0].Receipt.Digest != result.TerminalReceiptDigest {
-		t.Fatal("fresh recovery changed immutable typed history or SQL")
+		t.Fatal("fresh-process recovery changed immutable typed history or SQL")
 	}
-	t.Logf("typed runtime %s completed through exact terminal and fresh-manager replay", map[bool]string{false: "commit", true: "rollback"}[rollback])
+	t.Logf("typed runtime %s completed through exact terminal and fresh-process replay", map[bool]string{false: "commit", true: "rollback"}[rollback])
 }
 
 // liveGatewayRebindRuntimeLANBody checks the selected LAN listener's

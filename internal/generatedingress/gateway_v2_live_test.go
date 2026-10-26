@@ -202,7 +202,16 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 }
 
 func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveGatewayV2Fixture {
+	return newLiveGatewayV2FixtureWithRunner(t, spec, &runtimeprocess.ExecRunner{})
+}
+
+func newLiveGatewayV2FixtureWithRunner(t *testing.T, spec liveGatewayV2FixtureSpec,
+	runner runtimeprocess.CommandRunner,
+) *liveGatewayV2Fixture {
 	t.Helper()
+	if runner == nil {
+		t.Fatal("live gateway-v2 fixture runner is unavailable")
+	}
 	if os.Getenv("RIG_RUN_LIVE_GATEWAY_V2") != "1" {
 		t.Skip("set RIG_RUN_LIVE_GATEWAY_V2=1 on a disposable Linux Docker host")
 	}
@@ -230,7 +239,6 @@ func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveG
 	dockerConfig, working := directories.DockerConfigDirectory, directories.WorkingDirectory
 	ctx, cancel := context.WithTimeout(context.Background(), 18*time.Minute)
 	t.Cleanup(cancel)
-	runner := &runtimeprocess.ExecRunner{}
 	liveGatewayRequireLocalDocker(t, ctx, runner, docker, root, dockerConfig)
 	selected, port := liveGatewayV2SelectHostBinding(t)
 
