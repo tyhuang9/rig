@@ -14,8 +14,12 @@ import (
 	"strings"
 	"testing"
 	"text/template"
+	"time"
 
+	"github.com/google/uuid"
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentplans"
+	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedbuilder"
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
@@ -1592,4 +1596,371 @@ func removeGeneratedDomainTwoComponentObject(objects []generatedDomainDockerObje
 		result = append(result, object)
 	}
 	return result
+}
+
+func TestGeneratedDomainColdHistoricalLifecycleRetentionRequiresExactRunningSuccessor(t *testing.T) {
+	const (
+		appID            = "app-1"
+		oldDeployment    = "deployment-old"
+		middleDeployment = "deployment-middle"
+		newDeployment    = "deployment-new"
+		oldRelease       = "release-old"
+		middleRelease    = "release-middle"
+		operationID      = "operation-1"
+		currentJobID     = "job-current"
+	)
+	base := func() (deployments.GeneratedDomainStartupSnapshot, []generatedDomainColdGroup) {
+		database := deployments.GeneratedDomainStartupSnapshot{
+			LifecycleOperations: []deployments.GeneratedDomainStartupLifecycleOperation{{
+				AppID: appID, JobID: operationID, DeploymentID: oldDeployment,
+				DesiredRevision: 1, Complete: true,
+			}},
+			LifecycleBindings: []deployments.GeneratedDomainStartupLifecycleBinding{{
+				DeploymentJobID: currentJobID, AppID: appID, DesiredRevision: 1,
+				Mode: deploymentbinding.ModeRunning, AuthorizingOperationID: operationID,
+			}},
+		}
+		groups := []generatedDomainColdGroup{
+			{pins: candidateValidationPins{identity: candidateValidationIdentity{applicationID: appID},
+				deploymentID: oldDeployment, releaseID: oldRelease, candidateSlot: "blue"},
+				snapshot: candidateAdmissionSnapshot{lifecycleRetained: true}, kind: generatedDomainColdHistorical},
+			{pins: candidateValidationPins{identity: candidateValidationIdentity{applicationID: appID},
+				deploymentID: middleDeployment, releaseID: middleRelease, candidateSlot: "green"},
+				snapshot: candidateAdmissionSnapshot{headPins: candidateHeadPins{
+					previousDeploymentID: oldDeployment, previousReleaseID: oldRelease, previousSlot: "blue",
+				}}, kind: generatedDomainColdHistorical},
+			{pins: candidateValidationPins{identity: candidateValidationIdentity{applicationID: appID,
+				jobID: currentJobID}, deploymentID: newDeployment, releaseID: "release-new", candidateSlot: "blue"},
+				snapshot: candidateAdmissionSnapshot{headPins: candidateHeadPins{
+					previousDeploymentID: middleDeployment, previousReleaseID: middleRelease, previousSlot: "green",
+				}}, kind: generatedDomainColdCurrent},
+		}
+		return database, groups
+	}
+	if database, groups := base(); validateGeneratedDomainColdLifecycleRetention(database, groups) != nil {
+		t.Fatal("exact historical operation did not authorize a later running successor through its intermediate")
+	}
+	if database, groups := base(); true {
+		database.LifecycleOperations = append(database.LifecycleOperations,
+			deployments.GeneratedDomainStartupLifecycleOperation{AppID: appID, JobID: "operation-older",
+				DeploymentID: oldDeployment, DesiredRevision: 2, Complete: true})
+		if err := validateGeneratedDomainColdLifecycleRetention(database, groups); err != nil {
+			t.Fatalf("descriptive complete operation sharing the historical pin error=%v", err)
+		}
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*deployments.GeneratedDomainStartupSnapshot, []generatedDomainColdGroup)
+	}{
+		{name: "retained current", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			groups []generatedDomainColdGroup) {
+			groups[0].snapshot.lifecycleRetained = false
+			groups[2].snapshot.lifecycleRetained = true
+			database.LifecycleOperations[0].DeploymentID = newDeployment
+		}},
+		{name: "incomplete operation", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			database.LifecycleOperations[0].Complete = false
+		}},
+		{name: "crossed authorizer", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			database.LifecycleBindings[0].AuthorizingOperationID = "operation-crossed"
+		}},
+		{name: "duplicate operation", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			database.LifecycleOperations = append(database.LifecycleOperations, database.LifecycleOperations[0])
+		}},
+		{name: "unrelated operation deployment", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			database.LifecycleOperations[0].DeploymentID = "deployment-unrelated"
+		}},
+		{name: "historical predecessor still present", mutate: func(_ *deployments.GeneratedDomainStartupSnapshot,
+			groups []generatedDomainColdGroup) {
+			groups[0].kind = generatedDomainColdRisky
+		}},
+		{name: "missing intermediate", mutate: func(_ *deployments.GeneratedDomainStartupSnapshot,
+			groups []generatedDomainColdGroup) {
+			groups[1].pins.deploymentID = "deployment-missing"
+		}},
+		{name: "crossed intermediate release", mutate: func(_ *deployments.GeneratedDomainStartupSnapshot,
+			groups []generatedDomainColdGroup) {
+			groups[2].snapshot.headPins.previousReleaseID = oldRelease
+		}},
+		{name: "duplicate intermediate", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			groups []generatedDomainColdGroup) {
+			database.LifecycleOperations[0].DeploymentID = middleDeployment
+			groups[0].pins.deploymentID = middleDeployment
+		}},
+		{name: "cyclic ancestry", mutate: func(_ *deployments.GeneratedDomainStartupSnapshot,
+			groups []generatedDomainColdGroup) {
+			groups[1].snapshot.headPins = candidateHeadPins{previousDeploymentID: newDeployment,
+				previousReleaseID: "release-new", previousSlot: "blue"}
+		}},
+		{name: "legacy flag without operation", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			database.LifecycleOperations = nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database, groups := base()
+			test.mutate(&database, groups)
+			if err := validateGeneratedDomainColdLifecycleRetention(database, groups); !errors.Is(err, errGeneratedDomainConstructionRefused) {
+				t.Fatalf("lifecycle retention error=%v", err)
+			}
+		})
+	}
+}
+
+func TestGeneratedDomainColdCurrentDebtEvidenceRequiresTotalAbsenceOrExactChain(t *testing.T) {
+	appID, deploymentID, releaseID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	jobID, receiptID := uuid.NewString(), uuid.NewString()
+	component := candidateAdmissionComponent{plan: deploymentplans.Component{Name: "api"}, slot: "blue",
+		containerName: "api-blue", containerID: strings.Repeat("a", 64),
+		artifact: &candidateArtifactSnapshot{id: uuid.NewString()},
+		receipt:  &candidateIntentSnapshot{id: uuid.NewString(), policyDigest: strings.Repeat("d", 64)}}
+	group := generatedDomainColdGroup{pins: candidateValidationPins{
+		identity:     candidateValidationIdentity{applicationID: appID, jobID: jobID, attempt: 1},
+		deploymentID: deploymentID, releaseID: releaseID, candidateSlot: "blue",
+	}, snapshot: candidateAdmissionSnapshot{
+		pins: candidateImmutablePins{jobID: jobID},
+		headPins: candidateHeadPins{appID: appID, deploymentID: deploymentID,
+			releaseID: releaseID, slot: "blue"},
+		observedHead: candidateHeadSnapshot{appID: appID, deploymentID: deploymentID,
+			releaseID: releaseID, slot: "blue", activationReceiptID: receiptID, generation: 1},
+		components: []candidateAdmissionComponent{component},
+	}, kind: generatedDomainColdCurrent}
+	roster, ok := generatedDomainColdActivationRoster(group.snapshot)
+	if !ok {
+		t.Fatal("current debt evidence activation roster is invalid")
+	}
+	activation := generatedruntimestate.GeneratedDomainStartupRouteActivation{
+		ReceiptID: receiptID, AppID: appID, SuccessorDeploymentID: deploymentID,
+		SuccessorReleaseID: releaseID, SuccessorSlot: "blue", SuccessorGeneration: 1,
+		CreatorJobID: jobID, CreatorWorkerAttempt: 1,
+		CandidateRosterDigest:     generatedRouteActivationRosterDigest(roster),
+		PredecessorRosterDigest:   generatedRouteActivationRosterDigest(nil),
+		RouteIntentDigest:         strings.Repeat("b", 64),
+		CommittedRouteProofDigest: strings.Repeat("c", 64),
+	}
+
+	legacy := group
+	legacy.legacyHead = true
+	legacy.snapshot.observedHead.activationReceiptID = ""
+	for _, test := range []struct {
+		name   string
+		mutate func(*deployments.GeneratedDomainStartupSnapshot)
+	}{
+		{name: "route activation", mutate: func(database *deployments.GeneratedDomainStartupSnapshot) {
+			database.Runtime.RouteActivations = append(database.Runtime.RouteActivations,
+				generatedruntimestate.GeneratedDomainStartupRouteActivation{SuccessorDeploymentID: deploymentID})
+		}},
+		{name: "handoff authorization", mutate: func(database *deployments.GeneratedDomainStartupSnapshot) {
+			database.Runtime.AccountingHandoffAuthorizations = append(database.Runtime.AccountingHandoffAuthorizations,
+				generatedruntimestate.RouteAccountingHandoffAuthorization{SuccessorDeploymentID: deploymentID})
+		}},
+		{name: "handoff receipt", mutate: func(database *deployments.GeneratedDomainStartupSnapshot) {
+			database.Runtime.AccountingHandoffReceipts = append(database.Runtime.AccountingHandoffReceipts,
+				generatedruntimestate.RouteAccountingHandoffReceipt{SuccessorDeploymentID: deploymentID})
+		}},
+		{name: "completion receipt", mutate: func(database *deployments.GeneratedDomainStartupSnapshot) {
+			database.Runtime.RouteCompletionReceipts = append(database.Runtime.RouteCompletionReceipts,
+				generatedruntimestate.RouteCompletionReceipt{SuccessorDeploymentID: deploymentID})
+		}},
+	} {
+		t.Run("legacy same successor "+test.name, func(t *testing.T) {
+			database := deployments.GeneratedDomainStartupSnapshot{}
+			test.mutate(&database)
+			if restored, err := generatedDomainColdCurrentDebtEvidence(database, legacy, []generatedDomainColdGroup{legacy}); restored || !errors.Is(err, errGeneratedDomainConstructionRefused) {
+				t.Fatalf("legacy same-successor %s evidence=(%v, %v)", test.name, restored, err)
+			}
+		})
+	}
+	unrelated := deployments.GeneratedDomainStartupSnapshot{}
+	unrelated.Runtime.RouteActivations = append(unrelated.Runtime.RouteActivations,
+		generatedruntimestate.GeneratedDomainStartupRouteActivation{SuccessorDeploymentID: uuid.NewString()})
+	if restored, err := generatedDomainColdCurrentDebtEvidence(unrelated, legacy, []generatedDomainColdGroup{legacy}); restored || err != nil {
+		t.Fatalf("unrelated legacy evidence=(%v, %v)", restored, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*deployments.GeneratedDomainStartupSnapshot)
+	}{
+		{name: "same successor crossed activation", mutate: func(database *deployments.GeneratedDomainStartupSnapshot) {
+			crossed := activation
+			crossed.ReceiptID = uuid.NewString()
+			database.Runtime.RouteActivations = append(database.Runtime.RouteActivations, crossed)
+		}},
+		{name: "same receipt crossed authorization", mutate: func(database *deployments.GeneratedDomainStartupSnapshot) {
+			database.Runtime.AccountingHandoffAuthorizations = append(database.Runtime.AccountingHandoffAuthorizations,
+				generatedruntimestate.RouteAccountingHandoffAuthorization{ActivationReceiptID: receiptID,
+					AppID: appID, SuccessorDeploymentID: uuid.NewString()})
+		}},
+		{name: "same receipt crossed handoff", mutate: func(database *deployments.GeneratedDomainStartupSnapshot) {
+			database.Runtime.AccountingHandoffReceipts = append(database.Runtime.AccountingHandoffReceipts,
+				generatedruntimestate.RouteAccountingHandoffReceipt{ActivationReceiptID: receiptID,
+					AppID: appID, SuccessorDeploymentID: uuid.NewString()})
+		}},
+		{name: "same receipt crossed completion", mutate: func(database *deployments.GeneratedDomainStartupSnapshot) {
+			database.Runtime.RouteCompletionReceipts = append(database.Runtime.RouteCompletionReceipts,
+				generatedruntimestate.RouteCompletionReceipt{ActivationReceiptID: receiptID,
+					AppID: appID, SuccessorDeploymentID: uuid.NewString()})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			database := deployments.GeneratedDomainStartupSnapshot{}
+			database.Runtime.RouteActivations = append(database.Runtime.RouteActivations, activation)
+			test.mutate(&database)
+			if restored, err := generatedDomainColdCurrentDebtEvidence(database, group, []generatedDomainColdGroup{group}); restored || !errors.Is(err, errGeneratedDomainConstructionRefused) {
+				t.Fatalf("crossed evidence=(%v, %v)", restored, err)
+			}
+		})
+	}
+}
+
+func TestGeneratedDomainColdAuthorizerAncestryRequiresEveryCompletedHop(t *testing.T) {
+	appID := uuid.NewString()
+	stamp := time.Date(2026, 10, 26, 12, 0, 0, 0, time.UTC)
+	type identity struct {
+		deploymentID, releaseID, jobID, slot string
+	}
+	values := []identity{
+		{uuid.NewString(), uuid.NewString(), uuid.NewString(), "blue"},
+		{uuid.NewString(), uuid.NewString(), uuid.NewString(), "green"},
+		{uuid.NewString(), uuid.NewString(), uuid.NewString(), "blue"},
+	}
+	groups := make([]generatedDomainColdGroup, len(values))
+	for index, value := range values {
+		component := candidateAdmissionComponent{plan: deploymentplans.Component{Name: "api"}, slot: value.slot,
+			containerName: "api-" + value.slot, containerID: strings.Repeat(string(rune('a'+index)), 64),
+			artifact: &candidateArtifactSnapshot{id: uuid.NewString()},
+			receipt:  &candidateIntentSnapshot{id: uuid.NewString(), policyDigest: strings.Repeat("d", 64)}}
+		headPins := candidateHeadPins{appID: appID, deploymentID: value.deploymentID,
+			releaseID: value.releaseID, slot: value.slot}
+		groups[index] = generatedDomainColdGroup{pins: candidateValidationPins{
+			identity:     candidateValidationIdentity{applicationID: appID, jobID: value.jobID, attempt: 1},
+			deploymentID: value.deploymentID, releaseID: value.releaseID, candidateSlot: value.slot,
+		}, snapshot: candidateAdmissionSnapshot{pins: candidateImmutablePins{jobID: value.jobID},
+			headPins: headPins, components: []candidateAdmissionComponent{component}},
+			kind: generatedDomainColdHistorical}
+		if index > 0 {
+			groups[index].snapshot.headPins.previousDeploymentID = values[index-1].deploymentID
+			groups[index].snapshot.headPins.previousReleaseID = values[index-1].releaseID
+			groups[index].snapshot.headPins.previousSlot = values[index-1].slot
+		}
+	}
+	groups[0].snapshot.lifecycleRetained = true
+	groups[2].kind = generatedDomainColdCurrent
+
+	database := deployments.GeneratedDomainStartupSnapshot{}
+	for index, group := range groups {
+		roster, ok := generatedDomainColdActivationRoster(group.snapshot)
+		if !ok {
+			t.Fatal("test activation roster is invalid")
+		}
+		predecessorRoster := []generatedruntimestate.RouteActivationComponent(nil)
+		predecessorID, predecessorReceiptID := "", ""
+		predecessorGeneration := int64(0)
+		predecessorComponentCount := 0
+		if index > 0 {
+			predecessorRoster, ok = generatedDomainColdActivationRoster(groups[index-1].snapshot)
+			if !ok {
+				t.Fatal("test predecessor roster is invalid")
+			}
+			predecessorID = values[index-1].deploymentID
+			predecessorReceiptID = database.Runtime.RouteActivations[index-1].ReceiptID
+			predecessorGeneration = int64(index)
+			predecessorComponentCount = 1
+		}
+		activation := generatedruntimestate.GeneratedDomainStartupRouteActivation{
+			ReceiptID: uuid.NewString(), AppID: appID, SuccessorDeploymentID: group.pins.deploymentID,
+			SuccessorReleaseID: group.pins.releaseID, SuccessorSlot: group.pins.candidateSlot,
+			SuccessorGeneration: int64(index + 1), PredecessorDeploymentID: predecessorID,
+			PredecessorReleaseID:  group.snapshot.headPins.previousReleaseID,
+			PredecessorSlot:       group.snapshot.headPins.previousSlot,
+			PredecessorGeneration: predecessorGeneration, PredecessorActivationReceiptID: predecessorReceiptID,
+			CreatorJobID: group.pins.jobID(), CreatorWorkerAttempt: 1,
+			CandidateRosterDigest:   generatedRouteActivationRosterDigest(roster),
+			PredecessorRosterDigest: generatedRouteActivationRosterDigest(predecessorRoster),
+		}
+		database.Runtime.RouteActivations = append(database.Runtime.RouteActivations, activation)
+		database.Runtime.AccountingHandoffAuthorizations = append(database.Runtime.AccountingHandoffAuthorizations,
+			generatedruntimestate.RouteAccountingHandoffAuthorization{
+				ActivationReceiptID: activation.ReceiptID, AppID: appID,
+				SuccessorDeploymentID:   activation.SuccessorDeploymentID,
+				PredecessorDeploymentID: activation.PredecessorDeploymentID,
+				CandidateRosterDigest:   activation.CandidateRosterDigest,
+				PredecessorRosterDigest: activation.PredecessorRosterDigest,
+				SuccessorComponentCount: 1, PredecessorComponentCount: predecessorComponentCount, AuthorizedAt: stamp,
+			})
+		database.Runtime.AccountingHandoffReceipts = append(database.Runtime.AccountingHandoffReceipts,
+			generatedruntimestate.RouteAccountingHandoffReceipt{
+				ActivationReceiptID: activation.ReceiptID, AppID: appID,
+				SuccessorDeploymentID:   activation.SuccessorDeploymentID,
+				PredecessorDeploymentID: activation.PredecessorDeploymentID,
+				CandidateRosterDigest:   activation.CandidateRosterDigest,
+				PredecessorRosterDigest: activation.PredecessorRosterDigest,
+				SuccessorComponentCount: 1, PredecessorComponentCount: predecessorComponentCount,
+				HandedOffAt: stamp.Add(time.Second),
+			})
+		database.Runtime.RouteCompletionReceipts = append(database.Runtime.RouteCompletionReceipts,
+			generatedruntimestate.RouteCompletionReceipt{ActivationReceiptID: activation.ReceiptID, AppID: appID,
+				SuccessorDeploymentID: activation.SuccessorDeploymentID, CreatorJobID: group.pins.jobID(),
+				CreatorWorkerAttempt: 1, CurrentJobID: group.pins.jobID(), CurrentWorkerAttempt: 1,
+				CompletionCode: "deployment_completed", CompletedAt: stamp.Add(2 * time.Second)})
+		database.GeneratedDeployments = append(database.GeneratedDeployments,
+			deployments.GeneratedDomainStartupDeployment{ID: group.pins.deploymentID, AppID: appID,
+				JobID: group.pins.jobID(), Status: deployments.Succeeded, JobStatus: "succeeded",
+				JobPhase: "succeeded", JobAttempt: 1, CanonicalSuccessEventCount: 1, SuccessEventCount: 1,
+				CanonicalSuccessEventAt: stamp.Add(2 * time.Second)})
+	}
+	if !generatedDomainColdAuthorizerAncestry(database, groups, groups[2], values[0].deploymentID) {
+		t.Fatal("complete A to B to C accounting ancestry was refused")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*deployments.GeneratedDomainStartupSnapshot, []generatedDomainColdGroup)
+	}{
+		{name: "missing hop receipt", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			database.Runtime.RouteCompletionReceipts = database.Runtime.RouteCompletionReceipts[:2]
+		}},
+		{name: "crossed hop", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			database.Runtime.RouteActivations[2].PredecessorReleaseID = values[0].releaseID
+		}},
+		{name: "duplicate hop", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			database.Runtime.RouteActivations = append(database.Runtime.RouteActivations,
+				database.Runtime.RouteActivations[1])
+		}},
+		{name: "extra hop acknowledgement", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			_ []generatedDomainColdGroup) {
+			extra := database.Runtime.AccountingHandoffReceipts[1]
+			extra.ActivationReceiptID = uuid.NewString()
+			database.Runtime.AccountingHandoffReceipts = append(database.Runtime.AccountingHandoffReceipts, extra)
+		}},
+		{name: "cycle", mutate: func(database *deployments.GeneratedDomainStartupSnapshot,
+			groups []generatedDomainColdGroup) {
+			groups[1].snapshot.headPins = candidateHeadPins{previousDeploymentID: values[2].deploymentID,
+				previousReleaseID: values[2].releaseID, previousSlot: values[2].slot}
+			database.Runtime.RouteActivations[1].PredecessorDeploymentID = values[2].deploymentID
+			database.Runtime.RouteActivations[1].PredecessorReleaseID = values[2].releaseID
+			database.Runtime.RouteActivations[1].PredecessorSlot = values[2].slot
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			copyDatabase := database
+			copyDatabase.GeneratedDeployments = append([]deployments.GeneratedDomainStartupDeployment(nil), database.GeneratedDeployments...)
+			copyDatabase.Runtime.RouteActivations = append([]generatedruntimestate.GeneratedDomainStartupRouteActivation(nil), database.Runtime.RouteActivations...)
+			copyDatabase.Runtime.AccountingHandoffAuthorizations = append([]generatedruntimestate.RouteAccountingHandoffAuthorization(nil), database.Runtime.AccountingHandoffAuthorizations...)
+			copyDatabase.Runtime.AccountingHandoffReceipts = append([]generatedruntimestate.RouteAccountingHandoffReceipt(nil), database.Runtime.AccountingHandoffReceipts...)
+			copyDatabase.Runtime.RouteCompletionReceipts = append([]generatedruntimestate.RouteCompletionReceipt(nil), database.Runtime.RouteCompletionReceipts...)
+			copyGroups := append([]generatedDomainColdGroup(nil), groups...)
+			test.mutate(&copyDatabase, copyGroups)
+			if generatedDomainColdAuthorizerAncestry(copyDatabase, copyGroups, copyGroups[2], values[0].deploymentID) {
+				t.Fatal("invalid completed accounting ancestry was accepted")
+			}
+		})
+	}
 }

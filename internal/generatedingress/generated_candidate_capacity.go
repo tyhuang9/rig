@@ -31,7 +31,8 @@ var (
 // removed: receipt, command, cleanup and quiescence tombstones must outlive
 // every replaceable raw-charge epoch.
 type candidateCapacityLedger struct {
-	budget *generatedcapacity.Budget
+	budget      *generatedcapacity.Budget
+	coordinator *generatedDomainCapacityCoordinator
 
 	mu     sync.Mutex
 	groups map[candidateCapacityGroupKey]*candidateCapacityGroup
@@ -104,12 +105,16 @@ const (
 	candidateAccountingCandidate candidateAccountingOwner = iota
 	candidateAccountingTransferring
 	candidateAccountingRouteActive
+	candidateAccountingPendingPublication
 	candidateAccountingPredecessorRetiring
 	candidateAccountingPredecessorRetired
 )
 
 type candidateCapacityCharge struct {
 	epoch uint64
+	token candidateCapacityChargeToken
+	// lease remains the exact raw-token projection used by existing internal
+	// accounting proofs. Restored debt never populates it.
 	lease *generatedcapacity.Lease
 	refs  int
 	state candidateChargeState
@@ -118,6 +123,33 @@ type candidateCapacityCharge struct {
 	receiptRetained  bool
 	explicitRetained bool
 	logicallyRetired bool
+}
+
+type candidateCapacityChargeToken interface {
+	configured() bool
+	published() bool
+	release()
+}
+
+type candidateRawCapacityChargeToken struct {
+	lease *generatedcapacity.Lease
+}
+
+func (t *candidateRawCapacityChargeToken) configured() bool { return t != nil && t.lease != nil }
+func (t *candidateRawCapacityChargeToken) published() bool  { return t.configured() }
+func (t *candidateRawCapacityChargeToken) release() {
+	if t != nil && t.lease != nil {
+		t.lease.Release()
+		t.lease = nil
+	}
+}
+
+func candidateCapacityChargeTokenConfigured(token candidateCapacityChargeToken) bool {
+	return token != nil && token.configured()
+}
+
+func candidateCapacityChargeTokenPublished(token candidateCapacityChargeToken) bool {
+	return token != nil && token.published()
 }
 
 type candidateCapacityReservation struct {
@@ -248,6 +280,7 @@ type candidateAccountingHandoffEntry struct {
 	charge    *candidateCapacityCharge
 	receipt   *candidateReceiptTombstone
 	epoch     uint64
+	token     candidateCapacityChargeToken
 	lease     *generatedcapacity.Lease
 	release   candidateAccountingReleaseState
 }
@@ -303,15 +336,24 @@ type candidateReceiptSnapshot struct {
 type candidateRetiringCharge struct {
 	component *candidateCapacityComponent
 	charge    *candidateCapacityCharge
-	lease     *generatedcapacity.Lease
+	token     candidateCapacityChargeToken
 }
 
-func newCandidateCapacityLedger(budget *generatedcapacity.Budget) (*candidateCapacityLedger, error) {
+func newCandidateCapacityLedger(budget *generatedcapacity.Budget,
+	coordinators ...*generatedDomainCapacityCoordinator,
+) (*candidateCapacityLedger, error) {
 	if budget == nil {
 		return nil, errCandidateCapacityInvalid
 	}
+	var coordinator *generatedDomainCapacityCoordinator
+	if len(coordinators) > 1 {
+		return nil, errCandidateCapacityInvalid
+	}
+	if len(coordinators) == 1 {
+		coordinator = coordinators[0]
+	}
 	return &candidateCapacityLedger{
-		budget: budget,
+		budget: budget, coordinator: coordinator,
 		groups: make(map[candidateCapacityGroupKey]*candidateCapacityGroup),
 	}, nil
 }
@@ -361,6 +403,7 @@ func (l *candidateCapacityLedger) enterRetirementRoster(appID, deploymentID stri
 		component := group.byName[name]
 		if component == nil || component.charge == nil || component.charge.state != candidateChargeActive ||
 			!candidateAccountingOwnerCanBecomePredecessor(component.charge.owner) ||
+			!candidateCapacityChargeTokenPublished(component.charge.token) ||
 			component.charge.logicallyRetired || component.receipt == nil || component.receipt.id != receipts[name] {
 			return nil, errCandidateReceiptMismatch
 		}
@@ -396,7 +439,8 @@ func (l *candidateCapacityLedger) enterRetirementRoster(appID, deploymentID stri
 }
 
 func candidateAccountingOwnerCanBecomePredecessor(owner candidateAccountingOwner) bool {
-	return owner == candidateAccountingCandidate || owner == candidateAccountingRouteActive
+	return owner == candidateAccountingCandidate || owner == candidateAccountingRouteActive ||
+		owner == candidateAccountingPendingPublication
 }
 
 func (o *candidateRetirementRosterOperation) enterCommand(componentName string, command candidateCommand) error {
@@ -644,9 +688,9 @@ func (o *candidateAccountingHandoffOperation) releasePredecessorOnce() error {
 
 	for _, index := range pending {
 		entry := &o.predecessor[index]
-		entry.lease.Release()
+		entry.token.release()
 		o.predecessorGroup.mu.Lock()
-		if !validCandidateAccountingEntryLocked(*entry, o.predecessorGroup,
+		if !validCandidateAccountingEntryAfterTokenReleaseLocked(*entry, o.predecessorGroup,
 			candidateAccountingPredecessorRetiring, candidatePhysicalConfirmedAbsent) {
 			o.predecessorGroup.mu.Unlock()
 			o.closed = true
@@ -656,6 +700,7 @@ func (o *candidateAccountingHandoffOperation) releasePredecessorOnce() error {
 		entry.charge.owner = candidateAccountingPredecessorRetired
 		entry.charge.refs = 0
 		entry.charge.logicallyRetired = true
+		entry.charge.token = nil
 		entry.charge.lease = nil
 		entry.release = candidateAccountingReleaseComplete
 		o.predecessorGroup.changed.Broadcast()
@@ -719,7 +764,7 @@ func validateCandidateAccountingSuccessorLocked(
 		binding := operation.reservation.bindings[name]
 		_, found := tokens[component]
 		if component == nil || !found || !validCandidateBindingLocked(binding) ||
-			binding.component != component || binding.charge.lease == nil ||
+			binding.component != component || !candidateCapacityChargeTokenPublished(binding.charge.token) ||
 			binding.charge.owner != candidateAccountingCandidate || component.receipt == nil {
 			return nil, errCandidateCapacityStale
 		}
@@ -732,7 +777,7 @@ func validateCandidateAccountingSuccessorLocked(
 		}
 		entries = append(entries, candidateAccountingHandoffEntry{
 			component: component, charge: binding.charge, receipt: component.receipt,
-			epoch: binding.charge.epoch, lease: binding.charge.lease,
+			epoch: binding.charge.epoch, token: binding.charge.token, lease: binding.charge.lease,
 		})
 	}
 	return entries, nil
@@ -758,7 +803,7 @@ func validateCandidateAccountingPredecessorLocked(
 		component := group.byName[name]
 		_, found := tokens[component]
 		if component == nil || operation.byName[name] != component || !found || component.charge == nil ||
-			component.charge.state != candidateChargeActive || component.charge.lease == nil ||
+			component.charge.state != candidateChargeActive || !candidateCapacityChargeTokenPublished(component.charge.token) ||
 			!candidateAccountingOwnerCanBecomePredecessor(component.charge.owner) ||
 			component.charge.logicallyRetired || !component.charge.explicitRetained || component.receipt == nil {
 			return nil, errCandidateCapacityStale
@@ -772,7 +817,7 @@ func validateCandidateAccountingPredecessorLocked(
 		}
 		entries = append(entries, candidateAccountingHandoffEntry{
 			component: component, charge: component.charge, receipt: component.receipt,
-			epoch: component.charge.epoch, lease: component.charge.lease,
+			epoch: component.charge.epoch, token: component.charge.token, lease: component.charge.lease,
 		})
 	}
 	return entries, nil
@@ -800,7 +845,9 @@ func validCandidateAccountingEntryLocked(entry candidateAccountingHandoffEntry,
 ) bool {
 	if group == nil || entry.component == nil || group.byName[entry.component.name] != entry.component ||
 		entry.component.charge != entry.charge || entry.charge == nil || entry.charge.epoch != entry.epoch ||
-		entry.charge.lease != entry.lease || entry.lease == nil || entry.charge.state != candidateChargeActive ||
+		entry.charge.token != entry.token || !candidateCapacityChargeTokenPublished(entry.token) ||
+		!candidateAccountingTokenLeaseMatches(entry.token, entry.charge.lease, entry.lease, true) ||
+		entry.charge.state != candidateChargeActive ||
 		entry.charge.owner != owner || !entry.charge.explicitRetained || entry.charge.logicallyRetired ||
 		entry.component.receipt != entry.receipt ||
 		entry.receipt == nil {
@@ -810,12 +857,53 @@ func validCandidateAccountingEntryLocked(entry candidateAccountingHandoffEntry,
 	return word&candidateReceiptUnquiesced == 0 && candidatePhysicalFromWord(word) == physical
 }
 
+func validCandidateAccountingEntryAfterTokenReleaseLocked(entry candidateAccountingHandoffEntry,
+	group *candidateCapacityGroup, owner candidateAccountingOwner, physical candidatePhysicalState,
+) bool {
+	if group == nil || entry.component == nil || group.byName[entry.component.name] != entry.component ||
+		entry.component.charge != entry.charge || entry.charge == nil || entry.charge.epoch != entry.epoch ||
+		entry.charge.token != entry.token || entry.token == nil || candidateCapacityChargeTokenConfigured(entry.token) ||
+		!candidateAccountingTokenLeaseMatches(entry.token, entry.charge.lease, entry.lease, false) ||
+		entry.charge.state != candidateChargeActive || entry.charge.owner != owner ||
+		!entry.charge.explicitRetained || entry.charge.logicallyRetired ||
+		entry.component.receipt != entry.receipt || entry.receipt == nil {
+		return false
+	}
+	word := entry.receipt.state.Load()
+	return word&candidateReceiptUnquiesced == 0 && candidatePhysicalFromWord(word) == physical
+}
+
+func candidateAccountingTokenLeaseMatches(token candidateCapacityChargeToken, chargeLease,
+	capturedLease *generatedcapacity.Lease, published bool,
+) bool {
+	switch value := token.(type) {
+	case *candidateRawCapacityChargeToken:
+		if value == nil || capturedLease == nil || chargeLease != capturedLease {
+			return false
+		}
+		if published {
+			return value.lease == capturedLease
+		}
+		return value.lease == nil
+	case *generatedDomainCapacityDebtToken:
+		if value == nil || capturedLease != nil || chargeLease != nil {
+			return false
+		}
+		if published {
+			return value.published()
+		}
+		return !value.configured()
+	default:
+		return false
+	}
+}
+
 func validCandidateAccountingReleasedEntryLocked(entry candidateAccountingHandoffEntry,
 	group *candidateCapacityGroup,
 ) bool {
 	if group == nil || entry.component == nil || group.byName[entry.component.name] != entry.component ||
 		entry.component.charge != entry.charge || entry.charge == nil || entry.charge.epoch != entry.epoch ||
-		entry.lease == nil || entry.charge.lease != nil || entry.charge.state != candidateChargeReleased ||
+		entry.token == nil || entry.charge.token != nil || entry.charge.state != candidateChargeReleased ||
 		entry.charge.owner != candidateAccountingPredecessorRetired || !entry.charge.explicitRetained ||
 		!entry.charge.logicallyRetired || entry.component.receipt != entry.receipt || entry.receipt == nil {
 		return false
@@ -936,6 +1024,168 @@ func (l *candidateCapacityLedger) seedColdOwnership(spec candidateGroupSpec,
 	return nil
 }
 
+// seedColdOwnershipWithDebt installs one complete authenticated Current roster
+// while bootstrap capacity is still closed. The tokens are pending publication:
+// no ordinary alias, retirement or cleanup path may consume them until their
+// common coordinator is published.
+func (l *candidateCapacityLedger) seedColdOwnershipWithDebt(spec candidateGroupSpec,
+	receipts map[string]candidateColdReceiptSeed, tokens []*generatedDomainCapacityDebtToken,
+) error {
+	if l == nil || l.budget == nil || l.coordinator == nil {
+		return errCandidateCapacityInvalid
+	}
+	normalized, err := normalizeCandidateGroupSpec(spec)
+	if err != nil || len(receipts) != len(normalized.components) || len(tokens) != len(normalized.components) {
+		return errCandidateCapacityInvalid
+	}
+	words := make([]uint64, len(normalized.components))
+	seenTokens := make(map[*generatedDomainCapacityDebtToken]struct{}, len(tokens))
+	for index, name := range normalized.components {
+		seed, found := receipts[name]
+		if !found || seed.id == "" || tokens[index] == nil || tokens[index].owner != l.coordinator ||
+			!tokens[index].configured() ||
+			(seed.physical != candidatePhysicalPresent && seed.physical != candidatePhysicalHandedToRoute) {
+			return errCandidateCapacityInvalid
+		}
+		if _, duplicate := seenTokens[tokens[index]]; duplicate {
+			return errCandidateCapacityInvalid
+		}
+		seenTokens[tokens[index]] = struct{}{}
+		word := uint64(seed.physical) | candidateReceiptAcknowledged | candidateReceiptObserved
+		if seed.unknown {
+			return errCandidateCapacityInvalid
+		}
+		words[index] = word
+	}
+	key := candidateCapacityGroupKey{appID: normalized.appID, deploymentID: normalized.deploymentID}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.groups[key] != nil {
+		return errCandidateCapacityPinsChanged
+	}
+	group := newCandidateCapacityGroup(l, key, normalized)
+	for index, name := range normalized.components {
+		seed := receipts[name]
+		component := group.byName[name]
+		group.nextEpoch++
+		component.receipt = &candidateReceiptTombstone{id: seed.id}
+		component.receipt.state.Store(words[index])
+		component.charge = &candidateCapacityCharge{epoch: group.nextEpoch, token: tokens[index],
+			state: candidateChargeActive, owner: candidateAccountingPendingPublication, receiptRetained: true}
+	}
+	l.groups[key] = group
+	return nil
+}
+
+// abandonUnpublished detaches all raw tokens in a graph that registry state
+// still proves unreachable. It returns no authority and performs token release
+// only after dropping ledger and group locks.
+func (l *candidateCapacityLedger) abandonUnpublished() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	groups := make([]*candidateCapacityGroup, 0, len(l.groups))
+	for _, group := range l.groups {
+		groups = append(groups, group)
+	}
+	l.mu.Unlock()
+	var tokens []candidateCapacityChargeToken
+	for _, group := range groups {
+		group.mu.Lock()
+		for _, component := range group.byName {
+			if component == nil || component.charge == nil || component.charge.token == nil {
+				continue
+			}
+			tokens = append(tokens, component.charge.token)
+			component.charge.token = nil
+			component.charge.lease = nil
+			component.charge.state = candidateChargeReleased
+			component.charge.refs = 0
+			component.charge.logicallyRetired = true
+		}
+		group.changed.Broadcast()
+		group.mu.Unlock()
+	}
+	for _, token := range tokens {
+		token.release()
+	}
+}
+
+// publishRestoredOwnership is called only while the registry still excludes
+// every consumer of this construction. It first validates the complete
+// pending graph, then publishes the shared coordinator and promotes the exact
+// restored entries without reminting tokens.
+func (l *candidateCapacityLedger) publishRestoredOwnership() error {
+	if l == nil || l.coordinator == nil || !l.coordinator.readyToPublish() {
+		return errCandidateCapacityInvalid
+	}
+	l.mu.Lock()
+	groups := make([]*candidateCapacityGroup, 0, len(l.groups))
+	for _, group := range l.groups {
+		groups = append(groups, group)
+	}
+	l.mu.Unlock()
+	type pendingCharge struct {
+		group  *candidateCapacityGroup
+		charge *candidateCapacityCharge
+		token  *generatedDomainCapacityDebtToken
+	}
+	var pending []pendingCharge
+	pendingTokens := make(map[*generatedDomainCapacityDebtToken]struct{})
+	for _, group := range groups {
+		group.mu.Lock()
+		for _, component := range group.byName {
+			if component == nil || component.charge == nil ||
+				component.charge.owner != candidateAccountingPendingPublication {
+				continue
+			}
+			charge := component.charge
+			token, restored := charge.token.(*generatedDomainCapacityDebtToken)
+			if charge.state != candidateChargeActive || charge.logicallyRetired || !restored ||
+				token.owner != l.coordinator ||
+				!candidateCapacityChargeTokenConfigured(charge.token) ||
+				candidateCapacityChargeTokenPublished(charge.token) {
+				group.mu.Unlock()
+				return errCandidateCapacityInvalid
+			}
+			if _, duplicate := pendingTokens[token]; duplicate {
+				group.mu.Unlock()
+				return errCandidateCapacityInvalid
+			}
+			pendingTokens[token] = struct{}{}
+			pending = append(pending, pendingCharge{group: group, charge: charge, token: token})
+		}
+		group.mu.Unlock()
+	}
+	l.coordinator.mu.Lock()
+	expected := len(l.coordinator.tokens)
+	exactTokens := len(pendingTokens) == expected
+	if exactTokens {
+		for token := range l.coordinator.tokens {
+			if _, found := pendingTokens[token]; !found {
+				exactTokens = false
+				break
+			}
+		}
+	}
+	l.coordinator.mu.Unlock()
+	if !exactTokens || len(pending) != expected || l.coordinator.publish() != nil {
+		return errCandidateCapacityInvalid
+	}
+	for _, entry := range pending {
+		entry.group.mu.Lock()
+		if entry.charge.owner != candidateAccountingPendingPublication ||
+			!candidateCapacityChargeTokenPublished(entry.charge.token) {
+			entry.group.mu.Unlock()
+			return errCandidateCapacityInvalid
+		}
+		entry.charge.owner = candidateAccountingRouteActive
+		entry.group.mu.Unlock()
+	}
+	return nil
+}
+
 func (g *candidateCapacityGroup) reserve(
 	ctx context.Context,
 	ledger *candidateCapacityLedger,
@@ -994,6 +1244,19 @@ func (g *candidateCapacityGroup) reserve(
 	g.reserving = true
 	g.mu.Unlock()
 
+	var borrow *generatedDomainCapacityBorrow
+	if ledger.coordinator != nil {
+		var borrowErr error
+		borrow, borrowErr = ledger.coordinator.borrowAcquire()
+		if borrowErr != nil {
+			g.mu.Lock()
+			g.reserving = false
+			g.changed.Broadcast()
+			g.mu.Unlock()
+			return nil, borrowErr
+		}
+		defer borrow.release()
+	}
 	leases, acquireErr := ledger.budget.Acquire(ctx, spec.limits, len(missing))
 	if acquireErr != nil {
 		releaseCandidateAdmissionLeases(leases)
@@ -1036,8 +1299,8 @@ func (g *candidateCapacityGroup) reserve(
 	for index, component := range missing {
 		g.nextEpoch++
 		component.charge = &candidateCapacityCharge{
-			epoch:           g.nextEpoch,
-			lease:           leases[index],
+			epoch: g.nextEpoch,
+			token: &candidateRawCapacityChargeToken{lease: leases[index]}, lease: leases[index],
 			state:           candidateChargeActive,
 			receiptRetained: component.receipt != nil,
 		}
@@ -1214,7 +1477,7 @@ func (r *candidateCapacityReservation) releaseBindings() error {
 			retiring = append(retiring, candidateRetiringCharge{
 				component: binding.component,
 				charge:    binding.charge,
-				lease:     binding.charge.lease,
+				token:     binding.charge.token,
 			})
 		}
 	}
@@ -1232,7 +1495,7 @@ func candidateChargeCanRetire(
 	if component == nil || charge == nil || binding == nil || charge.state != candidateChargeActive ||
 		charge.owner != candidateAccountingCandidate ||
 		charge.refs != 0 || charge.receiptRetained || charge.explicitRetained ||
-		charge.logicallyRetired || charge.lease == nil {
+		charge.logicallyRetired || !candidateCapacityChargeTokenConfigured(charge.token) {
 		return false
 	}
 	receipt := component.receipt
@@ -1258,7 +1521,7 @@ func releaseRetiringCandidateCharges(
 	retiring []candidateRetiringCharge,
 ) {
 	for _, entry := range retiring {
-		entry.lease.Release()
+		entry.token.release()
 	}
 	if len(retiring) == 0 {
 		return
@@ -1267,6 +1530,7 @@ func releaseRetiringCandidateCharges(
 	for _, entry := range retiring {
 		if entry.component.charge == entry.charge && entry.charge.state == candidateChargeRetiring {
 			entry.charge.state = candidateChargeReleased
+			entry.charge.token = nil
 			entry.charge.lease = nil
 		}
 	}
@@ -1703,7 +1967,7 @@ func (o *candidateComponentOperation) retireConfirmedAbsent() error {
 		retiring = []candidateRetiringCharge{{
 			component: o.component,
 			charge:    charge,
-			lease:     charge.lease,
+			token:     charge.token,
 		}}
 	}
 	g.mu.Unlock()

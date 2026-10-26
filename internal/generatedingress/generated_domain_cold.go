@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcapacity"
@@ -27,15 +28,16 @@ const (
 )
 
 type generatedDomainColdGroup struct {
-	pins       candidateValidationPins
-	protected  candidateProtectedSnapshot
-	snapshot   candidateAdmissionSnapshot
-	kind       generatedDomainColdGroupKind
-	policies   map[string]candidatePolicy
-	receipts   map[string]candidateColdReceiptSeed
-	bindHead   bool
-	selfHead   bool
-	legacyHead bool
+	pins         candidateValidationPins
+	protected    candidateProtectedSnapshot
+	snapshot     candidateAdmissionSnapshot
+	kind         generatedDomainColdGroupKind
+	policies     map[string]candidatePolicy
+	receipts     map[string]candidateColdReceiptSeed
+	bindHead     bool
+	selfHead     bool
+	legacyHead   bool
+	restoredDebt bool
 }
 
 type generatedDomainColdManifest struct {
@@ -92,57 +94,6 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdGroupReconstruction, err)
 	}
-	// Persistent builder identity and physical ownership are part of the host
-	// census, not application capacity. Refuse incomplete or crossed builder
-	// state before installing any cold application accounting tombstones.
-	if _, err := attestGeneratedDomainColdBuilder(ctx, result.manager, result.candidates, observed.docker); err != nil {
-		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
-			generatedDomainConstructionStageColdConstruction,
-			generatedDomainConstructionReasonColdBuilderAttestation, err)
-	}
-	for index := range groups {
-		group := &groups[index]
-		spec := generatedDomainColdGroupSpec(result.candidates, *group)
-		if group.kind == generatedDomainColdRisky {
-			reservation, reserveErr := result.candidates.ledger.reserve(ctx, spec)
-			if reserveErr != nil {
-				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
-					generatedDomainConstructionStageColdConstruction,
-					generatedDomainConstructionReasonColdReservation, reserveErr)
-			}
-			// Reconstruction is conservative: once raw shares are acquired they
-			// remain retained across every later refusal or uncertain observation.
-			retainErr := reservation.retainAll()
-			seedErr := seedCandidateRisk(reservation, group.snapshot)
-			releaseErr := reservation.release()
-			if retainErr != nil || seedErr != nil || releaseErr != nil {
-				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
-					generatedDomainConstructionStageColdConstruction,
-					generatedDomainConstructionReasonColdReservation,
-					errors.Join(retainErr, seedErr, releaseErr))
-			}
-		}
-		if err := result.candidates.ledger.seedColdOwnership(spec, group.receipts); err != nil {
-			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
-				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdOwnership, err)
-		}
-		if group.bindHead {
-			var bindErr error
-			if group.selfHead {
-				_, bindErr = result.candidates.heads.bindColdSelf(group.snapshot.headPins,
-					group.snapshot.observedHead, group.legacyHead)
-			} else {
-				_, bindErr = result.candidates.heads.bindPredecessor(group.snapshot.headPins,
-					group.snapshot.observedHead)
-			}
-			if bindErr != nil {
-				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
-					generatedDomainConstructionStageColdConstruction,
-					generatedDomainConstructionReasonColdHead, bindErr)
-			}
-		}
-	}
 	var retainedGateway generatedDomainColdRetainedGatewayProof
 	var retainedV2 generatedDomainColdRetainedV2Proof
 	if err := attestGeneratedDomainColdGroupsWithRetainedProofs(ctx, result.manager, result.candidates, observed, groups,
@@ -150,6 +101,119 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdGroupAttestation, err)
+	}
+
+	// Classify every completed Current from the same typed startup snapshot and
+	// install its configured debt as one closed bootstrap batch. No Budget
+	// snapshot is available until the whole batch and its ledger tokens exist.
+	var debtLimits []generatedcapacity.Limits
+	for index := range groups {
+		if groups[index].kind != generatedDomainColdCurrent {
+			continue
+		}
+		restore, evidenceErr := generatedDomainColdCurrentDebtEvidence(observed.database, groups[index], groups)
+		if evidenceErr != nil {
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdOwnership, evidenceErr)
+		}
+		groups[index].restoredDebt = restore
+		if restore {
+			limit := generatedDomainColdGroupSpec(result.candidates, groups[index]).limits
+			for range groups[index].snapshot.components {
+				debtLimits = append(debtLimits, limit)
+			}
+		}
+	}
+	var debtTokens []*generatedDomainCapacityDebtToken
+	if len(debtLimits) != 0 {
+		debtTokens, err = result.capacity.installBootstrapBatch(debtLimits)
+		if err != nil {
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdOwnership, err)
+		}
+	}
+	debtOffset := 0
+	for index := range groups {
+		group := &groups[index]
+		spec := generatedDomainColdGroupSpec(result.candidates, *group)
+		var seedErr error
+		if group.restoredDebt {
+			count := len(group.snapshot.components)
+			if debtOffset+count > len(debtTokens) {
+				seedErr = errGeneratedDomainCapacityDebtState
+			} else {
+				seedErr = result.candidates.ledger.seedColdOwnershipWithDebt(
+					spec, group.receipts, debtTokens[debtOffset:debtOffset+count])
+				debtOffset += count
+			}
+		} else if group.kind != generatedDomainColdRisky {
+			seedErr = result.candidates.ledger.seedColdOwnership(spec, group.receipts)
+		}
+		if seedErr != nil {
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdOwnership, seedErr)
+		}
+	}
+	if debtOffset != len(debtTokens) {
+		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdOwnership, errGeneratedDomainCapacityDebtState)
+	}
+	if err := result.capacity.sealBootstrap(); err != nil {
+		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdOwnership, err)
+	}
+	for index := range groups {
+		group := &groups[index]
+		if group.kind != generatedDomainColdRisky {
+			continue
+		}
+		spec := generatedDomainColdGroupSpec(result.candidates, *group)
+		reservation, reserveErr := result.candidates.ledger.reserve(ctx, spec)
+		if reserveErr != nil {
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdReservation, reserveErr)
+		}
+		// Reconstruction is conservative: once raw shares are acquired they
+		// remain retained across every later refusal or uncertain observation.
+		retainErr := reservation.retainAll()
+		seedErr := seedCandidateRisk(reservation, group.snapshot)
+		releaseErr := reservation.release()
+		if retainErr != nil || seedErr != nil || releaseErr != nil {
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdReservation,
+				errors.Join(retainErr, seedErr, releaseErr))
+		}
+		if err := result.candidates.ledger.seedColdOwnership(spec, group.receipts); err != nil {
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdOwnership, err)
+		}
+	}
+	for index := range groups {
+		group := &groups[index]
+		if !group.bindHead {
+			continue
+		}
+		var bindErr error
+		if group.selfHead {
+			_, bindErr = result.candidates.heads.bindColdSelf(group.snapshot.headPins,
+				group.snapshot.observedHead, group.legacyHead)
+		} else {
+			_, bindErr = result.candidates.heads.bindPredecessor(group.snapshot.headPins,
+				group.snapshot.observedHead)
+		}
+		if bindErr != nil {
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdHead, bindErr)
+		}
 	}
 	manifest, err := snapshotGeneratedDomainColdManifest(result.candidates)
 	if err != nil {
@@ -299,6 +363,9 @@ func readGeneratedDomainColdGroups(ctx context.Context, authority *GeneratedCand
 		}
 		groups[index].kind, groups[index].bindHead = kind, bindHead
 		groups[index].selfHead, groups[index].legacyHead = selfHead, legacyHead
+	}
+	if err := validateGeneratedDomainColdLifecycleRetention(observed.database, groups); err != nil {
+		return nil, err
 	}
 	if err := validateGeneratedDomainColdGatewayRoutes(observed, groups); err != nil {
 		return nil, err
@@ -589,7 +656,7 @@ func validateGeneratedDomainColdSnapshot(ctx context.Context, stores *deployment
 		snapshot.configuration.formatVersion != 2 ||
 		snapshot.configuration.deploymentPlanRevisionID != pins.deploymentPlanRevisionID ||
 		snapshot.configuration.deploymentPlanRevisionNumber != pins.deploymentPlanRevisionNumber ||
-		snapshot.lifecycleRetained || len(snapshot.components) != len(protected.components) {
+		len(snapshot.components) != len(protected.components) {
 		return errGeneratedDomainConstructionRefused
 	}
 	if !generatedDomainColdStagePair(snapshot.main.status, snapshot.runtime.phase,
@@ -615,6 +682,79 @@ func validateGeneratedDomainColdSnapshot(ctx context.Context, stores *deployment
 	}
 	if err := validateCandidatePolicyTx(ctx, stores, tx, pins, snapshot, true); err != nil {
 		return err
+	}
+	return nil
+}
+
+// validateGeneratedDomainColdLifecycleRetention is the cold-only exception to
+// fresh candidate admission's blanket lifecycle-retention refusal. Retained
+// operations remain descriptive history. Only the exact operation selected by
+// a Current running binding can authorize configured-debt restoration, and its
+// pinned deployment must be an authenticated historical ancestor.
+func validateGeneratedDomainColdLifecycleRetention(database deployments.GeneratedDomainStartupSnapshot,
+	groups []generatedDomainColdGroup,
+) error {
+	type operationIdentity struct {
+		appID, jobID string
+		revision     int64
+	}
+	seenOperations := make(map[operationIdentity]struct{}, len(database.LifecycleOperations))
+	retained := make(map[string]int, len(groups))
+	for _, operation := range database.LifecycleOperations {
+		identity := operationIdentity{appID: operation.AppID, jobID: operation.JobID,
+			revision: operation.DesiredRevision}
+		if _, duplicate := seenOperations[identity]; duplicate || !operation.Complete {
+			return errGeneratedDomainConstructionRefused
+		}
+		seenOperations[identity] = struct{}{}
+		group, ok := generatedDomainColdGroupByDeployment(groups, operation.DeploymentID)
+		if !ok || group.pins.applicationID() != operation.AppID || group.kind != generatedDomainColdHistorical {
+			return errGeneratedDomainConstructionRefused
+		}
+		retained[operation.DeploymentID]++
+	}
+	for _, group := range groups {
+		if group.snapshot.lifecycleRetained != (retained[group.pins.deploymentID] != 0) {
+			return errGeneratedDomainConstructionRefused
+		}
+	}
+
+	for _, current := range groups {
+		if current.kind != generatedDomainColdCurrent {
+			continue
+		}
+		var binding deployments.GeneratedDomainStartupLifecycleBinding
+		bindingCount := 0
+		for _, value := range database.LifecycleBindings {
+			if value.DeploymentJobID == current.pins.jobID() {
+				binding, bindingCount = value, bindingCount+1
+			}
+		}
+		if bindingCount != 1 || binding.AppID != current.pins.applicationID() {
+			return errGeneratedDomainConstructionRefused
+		}
+		if binding.Mode == deploymentbinding.ModeLegacyUninitialized {
+			if binding.DesiredRevision != 0 || binding.AuthorizingOperationID != "" {
+				return errGeneratedDomainConstructionRefused
+			}
+			continue
+		}
+		if binding.Mode != deploymentbinding.ModeRunning || binding.DesiredRevision < 1 ||
+			binding.AuthorizingOperationID == "" {
+			return errGeneratedDomainConstructionRefused
+		}
+		var authorizer deployments.GeneratedDomainStartupLifecycleOperation
+		authorizerCount := 0
+		for _, operation := range database.LifecycleOperations {
+			if operation.AppID == binding.AppID && operation.JobID == binding.AuthorizingOperationID &&
+				operation.DesiredRevision == binding.DesiredRevision {
+				authorizer, authorizerCount = operation, authorizerCount+1
+			}
+		}
+		if authorizerCount != 1 || !authorizer.Complete || authorizer.DeploymentID == current.pins.deploymentID ||
+			!generatedDomainColdAuthorizerLineage(groups, current, authorizer.DeploymentID) {
+			return errGeneratedDomainConstructionRefused
+		}
 	}
 	return nil
 }
@@ -956,6 +1096,376 @@ func generatedDomainColdActivationReceiptLinksPredecessor(
 		}
 	}
 	return found == 1
+}
+
+type generatedDomainColdCompletedRouteEvidence struct {
+	activation    generatedruntimestate.GeneratedDomainStartupRouteActivation
+	authorization generatedruntimestate.RouteAccountingHandoffAuthorization
+	handoff       generatedruntimestate.RouteAccountingHandoffReceipt
+	completion    generatedruntimestate.RouteCompletionReceipt
+}
+
+func generatedDomainColdCompletedRouteEvidenceForGroup(database deployments.GeneratedDomainStartupSnapshot,
+	group generatedDomainColdGroup, groups []generatedDomainColdGroup,
+) (generatedDomainColdCompletedRouteEvidence, bool) {
+	var evidence generatedDomainColdCompletedRouteEvidence
+	activationCount := 0
+	for _, value := range database.Runtime.RouteActivations {
+		if value.AppID == group.pins.applicationID() && value.SuccessorDeploymentID == group.pins.deploymentID {
+			evidence.activation, activationCount = value, activationCount+1
+		}
+	}
+	if activationCount != 1 {
+		return generatedDomainColdCompletedRouteEvidence{}, false
+	}
+	activation := evidence.activation
+	candidateRoster, ok := generatedDomainColdActivationRoster(group.snapshot)
+	if !ok || activation.SuccessorReleaseID != group.pins.releaseID ||
+		activation.SuccessorSlot != group.pins.candidateSlot ||
+		activation.CreatorJobID != group.pins.jobID() || activation.CreatorWorkerAttempt < 1 ||
+		activation.CreatorWorkerAttempt > group.pins.attempt() ||
+		activation.CandidateRosterDigest != generatedRouteActivationRosterDigest(candidateRoster) ||
+		activation.PredecessorDeploymentID != group.snapshot.headPins.previousDeploymentID ||
+		activation.PredecessorReleaseID != group.snapshot.headPins.previousReleaseID ||
+		activation.PredecessorSlot != group.snapshot.headPins.previousSlot {
+		return generatedDomainColdCompletedRouteEvidence{}, false
+	}
+	predecessorCount := 0
+	if activation.PredecessorDeploymentID == "" {
+		if activation.PredecessorGeneration != 0 || activation.PredecessorActivationReceiptID != "" ||
+			activation.PredecessorRosterDigest != generatedRouteActivationRosterDigest(nil) {
+			return generatedDomainColdCompletedRouteEvidence{}, false
+		}
+	} else {
+		predecessor, found := generatedDomainColdGroupByDeployment(groups, activation.PredecessorDeploymentID)
+		if !found || predecessor.pins.applicationID() != group.pins.applicationID() ||
+			predecessor.pins.releaseID != activation.PredecessorReleaseID ||
+			predecessor.pins.candidateSlot != activation.PredecessorSlot {
+			return generatedDomainColdCompletedRouteEvidence{}, false
+		}
+		predecessorRoster, valid := generatedDomainColdActivationRoster(predecessor.snapshot)
+		if !valid || activation.PredecessorRosterDigest != generatedRouteActivationRosterDigest(predecessorRoster) {
+			return generatedDomainColdCompletedRouteEvidence{}, false
+		}
+		var predecessorActivation generatedruntimestate.GeneratedDomainStartupRouteActivation
+		predecessorActivationCount := 0
+		for _, value := range database.Runtime.RouteActivations {
+			if value.AppID == activation.AppID && value.SuccessorDeploymentID == activation.PredecessorDeploymentID {
+				predecessorActivation, predecessorActivationCount = value, predecessorActivationCount+1
+			}
+		}
+		if predecessorActivationCount != 1 || activation.PredecessorActivationReceiptID != predecessorActivation.ReceiptID ||
+			activation.PredecessorGeneration != predecessorActivation.SuccessorGeneration ||
+			activation.SuccessorGeneration != predecessorActivation.SuccessorGeneration+1 {
+			return generatedDomainColdCompletedRouteEvidence{}, false
+		}
+		predecessorCount = len(predecessor.snapshot.components)
+	}
+
+	authorizationCount, handoffCount, completionCount, present := 0, 0, 0, 0
+	for _, value := range database.Runtime.AccountingHandoffAuthorizations {
+		if value.AppID == activation.AppID && value.SuccessorDeploymentID == activation.SuccessorDeploymentID {
+			present++
+			if value.ActivationReceiptID == activation.ReceiptID {
+				evidence.authorization, authorizationCount = value, authorizationCount+1
+			}
+		}
+	}
+	for _, value := range database.Runtime.AccountingHandoffReceipts {
+		if value.AppID == activation.AppID && value.SuccessorDeploymentID == activation.SuccessorDeploymentID {
+			present++
+			if value.ActivationReceiptID == activation.ReceiptID {
+				evidence.handoff, handoffCount = value, handoffCount+1
+			}
+		}
+	}
+	for _, value := range database.Runtime.RouteCompletionReceipts {
+		if value.AppID == activation.AppID && value.SuccessorDeploymentID == activation.SuccessorDeploymentID {
+			present++
+			if value.ActivationReceiptID == activation.ReceiptID {
+				evidence.completion, completionCount = value, completionCount+1
+			}
+		}
+	}
+	if present != 3 || authorizationCount != 1 || handoffCount != 1 || completionCount != 1 {
+		return generatedDomainColdCompletedRouteEvidence{}, false
+	}
+	authorization, handoff, completion := evidence.authorization, evidence.handoff, evidence.completion
+	if authorization.AppID != activation.AppID ||
+		authorization.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
+		authorization.PredecessorDeploymentID != activation.PredecessorDeploymentID ||
+		authorization.CandidateRosterDigest != activation.CandidateRosterDigest ||
+		authorization.PredecessorRosterDigest != activation.PredecessorRosterDigest ||
+		authorization.SuccessorComponentCount != len(group.snapshot.components) ||
+		authorization.PredecessorComponentCount != predecessorCount || authorization.AuthorizedAt.IsZero() ||
+		handoff.AppID != authorization.AppID ||
+		handoff.SuccessorDeploymentID != authorization.SuccessorDeploymentID ||
+		handoff.PredecessorDeploymentID != authorization.PredecessorDeploymentID ||
+		handoff.CandidateRosterDigest != authorization.CandidateRosterDigest ||
+		handoff.PredecessorRosterDigest != authorization.PredecessorRosterDigest ||
+		handoff.SuccessorComponentCount != authorization.SuccessorComponentCount ||
+		handoff.PredecessorComponentCount != authorization.PredecessorComponentCount || handoff.HandedOffAt.IsZero() ||
+		authorization.AuthorizedAt.After(handoff.HandedOffAt) ||
+		completion.AppID != activation.AppID || completion.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
+		completion.CreatorJobID != activation.CreatorJobID ||
+		completion.CreatorWorkerAttempt != activation.CreatorWorkerAttempt ||
+		completion.CurrentJobID != group.pins.jobID() || completion.CurrentWorkerAttempt != group.pins.attempt() ||
+		completion.CompletionCode != "deployment_completed" || completion.CompletedAt.IsZero() ||
+		handoff.HandedOffAt.After(completion.CompletedAt) {
+		return generatedDomainColdCompletedRouteEvidence{}, false
+	}
+	var main deployments.GeneratedDomainStartupDeployment
+	mainCount := 0
+	for _, value := range database.GeneratedDeployments {
+		if value.ID == group.pins.deploymentID {
+			main, mainCount = value, mainCount+1
+		}
+	}
+	if mainCount != 1 || main.AppID != group.pins.applicationID() || main.JobID != group.pins.jobID() ||
+		main.Status != deployments.Succeeded || main.JobStatus != "succeeded" || main.JobPhase != "succeeded" ||
+		main.JobAttempt != completion.CurrentWorkerAttempt || main.CanonicalSuccessEventCount != 1 ||
+		main.SuccessEventCount != 1 || !main.CanonicalSuccessEventAt.Equal(completion.CompletedAt) {
+		return generatedDomainColdCompletedRouteEvidence{}, false
+	}
+	return evidence, true
+}
+
+func generatedDomainColdAuthorizerAncestry(database deployments.GeneratedDomainStartupSnapshot,
+	groups []generatedDomainColdGroup, current generatedDomainColdGroup, authorizerDeploymentID string,
+) bool {
+	if current.kind != generatedDomainColdCurrent || authorizerDeploymentID == "" ||
+		authorizerDeploymentID == current.pins.deploymentID {
+		return false
+	}
+	seen := make(map[string]struct{}, len(groups))
+	cursor := current
+	for len(seen) < len(groups) {
+		if _, duplicate := seen[cursor.pins.deploymentID]; duplicate {
+			return false
+		}
+		seen[cursor.pins.deploymentID] = struct{}{}
+		if _, ok := generatedDomainColdCompletedRouteEvidenceForGroup(database, cursor, groups); !ok {
+			return false
+		}
+		if cursor.pins.deploymentID == authorizerDeploymentID {
+			return cursor.kind == generatedDomainColdHistorical && cursor.snapshot.lifecycleRetained
+		}
+		predecessorID := cursor.snapshot.headPins.previousDeploymentID
+		if predecessorID == "" {
+			return false
+		}
+		predecessor, ok := generatedDomainColdGroupByDeployment(groups, predecessorID)
+		if !ok || predecessor.pins.applicationID() != current.pins.applicationID() ||
+			predecessor.pins.releaseID != cursor.snapshot.headPins.previousReleaseID ||
+			predecessor.pins.candidateSlot != cursor.snapshot.headPins.previousSlot {
+			return false
+		}
+		cursor = predecessor
+	}
+	return false
+}
+
+func generatedDomainColdAuthorizerLineage(groups []generatedDomainColdGroup,
+	current generatedDomainColdGroup, authorizerDeploymentID string,
+) bool {
+	if current.kind != generatedDomainColdCurrent || authorizerDeploymentID == "" ||
+		authorizerDeploymentID == current.pins.deploymentID {
+		return false
+	}
+	seen := make(map[string]struct{}, len(groups))
+	cursor := current
+	for len(seen) < len(groups) {
+		if _, duplicate := seen[cursor.pins.deploymentID]; duplicate {
+			return false
+		}
+		seen[cursor.pins.deploymentID] = struct{}{}
+		if cursor.pins.deploymentID == authorizerDeploymentID {
+			return cursor.kind == generatedDomainColdHistorical && cursor.snapshot.lifecycleRetained
+		}
+		predecessorID := cursor.snapshot.headPins.previousDeploymentID
+		if predecessorID == "" {
+			return false
+		}
+		predecessor, ok := generatedDomainColdGroupByDeployment(groups, predecessorID)
+		if !ok || predecessor.pins.applicationID() != current.pins.applicationID() ||
+			predecessor.pins.releaseID != cursor.snapshot.headPins.previousReleaseID ||
+			predecessor.pins.candidateSlot != cursor.snapshot.headPins.previousSlot {
+			return false
+		}
+		cursor = predecessor
+	}
+	return false
+}
+
+// generatedDomainColdCurrentDebtEvidence classifies only the independently
+// projected durable acknowledgement chain for one already-attested Current.
+// The DTOs authenticate classification; configured debt is derived later from
+// the validated component policies.
+func generatedDomainColdCurrentDebtEvidence(database deployments.GeneratedDomainStartupSnapshot,
+	group generatedDomainColdGroup, groups []generatedDomainColdGroup,
+) (bool, error) {
+	receiptID := group.snapshot.observedHead.activationReceiptID
+	if receiptID == "" {
+		if !group.legacyHead {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		for _, value := range database.Runtime.RouteActivations {
+			if value.SuccessorDeploymentID == group.pins.deploymentID {
+				return false, errGeneratedDomainConstructionRefused
+			}
+		}
+		for _, value := range database.Runtime.AccountingHandoffAuthorizations {
+			if value.SuccessorDeploymentID == group.pins.deploymentID {
+				return false, errGeneratedDomainConstructionRefused
+			}
+		}
+		for _, value := range database.Runtime.AccountingHandoffReceipts {
+			if value.SuccessorDeploymentID == group.pins.deploymentID {
+				return false, errGeneratedDomainConstructionRefused
+			}
+		}
+		for _, value := range database.Runtime.RouteCompletionReceipts {
+			if value.SuccessorDeploymentID == group.pins.deploymentID {
+				return false, errGeneratedDomainConstructionRefused
+			}
+		}
+		return false, nil
+	}
+	var activation generatedruntimestate.GeneratedDomainStartupRouteActivation
+	activationCount, relevantActivationCount := 0, 0
+	for _, value := range database.Runtime.RouteActivations {
+		if value.ReceiptID == receiptID || value.SuccessorDeploymentID == group.pins.deploymentID {
+			relevantActivationCount++
+		}
+		if value.ReceiptID == receiptID {
+			activation, activationCount = value, activationCount+1
+		}
+	}
+	if relevantActivationCount != 1 || activationCount != 1 || !generatedDomainColdActivationMatches(group.pins, group.snapshot, groups,
+		database.Runtime.RouteActivations) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+
+	var authorization generatedruntimestate.RouteAccountingHandoffAuthorization
+	var handoff generatedruntimestate.RouteAccountingHandoffReceipt
+	var completion generatedruntimestate.RouteCompletionReceipt
+	authorizationCount, handoffCount, completionCount := 0, 0, 0
+	present := 0
+	for _, value := range database.Runtime.AccountingHandoffAuthorizations {
+		if value.ActivationReceiptID == receiptID || value.SuccessorDeploymentID == activation.SuccessorDeploymentID {
+			present++
+			if value.ActivationReceiptID == receiptID {
+				authorization, authorizationCount = value, authorizationCount+1
+			}
+		}
+	}
+	for _, value := range database.Runtime.AccountingHandoffReceipts {
+		if value.ActivationReceiptID == receiptID || value.SuccessorDeploymentID == activation.SuccessorDeploymentID {
+			present++
+			if value.ActivationReceiptID == receiptID {
+				handoff, handoffCount = value, handoffCount+1
+			}
+		}
+	}
+	for _, value := range database.Runtime.RouteCompletionReceipts {
+		if value.ActivationReceiptID == receiptID || value.SuccessorDeploymentID == activation.SuccessorDeploymentID {
+			present++
+			if value.ActivationReceiptID == receiptID {
+				completion, completionCount = value, completionCount+1
+			}
+		}
+	}
+	if present == 0 {
+		return false, nil
+	}
+	if present != 3 || authorizationCount != 1 || handoffCount != 1 || completionCount != 1 {
+		return false, errGeneratedDomainConstructionRefused
+	}
+
+	predecessorCount := 0
+	if activation.PredecessorDeploymentID != "" {
+		predecessor, ok := generatedDomainColdGroupByDeployment(groups, activation.PredecessorDeploymentID)
+		if !ok {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		predecessorCount = len(predecessor.snapshot.components)
+	}
+	successorCount := len(group.snapshot.components)
+	if authorization.ActivationReceiptID != receiptID || authorization.AppID != activation.AppID ||
+		authorization.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
+		authorization.PredecessorDeploymentID != activation.PredecessorDeploymentID ||
+		authorization.CandidateRosterDigest != activation.CandidateRosterDigest ||
+		authorization.PredecessorRosterDigest != activation.PredecessorRosterDigest ||
+		authorization.SuccessorComponentCount != successorCount ||
+		authorization.PredecessorComponentCount != predecessorCount || authorization.AuthorizedAt.IsZero() ||
+		handoff.ActivationReceiptID != authorization.ActivationReceiptID || handoff.AppID != authorization.AppID ||
+		handoff.SuccessorDeploymentID != authorization.SuccessorDeploymentID ||
+		handoff.PredecessorDeploymentID != authorization.PredecessorDeploymentID ||
+		handoff.CandidateRosterDigest != authorization.CandidateRosterDigest ||
+		handoff.PredecessorRosterDigest != authorization.PredecessorRosterDigest ||
+		handoff.SuccessorComponentCount != authorization.SuccessorComponentCount ||
+		handoff.PredecessorComponentCount != authorization.PredecessorComponentCount || handoff.HandedOffAt.IsZero() ||
+		authorization.AuthorizedAt.After(handoff.HandedOffAt) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+	if completion.ActivationReceiptID != receiptID || completion.AppID != activation.AppID ||
+		completion.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
+		completion.CreatorJobID != activation.CreatorJobID ||
+		completion.CreatorWorkerAttempt != activation.CreatorWorkerAttempt ||
+		completion.CurrentJobID != group.pins.jobID() || completion.CurrentWorkerAttempt != group.pins.attempt() ||
+		completion.CompletionCode != "deployment_completed" || completion.CompletedAt.IsZero() ||
+		handoff.HandedOffAt.After(completion.CompletedAt) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+
+	var main deployments.GeneratedDomainStartupDeployment
+	mainCount := 0
+	for _, value := range database.GeneratedDeployments {
+		if value.ID == group.pins.deploymentID {
+			main, mainCount = value, mainCount+1
+		}
+	}
+	if mainCount != 1 || main.AppID != group.pins.applicationID() || main.JobID != group.pins.jobID() ||
+		main.Status != deployments.Succeeded || main.JobStatus != "succeeded" || main.JobPhase != "succeeded" ||
+		main.JobAttempt != completion.CurrentWorkerAttempt || main.CanonicalSuccessEventCount != 1 ||
+		main.SuccessEventCount != 1 || !main.CanonicalSuccessEventAt.Equal(completion.CompletedAt) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+	for _, appID := range database.UnresolvedLifecycleApps {
+		if appID == group.pins.applicationID() {
+			return false, errGeneratedDomainConstructionRefused
+		}
+	}
+	var binding deployments.GeneratedDomainStartupLifecycleBinding
+	bindingCount := 0
+	for _, value := range database.LifecycleBindings {
+		if value.DeploymentJobID == group.pins.jobID() {
+			binding, bindingCount = value, bindingCount+1
+		}
+	}
+	if bindingCount != 1 || binding.AppID != group.pins.applicationID() {
+		return false, errGeneratedDomainConstructionRefused
+	}
+	if binding.Mode != deploymentbinding.ModeRunning || binding.DesiredRevision < 1 ||
+		binding.AuthorizingOperationID == "" {
+		return false, errGeneratedDomainConstructionRefused
+	}
+	var authorizer deployments.GeneratedDomainStartupLifecycleOperation
+	operationCount := 0
+	for _, operation := range database.LifecycleOperations {
+		if operation.AppID == binding.AppID && operation.JobID == binding.AuthorizingOperationID &&
+			operation.DesiredRevision == binding.DesiredRevision {
+			authorizer, operationCount = operation, operationCount+1
+			if !operation.Complete {
+				return false, errGeneratedDomainConstructionRefused
+			}
+		}
+	}
+	if operationCount != 1 || authorizer.DeploymentID == activation.SuccessorDeploymentID ||
+		!generatedDomainColdAuthorizerAncestry(database, groups, group, authorizer.DeploymentID) {
+		return false, errGeneratedDomainConstructionRefused
+	}
+	return true, nil
 }
 
 func attestGeneratedDomainColdGroups(ctx context.Context, manager *Manager, authority *GeneratedCandidateAuthority,

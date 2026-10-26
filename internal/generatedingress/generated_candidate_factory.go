@@ -21,6 +21,7 @@ type GeneratedCandidateAuthority struct {
 	process     runtimeprocess.CommandRunner
 	environment GeneratedCandidateEnvironmentStager
 	budget      *generatedcapacity.Budget
+	coordinator *generatedDomainCapacityCoordinator
 	options     GeneratedCandidateProcessOptions
 	ledger      *candidateCapacityLedger
 	heads       *candidateHeadRegistry
@@ -37,6 +38,7 @@ func newGeneratedCandidateAuthorityConcrete(
 	environment GeneratedCandidateEnvironmentStager,
 	budget *generatedcapacity.Budget,
 	options GeneratedCandidateProcessOptions,
+	coordinators ...*generatedDomainCapacityCoordinator,
 ) (*GeneratedCandidateAuthority, error) {
 	if !generatedCandidateRepositoryConfigured(stores) ||
 		!generatedCandidatePointerIdentity(process) ||
@@ -49,12 +51,19 @@ func newGeneratedCandidateAuthorityConcrete(
 	if err != nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
-	ledger, err := newCandidateCapacityLedger(budget)
+	var coordinator *generatedDomainCapacityCoordinator
+	if len(coordinators) > 1 {
+		return nil, deploymentexecution.ErrInvalidConfiguration
+	}
+	if len(coordinators) == 1 {
+		coordinator = coordinators[0]
+	}
+	ledger, err := newCandidateCapacityLedger(budget, coordinator)
 	if err != nil {
 		return nil, deploymentexecution.ErrInvalidConfiguration
 	}
 	authority := &GeneratedCandidateAuthority{
-		stores: stores, process: process, environment: environment, budget: budget,
+		stores: stores, process: process, environment: environment, budget: budget, coordinator: coordinator,
 		options: options, ledger: ledger, heads: newCandidateHeadRegistry(), dockerEnv: dockerEnv,
 	}
 	authority.self = authority
@@ -63,7 +72,8 @@ func newGeneratedCandidateAuthorityConcrete(
 
 func validGeneratedCandidateAuthority(a *GeneratedCandidateAuthority) bool {
 	return a != nil && a.self == a && generatedCandidateRepositoryConfigured(a.stores) &&
-		a.budget != nil && a.budget.Configured() && a.ledger != nil && a.heads != nil
+		a.budget != nil && a.budget.Configured() && a.ledger != nil && a.heads != nil &&
+		a.ledger.coordinator == a.coordinator
 }
 
 func generatedCandidateRepositoryConfigured(stores *deployments.GeneratedOwnerStores) bool {

@@ -143,11 +143,14 @@ func (r *Repository) UsesDatabase(db *sql.DB) bool {
 // GeneratedDomainStartupSnapshot is a sanitized, descriptive census of all
 // retained generated runtime state. Its slices are always non-nil and sorted.
 type GeneratedDomainStartupSnapshot struct {
-	ActiveHeads      []GeneratedDomainStartupActiveHead
-	Deployments      []GeneratedDomainStartupDeployment
-	Components       []GeneratedDomainStartupComponent
-	CandidateIntents []GeneratedDomainStartupCandidateIntent
-	RouteActivations []GeneratedDomainStartupRouteActivation
+	ActiveHeads                     []GeneratedDomainStartupActiveHead
+	Deployments                     []GeneratedDomainStartupDeployment
+	Components                      []GeneratedDomainStartupComponent
+	CandidateIntents                []GeneratedDomainStartupCandidateIntent
+	RouteActivations                []GeneratedDomainStartupRouteActivation
+	AccountingHandoffAuthorizations []RouteAccountingHandoffAuthorization
+	AccountingHandoffReceipts       []RouteAccountingHandoffReceipt
+	RouteCompletionReceipts         []RouteCompletionReceipt
 }
 
 type GeneratedDomainStartupActiveHead struct {
@@ -225,9 +228,22 @@ func (r *Repository) GeneratedDomainStartupSnapshotTx(ctx context.Context, tx *s
 	if err != nil {
 		return GeneratedDomainStartupSnapshot{}, err
 	}
+	authorizations, err := readGeneratedDomainStartupAccountingHandoffAuthorizations(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	handoffs, err := readGeneratedDomainStartupAccountingHandoffReceipts(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
+	completions, err := readGeneratedDomainStartupRouteCompletionReceipts(ctx, tx)
+	if err != nil {
+		return GeneratedDomainStartupSnapshot{}, err
+	}
 	return GeneratedDomainStartupSnapshot{
 		ActiveHeads: heads, Deployments: deployments, Components: components, CandidateIntents: intents,
-		RouteActivations: activations,
+		RouteActivations: activations, AccountingHandoffAuthorizations: authorizations,
+		AccountingHandoffReceipts: handoffs, RouteCompletionReceipts: completions,
 	}, nil
 }
 

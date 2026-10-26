@@ -3,12 +3,118 @@ package generatedingress
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcapacity"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
+
+type generatedDomainDebtBlockingCapacityRunner struct {
+	delegate runtimeprocess.CommandRunner
+	entered  chan struct{}
+	once     sync.Once
+}
+
+func (r *generatedDomainDebtBlockingCapacityRunner) Run(ctx context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	if len(request.Args) >= 2 && request.Args[0] == "container" && request.Args[1] == "exec" &&
+		request.Args[len(request.Args)-1] == capacityProbeCommand {
+		r.once.Do(func() { close(r.entered) })
+		<-ctx.Done()
+		return runtimeprocess.CommandResult{}, ctx.Err()
+	}
+	return r.delegate.Run(ctx, request)
+}
+
+func TestGeneratedCandidateCapacityAcquirePathsHoldCoordinatorBorrowUntilTerminal(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		retained bool
+	}{
+		{name: "ordinary replacement"},
+		{name: "retained runtime", retained: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, delegate := newManagerFixture(t, false)
+			runner := &generatedDomainDebtBlockingCapacityRunner{delegate: delegate, entered: make(chan struct{})}
+			manager.runner = runner
+			coordinator, err := newGeneratedDomainCapacityCoordinator(manager)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := coordinator.sealBootstrap(); err != nil {
+				t.Fatal(err)
+			}
+			budget, err := generatedcapacity.New(coordinator)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var acquire func(context.Context) error
+			if test.retained {
+				fixture := newCandidateOwnerFixture(t)
+				authority, err := newGeneratedCandidateAuthorityConcrete(fixture.authority.stores, fixture.runner,
+					fixture.environment, budget, fixture.options, coordinator)
+				if err != nil {
+					t.Fatal(err)
+				}
+				acquire = func(ctx context.Context) error {
+					_, err := authority.ReserveRetainedCapacity(ctx,
+						"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 1)
+					return err
+				}
+			} else {
+				ledger, err := newCandidateCapacityLedger(budget, coordinator)
+				if err != nil {
+					t.Fatal(err)
+				}
+				acquire = func(ctx context.Context) error {
+					_, err := ledger.reserve(ctx,
+						candidateCapacityTestSpec("app-ordinary", "deployment-ordinary", "web"))
+					return err
+				}
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			result := make(chan error, 1)
+			go func() { result <- acquire(ctx) }()
+			<-runner.entered
+			coordinator.mu.Lock()
+			borrows := coordinator.borrows
+			coordinator.mu.Unlock()
+			if borrows != 1 {
+				t.Fatalf("borrow count during raw Acquire=%d", borrows)
+			}
+			aborted := make(chan error, 1)
+			go func() { aborted <- coordinator.abortUnpublished(nil) }()
+			candidateCapacityTestWait(t, func() bool {
+				coordinator.mu.Lock()
+				defer coordinator.mu.Unlock()
+				return coordinator.phase == generatedDomainCapacityAborting
+			}, "capacity debt coordinator to enter aborting phase")
+			select {
+			case err := <-aborted:
+				t.Fatalf("abort returned before raw Acquire completed: %v", err)
+			default:
+			}
+			cancel()
+			if err := <-result; !IsCode(err, DiagnosticCancelled) {
+				t.Fatalf("canceled raw Acquire error=%v", err)
+			}
+			if err := <-aborted; err != nil {
+				t.Fatal(err)
+			}
+			coordinator.mu.Lock()
+			phase, borrows := coordinator.phase, coordinator.borrows
+			coordinator.mu.Unlock()
+			if phase != generatedDomainCapacityClosed || borrows != 0 {
+				t.Fatalf("terminal coordinator phase=%d borrows=%d", phase, borrows)
+			}
+		})
+	}
+}
 
 func TestGeneratedCandidateRuntimeOwnerRequiresExactAuthorityAndComposition(t *testing.T) {
 	fixture := newCandidateOwnerFixture(t)

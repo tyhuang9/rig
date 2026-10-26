@@ -184,6 +184,80 @@ func readRouteAccountingHandoffReceiptTx(ctx context.Context, tx *sql.Tx,
 	return value, true, nil
 }
 
+func readGeneratedDomainStartupAccountingHandoffAuthorizations(ctx context.Context, tx *sql.Tx) (
+	[]RouteAccountingHandoffAuthorization, error,
+) {
+	rows, err := tx.QueryContext(ctx, `SELECT activation_receipt_id,app_id,successor_deployment_id,
+		predecessor_deployment_id,candidate_roster_digest,predecessor_roster_digest,
+		successor_component_count,predecessor_component_count,authorized_at
+		FROM generated_route_accounting_handoff_authorizations ORDER BY activation_receipt_id`)
+	if err != nil {
+		return nil, err
+	}
+	result := []RouteAccountingHandoffAuthorization{}
+	for rows.Next() {
+		var value RouteAccountingHandoffAuthorization
+		var stamp string
+		if err := rows.Scan(&value.ActivationReceiptID, &value.AppID, &value.SuccessorDeploymentID,
+			&value.PredecessorDeploymentID, &value.CandidateRosterDigest, &value.PredecessorRosterDigest,
+			&value.SuccessorComponentCount, &value.PredecessorComponentCount, &stamp); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		value.AuthorizedAt, err = parseTime(stamp)
+		if err != nil || !validRouteAccountingHandoffAuthorization(value) {
+			_ = rows.Close()
+			return nil, errors.Join(ErrInvalidState, err)
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func readGeneratedDomainStartupAccountingHandoffReceipts(ctx context.Context, tx *sql.Tx) (
+	[]RouteAccountingHandoffReceipt, error,
+) {
+	rows, err := tx.QueryContext(ctx, `SELECT activation_receipt_id,app_id,successor_deployment_id,
+		predecessor_deployment_id,candidate_roster_digest,predecessor_roster_digest,
+		successor_component_count,predecessor_component_count,handed_off_at
+		FROM generated_route_accounting_handoff_receipts ORDER BY activation_receipt_id`)
+	if err != nil {
+		return nil, err
+	}
+	result := []RouteAccountingHandoffReceipt{}
+	for rows.Next() {
+		var value RouteAccountingHandoffReceipt
+		var stamp string
+		if err := rows.Scan(&value.ActivationReceiptID, &value.AppID, &value.SuccessorDeploymentID,
+			&value.PredecessorDeploymentID, &value.CandidateRosterDigest, &value.PredecessorRosterDigest,
+			&value.SuccessorComponentCount, &value.PredecessorComponentCount, &stamp); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		value.HandedOffAt, err = parseTime(stamp)
+		if err != nil || !validRouteAccountingHandoffReceipt(value) {
+			_ = rows.Close()
+			return nil, errors.Join(ErrInvalidState, err)
+		}
+		result = append(result, value)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func validRouteAccountingHandoffAuthorization(value RouteAccountingHandoffAuthorization) bool {
 	return canonicalUUID(value.ActivationReceiptID) && canonicalUUID(value.AppID) &&
 		canonicalUUID(value.SuccessorDeploymentID) &&

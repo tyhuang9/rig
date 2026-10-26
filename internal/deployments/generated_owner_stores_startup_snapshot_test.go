@@ -20,6 +20,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/generatedimagestate"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
+	"github.com/hostd/hostd/internal/jobs"
 )
 
 func TestGeneratedOwnerStoresStartupSnapshotRequiresExactCanonicalBundle(t *testing.T) {
@@ -29,7 +30,8 @@ func TestGeneratedOwnerStoresStartupSnapshotRequiresExactCanonicalBundle(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.GeneratedDeployments == nil || snapshot.Artifacts == nil || snapshot.UnresolvedLifecycleApps == nil {
+	if snapshot.GeneratedDeployments == nil || snapshot.Artifacts == nil || snapshot.LifecycleOperations == nil ||
+		snapshot.LifecycleBindings == nil || snapshot.UnresolvedLifecycleApps == nil {
 		t.Fatal("canonical empty snapshot contains nil slices")
 	}
 	copyValue := *fixture.stores
@@ -124,7 +126,8 @@ func TestGeneratedOwnerStoresStartupSnapshotUsesOneRealSQLiteSnapshotAcrossReade
 	ctx := context.Background()
 	fixture := newGeneratedOwnerDomainFixture(t)
 	planID, releaseID := seedStartupGeneratedPlanRelease(t, fixture)
-	deployment, _, err := fixture.stores.repository.GetOrCreateByJob(ctx, fixture.base.appA, fixture.base.jobA, "current")
+	jobID := seedStartupGeneratedDeploymentJob(t, fixture)
+	deployment, _, err := fixture.stores.repository.GetOrCreateByJob(ctx, fixture.base.appA, jobID, "current")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,6 +216,16 @@ func TestGeneratedOwnerStoresStartupSnapshotLifecycleSummaryUsesCanonicalValidat
 		}
 		if snapshot.LifecycleOperationCount != 1 || len(snapshot.UnresolvedLifecycleApps) != 0 {
 			t.Fatalf("complete lifecycle summary=%#v", snapshot)
+		}
+		if len(snapshot.LifecycleOperations) != 1 || snapshot.LifecycleOperations[0] !=
+			(GeneratedDomainStartupLifecycleOperation{AppID: fixture.base.appA, JobID: jobID,
+				DeploymentID: deployment.ID, DesiredRevision: 1, Complete: true}) {
+			t.Fatalf("complete lifecycle operations=%#v", snapshot.LifecycleOperations)
+		}
+		if len(snapshot.LifecycleBindings) != 1 || snapshot.LifecycleBindings[0] !=
+			(GeneratedDomainStartupLifecycleBinding{DeploymentJobID: deployment.JobID,
+				AppID: fixture.base.appA, Mode: deploymentbinding.ModeLegacyUninitialized}) {
+			t.Fatalf("complete lifecycle bindings=%#v", snapshot.LifecycleBindings)
 		}
 	})
 
@@ -314,10 +327,14 @@ func TestGeneratedOwnerStoresStartupSnapshotIsReadOnlyStableAndSecretFree(t *tes
 	}
 	for _, value := range []any{
 		GeneratedDomainStartupDeployment{}, GeneratedDomainStartupArtifact{},
+		GeneratedDomainStartupLifecycleOperation{}, GeneratedDomainStartupLifecycleBinding{},
 		generatedruntimestate.GeneratedDomainStartupActiveHead{},
 		generatedruntimestate.GeneratedDomainStartupDeployment{},
 		generatedruntimestate.GeneratedDomainStartupComponent{},
 		generatedruntimestate.GeneratedDomainStartupCandidateIntent{},
+		generatedruntimestate.RouteAccountingHandoffAuthorization{},
+		generatedruntimestate.RouteAccountingHandoffReceipt{},
+		generatedruntimestate.RouteCompletionReceipt{},
 	} {
 		assertStartupSnapshotSafeValueType(t, reflect.TypeOf(value))
 	}
@@ -346,8 +363,8 @@ func TestGeneratedOwnerStoresStartupSnapshotFailsClosedForCancellationClosedData
 	t.Run("crossed generic parent", func(t *testing.T) {
 		fixture := newGeneratedOwnerDomainFixture(t)
 		planID, releaseID := seedStartupGeneratedPlanRelease(t, fixture)
-		seedStartupGenericDeployment(t, fixture, planID, releaseID)
-		if _, err := fixture.stores.database.Exec(`UPDATE jobs SET resource_id=? WHERE id=?`, fixture.base.appB, fixture.base.jobA); err != nil {
+		deployment := seedStartupGenericDeployment(t, fixture, planID, releaseID)
+		if _, err := fixture.stores.database.Exec(`UPDATE jobs SET resource_id=? WHERE id=?`, fixture.base.appB, deployment.JobID); err != nil {
 			t.Fatal(err)
 		}
 		snapshot, err := fixture.stores.GeneratedDomainStartupSnapshot(context.Background())
@@ -382,7 +399,8 @@ func seedStartupGeneratedPlanRelease(t *testing.T, fixture generatedOwnerDomainF
 
 func seedStartupGenericDeployment(t *testing.T, fixture generatedOwnerDomainFixture, planID, releaseID string) Deployment {
 	t.Helper()
-	deployment, _, err := fixture.stores.repository.GetOrCreateByJob(context.Background(), fixture.base.appA, fixture.base.jobA, "current")
+	jobID := seedStartupGeneratedDeploymentJob(t, fixture)
+	deployment, _, err := fixture.stores.repository.GetOrCreateByJob(context.Background(), fixture.base.appA, jobID, "current")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,6 +410,38 @@ func seedStartupGenericDeployment(t *testing.T, fixture generatedOwnerDomainFixt
 		t.Fatal(err)
 	}
 	return deployment
+}
+
+func seedStartupGeneratedDeploymentJob(t *testing.T, fixture generatedOwnerDomainFixture) string {
+	t.Helper()
+	validator, err := applifecycle.NewDeploymentBindingValidator(applifecycle.New(fixture.stores.database))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings, err := deploymentbinding.New(fixture.stores.database, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, err := jobs.NewWithDeploymentBindings(fixture.stores.database, bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := service.CreateDeploymentWithInputTransaction(context.Background(), jobs.DeploymentCreateRequest{
+		ApplicationID: fixture.base.appA, IdempotencyKey: "startup-generated-deployment",
+		RequestedBy: fixture.base.actor, Input: jobs.DeploymentInput{ConfigurationMode: jobs.ConfigurationCurrent},
+	}, jobs.DeploymentCreateHooks{})
+	if err != nil || !created.Created || created.Job.ID == "" ||
+		created.Binding.JobID() != created.Job.ID || created.Binding.ApplicationID() != fixture.base.appA ||
+		created.Binding.Mode() != deploymentbinding.ModeLegacyUninitialized {
+		t.Fatalf("create generated deployment job: created=%t job=%q binding=%q/%q/%q error=%v",
+			created.Created, created.Job.ID, created.Binding.JobID(), created.Binding.ApplicationID(), created.Binding.Mode(), err)
+	}
+	terminal, err := service.Cancel(created.Job.ID)
+	if err != nil || terminal.Status != string(jobs.Cancelled) || terminal.Phase != "cancelled" {
+		t.Fatalf("cancel generated deployment job: job=%q status=%q phase=%q error=%v",
+			created.Job.ID, terminal.Status, terminal.Phase, err)
+	}
+	return created.Job.ID
 }
 
 func startupLifecyclePins(t *testing.T, deploymentID, releaseID, planID string) (string, string) {
