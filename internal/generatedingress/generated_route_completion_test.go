@@ -277,8 +277,8 @@ func TestGeneratedRouteCompletionAccountingProofRefusals(t *testing.T) {
 		mutateGeneratedRouteCompletionAccounting(t, retirement, func(operation *candidateAccountingHandoffOperation) {
 			operation.successor[0].charge.owner = candidateAccountingCandidate
 		})
-		if err := retirement.Complete(context.Background()); err == nil {
-			t.Fatal("drifted successor authorized completion")
+		if err := retirement.Complete(context.Background()); !errors.Is(err, errCandidateCapacityStale) || !IsGeneratedRouteAccountingError(err) {
+			t.Fatalf("drifted successor error=%v", err)
 		}
 		assertGeneratedRouteCompletionAbsent(t, fixture.database(), retirement.state.receipt)
 	})
@@ -291,8 +291,8 @@ func TestGeneratedRouteCompletionAccountingProofRefusals(t *testing.T) {
 		mutateGeneratedRouteCompletionAccounting(t, retirement, func(operation *candidateAccountingHandoffOperation) {
 			operation.predecessor[0].release = candidateAccountingReleasePending
 		})
-		if err := retirement.Complete(context.Background()); err == nil {
-			t.Fatal("drifted predecessor tombstone authorized completion")
+		if err := retirement.Complete(context.Background()); !errors.Is(err, errCandidateCapacityStale) || !IsGeneratedRouteAccountingError(err) {
+			t.Fatalf("drifted predecessor tombstone error=%v", err)
 		}
 		assertGeneratedRouteCompletionAbsent(t, fixture.database(), retirement.state.receipt)
 	})
@@ -306,11 +306,65 @@ func TestGeneratedRouteCompletionAccountingProofRefusals(t *testing.T) {
 		mutateGeneratedRouteCompletionAccounting(t, retirement, func(operation *candidateAccountingHandoffOperation) {
 			operation.successor[0].charge.owner = candidateAccountingCandidate
 		})
-		if err := retirement.Complete(context.Background()); err == nil {
-			t.Fatal("ledger-drifted terminal replay succeeded")
+		if err := retirement.Complete(context.Background()); !errors.Is(err, errCandidateCapacityStale) || !IsGeneratedRouteAccountingError(err) {
+			t.Fatalf("ledger-drifted terminal replay error=%v", err)
 		}
 		assertGeneratedRouteCompletionState(t, fixture.database(), retirement.state.receipt, 1)
 	})
+}
+
+func TestGeneratedRouteAccountingErrorPredicate(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "capacity invalid", err: errCandidateCapacityInvalid, want: true},
+		{name: "capacity closing", err: errCandidateCapacityClosing, want: true},
+		{name: "capacity stale", err: errCandidateCapacityStale, want: true},
+		{name: "capacity busy", err: errCandidateCapacityBusy, want: true},
+		{name: "receipt mismatch", err: errCandidateReceiptMismatch, want: true},
+		{name: "mutation unquiesced", err: errCandidateMutationUnquiesced, want: true},
+		{name: "physical transition", err: errCandidatePhysicalTransition, want: true},
+		{name: "command entered", err: errCandidateCommandEntered, want: true},
+		{name: "pins changed", err: errCandidateCapacityPinsChanged},
+		{name: "confirmed absent", err: errCandidateConfirmedAbsent},
+		{name: "cleanup closed", err: errCandidateCleanupClosed},
+		{name: "operation kind", err: errCandidateOperationKind},
+		{name: "unmatched", err: errors.New("unmatched private accounting detail")},
+		{name: "nil"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := IsGeneratedRouteAccountingError(test.err); got != test.want {
+				t.Fatalf("accounting error=%t want=%t", got, test.want)
+			}
+		})
+	}
+
+	candidate := &GeneratedCandidateError{Code: "runtime_unavailable", cause: errors.New("private candidate detail")}
+	joined := errors.Join(candidate, errCandidateCapacityStale)
+	before := joined.Error()
+	if !IsGeneratedRouteAccountingError(joined) || !errors.Is(joined, errCandidateCapacityStale) {
+		t.Fatalf("joined accounting tree was not recognized: %v", joined)
+	}
+	var first *GeneratedCandidateError
+	if !errors.As(joined, &first) || first != candidate || joined.Error() != before {
+		t.Fatalf("predicate changed candidate tree first=%p want=%p error=%q", first, candidate, joined.Error())
+	}
+
+	var nilCandidate *GeneratedCandidateError
+	if nilCandidate.Error() != "generated candidate: unavailable" || nilCandidate.Unwrap() != nil {
+		t.Fatalf("typed-nil candidate was not closed and terminal: %q/%v", nilCandidate.Error(), nilCandidate.Unwrap())
+	}
+	inner := &GeneratedCandidateError{Code: "runtime_unavailable"}
+	outer := &GeneratedCandidateError{Code: "unmatched_outer", cause: inner}
+	if outer.Unwrap() != inner {
+		t.Fatal("unknown candidate wrapper did not retain its approved child")
+	}
+	var found *GeneratedCandidateError
+	if !errors.As(outer.Unwrap(), &found) || found != inner {
+		t.Fatalf("approved candidate child was not traversable: %p want=%p", found, inner)
+	}
 }
 
 func TestGeneratedRouteCompletionReplayGuardRejectsCrossedSucceededJob(t *testing.T) {

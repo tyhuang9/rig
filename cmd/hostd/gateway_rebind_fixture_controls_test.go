@@ -200,6 +200,9 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		"positive_fence",
 		"storage_unavailable",
 		"route_unresolved",
+		"candidate_observation_failed",
+		"accounting_unresolved",
+		"identity_ambiguous",
 	}
 	t.Run("route pause closed classifier", func(t *testing.T) {
 		for _, test := range []struct {
@@ -210,10 +213,14 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		}{
 			{name: "known retirement refusal", stderr: routeRecord("previous_retirement", "retirement_unavailable"), want: "previous_retirement/retirement_unavailable"},
 			{name: "known retirement identity", stderr: routeRecord("previous_retirement", "identity_lost"), want: "previous_retirement/identity_lost"},
+			{name: "known candidate observation", stderr: routeRecord("previous_retirement", "candidate_observation_failed"), want: "previous_retirement/candidate_observation_failed"},
+			{name: "known accounting refusal", stderr: routeRecord("previous_retirement", "accounting_unresolved"), want: "previous_retirement/accounting_unresolved"},
+			{name: "known family ambiguity", stderr: routeRecord("previous_retirement", "identity_ambiguous"), want: "previous_retirement/identity_ambiguous"},
 			{name: "unknown ancillary object is discarded", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"previous_retirement","route_pause_cause":"retirement_unavailable","ancillary":{"error":"` + secret + `"}}`, want: "previous_retirement/retirement_unavailable"},
 			{name: "retirement identity ancillary object is discarded", stderr: `{"msg":"generated route reconciliation paused","route_pause_stage":"previous_retirement","route_pause_cause":"route_unresolved","ancillary":{"error":"` + secret + `"}}`, want: "previous_retirement/route_unresolved"},
 			{name: "newest valid pause wins", stderr: routeRecord("route_switch", "unknown") + "\n" + routeRecord("runtime_success_advance", "state_conflict"), want: "runtime_success_advance/state_conflict"},
 			{name: "newest valid retirement identity wins", stderr: routeRecord("previous_retirement", "identity_lost") + "\n" + routeRecord("previous_retirement", "scope_unavailable"), want: "previous_retirement/scope_unavailable"},
+			{name: "newest valid retirement family wins", stderr: routeRecord("previous_retirement", "candidate_observation_failed") + "\n" + routeRecord("previous_retirement", "accounting_unresolved"), want: "previous_retirement/accounting_unresolved"},
 			{name: "startup and route pause coexist", stderr: knownRuntime + "\n" + routeRecord("previous_retirement", "retirement_unavailable"), want: "previous_retirement/retirement_unavailable", wantStartup: "runtime_composition"},
 			{name: "unknown stage", stderr: routeRecord("forged-stage", "unknown")},
 			{name: "invalid stage cause pair", stderr: routeRecord("runtime_begin", "retirement_unavailable")},

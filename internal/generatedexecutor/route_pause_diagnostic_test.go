@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -103,6 +104,7 @@ func TestGeneratedExecutorCompletionRoutePauseAttribution(t *testing.T) {
 
 func TestGeneratedExecutorRoutePauseCauseClassification(t *testing.T) {
 	var nilIngress *generatedingress.Error
+	var nilCandidate *generatedingress.GeneratedCandidateError
 	routeUnresolved := func() error {
 		return &generatedingress.Error{Code: generatedingress.DiagnosticRouteUnresolved}
 	}
@@ -136,6 +138,12 @@ func TestGeneratedExecutorRoutePauseCauseClassification(t *testing.T) {
 		{name: "storage unavailable", err: deploymentexecution.ErrUnavailable, want: routePauseCauseStorageUnavailable},
 		{name: "route unresolved", err: routeUnresolved(), want: routePauseCauseRouteUnresolved},
 		{name: "typed nil ingress is unknown", err: nilIngress, want: routePauseCauseUnknown},
+		{name: "typed nil candidate is unknown", err: nilCandidate, want: routePauseCauseUnknown},
+		{name: "typed nil candidate before identity preserves identity", err: errors.Join(nilCandidate, deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityLost},
+		{name: "identity before typed nil candidate preserves identity", err: errors.Join(deploymentexecution.ErrIdentityLost, nilCandidate), want: routePauseCauseIdentityLost},
+		{name: "arbitrary candidate code is unknown", err: &generatedingress.GeneratedCandidateError{Code: "private-arbitrary-code"}, want: routePauseCauseUnknown},
+		{name: "unknown candidate before approved candidate", err: errors.Join(&generatedingress.GeneratedCandidateError{Code: "private-arbitrary-code"}, &generatedingress.GeneratedCandidateError{Code: "runtime_unavailable"}), want: routePauseCauseCandidateObservation},
+		{name: "approved candidate before unknown candidate", err: errors.Join(&generatedingress.GeneratedCandidateError{Code: "runtime_unavailable"}, &generatedingress.GeneratedCandidateError{Code: "private-arbitrary-code"}), want: routePauseCauseCandidateObservation},
 		{name: "unrelated ingress before route", err: errors.Join(unrelatedIngress(), routeUnresolved()), want: routePauseCauseRouteUnresolved},
 		{name: "route before unrelated ingress", err: errors.Join(routeUnresolved(), unrelatedIngress()), want: routePauseCauseRouteUnresolved},
 		{name: "typed nil before route", err: errors.Join(nilIngress, routeUnresolved()), want: routePauseCauseRouteUnresolved},
@@ -143,17 +151,23 @@ func TestGeneratedExecutorRoutePauseCauseClassification(t *testing.T) {
 		{name: "identity wins storage", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrUnavailable), want: routePauseCauseIdentityLost},
 		{name: "identity wins storage reverse", err: errors.Join(deploymentexecution.ErrUnavailable, deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityLost},
 		{name: "duplicate identity remains identity", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityLost},
-		{name: "distinct identities are unknown", err: errors.Join(deploymentexecution.ErrAuthorityInvalid, deploymentexecution.ErrIdentityLost), want: routePauseCauseUnknown},
-		{name: "distinct identities reverse are unknown", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrAuthorityInvalid), want: routePauseCauseUnknown},
-		{name: "distinct identities with storage are unknown", err: errors.Join(deploymentexecution.ErrAuthorityInvalid, deploymentexecution.ErrUnavailable, deploymentexecution.ErrIdentityLost), want: routePauseCauseUnknown},
-		{name: "route and identity are unknown", err: errors.Join(routeUnresolved(), deploymentexecution.ErrIdentityLost), want: routePauseCauseUnknown},
-		{name: "route and identity reverse are unknown", err: errors.Join(deploymentexecution.ErrIdentityLost, routeUnresolved()), want: routePauseCauseUnknown},
+		{name: "distinct identities are ambiguous", err: errors.Join(deploymentexecution.ErrAuthorityInvalid, deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityAmbiguous},
+		{name: "distinct identities reverse are ambiguous", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrAuthorityInvalid), want: routePauseCauseIdentityAmbiguous},
+		{name: "distinct identities with storage are ambiguous", err: errors.Join(deploymentexecution.ErrAuthorityInvalid, deploymentexecution.ErrUnavailable, deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityAmbiguous},
+		{name: "route and identity are ambiguous", err: errors.Join(routeUnresolved(), deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityAmbiguous},
+		{name: "route and identity reverse are ambiguous", err: errors.Join(deploymentexecution.ErrIdentityLost, routeUnresolved()), want: routePauseCauseIdentityAmbiguous},
 		{name: "route wins storage", err: errors.Join(routeUnresolved(), deploymentexecution.ErrUnavailable), want: routePauseCauseRouteUnresolved},
 		{name: "route wins storage reverse", err: errors.Join(deploymentexecution.ErrUnavailable, routeUnresolved()), want: routePauseCauseRouteUnresolved},
+		{name: "candidate only", err: &generatedingress.GeneratedCandidateError{Code: "runtime_unavailable"}, want: routePauseCauseCandidateObservation},
+		{name: "candidate wins no family from unmatched", err: errors.Join(errors.New("private unmatched"), &generatedingress.GeneratedCandidateError{Code: "image_drift_detected"}), want: routePauseCauseCandidateObservation},
+		{name: "candidate and identity are ambiguous", err: errors.Join(&generatedingress.GeneratedCandidateError{Code: "network_drift_detected"}, deploymentexecution.ErrIdentityLost), want: routePauseCauseIdentityAmbiguous},
+		{name: "identity and candidate are ambiguous", err: errors.Join(deploymentexecution.ErrIdentityLost, &generatedingress.GeneratedCandidateError{Code: "network_drift_detected"}), want: routePauseCauseIdentityAmbiguous},
+		{name: "candidate yields to storage", err: errors.Join(&generatedingress.GeneratedCandidateError{Code: "image_unavailable"}, deploymentexecution.ErrUnavailable), want: routePauseCauseStorageUnavailable},
 		{name: "old state cause wins identity", err: errors.Join(deploymentexecution.ErrIdentityLost, generatedruntimestate.ErrConflict), want: routePauseCauseStateConflict},
 		{name: "canceled wins identity", err: errors.Join(deploymentexecution.ErrIdentityLost, deploymentexecution.ErrCanceled), want: routePauseCauseCanceled},
 		{name: "context deadline wins deployment cancellation", err: errors.Join(deploymentexecution.ErrCanceled, context.DeadlineExceeded), want: routePauseCauseDeadlineExceeded},
 		{name: "unapproved sealed cause does not fall through", err: errors.Join(routeSwitchError{cause: routePauseCauseRetirementUnavailable}, deploymentexecution.ErrIdentityLost), want: routePauseCauseUnknown},
+		{name: "unapproved sealed cause does not fall through to candidate", err: errors.Join(routeSwitchError{cause: routePauseCauseRetirementUnavailable}, &generatedingress.GeneratedCandidateError{Code: "runtime_unavailable"}), want: routePauseCauseUnknown},
 		{name: "unmatched", err: errors.New("token=do-not-disclose /private/path"), want: routePauseCauseUnknown},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -162,6 +176,68 @@ func TestGeneratedExecutorRoutePauseCauseClassification(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("candidate code allowlist and recursive tree", func(t *testing.T) {
+		for _, code := range []string{
+			"runtime_unavailable",
+			"process_termination_failed",
+			"runtime_output_truncated",
+			"candidate_hardening_failed",
+			"image_unavailable",
+			"image_drift_detected",
+			"network_drift_detected",
+			"candidate_cleanup_failed",
+			"cancelled",
+			"runtime_timeout",
+		} {
+			t.Run(code, func(t *testing.T) {
+				candidate := &generatedingress.GeneratedCandidateError{Code: code}
+				want := routePauseCauseCandidateObservation
+				if code == "candidate_cleanup_failed" {
+					want = routePauseCauseCandidateCleanupFailed
+				}
+				for _, err := range []error{
+					candidate,
+					fmt.Errorf("single private wrapper: %w", candidate),
+					errors.Join(errors.New("private sibling"), candidate),
+				} {
+					if got := classifyRoutePauseCause(err); got != want {
+						t.Fatalf("code=%q cause=%q want=%q", code, got, want)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("pure family precedence", func(t *testing.T) {
+		for _, test := range []struct {
+			name                           string
+			identity                       routePauseCause
+			identityCount                  int
+			storage, candidate, accounting bool
+			want                           routePauseCause
+		}{
+			{name: "candidate only", candidate: true, want: routePauseCauseCandidateObservation},
+			{name: "accounting only", accounting: true, want: routePauseCauseAccountingUnresolved},
+			{name: "candidate plus accounting", candidate: true, accounting: true, want: routePauseCauseIdentityAmbiguous},
+			{name: "candidate plus accounting and storage", storage: true, candidate: true, accounting: true, want: routePauseCauseIdentityAmbiguous},
+			{name: "candidate yields to storage", storage: true, candidate: true, want: routePauseCauseStorageUnavailable},
+			{name: "accounting yields to storage", storage: true, accounting: true, want: routePauseCauseStorageUnavailable},
+			{name: "identity plus candidate", identity: routePauseCauseIdentityLost, identityCount: 1, candidate: true, want: routePauseCauseIdentityAmbiguous},
+			{name: "identity plus accounting", identity: routePauseCauseIdentityLost, identityCount: 1, accounting: true, want: routePauseCauseIdentityAmbiguous},
+			{name: "one identity wins storage", identity: routePauseCauseIdentityLost, identityCount: 1, storage: true, want: routePauseCauseIdentityLost},
+			{name: "duplicate family stays identity", identity: routePauseCauseIdentityLost, identityCount: 1, want: routePauseCauseIdentityLost},
+			{name: "two identities are ambiguous", identity: routePauseCauseIdentityLost, identityCount: 2, want: routePauseCauseIdentityAmbiguous},
+			{name: "unmatched", want: routePauseCauseUnknown},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				if got := classifyPreviousRetirementFamilies(test.identity, test.identityCount,
+					test.storage, test.candidate, test.accounting); got != test.want {
+					t.Fatalf("cause=%q want=%q", got, test.want)
+				}
+			})
+		}
+	})
 }
 
 func TestGeneratedExecutorRoutePauseDiagnosticControls(t *testing.T) {
@@ -220,6 +296,9 @@ func TestGeneratedExecutorRoutePauseDiagnosticControls(t *testing.T) {
 			routePauseCausePositiveFence,
 			routePauseCauseStorageUnavailable,
 			routePauseCauseRouteUnresolved,
+			routePauseCauseCandidateObservation,
+			routePauseCauseAccountingUnresolved,
+			routePauseCauseIdentityAmbiguous,
 		}
 		stages := []routePauseStage{
 			routePauseStageRuntimeBegin,
@@ -275,6 +354,7 @@ func TestGeneratedExecutorPreviousRetirementAvailabilityRoutePauseAttribution(t 
 		want routePauseCause
 	}{
 		{name: "storage unavailable", err: deploymentexecution.ErrUnavailable, want: routePauseCauseStorageUnavailable},
+		{name: "candidate observation", err: &generatedingress.GeneratedCandidateError{Code: "runtime_unavailable"}, want: routePauseCauseCandidateObservation},
 		{name: "unmatched", err: errors.New("unmatched retirement boundary"), want: routePauseCauseUnknown},
 	} {
 		t.Run(test.name, func(t *testing.T) {
