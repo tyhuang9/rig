@@ -1157,7 +1157,10 @@ func liveHostdRebindKnownPreviousRetirementIdentityCause(cause string) bool {
 		"stage_invalid",
 		"positive_fence",
 		"storage_unavailable",
-		"route_unresolved":
+		"route_unresolved",
+		"candidate_observation_failed",
+		"accounting_unresolved",
+		"identity_ambiguous":
 		return true
 	default:
 		return false

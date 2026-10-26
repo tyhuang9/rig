@@ -50,6 +50,9 @@ const (
 	routePauseCausePositiveFence          routePauseCause = "positive_fence"
 	routePauseCauseStorageUnavailable     routePauseCause = "storage_unavailable"
 	routePauseCauseRouteUnresolved        routePauseCause = "route_unresolved"
+	routePauseCauseCandidateObservation   routePauseCause = "candidate_observation_failed"
+	routePauseCauseAccountingUnresolved   routePauseCause = "accounting_unresolved"
+	routePauseCauseIdentityAmbiguous      routePauseCause = "identity_ambiguous"
 )
 
 func (e *Executor) observeRoutePause(ctx context.Context, stage routePauseStage, cause routePauseCause) {
@@ -129,16 +132,82 @@ func classifyPreviousRetirementIdentity(err error) routePauseCause {
 		matched = identity.cause
 		count++
 	}
-	if count == 1 {
-		return matched
+	return classifyPreviousRetirementFamilies(matched, count,
+		errors.Is(err, deploymentexecution.ErrUnavailable),
+		generatedCandidateFamilyInErrorTree(err),
+		generatedingress.IsGeneratedRouteAccountingError(err))
+}
+
+func classifyPreviousRetirementFamilies(identity routePauseCause, identityCount int,
+	storage, candidate, accounting bool,
+) routePauseCause {
+	families := identityCount
+	if candidate {
+		families++
 	}
-	if count > 1 {
-		return routePauseCauseUnknown
+	if accounting {
+		families++
 	}
-	if errors.Is(err, deploymentexecution.ErrUnavailable) {
+	if families > 1 {
+		return routePauseCauseIdentityAmbiguous
+	}
+	if identityCount == 1 {
+		return identity
+	}
+	if storage {
 		return routePauseCauseStorageUnavailable
 	}
+	if candidate {
+		return routePauseCauseCandidateObservation
+	}
+	if accounting {
+		return routePauseCauseAccountingUnresolved
+	}
 	return routePauseCauseUnknown
+}
+
+func generatedCandidateFamilyInErrorTree(err error) bool {
+	if err == nil {
+		return false
+	}
+	if candidate, ok := err.(*generatedingress.GeneratedCandidateError); ok {
+		if candidate == nil {
+			return false
+		}
+		if knownGeneratedCandidateCode(candidate.Code) {
+			return true
+		}
+		return generatedCandidateFamilyInErrorTree(candidate.Unwrap())
+	}
+	switch wrapped := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, item := range wrapped.Unwrap() {
+			if generatedCandidateFamilyInErrorTree(item) {
+				return true
+			}
+		}
+	case interface{ Unwrap() error }:
+		return generatedCandidateFamilyInErrorTree(wrapped.Unwrap())
+	}
+	return false
+}
+
+func knownGeneratedCandidateCode(code string) bool {
+	switch code {
+	case "runtime_unavailable",
+		"process_termination_failed",
+		"runtime_output_truncated",
+		"candidate_hardening_failed",
+		"image_unavailable",
+		"image_drift_detected",
+		"network_drift_detected",
+		"candidate_cleanup_failed",
+		"cancelled",
+		"runtime_timeout":
+		return true
+	default:
+		return false
+	}
 }
 
 func generatedIngressCodeInErrorTree(err error, code generatedingress.DiagnosticCode) bool {
@@ -208,7 +277,10 @@ func knownPreviousRetirementIdentityCause(cause routePauseCause) bool {
 		routePauseCauseStageInvalid,
 		routePauseCausePositiveFence,
 		routePauseCauseStorageUnavailable,
-		routePauseCauseRouteUnresolved:
+		routePauseCauseRouteUnresolved,
+		routePauseCauseCandidateObservation,
+		routePauseCauseAccountingUnresolved,
+		routePauseCauseIdentityAmbiguous:
 		return true
 	default:
 		return false

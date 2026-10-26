@@ -15,11 +15,36 @@ type GeneratedCandidateError struct {
 	cause error
 }
 
-func (e *GeneratedCandidateError) Error() string { return "generated candidate: " + e.Code }
-func (e *GeneratedCandidateError) Unwrap() error { return e.cause }
+func (e *GeneratedCandidateError) Error() string {
+	if e == nil {
+		return "generated candidate: unavailable"
+	}
+	return "generated candidate: " + e.Code
+}
+func (e *GeneratedCandidateError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
 
 func candidateFailure(code string, cause error) error {
 	return &GeneratedCandidateError{Code: code, cause: cause}
+}
+
+// IsGeneratedRouteAccountingError reports whether err contains one of the
+// private accounting failures that can leave an authenticated route completion.
+// It exposes no ledger state or authority and leaves the supplied error tree
+// unchanged.
+func IsGeneratedRouteAccountingError(err error) bool {
+	return errors.Is(err, errCandidateCapacityInvalid) ||
+		errors.Is(err, errCandidateCapacityClosing) ||
+		errors.Is(err, errCandidateCapacityStale) ||
+		errors.Is(err, errCandidateCapacityBusy) ||
+		errors.Is(err, errCandidateReceiptMismatch) ||
+		errors.Is(err, errCandidateMutationUnquiesced) ||
+		errors.Is(err, errCandidatePhysicalTransition) ||
+		errors.Is(err, errCandidateCommandEntered)
 }
 
 // candidateProcessFailure never embeds a runner's text in the diagnostic.
