@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/hostd/hostd/internal/appaccess"
 )
 
 type generatedDomainColdRetainedGatewayPresence uint8
@@ -52,6 +54,14 @@ type generatedDomainColdRetainedGatewayProof struct {
 	digest         string
 }
 
+type generatedDomainColdRetainedGatewaySelectionStatus uint8
+
+const (
+	generatedDomainColdRetainedGatewaySelectionInconsistent generatedDomainColdRetainedGatewaySelectionStatus = iota
+	generatedDomainColdRetainedGatewaySelectionUnsupported
+	generatedDomainColdRetainedGatewaySelectionSupported
+)
+
 func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Manager,
 	authority *GeneratedCandidateAuthority, snapshot generatedDomainDockerStartupSnapshot,
 	expected generatedDomainGatewayExpectation,
@@ -71,18 +81,22 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdRetainedGatewayTriple, err)
 	}
-	selected, supported := generatedDomainColdRetainedGatewaySelectedAuthority(expected)
-	if supported {
+	selected, selectionStatus := generatedDomainColdRetainedGatewaySelectedAuthority(expected)
+	if selectionStatus == generatedDomainColdRetainedGatewaySelectionSupported {
 		result.authority = &selected
 	}
 	if presence == generatedDomainColdRetainedGatewayAbsent {
 		result.digest, err = generatedDomainColdRetainedGatewayDigest(result)
 		return result, err
 	}
-	if !supported {
+	if selectionStatus != generatedDomainColdRetainedGatewaySelectionSupported {
+		reason := generatedDomainConstructionReasonColdRetainedGatewaySelectionAuthority
+		if selectionStatus == generatedDomainColdRetainedGatewaySelectionUnsupported {
+			reason = generatedDomainConstructionReasonColdRetainedGatewaySelectionKind
+		}
 		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
-			generatedDomainConstructionReasonColdRetainedGatewaySelection,
+			reason,
 			errGeneratedDomainConstructionRefused)
 	}
 
@@ -90,7 +104,7 @@ func attestGeneratedDomainColdRetainedGateway(ctx context.Context, manager *Mana
 	if err != nil {
 		return generatedDomainColdRetainedGatewayProof{}, generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
-			generatedDomainConstructionReasonColdRetainedGatewaySelection, err)
+			generatedDomainConstructionReasonColdRetainedGatewaySelectionReader, err)
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -201,10 +215,24 @@ func generatedDomainColdActiveNativeV1Expectation(expected generatedDomainGatewa
 }
 
 func generatedDomainColdRetainedGatewaySelectedAuthority(expected generatedDomainGatewayExpectation) (
-	generatedDomainColdRetainedGatewayAuthority, bool,
+	generatedDomainColdRetainedGatewayAuthority, generatedDomainColdRetainedGatewaySelectionStatus,
 ) {
+	// These are the exact canonical current shapes that the retained V1 proof
+	// deliberately does not authorize. This branch describes the observed
+	// shape; it does not independently validate or mint current authority.
+	if expected.kind == generatedDomainGatewayCurrentV1 && expected.currentV1 != nil && expected.terminal != nil &&
+		expected.nativeV1 == nil && expected.nativeV2 == nil && expected.journal == nil && expected.upgrade == nil &&
+		expected.currentV2 == nil {
+		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionUnsupported
+	}
+	if expected.kind == generatedDomainGatewayCurrentV2 && expected.currentV2 != nil && expected.terminal != nil &&
+		expected.currentV2.Lineage.Kind == appaccess.GatewayRebindSourceGatewayRebind &&
+		expected.nativeV1 == nil && expected.nativeV2 == nil && expected.journal == nil && expected.upgrade == nil &&
+		expected.currentV1 == nil {
+		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionUnsupported
+	}
 	if expected.nativeV1 == nil || expected.nativeV2 == nil || expected.journal == nil || expected.upgrade == nil {
-		return generatedDomainColdRetainedGatewayAuthority{}, false
+		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
 	}
 	selection := *expected.upgrade
 	if selection.Store == nil || !selection.Existing || selection.PartialState || selection.Retired || selection.Aborted ||
@@ -215,15 +243,15 @@ func generatedDomainColdRetainedGatewaySelectedAuthority(expected generatedDomai
 		!reflect.DeepEqual(selection.State, *expected.nativeV2) ||
 		!reflect.DeepEqual(selection.Journal, *expected.journal) ||
 		!validGatewayTopologyInputs(*expected.nativeV1, selection.State, selection.Journal) {
-		return generatedDomainColdRetainedGatewayAuthority{}, false
+		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
 	}
 	lineage, err := gatewayUpgradeCurrentLineage(selection)
 	if err != nil {
-		return generatedDomainColdRetainedGatewayAuthority{}, false
+		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
 	}
 	stateDigest, err := canonicalDigest(selection.State)
 	if err != nil {
-		return generatedDomainColdRetainedGatewayAuthority{}, false
+		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
 	}
 	result := generatedDomainColdRetainedGatewayAuthority{
 		kind: expected.kind, stateDigest: expected.stateDigest, generation: selection.Generation,
@@ -233,19 +261,19 @@ func generatedDomainColdRetainedGatewaySelectedAuthority(expected generatedDomai
 	switch expected.kind {
 	case generatedDomainGatewayNativeV2:
 		if expected.currentV2 != nil || stateDigest != expected.stateDigest {
-			return generatedDomainColdRetainedGatewayAuthority{}, false
+			return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
 		}
 	case generatedDomainGatewayCurrentV2:
 		if !generatedDomainCurrentV2UpgradeExpectationValid(expected) || expected.currentV2 == nil ||
 			expected.currentV2.Lineage != lineage || expected.currentV2.Digest != expected.stateDigest {
-			return generatedDomainColdRetainedGatewayAuthority{}, false
+			return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
 		}
 		current := cloneGatewayCurrentRouteStateV2(*expected.currentV2)
 		result.currentV2 = &current
 	default:
-		return generatedDomainColdRetainedGatewayAuthority{}, false
+		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
 	}
-	return result, true
+	return result, generatedDomainColdRetainedGatewaySelectionSupported
 }
 
 func generatedDomainColdRetainedGatewayObjects(snapshot generatedDomainDockerStartupSnapshot) (

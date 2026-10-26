@@ -57,7 +57,7 @@ func liveHostdRebindRunCrashCase(t *testing.T, boundaryID, scenarioID string) {
 	operationID := uuid.NewString()
 	fixture.registerOperation(operationID)
 	child := liveHostdRebindStartChild(t, fixture, operationID, boundaryID, scenarioID)
-	ready := liveHostdRebindWaitReady(t, fixture, child)
+	ready := liveHostdRebindWaitReadyPhase(t, fixture, child, liveHostdRebindReadyPhaseInitial)
 	if ready.RecoveryOnly {
 		t.Fatal("fresh fixture entered recovery before rebind admission")
 	}
@@ -100,7 +100,7 @@ func liveHostdRebindRunCrashCase(t *testing.T, boundaryID, scenarioID string) {
 	}
 
 	recovery := liveHostdRebindStartChild(t, fixture, "", "", "")
-	recoveryReady := liveHostdRebindWaitReady(t, fixture, recovery)
+	recoveryReady := liveHostdRebindWaitReadyPhase(t, fixture, recovery, liveHostdRebindReadyPhaseFirstRecovery)
 	t.Log("rebind crash verification phase=first-recovery")
 	status := liveHostdRebindRecover(t, fixture, operationID, recoveryReady)
 	liveHostdRebindAssertCrashTerminalDisposition(t, "first-recovery", status, operationID, expectedDisposition)
@@ -109,7 +109,7 @@ func liveHostdRebindRunCrashCase(t *testing.T, boundaryID, scenarioID string) {
 	// A terminal result in a recovery-only process never relaxes that process.
 	// This third exact-binary process must independently return to normal mode.
 	normal := liveHostdRebindStartChild(t, fixture, "", "", "")
-	normalReady := liveHostdRebindWaitReady(t, fixture, normal)
+	normalReady := liveHostdRebindWaitReadyPhase(t, fixture, normal, liveHostdRebindReadyPhaseThirdNormal)
 	if normalReady.RecoveryOnly || normalReady.RecoveryKind != "" || normalReady.OperationID != "" {
 		t.Fatal("fresh post-terminal hostd did not return to normal startup")
 	}

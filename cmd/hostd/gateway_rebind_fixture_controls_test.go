@@ -32,6 +32,39 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	knownRuntime := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"runtime composition failed","error":"` + secret + `"}`
 	constructionError := "generated domain construction was refused: stage=empty_final_locked reason=docker_static_response"
 	knownConstruction := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"generated domain construction failed","error":"` + constructionError + `"}`
+	t.Run("readiness phase attribution is finite", func(t *testing.T) {
+		for _, test := range []struct {
+			phase  liveHostdRebindReadyPhase
+			reason string
+		}{
+			{liveHostdRebindReadyPhaseInitial, "cold_retained_gateway_selection_kind"},
+			{liveHostdRebindReadyPhaseFirstRecovery, "cold_retained_gateway_selection_authority"},
+			{liveHostdRebindReadyPhaseThirdNormal, "cold_retained_gateway_selection_reader"},
+		} {
+			cause := errors.New("generated domain construction was refused: stage=cold_construction reason=" + test.reason)
+			readiness := fmt.Errorf("full hostd child failed closed: %w", cause)
+			got := liveHostdRebindReadyPhaseError(test.phase, readiness)
+			wantPrefix := "full hostd child phase=" + string(test.phase) + " readiness: "
+			stage, reason, ok := controllerChildConstructionDiagnostic(got)
+			if got == nil || !strings.HasPrefix(got.Error(), wantPrefix) || !errors.Is(got, cause) ||
+				!ok || stage != "cold_construction" || reason != test.reason {
+				t.Fatalf("phase %q attribution = %v nested=%q/%q ok=%t", test.phase, got, stage, reason, ok)
+			}
+		}
+		cause := errors.New("closed readiness refusal")
+		for _, invalid := range []struct {
+			phase liveHostdRebindReadyPhase
+			err   error
+		}{
+			{liveHostdRebindReadyPhase("forged"), cause},
+			{liveHostdRebindReadyPhaseInitial, nil},
+		} {
+			got := liveHostdRebindReadyPhaseError(invalid.phase, invalid.err)
+			if got == nil || got.Error() != "full hostd child readiness phase is invalid" {
+				t.Fatalf("invalid phase attribution = %v", got)
+			}
+		}
+	})
 	coldBuilderConstruction := func(reason string) string {
 		return `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"generated domain construction failed","error":"generated domain construction was refused: stage=cold_construction reason=` + reason + `"}`
 	}
@@ -324,7 +357,9 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 			{name: "process kill cold group missing image", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_group_missing_image"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_group_missing_image"},
 			{name: "controller cold group missing network", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_group_missing_network"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_group_missing_network"},
 			{name: "controller cold group gateway", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_group_gateway_attestation"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_group_gateway_attestation"},
-			{name: "process kill cold retained selection", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_retained_gateway_selection"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_retained_gateway_selection"},
+			{name: "process kill cold retained selection kind", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_retained_gateway_selection_kind"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_retained_gateway_selection_kind"},
+			{name: "controller cold retained selection authority", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_retained_gateway_selection_authority"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_retained_gateway_selection_authority"},
+			{name: "process kill cold retained selection reader", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_retained_gateway_selection_reader"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_retained_gateway_selection_reader"},
 			{name: "controller cold retained triple", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_retained_gateway_triple"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_retained_gateway_triple"},
 			{name: "process kill cold retained read", value: constructionRecord("process_kill", "runtime_composition", "cold_construction", "cold_retained_gateway_read"), want: "process_kill/runtime_composition/failed construction=cold_construction/cold_retained_gateway_read"},
 			{name: "controller cold retained policy", value: constructionRecord("controller_restart", "generated_domain", "cold_construction", "cold_retained_gateway_policy"), want: "controller_restart/generated_domain/failed construction=cold_construction/cold_retained_gateway_policy"},

@@ -397,7 +397,7 @@ func generatedDomainNativeV1DockerDescriptors() []generatedDomainRecoveryDockerD
 	return []generatedDomainRecoveryDockerDescriptor{
 		{kind: "container", name: caddyContainerName, labels: map[string]string{
 			gatewayV2ManagedLabelKey: gatewayV2ManagedContainerLabel, gatewayV2IdentityLabelKey: gatewayV1IdentityVersion,
-			gatewayV2ListenerIsolationKey: gatewayV2ListenerIsolationVersion}},
+			gatewayV2ListenerIsolationKey: gatewayV1IdentityVersion}},
 		{kind: "network", name: caddyNetworkName, labels: map[string]string{
 			gatewayV2ManagedLabelKey: gatewayV2ManagedNetworkLabel, gatewayV2IdentityLabelKey: gatewayV1IdentityVersion},
 			data: generatedDomainDockerObjectData{driver: "bridge", scope: "local", options: map[string]string{}}},
