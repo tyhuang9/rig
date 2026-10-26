@@ -46,6 +46,10 @@ const (
 	liveGatewayRebindRuntimeCommitReplayMarker             = "GATEWAY_REBIND_RUNTIME_COMMIT_REPLAY_OK:no-effects"
 	liveGatewayRebindRuntimeRollbackReplayTest             = "TestLiveGatewayRebindRuntimeRollbackReplayChild"
 	liveGatewayRebindRuntimeRollbackReplayMarker           = "GATEWAY_REBIND_RUNTIME_ROLLBACK_REPLAY_OK:no-effects"
+	liveGatewayV2CommittedRestartTest                      = "TestLiveGatewayV2CommittedRestartChild"
+	liveGatewayV2CommittedRestartMarker                    = "GATEWAY_V2_COMMITTED_RESTART_OK:no-effects"
+	liveGatewayV2RollbackRestartTest                       = "TestLiveGatewayV2BindConflictRollbackRestartChild"
+	liveGatewayV2RollbackRestartMarker                     = "GATEWAY_V2_ROLLBACK_RESTART_OK:no-effects"
 	liveGatewayRebindStoppedStageCancellationTest          = "TestGatewayRebindStoppedStageReplayCancellationChild"
 	liveGatewayRebindStoppedStageCancellationStartedMarker = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_CANCEL_STARTED"
 	liveGatewayRebindStoppedStageCancellationSuccessMarker = "GATEWAY_REBIND_STOPPED_STAGE_REPLAY_CANCEL_OK"
@@ -81,6 +85,10 @@ func liveGatewayRebindStoppedStageReplayPairAllowed(pair liveGatewayRebindStoppe
 		testName: liveGatewayRebindRuntimeCommitReplayTest, successMarker: liveGatewayRebindRuntimeCommitReplayMarker,
 	}, liveGatewayRebindStoppedStageReplayPair{
 		testName: liveGatewayRebindRuntimeRollbackReplayTest, successMarker: liveGatewayRebindRuntimeRollbackReplayMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayV2CommittedRestartTest, successMarker: liveGatewayV2CommittedRestartMarker,
+	}, liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayV2RollbackRestartTest, successMarker: liveGatewayV2RollbackRestartMarker,
 	}:
 		return true
 	default:
@@ -432,6 +440,8 @@ func liveGatewayRebindStoppedStageReplayMarkerNamespaceContains(line string) boo
 		liveGatewayRebindStageStartReplayMarker,
 		liveGatewayRebindRuntimeCommitReplayMarker,
 		liveGatewayRebindRuntimeRollbackReplayMarker,
+		liveGatewayV2CommittedRestartMarker,
+		liveGatewayV2RollbackRestartMarker,
 		liveGatewayRebindStoppedStageCancellationSuccessMarker,
 	} {
 		if strings.Contains(line, marker) {
@@ -833,6 +843,8 @@ func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
 			{testName: liveGatewayRebindStageStartReplayTest, successMarker: liveGatewayRebindStageStartReplayMarker},
 			{testName: liveGatewayRebindRuntimeCommitReplayTest, successMarker: liveGatewayRebindRuntimeCommitReplayMarker},
 			{testName: liveGatewayRebindRuntimeRollbackReplayTest, successMarker: liveGatewayRebindRuntimeRollbackReplayMarker},
+			{testName: liveGatewayV2CommittedRestartTest, successMarker: liveGatewayV2CommittedRestartMarker},
+			{testName: liveGatewayV2RollbackRestartTest, successMarker: liveGatewayV2RollbackRestartMarker},
 		}
 		for _, pair := range known {
 			if !liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
@@ -845,6 +857,8 @@ func TestGatewayRebindStoppedStageReplayChildProtocolIsClosed(t *testing.T) {
 			{testName: liveGatewayRebindFinalConfigReplayTest, successMarker: "GATEWAY_REBIND_UNKNOWN_OK"},
 			{testName: liveGatewayRebindRuntimeCommitReplayTest, successMarker: liveGatewayRebindRuntimeRollbackReplayMarker},
 			{testName: liveGatewayRebindRuntimeRollbackReplayTest, successMarker: liveGatewayRebindRuntimeCommitReplayMarker},
+			{testName: liveGatewayV2CommittedRestartTest, successMarker: liveGatewayV2RollbackRestartMarker},
+			{testName: liveGatewayV2RollbackRestartTest, successMarker: liveGatewayV2CommittedRestartMarker},
 		} {
 			if liveGatewayRebindStoppedStageReplayPairAllowed(pair) {
 				t.Fatalf("crossed or unknown selector-marker pair was accepted: %+v", pair)

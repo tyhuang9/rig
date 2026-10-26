@@ -123,15 +123,12 @@ func TestLiveGatewayV2UpgradeCommitAndRestart(t *testing.T) {
 		t.Fatal("committed gateway-v2 operation unexpectedly has a rollback-retirement receipt")
 	}
 
-	restarted, err := New(fixture.runner, fixture.ingress.options)
-	if err != nil {
-		t.Fatal("restart generated ingress manager")
-	}
-	status, err := restarted.ObserveGatewayV2Operation(fixture.ctx, fixture.spec.operationID)
+	liveGatewayV2RunRestartChild(t, fixture, state, journal, false)
+	status, err := fixture.ingress.ObserveGatewayV2Operation(fixture.ctx, journal.OperationID)
 	if err != nil || status.OperationID != fixture.spec.operationID || status.Availability != GatewayV2OperationServing {
 		t.Fatalf("restarted gateway-v2 observation = %+v, err=%v", status, err)
 	}
-	observation, err := restarted.Observe(fixture.ctx, fixture.spec.appID)
+	observation, err := fixture.ingress.Observe(fixture.ctx, fixture.spec.appID)
 	wantURL := "http://" + fixture.spec.appID + ".rig.localhost:" + strconv.FormatUint(uint64(fixture.ingress.options.HostPort), 10)
 	if err != nil || observation.URL != wantURL || observation.Slot != fixture.candidates[0].Slot ||
 		!reflect.DeepEqual(observation.Endpoints, []generatedroute.RouteEndpoint{liveEndpoint(fixture.candidates[0])}) {
@@ -140,6 +137,11 @@ func TestLiveGatewayV2UpgradeCommitAndRestart(t *testing.T) {
 	assertLiveOneShot(t, fixture.ctx, fixture.ingress.options.HostPort, fixture.spec.appID, "/", fixture.spec.applicationReply,
 		"restarted manager did not observe the preserved local route")
 	liveGatewayV2AssertUnassigned404(t, fixture, fixture.interfaceIP)
+	liveGatewayV2AssertSourceUnchanged(t, fixture)
+	liveGatewayV2AssertCommittedIdentity(t, fixture, state, journal)
+	if _, err := store.loadRollbackRetirementReceipt(state, journal); err == nil {
+		t.Fatal("fresh-process committed observation gained a rollback-retirement receipt")
+	}
 }
 
 // TestLiveGatewayV2BindConflictRollsBack occupies the approved host listener
@@ -189,16 +191,140 @@ func TestLiveGatewayV2BindConflictRollsBack(t *testing.T) {
 		t.Fatal("bind-conflict rollback did not durably retire its v2 resources")
 	}
 
-	restarted, err := New(fixture.runner, fixture.ingress.options)
-	if err != nil {
-		t.Fatal("restart generated ingress manager after bind conflict")
-	}
-	status, err := restarted.ObserveGatewayV2Operation(fixture.ctx, fixture.spec.operationID)
+	liveGatewayV2RunRestartChild(t, fixture, state, journal, true)
+	status, err := fixture.ingress.ObserveGatewayV2Operation(fixture.ctx, journal.OperationID)
 	if err != nil || status.OperationID != fixture.spec.operationID || status.Availability != GatewayV2OperationUnavailable {
 		t.Fatalf("restarted rollback observation = %+v, err=%v", status, err)
 	}
+	observation, err := fixture.ingress.Observe(fixture.ctx, fixture.spec.appID)
+	wantURL := "http://" + fixture.spec.appID + ".rig.localhost:" + strconv.FormatUint(uint64(fixture.ingress.options.HostPort), 10)
+	if err != nil || observation.URL != wantURL || observation.Slot != fixture.candidates[0].Slot ||
+		!reflect.DeepEqual(observation.Endpoints, []generatedroute.RouteEndpoint{liveEndpoint(fixture.candidates[0])}) {
+		t.Fatalf("restarted rollback application observation = %+v, err=%v", observation, err)
+	}
 	assertLiveOneShot(t, fixture.ctx, fixture.ingress.options.HostPort, fixture.spec.appID, "/", fixture.spec.applicationReply,
 		"restarted manager did not preserve v1 after bind-conflict rollback")
+	liveGatewayV2AwaitConflict(t, fixture, "fresh-process rollback observation changed the conflict-owned listener")
+	liveGatewayV2AssertNoOwnedResources(t, fixture)
+	liveGatewayV2AssertSourceUnchanged(t, fixture)
+	if _, err := store.loadRollbackRetirementReceipt(state, journal); err != nil {
+		t.Fatal("fresh-process rollback observation lost its retirement receipt")
+	}
+}
+
+func liveGatewayV2RestartPair(rollback bool) liveGatewayRebindStoppedStageReplayPair {
+	if rollback {
+		return liveGatewayRebindStoppedStageReplayPair{
+			testName: liveGatewayV2RollbackRestartTest, successMarker: liveGatewayV2RollbackRestartMarker,
+		}
+	}
+	return liveGatewayRebindStoppedStageReplayPair{
+		testName: liveGatewayV2CommittedRestartTest, successMarker: liveGatewayV2CommittedRestartMarker,
+	}
+}
+
+func TestLiveGatewayV2CommittedRestartChild(t *testing.T) {
+	liveGatewayV2RestartChild(t, false)
+}
+
+func TestLiveGatewayV2BindConflictRollbackRestartChild(t *testing.T) {
+	liveGatewayV2RestartChild(t, true)
+}
+
+func liveGatewayV2RestartChild(t *testing.T, rollback bool) {
+	pair := liveGatewayV2RestartPair(rollback)
+	var audit *liveGatewayRebindRuntimeReplayRunner
+	runLiveGatewayRebindStoppedStageReplayChildProcessWithRunner(t, pair,
+		func(base runtimeprocess.CommandRunner) runtimeprocess.CommandRunner {
+			audit = &liveGatewayRebindRuntimeReplayRunner{runner: base}
+			return audit
+		}, func(child *liveGatewayRebindStoppedStageReplayChildProcess) liveGatewayRebindStoppedStageReplayChildOutcome {
+			wantReply := "gateway-v2-commit"
+			if rollback {
+				wantReply = "gateway-v2-conflict"
+			}
+			beforeFiles, err := readGatewayHistorySnapshot(child.manager.store)
+			store, storeErr := newGatewayUpgradeStateStore(child.value.DataRoot)
+			if err != nil || storeErr != nil {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "source", message: "open exact protected gateway-v2 restart source"}
+			}
+			state, journal, loadErr := store.loadBoundUpgrade(child.value.OperationID)
+			source, sourceErr := child.manager.store.load()
+			heads, headsErr := child.repository.GatewayRebindRuntimeHeads(child.ctx)
+			wantPhase, wantAvailability := gatewayPhaseCommitted, GatewayV2OperationServing
+			if rollback {
+				wantPhase, wantAvailability = gatewayPhaseRolledBack, GatewayV2OperationUnavailable
+			}
+			if loadErr != nil || sourceErr != nil || headsErr != nil ||
+				journal.OperationID != child.value.OperationID || state.OperationID != journal.OperationID ||
+				journal.Phase != wantPhase || source.Pending != nil || state.Pending != nil ||
+				len(source.Active) != 1 || len(state.Apps) != 1 || len(heads) != 1 {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "source", message: "select exact protected and SQL gateway-v2 restart source"}
+			}
+			appID := heads[0].AppID
+			route, routeFound := source.Active[appID]
+			app, appFound := state.Apps[appID]
+			if !routeFound || !appFound || validateRoute(route) != nil ||
+				!reflect.DeepEqual(app.Route, route) || heads[0].Slot != string(route.Slot) {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "source", message: "bind unique SQL application to exact protected route"}
+			}
+
+			status, statusErr := child.manager.ObserveGatewayV2Operation(child.ctx, journal.OperationID)
+			observation, observationErr := child.manager.Observe(child.ctx, appID)
+			wantURL := "http://" + appID + ".rig.localhost:" + strconv.FormatUint(uint64(child.value.HostPort), 10)
+			probe := liveOneShotRequest(child.ctx, child.value.HostPort, appID, "/", wantReply)
+			if statusErr != nil || status.OperationID != journal.OperationID || status.Availability != wantAvailability ||
+				observationErr != nil || observation.URL != wantURL ||
+				observation.Slot != route.Slot || !reflect.DeepEqual(observation.Endpoints, route.Endpoints) ||
+				!liveResponseMatches(probe) {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "replay", message: "fresh manager refused exact durable gateway-v2 route"}
+			}
+
+			afterFiles, filesErr := readGatewayHistorySnapshot(child.manager.store)
+			afterState, afterJournal, protectedErr := store.loadBoundUpgrade(journal.OperationID)
+			afterSource, routeErr := child.manager.store.load()
+			afterHeads, afterHeadsErr := child.repository.GatewayRebindRuntimeHeads(child.ctx)
+			if audit == nil || filesErr != nil || protectedErr != nil || routeErr != nil || afterHeadsErr != nil ||
+				!sameGatewayHistorySnapshot(beforeFiles, afterFiles) ||
+				!reflect.DeepEqual(state, afterState) || !reflect.DeepEqual(journal, afterJournal) ||
+				!reflect.DeepEqual(source, afterSource) || !reflect.DeepEqual(heads, afterHeads) ||
+				len(audit.effects) != 0 {
+				return liveGatewayRebindStoppedStageReplayChildOutcome{stage: "history", message: "fresh manager observation changed protected or SQL state or dispatched an effect"}
+			}
+			return liveGatewayRebindStoppedStageReplayChildOutcome{}
+		})
+}
+
+func liveGatewayV2RunRestartChild(t *testing.T, fixture *liveGatewayV2Fixture,
+	state gatewayV2RouteState, journal gatewayMigrationJournal, rollback bool,
+) {
+	t.Helper()
+	wantPhase := gatewayPhaseCommitted
+	if rollback {
+		wantPhase = gatewayPhaseRolledBack
+	}
+	if journal.OperationID != state.OperationID || journal.Phase != wantPhase {
+		t.Fatal("launch fresh gateway-v2 manager from an invalid terminal operation")
+	}
+	beforeFiles, err := readGatewayHistorySnapshot(fixture.ingress.store)
+	beforeHeads, headsErr := fixture.repository.GatewayRebindRuntimeHeads(fixture.ctx)
+	if err != nil || headsErr != nil {
+		t.Fatal("read immutable gateway-v2 restart evidence")
+	}
+	runLiveGatewayRebindStoppedStageReplayChildForOperationWithPair(t, fixture,
+		journal.OperationID, liveGatewayV2RestartPair(rollback))
+	afterFiles, filesErr := readGatewayHistorySnapshot(fixture.ingress.store)
+	afterHeads, afterHeadsErr := fixture.repository.GatewayRebindRuntimeHeads(fixture.ctx)
+	store, storeErr := newGatewayUpgradeStateStore(fixture.stateRoot)
+	if filesErr != nil || afterHeadsErr != nil || storeErr != nil {
+		t.Fatal("reread immutable gateway-v2 restart evidence")
+	}
+	afterState, afterJournal, loadErr := store.loadBoundUpgrade(journal.OperationID)
+	if loadErr != nil ||
+		!sameGatewayHistorySnapshot(beforeFiles, afterFiles) || !reflect.DeepEqual(beforeHeads, afterHeads) ||
+		!reflect.DeepEqual(state, afterState) || !reflect.DeepEqual(journal, afterJournal) {
+		t.Fatal("fresh-process gateway-v2 observation changed protected or SQL evidence")
+	}
 }
 
 func newLiveGatewayV2Fixture(t *testing.T, spec liveGatewayV2FixtureSpec) *liveGatewayV2Fixture {

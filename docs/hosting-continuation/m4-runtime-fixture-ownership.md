@@ -52,9 +52,10 @@ runtime authority, public APIs, database provisioning or deployment.
 External databases remain application-owned. The separate retained-V2
 production repair in PR #245 still requires hosted acceptance.
 
-## Acceptance status
+## Original ownership/replay verification
 
-The final frozen test source passed focused Windows verification on
+The original published test source at
+`7680cff3ebfb8602b67178fef9df39bca9497586` passed focused Windows verification on
 2026-10-26 with Go 1.26.7, `GOTOOLCHAIN=local`,
 `GOFLAGS=-mod=readonly -p=1 -buildvcs=false` and `CGO_ENABLED=0`.
 The source manifest SHA-256 is
@@ -98,6 +99,54 @@ Linux race or manual UI run was performed. Hosted jobs must establish both
 full commit and rollback journeys, including genuine process replay and
 the preserved SQL/history/physical assertions. Full M4 acceptance remains
 open.
+
+## Gateway V2 restart follow-up
+
+[PR #245's Gateway V2 Docker job](https://github.com/tyhuang9/rig/actions/runs/40302965729/job/121505057206)
+failed its commit/restart and bind-conflict/rollback tests after 55.16 and
+38.87 seconds, respectively. Both reported fixed restart-manager errors;
+the log does not expose the underlying diagnostic. Raw log SHA-256:
+`aa2922632f457f4e249595d809b72fc9ce2e13d5ee99984b811821867c33bc83`.
+
+Both test bodies retain the fixture's original domain owner and then call
+ordinary `New` again in that process. The follow-up applies the same
+ownership correction to these two restart checks: use separate processes
+with two exact selector/marker pairs in the existing bounded protocol.
+Keep the manifest private, use the actual upgrade-journal operation ID,
+and construct one Manager in each child.
+
+The child must derive the unique application and current route from
+authenticated protected history and the corresponding SQL source. It
+checks the pair-specific committed or rolled-back terminal, observes the
+reconstructed route, and preserves SQL/history with no mutation or
+capacity commands. Missing, crossed, ambiguous or inconsistent sources
+must refuse. The parent retains its fixed application, exact route and
+HTTP/listener assertions, plus physical-resource and cleanup checks.
+
+This follow-up changes two test files only. Production ownership and
+restart rules stay intact. On 2026-10-26, a fresh ordinary Go 1.26.7
+compile and exact discovery passed. The two live parents, two new child
+parents and two local control parents were each discovered exactly once.
+The executed controls were `TestGatewayRebindRuntimeReplayCommandAudit`
+and `TestGatewayRebindStoppedStageReplayChildProtocolIsClosed`: two
+parents and 43 child cases, 45 unique passes with no failures or skips.
+They ran with an anchored selector, `-test.count=1`, `-test.v` and
+`-test.timeout=10m`. Formatting, scoped vet and canonical generation
+checks also passed.
+
+The follow-up source manifest SHA-256 is
+`b0836830ed71e539b66fc8d874917cd190b55682531088e4709ef1ef5fdf0288`;
+its binary SHA-256 is
+`63f63303b2bd22ac27daf0cdead747b0432d4393c485267e5a0e11b17a615608`.
+Source/security review found no blocking issue. SQL runtime heads encode
+application identity and slot; protected route state supplies endpoints.
+The child checks their supported relationships and preserves each full
+snapshot without claiming SQL contains endpoint topology.
+
+The live parents and children were discovered, not executed locally.
+Both real Docker journeys remain pending hosted verification. The earlier
+52 passes above describe the original published source and are not added
+to the follow-up's 45-pass count.
 
 ## Rollback
 
