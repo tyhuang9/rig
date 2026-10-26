@@ -68,6 +68,7 @@ type generatedDomainGatewayExpectation struct {
 	currentV1   *gatewayCurrentRouteState
 	currentV2   *gatewayCurrentRouteStateV2
 	terminal    *gatewayRebindAttemptTerminalView
+	retainedV1  *generatedDomainRetainedV1Projection
 	names       map[string]map[string]struct{}
 	ids         map[string]map[string]struct{}
 }

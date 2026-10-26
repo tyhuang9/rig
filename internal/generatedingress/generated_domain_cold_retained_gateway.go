@@ -21,8 +21,8 @@ const (
 
 // generatedDomainColdRetainedGatewayAuthority binds an accepted retained V1
 // triple to the exact committed upgrade selected by the canonical startup
-// resolver. A current V2 projection is included when it is the selected
-// upgrade-origin successor.
+// resolver. A current projection is included when it is the selected
+// successor; its active digest remains distinct from the retained upgrade.
 type generatedDomainColdRetainedGatewayAuthority struct {
 	kind        generatedDomainGatewayKind
 	stateDigest string
@@ -31,6 +31,7 @@ type generatedDomainColdRetainedGatewayAuthority struct {
 	source      routeState
 	state       gatewayV2RouteState
 	journal     gatewayMigrationJournal
+	currentV1   *gatewayCurrentRouteState
 	currentV2   *gatewayCurrentRouteStateV2
 }
 
@@ -202,6 +203,7 @@ func generatedDomainColdActiveNativeV1Expectation(expected generatedDomainGatewa
 	if expected.kind != generatedDomainGatewayNativeV1 || expected.nativeV1 == nil ||
 		expected.nativeV2 != nil || expected.journal != nil || expected.upgrade != nil ||
 		expected.currentV1 != nil || expected.currentV2 != nil || expected.terminal != nil ||
+		expected.retainedV1 != nil ||
 		!validRouteState(*expected.nativeV1) || expected.nativeV1.Pending != nil {
 		return false
 	}
@@ -222,14 +224,33 @@ func generatedDomainColdRetainedGatewaySelectedAuthority(expected generatedDomai
 	// shape; it does not independently validate or mint current authority.
 	if expected.kind == generatedDomainGatewayCurrentV1 && expected.currentV1 != nil && expected.terminal != nil &&
 		expected.nativeV1 == nil && expected.nativeV2 == nil && expected.journal == nil && expected.upgrade == nil &&
-		expected.currentV2 == nil {
+		expected.currentV2 == nil && expected.retainedV1 == nil {
 		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionUnsupported
 	}
 	if expected.kind == generatedDomainGatewayCurrentV2 && expected.currentV2 != nil && expected.terminal != nil &&
 		expected.currentV2.Lineage.Kind == appaccess.GatewayRebindSourceGatewayRebind &&
 		expected.nativeV1 == nil && expected.nativeV2 == nil && expected.journal == nil && expected.upgrade == nil &&
-		expected.currentV1 == nil {
+		expected.currentV1 == nil && expected.retainedV1 == nil {
 		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionUnsupported
+	}
+	if expected.kind == generatedDomainGatewayCurrentV1 {
+		if expected.currentV1 == nil || expected.terminal == nil || expected.currentV2 != nil ||
+			expected.nativeV1 != nil || expected.nativeV2 != nil || expected.journal != nil || expected.upgrade != nil ||
+			expected.retainedV1 == nil || expected.currentV1.Lineage.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
+			expected.currentV1.Digest != expected.stateDigest ||
+			!gatewayRebindAttemptTerminalMatchesLineage(*expected.terminal, expected.currentV1.Lineage) ||
+			!generatedDomainRetainedV1ProjectionValid(expected.retainedV1) {
+			return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
+		}
+		projection := cloneGeneratedDomainRetainedV1Projection(*expected.retainedV1)
+		current := cloneGatewayCurrentRouteState(*expected.currentV1)
+		return generatedDomainColdRetainedGatewayAuthority{kind: expected.kind, stateDigest: expected.stateDigest,
+				generation: projection.upgradeLineage.ProtectedGeneration, operationID: projection.state.OperationID,
+				source: projection.source, state: projection.state, journal: projection.journal, currentV1: &current},
+			generatedDomainColdRetainedGatewaySelectionSupported
+	}
+	if expected.retainedV1 != nil {
+		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
 	}
 	if expected.nativeV1 == nil || expected.nativeV2 == nil || expected.journal == nil || expected.upgrade == nil {
 		return generatedDomainColdRetainedGatewayAuthority{}, generatedDomainColdRetainedGatewaySelectionInconsistent
@@ -430,6 +451,10 @@ func cloneGeneratedDomainColdRetainedGatewayProof(value generatedDomainColdRetai
 		authority := *value.authority
 		authority.source = cloneRouteState(value.authority.source)
 		authority.state = cloneGatewayV2RouteState(value.authority.state)
+		if value.authority.currentV1 != nil {
+			current := cloneGatewayCurrentRouteState(*value.authority.currentV1)
+			authority.currentV1 = &current
+		}
 		if value.authority.currentV2 != nil {
 			current := cloneGatewayCurrentRouteStateV2(*value.authority.currentV2)
 			authority.currentV2 = &current
@@ -583,6 +608,7 @@ func generatedDomainColdRetainedGatewayDigest(proof generatedDomainColdRetainedG
 		Source      routeState
 		State       gatewayV2RouteState
 		Journal     gatewayMigrationJournal
+		CurrentV1   *gatewayCurrentRouteState
 		CurrentV2   *gatewayCurrentRouteStateV2
 	}
 	envelope := struct {
@@ -606,6 +632,7 @@ func generatedDomainColdRetainedGatewayDigest(proof generatedDomainColdRetainedG
 			StateDigest: proof.authority.stateDigest, Generation: proof.authority.generation,
 			OperationID: proof.authority.operationID, Source: proof.authority.source,
 			State: proof.authority.state, Journal: proof.authority.journal,
+			CurrentV1: proof.authority.currentV1,
 			CurrentV2: proof.authority.currentV2}
 	}
 	envelope.Objects = make([]digestObject, len(proof.objects))
