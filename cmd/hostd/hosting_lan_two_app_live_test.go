@@ -1547,7 +1547,7 @@ func lanTwoAppNamespaceProbe(t *testing.T, ctx context.Context, docker, address 
 		t.Fatal("create separate Docker client network")
 	}
 	networkID := string(bytes.TrimSpace(created))
-	t.Cleanup(func() {
+	cleanup := func() {
 		cleanup, stop := context.WithTimeout(context.Background(), time.Minute)
 		defer stop()
 		containers, err := controllerJourneyDocker(cleanup, docker, nil, "ps", "-aq", "--filter", "label=io.rig.operation-id="+clientOperationID)
@@ -1592,7 +1592,9 @@ func lanTwoAppNamespaceProbe(t *testing.T, ctx context.Context, docker, address 
 		if _, err := controllerJourneyDocker(cleanup, docker, nil, "network", "rm", networkID); err != nil {
 			t.Error("remove exact separate client network")
 		}
-	})
+	}
+	t.Cleanup(cleanup)
+	defer cleanup()
 	args := []string{"run", "--rm", "--network", networkName,
 		"--label", "io.rig.managed=lan-test-client", "--label", "io.rig.operation-id=" + clientOperationID,
 		"--entrypoint", "node",
