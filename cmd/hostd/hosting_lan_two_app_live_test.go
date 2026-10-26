@@ -753,6 +753,8 @@ func (child *liveColdRuntimeRestartProcess) stop() {
 
 func liveColdRuntimeRestartChildRequested(t *testing.T, requiredOptIn string) bool {
 	t.Helper()
+	startup := &liveColdRuntimeStartupState{stage: controllerChildStartupManifest}
+	defer startup.report(t)
 	manifestPath := os.Getenv(liveColdRuntimeManifestEnv)
 	if manifestPath == "" {
 		return false
@@ -769,27 +771,51 @@ func liveColdRuntimeRestartChildRequested(t *testing.T, requiredOptIn string) bo
 		os.Getenv("DOCKER_HOST") != "" || os.Getenv("DOCKER_CONTEXT") != "" {
 		t.Fatal("cold runtime child requires an exact local Linux fixture manifest")
 	}
-	liveColdRuntimeRunRestartChild(t, manifest)
+	liveColdRuntimeRunRestartChild(t, manifest, startup)
 	return true
 }
 
-func liveColdRuntimeRunRestartChild(t *testing.T, manifest liveColdRuntimeRestartManifest) {
+type liveColdRuntimeStartupState struct {
+	stage        controllerChildStartupStage
+	construction error
+	complete     bool
+	emitted      bool
+}
+
+func (state *liveColdRuntimeStartupState) advance(stage controllerChildStartupStage) {
+	state.stage = stage
+	state.construction = nil
+}
+
+func (state *liveColdRuntimeStartupState) report(t *testing.T) {
+	if state == nil || !t.Failed() || state.complete || state.emitted {
+		return
+	}
+	state.emitted = controllerChildStartupWriteDiagnostic(
+		controllerChildStartupControllerRestart, state.stage, state.construction)
+}
+
+func liveColdRuntimeRunRestartChild(t *testing.T, manifest liveColdRuntimeRestartManifest, startup *liveColdRuntimeStartupState) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
 	defer cancel()
+	startup.advance(controllerChildStartupDirectories)
 	directories, err := runtimedocker.PrepareControllerDirectories(manifest.DataRoot)
 	if err != nil {
 		t.Fatal("prepare cold restarted controller directories")
 	}
+	startup.advance(controllerChildStartupOwnerLease)
 	ownerLease, err := controllerowner.Acquire(ctx, directories.WorkingDirectory)
 	if err != nil {
 		t.Fatal("acquire cold restarted controller owner")
 	}
 	defer func() { _ = ownerLease.Close() }()
+	startup.advance(controllerChildStartupSealedDatabase)
 	db, err := database.OpenForGeneratedDomain(ctx, manifest.DataRoot, ownerLease)
 	if err != nil {
 		t.Fatal("open sealed cold restarted controller database")
 	}
 	defer db.Close()
+	startup.advance(controllerChildStartupSourceMaterializer)
 	provider := controllerJourneyNewGitHubProvider(t, manifest.Source)
 	if manifest.Mode == liveColdRuntimeMigration {
 		provider.AddRevision(t, migrationJourneyV2SHA, manifest.SourceV2)
@@ -798,17 +824,32 @@ func liveColdRuntimeRunRestartChild(t *testing.T, manifest liveColdRuntimeRestar
 	sources := sourceconnections.NewService(sourceconnections.NewRepository(db), provider,
 		sourceconnections.NewFileCredentialStore(manifest.DataRoot), "fixture-app", time.Now)
 	snapshots, err := releasesnapshot.New(db, sources, manifest.DataRoot)
-	if err != nil || snapshots.Recover() != nil {
+	if err != nil {
+		t.Fatal("open cold restarted source materializer")
+	}
+	startup.advance(controllerChildStartupSourceRecovery)
+	if snapshots.Recover() != nil {
 		t.Fatal("recover cold restarted source materializer")
 	}
+	startup.advance(controllerChildStartupConfiguration)
 	configuration, err := appconfig.New(db, manifest.DataRoot)
-	if err != nil || configuration.Recover(ctx) != nil {
+	if err != nil {
+		t.Fatal("open cold restarted scoped configuration")
+	}
+	startup.advance(controllerChildStartupConfigurationRecovery)
+	if configuration.Recover(ctx) != nil {
 		t.Fatal("recover cold restarted scoped configuration")
 	}
+	startup.advance(controllerChildStartupDeploymentPlans)
 	plans, err := deploymentplans.New(db, manifest.DataRoot)
-	if err != nil || plans.Recover(ctx) != nil {
+	if err != nil {
+		t.Fatal("open cold restarted deployment plans")
+	}
+	startup.advance(controllerChildStartupPlanRecovery)
+	if plans.Recover(ctx) != nil {
 		t.Fatal("recover cold restarted deployment plans")
 	}
+	startup.advance(controllerChildStartupDeploymentJobs)
 	jobStore, bindings, err := newDeploymentJobService(db)
 	if err != nil {
 		t.Fatal("open cold restarted deployment jobs")
@@ -833,15 +874,19 @@ func liveColdRuntimeRunRestartChild(t *testing.T, manifest liveColdRuntimeRestar
 			return recoveryMigration
 		}
 	}
+	startup.advance(controllerChildStartupGeneratedDomain)
 	generated, err := prepareCompleteGeneratedRuntimeDomainForTest(t, ctx, settings, dependencies, options)
 	if err != nil {
+		startup.construction = err
 		t.Fatal("construct cold restarted generated domain:", err)
 	}
 	dependencies.generated = generated
+	startup.advance(controllerChildStartupRuntimeComposition)
 	composition, err := prepareRuntimeComposition(ctx, settings, dependencies, options)
 	if err != nil {
 		t.Fatal("compose cold restarted generated runtime:", err)
 	}
+	startup.advance(controllerChildStartupWorkerRecovery)
 	workerContext, stopWorker := context.WithCancel(ctx)
 	workerFailure := false
 	done, err := prepareRuntimeWorker(workerContext, runtimeRecovery{recoverState: jobStore.RecoverRuntimeContext}, composition.executor,
@@ -873,6 +918,7 @@ func liveColdRuntimeRunRestartChild(t *testing.T, manifest liveColdRuntimeRestar
 			t.Error("cold restarted durable worker failed")
 		}
 	}()
+	startup.advance(controllerChildStartupAPIListener)
 	access := appaccess.New(db)
 	server := controllerJourneyRestartControllerServer(t, (&controller.Server{
 		Auth: auth.New(db), Apps: dependencies.applications, Jobs: jobStore, Machines: machines.New(db), Sources: sources,
@@ -893,7 +939,9 @@ func liveColdRuntimeRunRestartChild(t *testing.T, manifest liveColdRuntimeRestar
 			t.Fatal("publish cold restart response")
 		}
 	}
+	startup.advance(controllerChildStartupReadyProtocol)
 	respond(0)
+	startup.complete = true
 	tick := time.NewTicker(25 * time.Millisecond)
 	defer tick.Stop()
 	for {

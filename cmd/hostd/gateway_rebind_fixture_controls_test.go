@@ -24,6 +24,21 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		case "process_kill":
 			controllerChildStartupFailWithConstruction(t, controllerChildStartupProcessKill,
 				controllerChildStartupRuntimeComposition, construction, "controlled child failure /private/path "+secret)
+		case "cold_deferred_ordinary":
+			startup := &liveColdRuntimeStartupState{stage: controllerChildStartupSourceMaterializer}
+			defer startup.report(t)
+			func() { t.Fatal("controlled nested failure /private/path " + secret) }()
+		case "cold_deferred_construction":
+			startup := &liveColdRuntimeStartupState{
+				stage:        controllerChildStartupGeneratedDomain,
+				construction: construction,
+			}
+			defer startup.report(t)
+			func() { t.Fatal("controlled nested construction failure /private/path " + secret) }()
+		case "cold_deferred_complete":
+			startup := &liveColdRuntimeStartupState{stage: controllerChildStartupReadyProtocol, complete: true}
+			defer startup.report(t)
+			func() { t.Fatal("controlled post-startup failure /private/path " + secret) }()
 		default:
 			t.Fatal("unknown child diagnostic control")
 		}
@@ -519,6 +534,52 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 				}
 				if strings.Contains(got, secret) || strings.Contains(got, "/private/path") {
 					t.Fatalf("actual child diagnostic exposed private output: %q", got)
+				}
+			})
+		}
+	})
+
+	t.Run("cold child defer exposes exactly one closed startup stage", func(t *testing.T) {
+		for _, test := range []struct {
+			mode      string
+			wantCode  string
+			failed    bool
+			wantCount int
+		}{
+			{mode: "cold_deferred_ordinary", wantCode: "controller_restart/source_materializer/failed", failed: true, wantCount: 1},
+			{mode: "cold_deferred_construction", wantCode: "controller_restart/generated_domain/failed construction=empty_final_locked/docker_static_response", failed: true, wantCount: 1},
+			{mode: "cold_deferred_complete", failed: true},
+		} {
+			t.Run(test.mode, func(t *testing.T) {
+				command := exec.Command(os.Args[0], "-test.run=^TestLiveHostdRebindClosedDiagnosticControls$", "-test.timeout=30s")
+				for _, value := range os.Environ() {
+					if !strings.HasPrefix(value, "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL=") {
+						command.Env = append(command.Env, value)
+					}
+				}
+				command.Env = append(command.Env, "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL="+test.mode)
+				child := controllerProcessKillCapture(command)
+				if command.Stdout != nil {
+					t.Fatal("cold child diagnostic control captured arbitrary stdout")
+				}
+				child.err = command.Run()
+				close(child.done)
+				if (child.err != nil) != test.failed {
+					t.Fatalf("cold child diagnostic failure=%t want %t", child.err != nil, test.failed)
+				}
+				stderr := child.stderr.String()
+				if len(stderr) > controllerChildStartupDiagnosticMaxBytes || strings.Contains(stderr, secret) || strings.Contains(stderr, "/private/path") {
+					t.Fatal("cold child stderr was over-wide or exposed private output")
+				}
+				count := 0
+				for _, line := range strings.Split(stderr, "\n") {
+					if _, _, _, _, ok := controllerChildStartupDiagnosticRecord([]byte(strings.TrimSpace(line))); ok {
+						count++
+					}
+				}
+				if count != test.wantCount || controllerChildStartupDiagnosticCode(stderr) != test.wantCode {
+					t.Fatalf("cold child closed records=%d code=%q want %d/%q", count,
+						controllerChildStartupDiagnosticCode(stderr), test.wantCount, test.wantCode)
 				}
 			})
 		}
