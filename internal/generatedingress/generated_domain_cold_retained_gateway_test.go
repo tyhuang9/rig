@@ -112,9 +112,6 @@ func TestGeneratedDomainColdAccountsForExactRetainedV1TripleWithCurrentV2Upgrade
 }
 
 func TestGeneratedDomainColdAcceptsCompleteRetainedV1UnderRebindOrigin(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	for _, test := range []struct {
 		name   string
 		mutate func(*generatedDomainProtectedStartupSnapshot)
@@ -133,6 +130,9 @@ func TestGeneratedDomainColdAcceptsCompleteRetainedV1UnderRebindOrigin(t *testin
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture := newGeneratedDomainRetainedV1RebindFixture(t)
 				expected, protected := generatedDomainRetainedV1RebindExpectation(t, fixture, test.mutate)
@@ -219,9 +219,6 @@ func TestGeneratedDomainColdAcceptsCompleteRetainedV1UnderRebindOrigin(t *testin
 }
 
 func TestGeneratedDomainColdRejectsCompleteRetainedV1UnderRebindOrigin(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	for _, test := range []struct {
 		name   string
 		mutate func(*generatedDomainProtectedStartupSnapshot)
@@ -250,6 +247,9 @@ func TestGeneratedDomainColdRejectsCompleteRetainedV1UnderRebindOrigin(t *testin
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture := newGeneratedDomainRetainedV1RebindFixture(t)
 				expected, _ := generatedDomainRetainedV1RebindExpectation(t, fixture, test.mutate)
@@ -1074,9 +1074,6 @@ func generatedDomainRetainedV1ColdAttestationFixture(t *testing.T) (generatedDom
 }
 
 func TestGeneratedDomainColdRetainedGatewaySelectionTripleAndReadAttribution(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	for _, test := range []struct {
 		name   string
 		reason generatedDomainConstructionReason
@@ -1160,15 +1157,15 @@ func TestGeneratedDomainColdRetainedGatewaySelectionTripleAndReadAttribution(t *
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, func(t *testing.T) { test.run(t) })
 		})
 	}
 }
 
 func TestGeneratedDomainColdRetainedGatewaySelectionAuthorityAndReaderAttribution(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	for _, test := range []struct {
 		name string
 		run  func(*testing.T)
@@ -1234,6 +1231,9 @@ func TestGeneratedDomainColdRetainedGatewaySelectionAuthorityAndReaderAttributio
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, test.run)
 		})
 	}
