@@ -79,7 +79,7 @@ func runLiveGeneratedImageCompilerMode(t *testing.T, manual bool, mode string) {
 
 	runner := runtimeprocess.ExecRunner{}
 	buildObservation := &liveGeneratedImageBuildObservation{delegate: runner, status: "not_attempted"}
-	dataRoot := t.TempDir()
+	dataRoot := generateddomaintest.NewRetainedRoot(t)
 	controllerDirectories, err := runtimedocker.PrepareControllerDirectories(dataRoot)
 	if err != nil {
 		t.Fatal("live generated runtime controller directory configuration failed")
