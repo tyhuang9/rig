@@ -290,7 +290,7 @@ jobs:
 
   postgres-race-gate:
     name: PostgreSQL and Linux race verification
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     needs: [postgres-race, repository-race, ingress-race]
     runs-on: ubuntu-24.04
     timeout-minutes: 2

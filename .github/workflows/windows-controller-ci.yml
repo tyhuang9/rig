@@ -163,7 +163,7 @@ jobs:
 
   windows-controller:
     name: Windows controller verification
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     needs: [windows-controller-core, windows-ingress]
     runs-on: windows-2025
     timeout-minutes: 2

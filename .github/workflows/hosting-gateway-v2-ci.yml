@@ -210,7 +210,7 @@ jobs:
   supported-hostd-rebind-crash-matrix-complete:
     name: Supported hostd rebind crash and recovery matrix
     needs: [supported-hostd-rebind-crash-matrix]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
