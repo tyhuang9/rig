@@ -386,6 +386,13 @@ func controllerChildStartupFailWithConstruction(t *testing.T, kind controllerChi
 	stage controllerChildStartupStage, construction error, message string,
 ) {
 	t.Helper()
+	controllerChildStartupWriteDiagnostic(kind, stage, construction)
+	t.Fatal(message)
+}
+
+func controllerChildStartupWriteDiagnostic(kind controllerChildStartupKind,
+	stage controllerChildStartupStage, construction error,
+) bool {
 	record := struct {
 		Message            string `json:"msg"`
 		Kind               string `json:"child_kind"`
@@ -405,9 +412,10 @@ func controllerChildStartupFailWithConstruction(t *testing.T, kind controllerChi
 	if controllerChildStartupKnownPair(record.Kind, record.Stage) {
 		if encoded, err := json.Marshal(record); err == nil {
 			_, _ = fmt.Fprintln(os.Stderr, string(encoded))
+			return true
 		}
 	}
-	t.Fatal(message)
+	return false
 }
 
 func controllerChildConstructionDiagnostic(err error) (string, string, bool) {

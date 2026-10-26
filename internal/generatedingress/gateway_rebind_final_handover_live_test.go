@@ -48,12 +48,18 @@ type liveFinalHandoverFixture struct {
 }
 
 func newLiveGatewayRebindSourceFixture(t *testing.T, permissionEnvironment string) liveGatewayRebindSourceFixture {
+	return newLiveGatewayRebindSourceFixtureWithRunner(t, permissionEnvironment, &runtimeprocess.ExecRunner{})
+}
+
+func newLiveGatewayRebindSourceFixtureWithRunner(t *testing.T, permissionEnvironment string,
+	runner runtimeprocess.CommandRunner,
+) liveGatewayRebindSourceFixture {
 	t.Helper()
 	before, after := liveGatewayRebindHostAddresses(t, permissionEnvironment)
 	spec := liveGatewayV2FixtureSpec{appID: "e1111111-1111-4111-8111-111111111111", planID: "e2222222-2222-4222-8222-222222222222",
 		operationID: "e3333333-3333-4333-8333-333333333333", profileRevision: "e4444444-4444-4444-8444-444444444444",
 		approvedBy: gatewayRebindTestAdministrator, imageTag: "rig-generated-gateway-v2-live:final-handover", applicationReply: "final-handover-lan", countRequests: true}
-	fixture := newLiveGatewayV2Fixture(t, spec)
+	fixture := newLiveGatewayV2FixtureWithRunner(t, spec, runner)
 	journeyContext, cancelJourney := context.WithTimeout(context.Background(), 30*time.Minute)
 	t.Cleanup(cancelJourney)
 	fixture.ctx = journeyContext
