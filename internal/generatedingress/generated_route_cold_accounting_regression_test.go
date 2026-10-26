@@ -174,6 +174,57 @@ func TestGeneratedDomainRestartAccountingCompletedCurrentSupportsDistinctReplace
 	})
 }
 
+func TestGeneratedDomainRestartAccountingInitialLegacyCurrentRestoresConfiguredDebt(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	generatedDomainConstructionCase(t, func(t *testing.T) {
+		fixture := newGeneratedRouteColdAccountingInitialCurrentFixture(t)
+		assertGeneratedRouteColdAccountingInitialLegacyCurrentSnapshot(t, fixture)
+		beforeProtection := generatedRouteColdAccountingProtection(t, fixture)
+		beforeCommands := fixture.construction.snapshot()
+		beforeStop := fixture.predecessor.count(candidateOwnerStop)
+		beforeRemove := fixture.predecessor.count(candidateOwnerRemove)
+
+		result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+			fixture.process, fixture.environment, fixture.identity.options)
+		if err != nil {
+			var diagnostic *generatedDomainConstructionDiagnostic
+			if result != nil || !errors.As(err, &diagnostic) || diagnostic == nil ||
+				diagnostic.stage != generatedDomainConstructionStageColdConstruction ||
+				diagnostic.reason != generatedDomainConstructionReasonColdOwnership {
+				t.Fatalf("initial legacy Current cold construction result=%#v diagnostic=%#v error=%v",
+					result, diagnostic, err)
+			}
+			assertGeneratedRouteColdAccountingInitialLegacyCurrentSnapshot(t, fixture)
+			assertGeneratedRouteColdAccountingProtectionUnchanged(t, beforeProtection, fixture)
+			if fixture.predecessor.count(candidateOwnerStop) != beforeStop ||
+				fixture.predecessor.count(candidateOwnerRemove) != beforeRemove {
+				t.Fatal("initial legacy Current cold refusal reached candidate effects")
+			}
+			if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+				generatedRouteColdAccountingCapacityProbeCount(beforeCommands) {
+				t.Fatal("initial legacy Current cold ownership refusal acquired a fresh capacity share")
+			}
+			t.Fatalf("initial legacy Current cold construction reached the expected ownership refusal: %v", err)
+		}
+		if result == nil || result.candidates == nil || result.routes == nil {
+			t.Fatalf("initial legacy Current cold construction result=%#v", result)
+		}
+		assertGeneratedRouteColdAccountingRestoredCurrent(t, result, fixture)
+		assertGeneratedRouteColdAccountingInitialLegacyCurrentSnapshot(t, fixture)
+		assertGeneratedRouteColdAccountingProtectionUnchanged(t, beforeProtection, fixture)
+		if fixture.predecessor.count(candidateOwnerStop) != beforeStop ||
+			fixture.predecessor.count(candidateOwnerRemove) != beforeRemove {
+			t.Fatal("initial legacy Current cold reconstruction replayed candidate effects")
+		}
+		if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+			generatedRouteColdAccountingCapacityProbeCount(beforeCommands) {
+			t.Fatal("initial legacy Current cold reconstruction acquired a fresh capacity share")
+		}
+	})
+}
+
 func TestGeneratedDomainRestartAccountingInterruptedDrainingRestoresConfiguredDebt(t *testing.T) {
 	if !generatedDomainRegistryIsolated(t) {
 		return
@@ -322,6 +373,51 @@ func assertGeneratedRouteColdAccountingDrainingSnapshot(t *testing.T,
 		componentState != string(generatedruntimestate.ComponentActive) {
 		t.Fatalf("interrupted Draining component state=%q error=%v", componentState, err)
 	}
+}
+
+func assertGeneratedRouteColdAccountingInitialLegacyCurrentSnapshot(t *testing.T,
+	fixture generatedRouteColdAccountingFixture,
+) {
+	t.Helper()
+	db := fixture.identity.database
+	count := func(query string, arguments ...any) int {
+		t.Helper()
+		var value int
+		if err := db.QueryRow(query, arguments...).Scan(&value); err != nil {
+			t.Fatalf("read initial legacy Current durable count: %v", err)
+		}
+		return value
+	}
+	receiptID := fixture.firstReceipt.ReceiptID
+	intents := count(`SELECT COUNT(*) FROM generated_candidate_intents WHERE id=?`, fixture.componentReceipt)
+	activations := count(`SELECT COUNT(*) FROM generated_route_activations WHERE id=?`, receiptID)
+	retirementComponents := count(`SELECT COUNT(*) FROM generated_route_predecessor_retirements
+		WHERE activation_receipt_id=?`, receiptID)
+	retirementReceipts := count(`SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	authorizations := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations
+		WHERE activation_receipt_id=?`, receiptID)
+	handoffs := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	completions := count(`SELECT COUNT(*) FROM generated_route_completion_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	state, err := generatedruntimestate.New(db).Get(context.Background(), fixture.migration.guarded.appID,
+		fixture.migration.request.DeploymentID)
+	if err != nil || state.Phase != generatedruntimestate.PhaseSucceeded || intents != 1 || activations != 1 ||
+		retirementComponents != 0 || retirementReceipts != 1 || authorizations != 1 || handoffs != 1 ||
+		completions != 1 {
+		t.Fatalf("initial legacy Current state phase=%s receipts=%d/%d/%d/%d/%d/%d/%d error=%v",
+			state.Phase, intents, activations, retirementComponents, retirementReceipts, authorizations, handoffs,
+			completions, err)
+	}
+	binding, err := fixture.migration.bindings.Read(context.Background(), fixture.migration.claim.JobID())
+	if err != nil || binding.JobID() != fixture.migration.claim.JobID() ||
+		binding.ApplicationID() != fixture.migration.guarded.appID ||
+		binding.Mode() != deploymentbinding.ModeLegacyUninitialized || binding.DesiredRevision() != 0 ||
+		binding.AuthorizingLifecycleJobID() != "" {
+		t.Fatalf("initial legacy Current binding=%#v error=%v", binding, err)
+	}
+	assertGeneratedRouteCompletionState(t, db, fixture.firstReceipt, 1)
 }
 
 func assertGeneratedRouteColdAccountingRestoredCurrent(t *testing.T, result *generatedDomainConstruction,
@@ -601,18 +697,35 @@ func candidateOwnerPhysicalMatches(physical candidateOwnerPhysical, kind candida
 	}
 }
 
+type generatedRouteColdAccountingCompletionStage uint8
+
+const (
+	generatedRouteColdAccountingInitialComplete generatedRouteColdAccountingCompletionStage = iota + 1
+	generatedRouteColdAccountingLifecycleComplete
+	generatedRouteColdAccountingLifecycleDraining
+)
+
 func newGeneratedRouteColdAccountingFixture(t *testing.T) generatedRouteColdAccountingFixture {
-	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, true)
+	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, generatedRouteColdAccountingLifecycleComplete)
 }
 
 func newGeneratedRouteColdAccountingDrainingFixture(t *testing.T) generatedRouteColdAccountingFixture {
-	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, false)
+	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, generatedRouteColdAccountingLifecycleDraining)
+}
+
+func newGeneratedRouteColdAccountingInitialCurrentFixture(t *testing.T) generatedRouteColdAccountingFixture {
+	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, generatedRouteColdAccountingInitialComplete)
 }
 
 func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
-	complete bool,
+	stage generatedRouteColdAccountingCompletionStage,
 ) generatedRouteColdAccountingFixture {
 	t.Helper()
+	if stage != generatedRouteColdAccountingInitialComplete &&
+		stage != generatedRouteColdAccountingLifecycleComplete &&
+		stage != generatedRouteColdAccountingLifecycleDraining {
+		t.Fatal("cold accounting fixture requires an exact completion stage")
+	}
 	identity := newGeneratedDomainIdentityFixture(t)
 	migration, jobService := newGeneratedRouteCanonicalMigrationOnDatabase(t, identity.database,
 		identity.dataRoot, identity.options.WorkingDirectory)
@@ -676,60 +789,66 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 	if err != nil || firstHead.DeploymentID != migration.request.DeploymentID {
 		t.Fatalf("read first completed Current head=%#v error=%v", firstHead, err)
 	}
-	establishGeneratedRoutePredecessorLifecycle(t, owner, firstHead)
+	currentReceipt := retirement.state.receipt
+	lifecycleDeploymentID := ""
+	effectsMigration := migration
+	if stage != generatedRouteColdAccountingInitialComplete {
+		establishGeneratedRoutePredecessorLifecycle(t, owner, firstHead)
 
-	secondMigration := newGeneratedRouteSuccessorMigration(t, migration, jobService)
-	owner.validation = newGeneratedRouteSuccessorValidation(t, secondMigration)
-	owner.runner.containerID = strings.Repeat("8", 64)
-	secondExecution, secondIdentity := prepareGeneratedRouteSequentialCandidate(t, owner)
-	currentRoute, err := manager.Observe(context.Background(), migration.guarded.appID)
-	if err != nil {
-		t.Fatalf("observe first completed Current route: %v", err)
-	}
-	secondRequest := generatedRouteRequest(migration.guarded.appID, secondIdentity)
-	secondRequest.FromSlot = currentRoute.Slot
-	secondSealed, err := routes.Pin(secondMigration.guarded.context, secondExecution, secondRequest)
-	if err != nil {
-		t.Fatalf("pin lifecycle-bound Current: %v", err)
-	}
-	physicalRoutes.network = secondIdentity.NetworkName
-	physicalRoutes.endpoint = generatedRouteEndpoint(secondIdentity)
-	physicalRoutes.slot = generatedidentity.Slot(secondIdentity.Slot)
-	physicalRoutes.endpoints[secondIdentity.ContainerID] = generatedRouteEndpointSnapshot{
-		appID: migration.guarded.appID, endpoint: generatedRouteEndpoint(secondIdentity),
-		slot: generatedidentity.Slot(secondIdentity.Slot),
-	}
-	_, secondRetirement, err := secondSealed.ActivateWithPredecessorRetirement(secondMigration.guarded.context)
-	if err != nil || secondRetirement == nil {
-		t.Fatalf("activate lifecycle-bound Current retirement=%#v error=%v", secondRetirement, err)
-	}
-	t.Cleanup(secondRetirement.Leave)
-	if complete {
-		if err := secondRetirement.Complete(context.Background()); err != nil {
-			t.Fatalf("complete lifecycle-bound Current: %v", err)
+		secondMigration := newGeneratedRouteSuccessorMigration(t, migration, jobService)
+		owner.validation = newGeneratedRouteSuccessorValidation(t, secondMigration)
+		owner.runner.containerID = strings.Repeat("8", 64)
+		secondExecution, secondIdentity := prepareGeneratedRouteSequentialCandidate(t, owner)
+		currentRoute, err := manager.Observe(context.Background(), migration.guarded.appID)
+		if err != nil {
+			t.Fatalf("observe first completed Current route: %v", err)
 		}
-	} else {
-		if retired, err := secondRetirement.Retire(context.Background()); err != nil ||
-			retired.ActivationReceiptID != secondRetirement.state.receipt.ReceiptID ||
-			retired.SuccessorDeploymentID != secondMigration.request.DeploymentID {
-			t.Fatalf("retire interrupted Draining predecessor=%#v error=%v", retired, err)
+		secondRequest := generatedRouteRequest(migration.guarded.appID, secondIdentity)
+		secondRequest.FromSlot = currentRoute.Slot
+		secondSealed, err := routes.Pin(secondMigration.guarded.context, secondExecution, secondRequest)
+		if err != nil {
+			t.Fatalf("pin lifecycle-bound Current: %v", err)
 		}
-		handoff, err := secondRetirement.completeAccountingHandoff(context.Background())
-		if err != nil || handoff.ActivationReceiptID != secondRetirement.state.receipt.ReceiptID ||
-			handoff.SuccessorDeploymentID != secondMigration.request.DeploymentID {
-			t.Fatalf("complete interrupted Draining accounting handoff=%#v error=%v", handoff, err)
+		physicalRoutes.network = secondIdentity.NetworkName
+		physicalRoutes.endpoint = generatedRouteEndpoint(secondIdentity)
+		physicalRoutes.slot = generatedidentity.Slot(secondIdentity.Slot)
+		physicalRoutes.endpoints[secondIdentity.ContainerID] = generatedRouteEndpointSnapshot{
+			appID: migration.guarded.appID, endpoint: generatedRouteEndpoint(secondIdentity),
+			slot: generatedidentity.Slot(secondIdentity.Slot),
 		}
+		_, secondRetirement, err := secondSealed.ActivateWithPredecessorRetirement(secondMigration.guarded.context)
+		if err != nil || secondRetirement == nil {
+			t.Fatalf("activate lifecycle-bound Current retirement=%#v error=%v", secondRetirement, err)
+		}
+		t.Cleanup(secondRetirement.Leave)
+		if stage == generatedRouteColdAccountingLifecycleComplete {
+			if err := secondRetirement.Complete(context.Background()); err != nil {
+				t.Fatalf("complete lifecycle-bound Current: %v", err)
+			}
+		} else {
+			if retired, err := secondRetirement.Retire(context.Background()); err != nil ||
+				retired.ActivationReceiptID != secondRetirement.state.receipt.ReceiptID ||
+				retired.SuccessorDeploymentID != secondMigration.request.DeploymentID {
+				t.Fatalf("retire interrupted Draining predecessor=%#v error=%v", retired, err)
+			}
+			handoff, err := secondRetirement.completeAccountingHandoff(context.Background())
+			if err != nil || handoff.ActivationReceiptID != secondRetirement.state.receipt.ReceiptID ||
+				handoff.SuccessorDeploymentID != secondMigration.request.DeploymentID {
+				t.Fatalf("complete interrupted Draining accounting handoff=%#v error=%v", handoff, err)
+			}
+		}
+		currentReceipt = secondRetirement.state.receipt
+		secondRetirement.Leave()
+		secondExecution.Leave()
+		lifecycleDeploymentID = firstHead.DeploymentID
+		migration = secondMigration
+		candidateIdentity = secondIdentity
 	}
-	firstReceipt := secondRetirement.state.receipt
-	secondRetirement.Leave()
 	retirement.Leave()
-	secondExecution.Leave()
 	execution.Leave()
-	if err := migration.releaseEffects(); err != nil {
+	if err := effectsMigration.releaseEffects(); err != nil {
 		t.Fatalf("release completed Current fixture effects before restart: %v", err)
 	}
-	migration = secondMigration
-	candidateIdentity = secondIdentity
 
 	stateValue, err := store.load()
 	if err != nil {
@@ -759,13 +878,13 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 				mountpoint: observation.V1VolumeIdentity.Mountpoint, createdAt: observation.V1VolumeIdentity.CreatedAt}
 		}
 	}
-	physicalCandidate, found := candidateRunner.physical[secondIdentity.ContainerID]
+	physicalCandidate, found := candidateRunner.physical[candidateIdentity.ContainerID]
 	physicalReceipt := physicalCandidate.receiptID
 	if physicalReceipt == "" {
 		physicalReceipt = physicalCandidate.policy.identity.ReceiptID
 	}
-	if !found || physicalCandidate.containerID != secondIdentity.ContainerID ||
-		physicalReceipt != secondIdentity.ReceiptID || !physicalCandidate.exists || !physicalCandidate.running ||
+	if !found || physicalCandidate.containerID != candidateIdentity.ContainerID ||
+		physicalReceipt != candidateIdentity.ReceiptID || !physicalCandidate.exists || !physicalCandidate.running ||
 		physicalCandidate.health != "healthy" || physicalCandidate.policy.identity.Component == "" {
 		t.Fatal("completed Current is absent from the authentic sequential candidate runner")
 	}
@@ -776,8 +895,8 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 	if !reflect.DeepEqual(comparison, healthyCandidate) {
 		t.Fatal("health-only Current degradation changed authenticated physical identity")
 	}
-	candidateRunner.physical[secondIdentity.ContainerID] = physicalCandidate
-	if !reflect.DeepEqual(candidateRunner.physical[secondIdentity.ContainerID], physicalCandidate) {
+	candidateRunner.physical[candidateIdentity.ContainerID] = physicalCandidate
+	if !reflect.DeepEqual(candidateRunner.physical[candidateIdentity.ContainerID], physicalCandidate) {
 		t.Fatal("authentic sequential runner did not retain the health-only Current observation")
 	}
 	objects = append(objects, generatedDomainA0ApplicationObjects(t, []candidateOwnerPhysical{physicalCandidate})...)
@@ -786,7 +905,7 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 	identity.options.HostPort = journal.Source.LocalHostPort
 	cold := &generatedDomainConstructionRunner{roster: candidateRunner, delegate: &generatedDomainRecoveryCensusRunner{
 		daemonID: "generated-domain-cold-accounting", objects: objects, imageID: observation.Image.ID, gateway: gateway}}
-	if !complete {
+	if stage == generatedRouteColdAccountingLifecycleDraining {
 		if identity.options.MemoryBytes <= 1 || identity.options.ReplacementDiskBytes == 0 {
 			t.Fatal("interrupted Draining fixture has invalid capacity limits")
 		}
@@ -799,9 +918,9 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 
 	return generatedRouteColdAccountingFixture{identity: identity, migration: migration, jobs: jobService,
 		process: process, routes: physicalRoutes, predecessor: owner.runner, construction: cold,
-		environment: &candidateFactoryEnvironment{path: t.TempDir()}, firstReceipt: firstReceipt,
+		environment: &candidateFactoryEnvironment{path: t.TempDir()}, firstReceipt: currentReceipt,
 		componentName: physicalCandidate.policy.identity.Component, componentReceipt: candidateIdentity.ReceiptID,
-		lifecycleDeploymentID: firstHead.DeploymentID}
+		lifecycleDeploymentID: lifecycleDeploymentID}
 }
 
 func newGeneratedRouteColdAccountingSequentialOwner(t *testing.T, validation *candidateValidationFixture,

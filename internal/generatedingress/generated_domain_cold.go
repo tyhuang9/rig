@@ -1630,6 +1630,12 @@ func generatedDomainColdCurrentDebtEvidence(database deployments.GeneratedDomain
 	if bindingCount != 1 || binding.AppID != group.pins.applicationID() {
 		return false, errGeneratedDomainConstructionRefused
 	}
+	if binding.Mode == deploymentbinding.ModeLegacyUninitialized {
+		if binding.DesiredRevision != 0 || binding.AuthorizingOperationID != "" {
+			return false, errGeneratedDomainConstructionRefused
+		}
+		return true, nil
+	}
 	if binding.Mode != deploymentbinding.ModeRunning || binding.DesiredRevision < 1 ||
 		binding.AuthorizingOperationID == "" {
 		return false, errGeneratedDomainConstructionRefused
