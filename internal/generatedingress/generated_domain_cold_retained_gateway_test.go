@@ -1247,6 +1247,101 @@ func generatedDomainRetainedV1CanonicalizeDockerIDs(observation *gatewayV2Docker
 	}
 }
 
+func TestGeneratedDomainNativeV1DescriptorMatchesProducerLabels(t *testing.T) {
+	for index, args := range [][]string{
+		{"--label"},
+		{"--label", "=v1"},
+		{"--label", "io.rig.managed"},
+		{"--label", "io.rig.managed=generated-ingress", "--label", "io.rig.managed=generated-ingress"},
+		{"--label=io.rig.managed=generated-ingress"},
+	} {
+		if _, err := generatedDomainNativeV1LabelsFromCreateArgs(args); err == nil {
+			t.Fatalf("malformed producer label arguments %d were accepted: %#v", index, args)
+		}
+	}
+
+	descriptors := generatedDomainNativeV1DockerDescriptors()
+	if len(descriptors) != 3 || descriptors[0].kind != "container" {
+		t.Fatalf("native V1 descriptors = %#v", descriptors)
+	}
+	producer := generatedDomainNativeV1ProducerContainerLabels(t)
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]string)
+		want   bool
+	}{
+		{name: "exact_producer", want: true},
+		{name: "crossed_v2", mutate: func(labels map[string]string) {
+			labels["io.rig.listener-isolation"] = "v2"
+		}},
+		{name: "missing_listener", mutate: func(labels map[string]string) {
+			delete(labels, "io.rig.listener-isolation")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			labels := cloneStringMap(producer)
+			if test.mutate != nil {
+				test.mutate(labels)
+			}
+			object := generatedDomainDockerObject{kind: "container", id: strings.Repeat("a", 64),
+				name: caddyContainerName, labels: labels}
+			if got := generatedDomainRecoveryDockerObjectMatches(object, descriptors[0]); got != test.want {
+				t.Fatalf("producer-shaped native V1 labels matched=%t, want %t: %#v", got, test.want, labels)
+			}
+		})
+	}
+}
+
+func generatedDomainNativeV1ProducerContainerLabels(t *testing.T) map[string]string {
+	t.Helper()
+	args, err := caddyCreateArgs(strings.Repeat("b", 64), "10.241.0.2", 8443)
+	if err != nil {
+		t.Fatalf("create native V1 producer arguments: %v", err)
+	}
+	labels, err := generatedDomainNativeV1LabelsFromCreateArgs(args)
+	if err != nil {
+		t.Fatalf("parse native V1 producer labels: %v", err)
+	}
+	want := map[string]string{
+		"io.rig.managed":            "generated-ingress",
+		"io.rig.identity-version":   "v1",
+		"io.rig.listener-isolation": "v1",
+	}
+	if !reflect.DeepEqual(labels, want) {
+		t.Fatalf("native V1 producer labels = %#v, want %#v", labels, want)
+	}
+	return cloneStringMap(labels)
+}
+
+func generatedDomainNativeV1LabelsFromCreateArgs(args []string) (map[string]string, error) {
+	labels := make(map[string]string)
+	for index := 0; index < len(args); index++ {
+		argument := args[index]
+		if argument != "--label" {
+			if strings.HasPrefix(argument, "--label") {
+				return nil, errors.New("native V1 producer label argument is not paired")
+			}
+			continue
+		}
+		if index+1 >= len(args) {
+			return nil, errors.New("native V1 producer label value is missing")
+		}
+		index++
+		key, value, ok := strings.Cut(args[index], "=")
+		if !ok || key == "" {
+			return nil, errors.New("native V1 producer label is malformed")
+		}
+		if _, exists := labels[key]; exists {
+			return nil, errors.New("native V1 producer label is duplicated")
+		}
+		labels[key] = value
+	}
+	if len(labels) == 0 {
+		return nil, errors.New("native V1 producer labels are absent")
+	}
+	return labels, nil
+}
+
 func generatedDomainRetainedV1CensusObjects(t *testing.T,
 	observation gatewayV2DockerObservation,
 ) []generatedDomainDockerObject {
@@ -1260,6 +1355,7 @@ func generatedDomainRetainedV1CensusObjects(t *testing.T,
 		switch descriptor.kind {
 		case "container":
 			descriptor.id = observation.V1Container.ID
+			descriptor.labels = generatedDomainNativeV1ProducerContainerLabels(t)
 		case "network":
 			descriptor.id = observation.V1NetworkID
 		case "volume":
