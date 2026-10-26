@@ -1432,7 +1432,12 @@ func controllerJourneyStartRestartChild(t *testing.T, ctx context.Context, manif
 		child.err = command.Wait()
 		close(child.done)
 	}()
-	t.Cleanup(func() { controllerProcessKillCleanupChild(child) })
+	t.Cleanup(func() {
+		controllerProcessKillCleanupChild(child)
+		if t.Failed() {
+			controllerProcessKillReportClosedDiagnostic(t, child)
+		}
+	})
 	result := &controllerJourneyRestartProcess{t: t, ctx: ctx, child: child, directory: manifest.ControlDirectory}
 	ready := result.wait(0, 7*time.Minute)
 	if ready.PID != child.command.Process.Pid || ready.PID == os.Getpid() {
