@@ -650,6 +650,11 @@ func liveGatewayRebindRuntimeReplayReadExec(args []string) bool {
 	if reflect.DeepEqual(args, config) {
 		return true
 	}
+	legacyConfig := []string{"container", "exec", args[2], "curl", "--silent", "--show-error", "--fail",
+		"--max-time", "10", "http://127.0.0.1:2019/config/"}
+	if reflect.DeepEqual(args, legacyConfig) {
+		return true
+	}
 	challengePrefix := []string{"container", "exec", args[2], "curl", "--disable", "--silent", "--show-error", "--output", "-",
 		"--write-out", "\n%{http_code}", "--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1",
 		"--max-time", "2", "--header"}
@@ -698,6 +703,7 @@ func TestGatewayRebindRuntimeReplayCommandAudit(t *testing.T) {
 		{name: "volume inspect", args: []string{"volume", "inspect", "volume"}, read: true},
 		{name: "config copy out", args: []string{"container", "cp", container + ":/config/active.json", "-"}, read: true},
 		{name: "admin config get", args: []string{"container", "exec", container, "curl", "--disable", "--silent", "--show-error", "--fail", "--proto", "=http", "--noproxy", "*", "--max-time", "10", "http://127.0.0.1:2019/config/"}, read: true},
+		{name: "legacy admin config get", args: []string{"container", "exec", container, "curl", "--silent", "--show-error", "--fail", "--max-time", "10", "http://127.0.0.1:2019/config/"}, read: true},
 		{name: "challenge get", args: []string{"container", "exec", container, "curl", "--disable", "--silent", "--show-error", "--output", "-", "--write-out", "\n%{http_code}", "--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2", "--header", "Host: 192.0.2.2", "http://172.18.0.2:8080" + gatewayV2ChallengePathPrefix + strings.Repeat("a", 64)}, read: true},
 		{name: "status get", args: []string{"container", "exec", container, "curl", "--disable", "--silent", "--output", "/dev/null", "--write-out", "%{http_code}", "--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2", "--header", "Host: app.rig.localhost", "http://172.18.0.2:8080/"}, read: true},
 		{name: "endpoint head", args: []string{"container", "exec", container, "curl", "--disable", "--silent", "--head", "--output", "/dev/null", "--write-out", "%{http_code}", "--http1.1", "--proto", "=http", "--noproxy", "*", "--connect-timeout", "1", "--max-time", "2", "http://app.network:3000/"}, read: true},
@@ -709,6 +715,7 @@ func TestGatewayRebindRuntimeReplayCommandAudit(t *testing.T) {
 		{name: "copy in container", args: []string{"container", "exec", "--user", "0:0", container, "cp", "/config/a", "/config/b"}},
 		{name: "move in container", args: []string{"container", "exec", "--user", "0:0", container, "mv", "/config/a", "/config/b"}},
 		{name: "unknown extra exec tokens", args: []string{"container", "exec", container, "curl", "--disable", "--silent", "--show-error", "--fail", "--proto", "=http", "--noproxy", "*", "--max-time", "10", "http://127.0.0.1:2019/config/", "unexpected"}},
+		{name: "legacy admin config get extra tokens", args: []string{"container", "exec", container, "curl", "--silent", "--show-error", "--fail", "--max-time", "10", "http://127.0.0.1:2019/config/", "unexpected"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if got := liveGatewayRebindRuntimeReplayRead(test.args); got != test.read {

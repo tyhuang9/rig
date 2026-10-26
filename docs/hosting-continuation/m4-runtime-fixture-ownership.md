@@ -204,6 +204,56 @@ do not newly execute completed-domain ownership refusal. The earlier
 52-pass and 45-pass results belong to their respective published source
 versions and are not added to this follow-up's 26-pass count.
 
+## Hosted Gateway V2 outcome and command audit
+
+On published `2c94e8193ef584b4ead40f1bac12c5c3359f3ce8`,
+[the hosted Gateway V2 job](https://github.com/tyhuang9/rig/actions/runs/40309622919/job/121527253873)
+executed the genuine commit/restart parent successfully in 58.50 seconds.
+The passive Docker and public predecessor parents also passed in 47.89
+and 56.79 seconds. The bind-conflict rollback parent failed after 36.22
+seconds at the child's fixed `history` stage. The job and complete
+rollback journey remain unaccepted.
+
+The exact captured checkout was
+`66fcb69f7baaf2ade7ddc8e4356bd75e72718cb1`; raw log SHA-256:
+`fc77a0e8f550dac2522e791a92b8013757d40fbcb488cd9b02fa636b9d64cd92`.
+
+Source inspection identifies a false positive in the test's command
+audit. Rollback observes the original legacy gateway, whose config read
+uses this exact argument sequence:
+
+```text
+container exec <container-id> curl --silent --show-error --fail --max-time 10 http://127.0.0.1:2019/config/
+```
+
+The audit currently recognizes the newer config-read sequence but marks
+this older sequence as an effect. That alone fails the combined history
+and zero-effect assertion after otherwise successful replay. The fixed
+stage does not reveal whether another predicate in that assertion also
+fails.
+
+The follow-up recognizes only this exact additional read form and adds
+its positive case and an extra-token refusal to the existing audit
+table. Full history, SQL, effect, physical-resource and cleanup checks
+remain required. Production command construction and the child protocol
+stay unchanged.
+
+On 2026-10-26, fresh pinned Windows Go 1.26.7 compilation and exact
+discovery of `TestGatewayRebindRuntimeReplayCommandAudit` passed. The
+anchored selection used `-test.count=1 -test.v -test.timeout=2m` and
+produced 19 unique passes: one parent and 18 rows, with no failures or
+skips. Gofmt, scoped vet, canonical generation, diff and source-stability
+checks passed. Source/security review found no blocking issue.
+
+Source manifest SHA-256:
+`88c50dd919cfcd045428e6ba67997e9bb0f32d0ac5dd94279ae66c429db20a15`;
+binary SHA-256:
+`241f92f730c51e6bb5ee88929220fc069e321257d8f477887c743c3fbc0d0314`.
+The local audit proves the exact classification and table refusals.
+Hosted rollback must execute again with all its assertions before
+acceptance. Earlier test counts describe earlier source versions and
+are not added to this follow-up's 19-pass count.
+
 ## Rollback
 
 Revert this fixture change through the PR workflow to restore the prior
