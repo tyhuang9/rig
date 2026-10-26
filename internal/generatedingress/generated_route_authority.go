@@ -18,11 +18,12 @@ import (
 // GeneratedRouteAuthority owns route pinning and atomic activation for the
 // exact Manager and candidate owner published by one GeneratedDomain.
 type GeneratedRouteAuthority struct {
-	self       *GeneratedRouteAuthority
-	manager    *Manager
-	candidates *GeneratedCandidateAuthority
-	stores     *deployments.GeneratedOwnerStores
-	runtime    *generatedruntimestate.Repository
+	self         *GeneratedRouteAuthority
+	manager      *Manager
+	candidates   *GeneratedCandidateAuthority
+	stores       *deployments.GeneratedOwnerStores
+	runtime      *generatedruntimestate.Repository
+	construction *generatedDomainConstruction
 }
 
 func newGeneratedRouteAuthority(manager *Manager, candidates *GeneratedCandidateAuthority,
@@ -41,7 +42,7 @@ func newGeneratedRouteAuthority(manager *Manager, candidates *GeneratedCandidate
 func (a *GeneratedRouteAuthority) configuredFor(construction *generatedDomainConstruction) bool {
 	return a.configured() && construction != nil && a.manager == construction.manager &&
 		a.candidates == construction.candidates && a.stores == construction.candidates.stores &&
-		a == construction.routes
+		a == construction.routes && a.construction == construction
 }
 
 func (a *GeneratedRouteAuthority) configured() bool {
@@ -49,7 +50,11 @@ func (a *GeneratedRouteAuthority) configured() bool {
 		a.stores.Configured() && a.candidates.stores == a.stores &&
 		a.candidates.ledger != nil && a.candidates.heads != nil &&
 		a.runtime != nil && a.runtime.UsesDatabase(a.stores.Database()) &&
-		a.manager.domainView != nil && a.manager.domainView.manager == a.manager
+		a.manager.domainView != nil && a.manager.domainView.manager == a.manager &&
+		(a.construction == nil || (a.construction.routes == a &&
+			a.construction.manager == a.manager && a.construction.candidates == a.candidates &&
+			a.construction.reservation != nil && a.construction.domain != nil &&
+			a.construction.domain.construction == a.construction))
 }
 
 // GeneratedRouteExecution is a one-shot sealed route and activation

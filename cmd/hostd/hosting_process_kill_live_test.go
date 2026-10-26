@@ -58,6 +58,7 @@ const (
 	controllerKillBeforeStart  controllerProcessKillBoundary = "before_candidate_start"
 	controllerKillAfterRoute   controllerProcessKillBoundary = "after_route_commit"
 	controllerKillBeforeDrain  controllerProcessKillBoundary = "before_drain_stop"
+	controllerKillAfterHandoff controllerProcessKillBoundary = "after_predecessor_handoff_before_completion"
 	controllerKillAfterSuccess controllerProcessKillBoundary = "after_runtime_success"
 	controllerKillAfterMain    controllerProcessKillBoundary = "after_main_success"
 )
@@ -274,6 +275,29 @@ func (e controllerProcessKillExecutor) Execute(ctx context.Context, job jobs.Job
 	if e.delegate == nil {
 		return jobs.ExecutionResult{}, errors.New("process-kill executor delegate is required")
 	}
+	if e.barrier != nil && e.barrier.boundary == controllerKillAfterHandoff {
+		if _, err := e.barrier.db.ExecContext(ctx, `CREATE TRIGGER controller_process_kill_completion_fault
+			BEFORE INSERT ON generated_route_completion_receipts
+			BEGIN SELECT RAISE(ABORT, 'fixed process-kill completion fault'); END`); err != nil {
+			return jobs.ExecutionResult{}, err
+		}
+		result, err := e.delegate.Execute(ctx, job,
+			controllerProcessKillReporter{delegate: reporter, barrier: e.barrier})
+		if _, dropErr := e.barrier.db.ExecContext(ctx,
+			`DROP TRIGGER controller_process_kill_completion_fault`); dropErr != nil {
+			return jobs.ExecutionResult{}, dropErr
+		}
+		if err != nil || result.Disposition != jobs.ExecutionWaitingUser ||
+			result.PauseDisposition != jobs.PauseRouteReconciliationRequired ||
+			!e.barrier.completedHandoffWithoutCompletion(ctx) {
+			return jobs.ExecutionResult{}, errors.New("process-kill completion fault missed the exact durable handoff")
+		}
+		if waitErr := e.barrier.wait(ctx, generatedruntimestate.PhaseDraining,
+			func(generatedruntimestate.Deployment) bool { return true }); waitErr != nil {
+			return jobs.ExecutionResult{}, waitErr
+		}
+		return result, nil
+	}
 	result, err := e.delegate.Execute(ctx, job, controllerProcessKillReporter{delegate: reporter, barrier: e.barrier})
 	if err == nil && e.barrier != nil && e.barrier.boundary == controllerKillAfterMain && result.Disposition == jobs.ExecutionCompleted {
 		var status string
@@ -286,6 +310,39 @@ func (e controllerProcessKillExecutor) Execute(ctx context.Context, job jobs.Job
 		}
 	}
 	return result, err
+}
+
+func (b *controllerProcessKillBarrier) completedHandoffWithoutCompletion(ctx context.Context) bool {
+	if b == nil || b.db == nil || b.appID == "" || b.jobID == "" {
+		return false
+	}
+	deploymentID := b.resolveDeploymentID(ctx)
+	if deploymentID == "" {
+		return false
+	}
+	var activationID string
+	var activations, retirements, authorizations, handoffs, completions int
+	err := b.db.QueryRowContext(ctx, `SELECT a.id,
+		(SELECT COUNT(*) FROM generated_route_activations value
+		 WHERE value.app_id=a.app_id AND value.successor_deployment_id=a.successor_deployment_id),
+		(SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts value
+		 WHERE value.activation_receipt_id=a.id),
+		(SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations value
+		 WHERE value.activation_receipt_id=a.id),
+		(SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts value
+		 WHERE value.activation_receipt_id=a.id),
+		(SELECT COUNT(*) FROM generated_route_completion_receipts value
+		 WHERE value.activation_receipt_id=a.id)
+		FROM generated_route_activations a
+		WHERE a.app_id=? AND a.successor_deployment_id=? AND a.creator_job_id=?`,
+		b.appID, deploymentID, b.jobID).Scan(&activationID, &activations, &retirements,
+		&authorizations, &handoffs, &completions)
+	if err != nil || activationID == "" || activations != 1 || retirements != 1 ||
+		authorizations != 1 || handoffs != 1 || completions != 0 {
+		return false
+	}
+	runtime, err := b.state.Get(ctx, b.appID, deploymentID)
+	return err == nil && runtime.Phase == generatedruntimestate.PhaseDraining
 }
 
 type controllerProcessKillReporter struct {
@@ -722,7 +779,7 @@ func controllerProcessKillMatrix(
 	previousMarker := "controller-journey"
 	for index, boundary := range []controllerProcessKillBoundary{
 		controllerKillBeforeBuild, controllerKillBeforeStart, controllerKillAfterRoute,
-		controllerKillBeforeDrain, controllerKillAfterSuccess, controllerKillAfterMain,
+		controllerKillBeforeDrain, controllerKillAfterHandoff, controllerKillAfterSuccess, controllerKillAfterMain,
 	} {
 		if !t.Run(string(boundary), func(t *testing.T) {
 			if index > 0 {
@@ -795,6 +852,11 @@ func controllerProcessKillMatrix(
 			}
 			if err != nil || json.Unmarshal(body, &signal) != nil || signal.Boundary != boundary {
 				t.Fatal("process-kill child signaled the wrong durable boundary")
+			}
+			if boundary == controllerKillAfterHandoff && !(&controllerProcessKillBarrier{
+				state: state, db: db, appID: appID, jobID: mutation.Job.ID,
+			}).completedHandoffWithoutCompletion(ctx) {
+				t.Fatal("fault/restart boundary omitted the exact durable handoff prefix")
 			}
 			before, err := jobStore.Get(mutation.Job.ID)
 			if err != nil || before.Status != string(jobs.Running) || before.Attempt != 1 {
@@ -940,7 +1002,13 @@ func controllerProcessKillMatrix(
 			controllerJourneyRoutedRequest(t, ctx, appID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 			controllerJourneyRoutedRequest(t, ctx, appID, http.MethodGet, "/api/version", "", http.StatusOK, candidateMarker)
 			previousMarker = candidateMarker
-			t.Logf("controller SIGKILL recovery boundary=%s job=%s deployment=%s release=%s prior=%s active=%s", boundary, mutation.Job.ID, pinned.DeploymentID, pinned.ReleaseID, previous.DeploymentID, finalHead.DeploymentID)
+			if boundary == controllerKillAfterHandoff {
+				t.Logf("controller completion fault/restart boundary=%s job=%s deployment=%s release=%s prior=%s active=%s",
+					boundary, mutation.Job.ID, pinned.DeploymentID, pinned.ReleaseID,
+					previous.DeploymentID, finalHead.DeploymentID)
+			} else {
+				t.Logf("controller SIGKILL recovery boundary=%s job=%s deployment=%s release=%s prior=%s active=%s", boundary, mutation.Job.ID, pinned.DeploymentID, pinned.ReleaseID, previous.DeploymentID, finalHead.DeploymentID)
+			}
 		}) {
 			return
 		}

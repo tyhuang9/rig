@@ -23,6 +23,7 @@ import (
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedimage"
 	"github.com/hostd/hostd/internal/generatedingress"
+	"github.com/hostd/hostd/internal/generatedrecovery"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
@@ -515,6 +516,8 @@ type fakeRoutes struct {
 	delegateCalls     int
 	attestErr         error
 	attestCalls       int
+	recoveredErr      error
+	recoveredCalls    int
 	retirementCalls   int
 	retirementErr     error
 	retirementBlock   error
@@ -530,6 +533,21 @@ func (f *fakeRoutes) attestPublished(ctx context.Context, claim deploymentexecut
 		return f.delegate.attestPublished(ctx, claim, deploymentID)
 	}
 	return nil
+}
+
+func (f *fakeRoutes) completeRecovered(ctx context.Context,
+	claim deploymentexecution.Claim, deploymentID string,
+) error {
+	f.recoveredCalls++
+	if f.recoveredErr != nil {
+		return f.recoveredErr
+	}
+	if f.delegate != nil {
+		f.lastErr = f.delegate.completeRecovered(ctx, claim, deploymentID)
+		return f.lastErr
+	}
+	f.lastErr = deploymentexecution.ErrScopeUnavailable
+	return f.lastErr
 }
 
 func (f *fakeRoutes) Switch(_ context.Context, request generatedruntime.RouteSwitchRequest) error {
@@ -1197,6 +1215,261 @@ func TestGeneratedExecutorCompletionPrecommitFailureRetainsReceiptsAndCapacity(t
 			fixture.routes.retirementCalls, fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
 	}
 	checkCompetitor(true)
+}
+
+type generatedExecutorRecoveredCompletionExecutor func(context.Context, jobs.Job, jobs.ProgressReporter) (jobs.ExecutionResult, error)
+
+func (f generatedExecutorRecoveredCompletionExecutor) Execute(ctx context.Context, job jobs.Job,
+	reporter jobs.ProgressReporter,
+) (jobs.ExecutionResult, error) {
+	return f(ctx, job, reporter)
+}
+
+func TestGeneratedExecutorFreshWorkerCompletesDurableDrainingWithoutProcessLocalRetirement(t *testing.T) {
+	fixture := newSealedExecutorFixture(t)
+	fixture.capacity.SetCapacity(128<<20, 128<<20)
+	checkCompetitor := fixture.capacityCompetitor(t)
+	var competitorJobID, competitorAppID, competitorStatus string
+	var competitorAttempt int
+	var competitorCount int
+	if err := fixture.db.QueryRow(`SELECT COUNT(*) FROM jobs WHERE id<>?`, fixture.job.ID).Scan(&competitorCount); err != nil || competitorCount != 1 {
+		t.Fatalf("capacity competitor jobs=%d err=%v", competitorCount, err)
+	}
+	if err := fixture.db.QueryRow(`SELECT id,resource_id,status,attempt FROM jobs WHERE id<>?`, fixture.job.ID).
+		Scan(&competitorJobID, &competitorAppID, &competitorStatus, &competitorAttempt); err != nil ||
+		competitorJobID == "" || competitorAppID == fixture.app.ID || competitorStatus != string(jobs.Running) || competitorAttempt != 1 {
+		t.Fatalf("capacity competitor job=%q app=%q status=%q attempt=%d err=%v",
+			competitorJobID, competitorAppID, competitorStatus, competitorAttempt, err)
+	}
+	if _, err := fixture.db.Exec(`CREATE TRIGGER generated_executor_completion_receipt_fault
+		BEFORE INSERT ON generated_route_completion_receipts
+		BEGIN SELECT RAISE(ABORT, 'generated completion receipt unavailable'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := fixture.execute()
+	if err != nil || first.Disposition != jobs.ExecutionWaitingUser ||
+		first.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+		t.Fatalf("first result=%+v err=%v", first, err)
+	}
+	if fixture.routes.lastActivation.retirement == nil {
+		t.Fatal("precommit failure omitted the process-local retirement handle")
+	}
+	if _, err := fixture.routes.lastActivation.retirement.Retire(context.Background()); !errors.Is(err, deploymentexecution.ErrScopeUnavailable) {
+		t.Fatalf("first executor return leaked a live retirement handle: %v", err)
+	}
+	assertGeneratedExecutorRecoveredCompletionDraining(t, fixture)
+	beforeRetirementCalls := fixture.routes.retirementCalls
+	beforeRouteRequests, beforeDelegateCalls, beforeAttestCalls := len(fixture.routes.requests),
+		fixture.routes.delegateCalls, fixture.routes.attestCalls
+	beforeAuthorizationCalls, beforeCapacityCalls := fixture.authorization.calls, fixture.capacity.CapacityCalls()
+	beforeCompilerCalls := fixture.compiler.calls
+	beforeReserveCalls, beforeNetworkCalls, beforePinCalls := len(fixture.runtime.reserveRequests),
+		fixture.runtime.networkCalls, fixture.runtime.pinCalls
+	beforeRetainedCalls, beforeRuntimeStops := fixture.runtime.retained, fixture.runtime.stopCalls
+	beforeCreate, beforeStart := fixture.runner.createCalls, fixture.runner.startCalls
+	beforeStop, beforeRemove := fixture.runner.stopCalls, fixture.runner.removeCalls
+	beforeStage, beforeCleanup := fixture.environment.stageCalls, fixture.environment.cleanupCalls
+	if _, err := fixture.db.Exec(`DROP TRIGGER generated_executor_completion_receipt_fault`); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := generatedrecovery.RecoverRuntime(context.Background(), fixture.db, time.Now().UTC(), fixture.bindings)
+	if err != nil || recovered.Jobs.RequeuedGenerated != 2 {
+		t.Fatalf("recover durable Draining worker: result=%+v err=%v", recovered, err)
+	}
+	rows, err := fixture.db.Query(`SELECT id,resource_id,attempt FROM jobs WHERE status='queued' ORDER BY created_at,id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type recoveredQueuedJob struct {
+		id, appID string
+		attempt   int
+	}
+	var recoveredJobs []recoveredQueuedJob
+	for rows.Next() {
+		var job recoveredQueuedJob
+		if err := rows.Scan(&job.id, &job.appID, &job.attempt); err != nil {
+			_ = rows.Close()
+			t.Fatal(err)
+		}
+		recoveredJobs = append(recoveredJobs, job)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		t.Fatal(err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(recoveredJobs) != 2 || recoveredJobs[0].id != fixture.job.ID || recoveredJobs[0].appID != fixture.app.ID ||
+		recoveredJobs[0].attempt != fixture.job.Attempt || recoveredJobs[1].id != competitorJobID ||
+		recoveredJobs[1].appID != competitorAppID || recoveredJobs[1].attempt != competitorAttempt {
+		t.Fatalf("recovered queue did not select exact target before competitor: jobs=%+v", recoveredJobs)
+	}
+	service, err := jobs.NewWithDeploymentBindings(fixture.db, fixture.bindings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	joined := false
+	stopWorker := func() error {
+		cancel()
+		if joined {
+			return nil
+		}
+		select {
+		case workerErr := <-done:
+			joined = true
+			return workerErr
+		case <-time.After(5 * time.Second):
+			return errors.New("recovered durable Draining worker did not stop")
+		}
+	}
+	defer func() {
+		if !joined {
+			if workerErr := stopWorker(); workerErr != nil {
+				t.Errorf("cleanup recovered durable Draining worker: %v", workerErr)
+			}
+		}
+	}()
+	var retryResult jobs.ExecutionResult
+	var retryJob jobs.Job
+	var terminalJob jobs.Job
+	executor := generatedExecutorRecoveredCompletionExecutor(func(ctx context.Context, job jobs.Job,
+		reporter jobs.ProgressReporter,
+	) (jobs.ExecutionResult, error) {
+		if job.ID != fixture.job.ID || job.ResourceID != fixture.app.ID {
+			return jobs.ExecutionResult{}, errors.New("recovered durable Draining worker selected an unrelated job")
+		}
+		retryJob = job
+		binding, readErr := fixture.bindings.Read(ctx, job.ID)
+		if readErr != nil {
+			return jobs.ExecutionResult{}, readErr
+		}
+		classification, checkErr := fixture.bindings.Check(ctx, binding)
+		if checkErr != nil || classification != deploymentbinding.ClassificationCurrent {
+			return jobs.ExecutionResult{}, errors.Join(deploymentbinding.ErrInvalidBinding, checkErr)
+		}
+		claim, claimErr := deploymentexecution.NewClaim(binding, job.ID, job.ResourceID, job.Attempt)
+		if claimErr != nil {
+			return jobs.ExecutionResult{}, claimErr
+		}
+		retryResult, readErr = fixture.executor.ExecuteBound(ctx, job, claim, reporter)
+		return retryResult, readErr
+	})
+	admissionCalls := 0
+	admission := func(parent context.Context) (context.Context, func() error, error) {
+		// The ingress regression separately proves fresh cold scoped admission. This
+		// warm-domain executor fixture retains its already authenticated domain scope
+		// and exercises only the durable-completion capability gap.
+		admissionCalls++
+		if admissionCalls == 1 {
+			return fixture.context, func() error { return nil }, nil
+		}
+		<-parent.Done()
+		return nil, nil, parent.Err()
+	}
+	go func() { done <- service.RunWorkerWithScopedAdmission(ctx, executor, admission) }()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		job, getErr := service.Get(fixture.job.ID)
+		if getErr == nil && (job.Status == string(jobs.WaitingUser) || job.Status == string(jobs.Succeeded)) {
+			terminalJob = job
+			if workerErr := stopWorker(); workerErr != nil {
+				t.Fatalf("stop recovered durable Draining worker: %v", workerErr)
+			}
+			break
+		}
+		select {
+		case workerErr := <-done:
+			joined = true
+			if workerErr != nil {
+				t.Fatalf("recovered durable Draining worker: %v", workerErr)
+			}
+			t.Fatal("recovered durable Draining worker stopped before target disposition")
+		case <-deadline.C:
+			t.Fatalf("recovered durable Draining worker timeout: job=%+v err=%v", job, getErr)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+
+	if retryJob.ID != fixture.job.ID || retryJob.ResourceID != fixture.app.ID ||
+		retryJob.Attempt != fixture.job.Attempt+1 {
+		t.Fatalf("recovered durable Draining worker=%+v initial=%+v", retryJob, fixture.job)
+	}
+	competitorJob, err := service.Get(competitorJobID)
+	if err != nil || competitorJob.ResourceID != competitorAppID || competitorJob.Status != string(jobs.Queued) || competitorJob.Attempt != competitorAttempt {
+		t.Fatalf("capacity competitor changed before pressure recheck: job=%+v err=%v", competitorJob, err)
+	}
+	if len(fixture.routes.requests) != beforeRouteRequests || fixture.routes.delegateCalls != beforeDelegateCalls ||
+		fixture.routes.attestCalls != beforeAttestCalls || fixture.routes.retirementCalls != beforeRetirementCalls ||
+		fixture.authorization.calls != beforeAuthorizationCalls || fixture.capacity.CapacityCalls() != beforeCapacityCalls ||
+		fixture.compiler.calls != beforeCompilerCalls || len(fixture.runtime.reserveRequests) != beforeReserveCalls ||
+		fixture.runtime.networkCalls != beforeNetworkCalls || fixture.runtime.pinCalls != beforePinCalls ||
+		fixture.runtime.retained != beforeRetainedCalls || fixture.runtime.stopCalls != beforeRuntimeStops ||
+		fixture.runner.createCalls != beforeCreate || fixture.runner.startCalls != beforeStart ||
+		fixture.runner.stopCalls != beforeStop || fixture.runner.removeCalls != beforeRemove ||
+		fixture.environment.stageCalls != beforeStage || fixture.environment.cleanupCalls != beforeCleanup {
+		t.Fatalf("recovered durable Draining retry changed effects route=%d/%d delegate=%d/%d attest=%d/%d retirement=%d/%d authorization=%d/%d capacity=%d/%d compiler=%d/%d reserve=%d/%d network=%d/%d pin=%d/%d retained=%d/%d runtimeStop=%d/%d create=%d/%d start=%d/%d stop=%d/%d remove=%d/%d stage=%d/%d cleanup=%d/%d",
+			beforeRouteRequests, len(fixture.routes.requests), beforeDelegateCalls, fixture.routes.delegateCalls,
+			beforeAttestCalls, fixture.routes.attestCalls, beforeRetirementCalls, fixture.routes.retirementCalls,
+			beforeAuthorizationCalls, fixture.authorization.calls, beforeCapacityCalls, fixture.capacity.CapacityCalls(),
+			beforeCompilerCalls, fixture.compiler.calls, beforeReserveCalls, len(fixture.runtime.reserveRequests),
+			beforeNetworkCalls, fixture.runtime.networkCalls, beforePinCalls, fixture.runtime.pinCalls,
+			beforeRetainedCalls, fixture.runtime.retained, beforeRuntimeStops, fixture.runtime.stopCalls,
+			beforeCreate, fixture.runner.createCalls, beforeStart, fixture.runner.startCalls,
+			beforeStop, fixture.runner.stopCalls, beforeRemove, fixture.runner.removeCalls,
+			beforeStage, fixture.environment.stageCalls, beforeCleanup, fixture.environment.cleanupCalls)
+	}
+	checkCompetitor(true)
+	if terminalJob.Status == string(jobs.Succeeded) {
+		if retryResult.CompletionCode != "deployment_completed" || retryResult.Disposition != "" ||
+			retryResult.PauseDisposition != "" {
+			t.Fatalf("completed recovered durable Draining result=%+v job=%+v", retryResult, terminalJob)
+		}
+		runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
+		if runtimeDeployment.Phase != generatedruntimestate.PhaseSucceeded ||
+			deployment.Status != deployments.Succeeded ||
+			generatedExecutorCompletionReceiptCount(t, fixture) != 1 ||
+			generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID) != 1 {
+			t.Fatalf("completed recovered durable Draining runtime=%+v deployment=%+v completion=%d events=%d",
+				runtimeDeployment, deployment, generatedExecutorCompletionReceiptCount(t, fixture),
+				generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID))
+		}
+		return
+	}
+	assertGeneratedExecutorRecoveredCompletionDraining(t, fixture)
+	if retryResult.Disposition != jobs.ExecutionWaitingUser ||
+		retryResult.PauseDisposition != jobs.PauseRouteReconciliationRequired || retryResult.CompletionCode != "" {
+		t.Fatalf("qualified recovered durable Draining result=%+v job=%+v", retryResult, terminalJob)
+	}
+	if fixture.routes.recoveredCalls != 1 || !errors.Is(fixture.routes.lastErr,
+		deploymentexecution.ErrInvalidConfiguration) {
+		t.Fatalf("warm recovered completion calls=%d error=%v", fixture.routes.recoveredCalls,
+			fixture.routes.lastErr)
+	}
+}
+
+func assertGeneratedExecutorRecoveredCompletionDraining(t *testing.T, fixture *sealedExecutorFixture) {
+	t.Helper()
+	runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseDraining ||
+		deployment.Status != deployments.WaitingHealth ||
+		generatedExecutorActivationReceiptCount(t, fixture) != 1 ||
+		generatedExecutorRetirementReceiptCount(t, fixture) != 1 ||
+		generatedExecutorAccountingHandoffReceiptCount(t, fixture) != 1 ||
+		generatedExecutorCompletionReceiptCount(t, fixture) != 0 ||
+		generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID) != 0 {
+		t.Fatalf("durable Draining runtime=%+v deployment=%+v receipts=%d/%d/%d/%d events=%d",
+			runtimeDeployment, deployment, generatedExecutorActivationReceiptCount(t, fixture),
+			generatedExecutorRetirementReceiptCount(t, fixture),
+			generatedExecutorAccountingHandoffReceiptCount(t, fixture),
+			generatedExecutorCompletionReceiptCount(t, fixture),
+			generatedExecutorCompletionEventCount(t, fixture, fixture.job.ID))
+	}
 }
 
 func TestGeneratedExecutorDistinguishesPlanStorageAndValidationFailures(t *testing.T) {

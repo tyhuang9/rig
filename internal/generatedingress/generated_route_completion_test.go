@@ -11,9 +11,116 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
+
+func TestCandidateRecoveredCompletionHoldPinsExactRestoredRoster(t *testing.T) {
+	newFixture := func(t *testing.T) (*candidateCapacityLedger, *generatedDomainCapacityCoordinator,
+		candidateGroupSpec, map[string]string, *candidateCapacityComponent,
+	) {
+		t.Helper()
+		manager, _ := newManagerFixture(t, false)
+		coordinator, err := newGeneratedDomainCapacityCoordinator(manager)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spec := candidateCapacityTestSpec("recovered-app", "recovered-deployment", "api")
+		tokens, err := coordinator.installBootstrapBatch([]generatedcapacity.Limits{spec.limits})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := coordinator.sealBootstrap(); err != nil {
+			t.Fatal(err)
+		}
+		budget, err := generatedcapacity.New(coordinator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ledger, err := newCandidateCapacityLedger(budget, coordinator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.seedColdOwnershipWithDebt(spec, map[string]candidateColdReceiptSeed{
+			"api": {id: "recovered-receipt", physical: candidatePhysicalHandedToRoute},
+		}, tokens); err != nil {
+			t.Fatal(err)
+		}
+		if err := ledger.publishRestoredOwnership(); err != nil {
+			t.Fatal(err)
+		}
+		ledger.mu.Lock()
+		group := ledger.groups[candidateCapacityGroupKey{appID: spec.appID, deploymentID: spec.deploymentID}]
+		ledger.mu.Unlock()
+		if group == nil {
+			t.Fatal("restored group is absent")
+		}
+		component := group.byName["api"]
+		if component == nil || component.charge == nil || !component.charge.receiptRetained ||
+			component.charge.explicitRetained {
+			t.Fatalf("restored producer retention=%#v", component)
+		}
+		return ledger, coordinator, spec, map[string]string{"api": "recovered-receipt"}, component
+	}
+
+	t.Run("unrelated borrow coexists and close invalidates", func(t *testing.T) {
+		ledger, coordinator, spec, receipts, _ := newFixture(t)
+		borrow, err := coordinator.borrowAcquire()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer borrow.release()
+		hold, err := ledger.holdRecoveredCompletionRoster(spec, receipts)
+		if err != nil || hold == nil || !hold.valid() {
+			t.Fatalf("recovered hold=%#v error=%v", hold, err)
+		}
+		if operation, err := ledger.enterRetirementRoster(spec.appID, spec.deploymentID, receipts); operation != nil || !errors.Is(err, errCandidateCapacityBusy) {
+			t.Fatalf("retirement while held=%#v error=%v", operation, err)
+		}
+		hold.leave()
+		if hold.valid() {
+			t.Fatal("closed recovered hold remained valid")
+		}
+	})
+
+	t.Run("crossed receipt refuses before hold", func(t *testing.T) {
+		ledger, _, spec, _, _ := newFixture(t)
+		if hold, err := ledger.holdRecoveredCompletionRoster(spec,
+			map[string]string{"api": "crossed-receipt"}); hold != nil ||
+			!errors.Is(err, errCandidateCapacityStale) {
+			t.Fatalf("crossed receipt hold=%#v error=%v", hold, err)
+		}
+	})
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*candidateCapacityComponent)
+	}{
+		{name: "stale epoch", mutate: func(component *candidateCapacityComponent) { component.charge.epoch++ }},
+		{name: "substituted token", mutate: func(component *candidateCapacityComponent) {
+			component.charge.token = &generatedDomainCapacityDebtToken{}
+		}},
+		{name: "changed receipt", mutate: func(component *candidateCapacityComponent) {
+			component.receipt = &candidateReceiptTombstone{id: "changed-receipt"}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ledger, _, spec, receipts, component := newFixture(t)
+			hold, err := ledger.holdRecoveredCompletionRoster(spec, receipts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer hold.leave()
+			hold.group.mu.Lock()
+			test.mutate(component)
+			hold.group.mu.Unlock()
+			if hold.valid() {
+				t.Fatal("changed restored accounting remained valid")
+			}
+		})
+	}
+}
 
 func TestGeneratedRouteCompletionSuccess(t *testing.T) {
 	t.Run("full predecessor and exact replay", func(t *testing.T) {

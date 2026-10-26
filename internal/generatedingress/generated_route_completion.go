@@ -3,6 +3,7 @@ package generatedingress
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"sync"
 	"time"
 
@@ -11,6 +12,317 @@ import (
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/jobs"
 )
+
+type generatedRecoveredRouteCompletionEvidence struct {
+	group             generatedDomainColdGroup
+	activation        generatedruntimestate.GeneratedDomainStartupRouteActivation
+	handoff           generatedruntimestate.RouteAccountingHandoffReceipt
+	completion        generatedruntimestate.RouteCompletionReceipt
+	candidateRoster   []generatedruntimestate.RouteActivationComponent
+	predecessorRoster []generatedruntimestate.RouteActivationComponent
+	receipts          map[string]string
+	replay            bool
+}
+
+// CompleteRecovered completes only the exact interrupted Draining handoff
+// reconstructed by this cold GeneratedDomain. Durable receipts remain
+// descriptive: the live Claim, sealed cold construction, restored accounting
+// roster and fresh physical observation are all required for authority.
+func (a *GeneratedRouteAuthority) CompleteRecovered(ctx context.Context,
+	claim deploymentexecution.Claim, deploymentID string,
+) error {
+	if !a.configured() || ctx == nil || claim.ApplicationID() == "" || !validAppID(deploymentID) ||
+		a.construction == nil || !a.configuredFor(a.construction) || a.construction.cold == nil ||
+		a.construction.manifest == nil ||
+		!sameGeneratedDomainColdManifest(a.construction.cold, a.construction.manifest.cold) {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
+	pinned, err := a.stores.ExecutionGuard().PinScope(ctx)
+	if err != nil {
+		return err
+	}
+	defer pinned.Leave()
+
+	construction := a.construction
+	input := construction.reservation.input
+	observed, err := inspectGeneratedDomainStartupObservation(ctx, input.stores, input.runner, input.options)
+	if err != nil {
+		return err
+	}
+	if err := reattestGeneratedDomainCold(ctx, construction.manager, construction.candidates,
+		observed, *construction.cold); err != nil {
+		return err
+	}
+	groups, err := readGeneratedDomainColdGroups(ctx, construction.candidates, observed)
+	if err != nil {
+		return err
+	}
+	evidence, err := recoveredRouteCompletionEvidence(observed, groups, claim, deploymentID)
+	if err != nil {
+		return err
+	}
+	hold, err := construction.candidates.ledger.holdRecoveredCompletionRoster(
+		generatedDomainColdGroupSpec(construction.candidates, evidence.group), evidence.receipts)
+	if err != nil {
+		return err
+	}
+	defer hold.leave()
+	if !hold.valid() {
+		return deploymentexecution.ErrAuthorityStale
+	}
+	if evidence.replay {
+		activation, err := a.readRecoveredRouteActivation(ctx, evidence.activation)
+		if err != nil {
+			return err
+		}
+		if err := a.attestRecoveredRouteCompletion(ctx, pinned, claim, activation,
+			evidence.completion); err != nil {
+			return err
+		}
+	} else if err := a.AttestPublished(ctx, claim, deploymentID); err != nil {
+		return err
+	}
+	return a.completeRecovered(ctx, pinned, claim, evidence, hold)
+}
+
+func (a *GeneratedRouteAuthority) readRecoveredRouteActivation(ctx context.Context,
+	observed generatedruntimestate.GeneratedDomainStartupRouteActivation,
+) (generatedruntimestate.RouteActivationReceipt, error) {
+	tx, err := a.stores.Database().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return generatedruntimestate.RouteActivationReceipt{}, err
+	}
+	defer tx.Rollback()
+	activation, err := readGeneratedRouteActivationReceiptTx(ctx, tx, observed.ReceiptID)
+	if err != nil || !sameRecoveredRouteActivation(activation, observed) {
+		return generatedruntimestate.RouteActivationReceipt{}, errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return generatedruntimestate.RouteActivationReceipt{}, err
+	}
+	return activation, nil
+}
+
+func recoveredRouteCompletionEvidence(observed generatedDomainStartupObservation,
+	groups []generatedDomainColdGroup, claim deploymentexecution.Claim, deploymentID string,
+) (generatedRecoveredRouteCompletionEvidence, error) {
+	var result generatedRecoveredRouteCompletionEvidence
+	groupCount := 0
+	for _, group := range groups {
+		if group.pins.applicationID() == claim.ApplicationID() && group.pins.deploymentID == deploymentID {
+			result.group, groupCount = group, groupCount+1
+		}
+	}
+	if groupCount != 1 || result.group.pins.jobID() != claim.JobID() ||
+		claim.Attempt() < result.group.pins.attempt() {
+		return result, deploymentexecution.ErrIdentityLost
+	}
+	restored, err := generatedDomainColdDrainingDebtEvidence(observed.database, result.group, groups)
+	if err != nil {
+		return result, errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	if !restored {
+		completed, completedErr := generatedDomainColdCurrentDebtEvidence(observed.database, result.group, groups)
+		if completedErr != nil || !completed ||
+			result.group.snapshot.runtime.phase != generatedruntimestate.PhaseSucceeded {
+			return result, errors.Join(deploymentexecution.ErrIdentityLost, completedErr)
+		}
+		result.replay = true
+	}
+	receiptID := result.group.snapshot.observedHead.activationReceiptID
+	activationCount := 0
+	for _, activation := range observed.database.Runtime.RouteActivations {
+		if activation.ReceiptID == receiptID && activation.AppID == claim.ApplicationID() &&
+			activation.SuccessorDeploymentID == deploymentID {
+			result.activation, activationCount = activation, activationCount+1
+		}
+	}
+	handoffCount := 0
+	for _, handoff := range observed.database.Runtime.AccountingHandoffReceipts {
+		if handoff.ActivationReceiptID == receiptID && handoff.AppID == claim.ApplicationID() &&
+			handoff.SuccessorDeploymentID == deploymentID {
+			result.handoff, handoffCount = handoff, handoffCount+1
+		}
+	}
+	completionCount := 0
+	for _, completion := range observed.database.Runtime.RouteCompletionReceipts {
+		if completion.ActivationReceiptID == receiptID && completion.AppID == claim.ApplicationID() &&
+			completion.SuccessorDeploymentID == deploymentID {
+			result.completion, completionCount = completion, completionCount+1
+		}
+	}
+	if result.replay {
+		if completionCount != 1 || result.completion.CurrentJobID != claim.JobID() ||
+			result.completion.CurrentWorkerAttempt != claim.Attempt() {
+			return result, deploymentexecution.ErrIdentityLost
+		}
+	} else if completionCount != 0 {
+		return result, deploymentexecution.ErrIdentityLost
+	}
+	result.candidateRoster, _ = generatedDomainColdActivationRoster(result.group.snapshot)
+	if result.activation.PredecessorDeploymentID != "" {
+		predecessor, found := generatedDomainColdGroupByDeployment(groups,
+			result.activation.PredecessorDeploymentID)
+		if !found {
+			return result, deploymentexecution.ErrIdentityLost
+		}
+		result.predecessorRoster, _ = generatedDomainColdActivationRoster(predecessor.snapshot)
+	} else {
+		result.predecessorRoster = []generatedruntimestate.RouteActivationComponent{}
+	}
+	if activationCount != 1 || handoffCount != 1 || len(result.candidateRoster) == 0 ||
+		(result.activation.PredecessorDeploymentID != "" && len(result.predecessorRoster) == 0) {
+		return result, deploymentexecution.ErrIdentityLost
+	}
+	result.receipts = make(map[string]string, len(result.group.receipts))
+	for name, receipt := range result.group.receipts {
+		if name == "" || receipt.id == "" || receipt.physical != candidatePhysicalHandedToRoute || receipt.unknown {
+			return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrIdentityLost
+		}
+		result.receipts[name] = receipt.id
+	}
+	if len(result.receipts) != len(result.candidateRoster) {
+		return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrIdentityLost
+	}
+	return result, nil
+}
+
+func (a *GeneratedRouteAuthority) completeRecovered(ctx context.Context, pinned *deploymentexecution.Pinned,
+	claim deploymentexecution.Claim, evidence generatedRecoveredRouteCompletionEvidence,
+	hold *candidateRecoveredCompletionHold,
+) error {
+	tx, err := a.stores.Database().BeginTx(ctx, nil)
+	if err != nil {
+		return gateDatabaseError(ctx, err)
+	}
+	defer tx.Rollback()
+	activation, err := readGeneratedRouteActivationReceiptTx(ctx, tx, evidence.activation.ReceiptID)
+	if err != nil || !sameRecoveredRouteActivation(activation, evidence.activation) {
+		return errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	input := generatedruntimestate.RouteCompletionInput{Activation: activation,
+		AccountingHandoff: evidence.handoff, CurrentJobID: claim.JobID(),
+		CurrentWorkerAttempt: claim.Attempt(), CompletedAt: time.Now().UTC()}
+	existing, found, err := a.runtime.ReadRouteCompletionReceiptTx(ctx, tx, activation.ReceiptID)
+	if err != nil {
+		return err
+	}
+	if found {
+		input.CompletedAt = existing.CompletedAt
+		if existing != routeCompletionReceipt(input) {
+			return deploymentexecution.ErrIdentityLost
+		}
+		if err := pinned.CheckGeneratedRouteCompletionReplayTx(tx, claim, activation, existing); err != nil {
+			return err
+		}
+		if err := a.runtime.ValidateRouteCompletionReceiptsTx(ctx, tx, input); err != nil {
+			return err
+		}
+		if !routeRetirementRosterMatchesTx(ctx, tx, evidence.candidateRoster,
+			generatedruntimestate.ComponentActive, false) ||
+			!routeRetirementRosterMatchesTx(ctx, tx, evidence.predecessorRoster,
+				generatedruntimestate.ComponentStopped, false) || !hold.valid() ||
+			exactGeneratedRouteCompletionEventTx(ctx, tx, input) != nil {
+			return deploymentexecution.ErrIdentityLost
+		}
+		return tx.Commit()
+	}
+	if err := a.stores.ExecutionGuard().CheckPublishedRouteAttestationTx(ctx, tx, claim,
+		activation.SuccessorDeploymentID); err != nil {
+		return err
+	}
+	if err := a.runtime.ValidateRouteCompletionReceiptsTx(ctx, tx, input); err != nil {
+		return err
+	}
+	if !routeRetirementRosterMatchesTx(ctx, tx, evidence.candidateRoster,
+		generatedruntimestate.ComponentActive, false) ||
+		!routeRetirementRosterMatchesTx(ctx, tx, evidence.predecessorRoster,
+			generatedruntimestate.ComponentStopped, false) || !hold.valid() {
+		return deploymentexecution.ErrIdentityLost
+	}
+	runtimeValue, runtimeChanged, err := a.runtime.RecordGeneratedRouteSucceededTx(ctx, tx, input)
+	if err != nil {
+		return err
+	}
+	mainValue, mainChanged, err := a.stores.Repository().RecordGeneratedRouteSucceededTx(ctx, tx, input)
+	if err != nil {
+		return err
+	}
+	receipt, receiptChanged, err := a.runtime.RecordRouteCompletionReceiptTx(ctx, tx, input)
+	if err != nil {
+		return err
+	}
+	jobResult, jobChanged, err := jobs.CompleteGeneratedRouteTx(ctx, tx, receipt)
+	if err != nil {
+		return err
+	}
+	if !runtimeChanged || !mainChanged || !receiptChanged || !jobChanged || !hold.valid() ||
+		!exactGeneratedRouteCompletionResult(input, runtimeValue, mainValue, receipt, jobResult) {
+		return deploymentexecution.ErrIdentityLost
+	}
+	if err := tx.Commit(); err != nil {
+		commitErr := gateDatabaseError(ctx, err)
+		if readErr := a.readRecoveredCompletion(ctx, pinned, claim, evidence, hold, input); readErr == nil {
+			return nil
+		}
+		return commitErr
+	}
+	return nil
+}
+
+func (a *GeneratedRouteAuthority) readRecoveredCompletion(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	evidence generatedRecoveredRouteCompletionEvidence, hold *candidateRecoveredCompletionHold,
+	input generatedruntimestate.RouteCompletionInput,
+) error {
+	tx, err := a.stores.Database().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	receipt, found, err := a.runtime.ReadRouteCompletionReceiptTx(ctx, tx, input.Activation.ReceiptID)
+	if err != nil {
+		return err
+	}
+	if !found || receipt != routeCompletionReceipt(input) {
+		return deploymentexecution.ErrIdentityLost
+	}
+	if err := pinned.CheckGeneratedRouteCompletionReplayTx(tx, claim, input.Activation, receipt); err != nil {
+		return err
+	}
+	if err := a.runtime.ValidateRouteCompletionReceiptsTx(ctx, tx, input); err != nil {
+		return err
+	}
+	if !routeRetirementRosterMatchesTx(ctx, tx, evidence.candidateRoster,
+		generatedruntimestate.ComponentActive, false) ||
+		!routeRetirementRosterMatchesTx(ctx, tx, evidence.predecessorRoster,
+			generatedruntimestate.ComponentStopped, false) || !hold.valid() ||
+		exactGeneratedRouteCompletionEventTx(ctx, tx, input) != nil {
+		return deploymentexecution.ErrIdentityLost
+	}
+	return tx.Commit()
+}
+
+func sameRecoveredRouteActivation(value generatedruntimestate.RouteActivationReceipt,
+	observed generatedruntimestate.GeneratedDomainStartupRouteActivation,
+) bool {
+	return value.ReceiptID == observed.ReceiptID && value.AppID == observed.AppID &&
+		value.SuccessorDeploymentID == observed.SuccessorDeploymentID &&
+		value.SuccessorReleaseID == observed.SuccessorReleaseID &&
+		value.SuccessorSlot == observed.SuccessorSlot &&
+		value.SuccessorGeneration == observed.SuccessorGeneration &&
+		value.PredecessorDeploymentID == observed.PredecessorDeploymentID &&
+		value.PredecessorReleaseID == observed.PredecessorReleaseID &&
+		value.PredecessorSlot == observed.PredecessorSlot &&
+		value.PredecessorGeneration == observed.PredecessorGeneration &&
+		value.PredecessorActivationReceiptID == observed.PredecessorActivationReceiptID &&
+		value.CreatorJobID == observed.CreatorJobID &&
+		value.CreatorWorkerAttempt == observed.CreatorWorkerAttempt &&
+		value.CandidateRosterDigest == observed.CandidateRosterDigest &&
+		value.PredecessorRosterDigest == observed.PredecessorRosterDigest &&
+		value.RouteIntentDigest == observed.RouteIntentDigest &&
+		value.CommittedRouteProofDigest == observed.CommittedRouteProofDigest && !value.ActivatedAt.IsZero()
+}
 
 type generatedRouteCompletionOperation struct {
 	mu sync.Mutex
