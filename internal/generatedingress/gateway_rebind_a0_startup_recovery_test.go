@@ -184,6 +184,30 @@ func TestGatewayRebindConcreteCompositionReconstructsFreshA0ThenRecoversForward(
 		t.Fatalf("reconstructed A0 committed protected history: checkpoints=%d intents=%d progress=%d terminals=%d error=%v",
 			len(history.Checkpoints), len(history.IntentsV2), len(history.Progress), len(history.TerminalsV2), err)
 	}
+	identity := newGeneratedDomainIdentityFixtureOnDatabase(t, fixture.db, fresh.options.DataRoot)
+	database, err := identity.stores.GeneratedDomainStartupSnapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protected, err := readGeneratedDomainProtectedStartup(ctx, fresh.options.DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := resolveGeneratedDomainColdGatewayExpectation(database, protected)
+	if err != nil || expected.kind != generatedDomainGatewayCurrentV1 || expected.currentV1 == nil ||
+		expected.terminal == nil || expected.retainedV1 == nil ||
+		expected.currentV1.Lineage.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
+		!generatedDomainRetainedV1ProjectionValid(expected.retainedV1) {
+		t.Fatalf("reconstructed A0 retained CurrentV1 expectation = %#v, %v", expected, err)
+	}
+	selected, status := generatedDomainColdRetainedGatewaySelectedAuthority(expected)
+	if status != generatedDomainColdRetainedGatewaySelectionSupported || selected.currentV1 == nil ||
+		selected.currentV1.Digest != expected.currentV1.Digest ||
+		!reflect.DeepEqual(selected.source, history.Source) ||
+		!reflect.DeepEqual(selected.state, history.Predecessor.State) ||
+		!reflect.DeepEqual(selected.journal, history.Predecessor.Journal) {
+		t.Fatalf("reconstructed A0 retained CurrentV1 authority = %#v status=%d", selected, status)
+	}
 	gatewayRebindSequenceRequireRetainedFiles(t, fresh, retainedFiles)
 	if !runner.finalPresent || !runner.final.Running || runner.stagePresent ||
 		runner.predecessor.FinalContainer.Running || !runner.networkPresent ||

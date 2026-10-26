@@ -111,77 +111,153 @@ func TestGeneratedDomainColdAccountsForExactRetainedV1TripleWithCurrentV2Upgrade
 	})
 }
 
+func TestGeneratedDomainColdAcceptsCompleteRetainedV1UnderRebindOrigin(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*generatedDomainProtectedStartupSnapshot)
+		pass   bool
+	}{
+		{name: "complete_chain", pass: true},
+		{name: "missing_original_source", mutate: func(protected *generatedDomainProtectedStartupSnapshot) {
+			protected.rebind.Source = routeState{}
+		}},
+		{name: "crossed_upgrade_journal", mutate: func(protected *generatedDomainProtectedStartupSnapshot) {
+			for _, current := range protected.currentV1 {
+				protected.rebind.Predecessor.Journal.OperationID = current.Lineage.OperationID
+				return
+			}
+			t.Fatal("crossed-journal fixture lacks current state")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture := newGeneratedDomainRetainedV1RebindFixture(t)
+				expected, protected := generatedDomainRetainedV1RebindExpectation(t, fixture, test.mutate)
+				before := generatedDomainRetainedV1RebindProtection(t, fixture)
+				beforeCommands := len(fixture.runner.snapshot())
+				if !test.pass {
+					generatedDomainRetainedV1AssertRebindSelectionRefused(t, fixture, expected, beforeCommands)
+					return
+				}
+				if expected.retainedV1 == nil || !generatedDomainRetainedV1ProjectionValid(expected.retainedV1) {
+					t.Fatalf("canonical rebind-origin retained projection = %#v", expected.retainedV1)
+				}
+				generatedDomainRetainedV1AssertMetadataRefusals(t, expected, protected.rebind)
+				retained := cloneGeneratedDomainRetainedV1Projection(*expected.retainedV1)
+				generatedDomainRetainedV1MutateExistingRoute(t, protected.rebind.Source.Active, "-source-mutated")
+				generatedDomainRetainedV1MutateExistingV2App(t, protected.rebind.Predecessor.State.Apps,
+					"-state-mutated")
+				if !reflect.DeepEqual(retained, *expected.retainedV1) {
+					t.Fatal("retained projection aliases the scanned protected snapshot")
+				}
+				manager, authority := generatedDomainRetainedV1RebindAttestors(fixture)
+				proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), manager, authority,
+					generatedDomainDockerStartupSnapshot{daemonID: fixture.runner.delegate.daemonID,
+						objects: fixture.runner.delegate.objects}, expected)
+				if err != nil || proof.presence != generatedDomainColdRetainedGatewayPresent ||
+					proof.authority == nil || proof.authority.currentV1 == nil || len(proof.objects) != 3 ||
+					proof.authority.stateDigest != expected.stateDigest ||
+					proof.authority.currentV1.Digest != expected.currentV1.Digest || proof.digest == "" {
+					t.Fatalf("rebind-origin retained V1 proof = %#v, %v", proof, err)
+				}
+				commands := fixture.runner.snapshot()[beforeCommands:]
+				generatedDomainRetainedV1AssertFinalReadPrefix(t, commands, fixture.observation, expected)
+				for _, command := range commands {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+						t.Fatalf("rebind-origin retained proof dispatched effect/capacity probe: %#v", command)
+					}
+				}
+				generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+				cloned := cloneGeneratedDomainColdRetainedGatewayProof(proof)
+				generatedDomainRetainedV1MutateExistingRoute(t, cloned.authority.source.Active, "-clone-mutated")
+				generatedDomainRetainedV1MutateExistingV2App(t, cloned.authority.state.Apps, "-clone-mutated")
+				generatedDomainRetainedV1MutateExistingCurrentApp(t, cloned.authority.currentV1.Apps,
+					"-clone-mutated")
+				if !reflect.DeepEqual(*expected.retainedV1, retained) ||
+					!reflect.DeepEqual(proof.authority.source, retained.source) ||
+					!reflect.DeepEqual(proof.authority.state, retained.state) ||
+					!reflect.DeepEqual(*proof.authority.currentV1, *expected.currentV1) {
+					t.Fatal("returned retained proof aliases the expectation")
+				}
+				cloneBeforeReverseMutation := cloneGeneratedDomainColdRetainedGatewayProof(cloned)
+				generatedDomainRetainedV1MutateExistingRoute(t, proof.authority.source.Active, "-proof-mutated")
+				generatedDomainRetainedV1MutateExistingV2App(t, proof.authority.state.Apps, "-proof-mutated")
+				generatedDomainRetainedV1MutateExistingCurrentApp(t, proof.authority.currentV1.Apps,
+					"-proof-mutated")
+				if !reflect.DeepEqual(cloned, cloneBeforeReverseMutation) ||
+					!reflect.DeepEqual(*expected.retainedV1, retained) {
+					t.Fatal("returned retained proof and its clone alias in reverse")
+				}
+				beforePublic := len(fixture.runner.snapshot())
+				domain, publicErr := NewGeneratedDomain(context.Background(), fixture.identity.stores,
+					fixture.runner, fixture.environment, generatedColdBoundaryPublicOptions(fixture.identity.options))
+				if domain != nil || publicErr == nil {
+					t.Fatalf("rebind-origin retained V1 public domain = %#v, %v", domain, publicErr)
+				}
+				assertGeneratedDomainConstructionDiagnostic(t, publicErr,
+					generatedDomainConstructionStageStartupObservation, generatedDomainConstructionReasonPhysicalIdentity,
+					"generated domain construction was refused: stage=startup_observation reason=physical_identity")
+				for _, command := range fixture.runner.snapshot()[beforePublic:] {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) ||
+						generatedDomainRetainedV1DetailedReadCommand(command, fixture.observation) {
+						t.Fatalf("early public refusal dispatched retained read/effect/capacity command: %#v", command)
+					}
+				}
+				generatedDomainA0AssertNoInteractiveGatewayCommands(t, fixture.runner.snapshot()[beforePublic:])
+				after := generatedDomainRetainedV1RebindProtection(t, fixture)
+				if !reflect.DeepEqual(before.database, after.database) ||
+					!sameGatewayHistorySnapshot(before.history, after.history) ||
+					!sameGeneratedDomainProtectedStartup(before.protected, after.protected) {
+					t.Fatal("rebind-origin retained proof changed SQL or protected files")
+				}
+			})
+		})
+	}
+}
+
 func TestGeneratedDomainColdRejectsCompleteRetainedV1UnderRebindOrigin(t *testing.T) {
 	if !generatedDomainRegistryIsolated(t) {
 		return
 	}
-	generatedDomainConstructionCase(t, func(t *testing.T) {
-		fixture := newGeneratedDomainRetainedV1RebindFixture(t)
-		database, err := fixture.identity.stores.GeneratedDomainStartupSnapshot(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-		protected, err := readGeneratedDomainProtectedStartup(context.Background(), fixture.identity.options.DataRoot)
-		if err != nil {
-			t.Fatal(err)
-		}
-		expected, err := resolveGeneratedDomainColdGatewayExpectation(database, protected)
-		if err != nil || expected.kind != generatedDomainGatewayCurrentV1 || expected.currentV1 == nil ||
-			expected.terminal == nil || expected.currentV1.Lineage.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
-			expected.currentV1.Digest != fixture.currentDigest {
-			t.Fatalf("canonical rebind-origin gateway expectation = %#v, %v", expected, err)
-		}
-		if _, status := generatedDomainColdRetainedGatewaySelectedAuthority(expected); status != generatedDomainColdRetainedGatewaySelectionUnsupported {
-			t.Fatalf("rebind-origin current V1 selection status = %d, want unsupported", status)
-		}
-		objects, presence, err := generatedDomainColdRetainedGatewayObjects(
-			generatedDomainDockerStartupSnapshot{objects: fixture.runner.delegate.objects})
-		if err != nil || presence != generatedDomainColdRetainedGatewayPresent || len(objects) != 3 ||
-			objects[0].id != fixture.observation.V1Container.ID ||
-			objects[1].id != fixture.observation.V1NetworkID || objects[2].name != caddyVolumeName {
-			t.Fatalf("complete retained V1 rebind census = %#v presence=%d error=%v", objects, presence, err)
-		}
-
-		t.Run("private_gate_exact_present_unsupported", func(t *testing.T) {
-			beforeCommands := len(fixture.runner.snapshot())
-			proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), nil, nil,
-				generatedDomainDockerStartupSnapshot{objects: fixture.runner.delegate.objects}, expected)
-			if !errors.Is(err, errGeneratedDomainConstructionRefused) ||
-				!reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
-				t.Fatalf("private retained V1 unsupported-lineage gate proof=%#v error=%v", proof, err)
+	for _, test := range []struct {
+		name   string
+		mutate func(*generatedDomainProtectedStartupSnapshot)
+	}{
+		{name: "missing_checkpoint", mutate: func(protected *generatedDomainProtectedStartupSnapshot) {
+			protected.rebind.Checkpoints = nil
+		}},
+		{name: "ambiguous_duplicate_history", mutate: func(protected *generatedDomainProtectedStartupSnapshot) {
+			protected.rebind.Checkpoints = append(protected.rebind.Checkpoints, protected.rebind.Checkpoints[0])
+		}},
+		{name: "crossed_upgrade_generation_metadata", mutate: func(protected *generatedDomainProtectedStartupSnapshot) {
+			var current gatewayCurrentRouteState
+			for _, value := range protected.currentV1 {
+				current = value
+				break
 			}
-			if commands := fixture.runner.snapshot(); len(commands) != beforeCommands {
-				t.Fatalf("private retained V1 unsupported-lineage gate dispatched reads: %#v", commands[beforeCommands:])
+			selection := protected.rebind.Predecessor
+			if current.Lineage.ProtectedGeneration == 0 || selection.Store == nil {
+				t.Fatal("crossed-generation fixture lacks current or predecessor metadata")
 			}
+			store := *selection.Store
+			selection.Generation = current.Lineage.ProtectedGeneration
+			store.generation = selection.Generation
+			selection.Store = &store
+			protected.rebind.Predecessor = selection
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture := newGeneratedDomainRetainedV1RebindFixture(t)
+				expected, _ := generatedDomainRetainedV1RebindExpectation(t, fixture, test.mutate)
+				generatedDomainRetainedV1AssertRebindSelectionRefused(t, fixture, expected,
+					len(fixture.runner.snapshot()))
+			})
 		})
-
-		t.Run("public_constructor_early_physical_identity_refusal_no_effects_not_gate_reachability", func(t *testing.T) {
-			before := generatedDomainRetainedV1RebindProtection(t, fixture)
-			domain, err := NewGeneratedDomain(context.Background(), fixture.identity.stores,
-				fixture.runner, fixture.environment, generatedColdBoundaryPublicOptions(fixture.identity.options))
-			if domain != nil || err == nil {
-				t.Fatalf("rebind-origin retained V1 domain = %#v, %v", domain, err)
-			}
-			assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageStartupObservation,
-				generatedDomainConstructionReasonPhysicalIdentity,
-				"generated domain construction was refused: stage=startup_observation reason=physical_identity")
-			after := generatedDomainRetainedV1RebindProtection(t, fixture)
-			if !reflect.DeepEqual(before.database, after.database) ||
-				!sameGatewayHistorySnapshot(before.history, after.history) ||
-				!sameGeneratedDomainProtectedStartup(before.protected, after.protected) {
-				t.Fatal("rebind-origin retained V1 refusal changed SQL or protected files")
-			}
-			for _, command := range fixture.runner.snapshot() {
-				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
-					t.Fatalf("rebind-origin retained V1 refusal dispatched an effect or capacity probe: %#v", command)
-				}
-				if generatedDomainRetainedV1DetailedReadCommand(command, fixture.observation) {
-					t.Fatalf("rebind-origin retained V1 refusal dispatched a retained detail read: %#v", command)
-				}
-			}
-			generatedDomainA0AssertNoInteractiveGatewayCommands(t, fixture.runner.snapshot())
-		})
-	})
+	}
 }
 
 type generatedDomainRetainedV1RebindFixture struct {
@@ -284,6 +360,165 @@ func newGeneratedDomainRetainedV1RebindFixture(t *testing.T) generatedDomainReta
 	return generatedDomainRetainedV1RebindFixture{identity: identity, runner: construction,
 		environment: &candidateFactoryEnvironment{path: t.TempDir()}, store: store,
 		observation: observation, currentDigest: selection.State.Digest}
+}
+
+func generatedDomainRetainedV1RebindExpectation(t *testing.T, fixture generatedDomainRetainedV1RebindFixture,
+	mutate func(*generatedDomainProtectedStartupSnapshot),
+) (generatedDomainGatewayExpectation, generatedDomainProtectedStartupSnapshot) {
+	t.Helper()
+	database, err := fixture.identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	protected, err := readGeneratedDomainProtectedStartup(context.Background(), fixture.identity.options.DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		mutate(&protected)
+	}
+	expected, err := resolveGeneratedDomainColdGatewayExpectation(database, protected)
+	if err != nil || expected.kind != generatedDomainGatewayCurrentV1 || expected.currentV1 == nil ||
+		expected.terminal == nil || expected.currentV1.Lineage.Kind != appaccess.GatewayRebindSourceGatewayRebind ||
+		expected.currentV1.Digest != fixture.currentDigest || expected.stateDigest != fixture.currentDigest {
+		t.Fatalf("canonical rebind-origin gateway expectation = %#v, %v", expected, err)
+	}
+	bare := expected
+	bare.retainedV1 = nil
+	expectedDescriptors, expectedImage, expectedOK := generatedDomainGatewayDockerDescriptors(expected)
+	bareDescriptors, bareImage, bareOK := generatedDomainGatewayDockerDescriptors(bare)
+	if expectedOK != bareOK || expectedImage != bareImage || !reflect.DeepEqual(expectedDescriptors, bareDescriptors) ||
+		!reflect.DeepEqual(expected.names, generatedDomainGatewayExpectedNames(bare)) {
+		t.Fatal("retained projection changed the active CurrentV1 Docker identity")
+	}
+	bareIDs, err := generatedDomainGatewayExpectedIDs(bare)
+	if err != nil || !reflect.DeepEqual(expected.ids, bareIDs) {
+		t.Fatal("retained projection changed the active CurrentV1 Docker IDs")
+	}
+	return expected, protected
+}
+
+func generatedDomainRetainedV1MutateExistingRoute(t *testing.T, routes map[string]routeRecord, suffix string) string {
+	t.Helper()
+	for appID, route := range routes {
+		if len(route.Endpoints) == 0 {
+			t.Fatalf("retained V1 route %q has no endpoint", appID)
+		}
+		route.Endpoints[0].Component += suffix
+		routes[appID] = route
+		return appID
+	}
+	t.Fatal("retained V1 route map is empty")
+	return ""
+}
+
+func generatedDomainRetainedV1MutateExistingV2App(t *testing.T,
+	apps map[string]gatewayV2AppRoute, suffix string,
+) string {
+	t.Helper()
+	for appID, app := range apps {
+		if len(app.Route.Endpoints) == 0 {
+			t.Fatalf("retained V2 app %q has no endpoint", appID)
+		}
+		app.Route.Endpoints[0].Role += suffix
+		apps[appID] = app
+		return appID
+	}
+	t.Fatal("retained V2 app map is empty")
+	return ""
+}
+
+func generatedDomainRetainedV1MutateExistingCurrentApp(t *testing.T,
+	apps map[string]gatewayCurrentAppRoute, suffix string,
+) string {
+	t.Helper()
+	for appID, app := range apps {
+		if len(app.Route.Endpoints) == 0 {
+			t.Fatalf("retained current app %q has no endpoint", appID)
+		}
+		app.Route.Endpoints[0].NetworkAlias += suffix
+		apps[appID] = app
+		return appID
+	}
+	t.Fatal("retained current app map is empty")
+	return ""
+}
+
+func generatedDomainRetainedV1AssertMetadataRefusals(t *testing.T, expected generatedDomainGatewayExpectation,
+	history gatewayRebindProtectedIntentHistory,
+) {
+	t.Helper()
+	if expected.currentV1 == nil || expected.terminal == nil || history.Predecessor.Store == nil {
+		t.Fatal("retained CurrentV1 metadata fixture is incomplete")
+	}
+	assertRefused := func(name string, mutate func(*gatewayUpgradeGenerationSelection)) {
+		t.Helper()
+		crossed := history
+		selection := crossed.Predecessor
+		store := *selection.Store
+		selection.Store = &store
+		mutate(&selection)
+		crossed.Predecessor = selection
+		if projection, ok := generatedDomainCurrentV1RetainedProjection(*expected.currentV1,
+			*expected.terminal, crossed); ok || projection != nil {
+			t.Fatalf("%s predecessor metadata produced retained projection: %#v", name, projection)
+		}
+	}
+	assertRefused("crossed_generation", func(selection *gatewayUpgradeGenerationSelection) {
+		selection.Store.generation++
+	})
+	assertRefused("crossed_operation", func(selection *gatewayUpgradeGenerationSelection) {
+		selection.Store.operationID = expected.currentV1.Lineage.OperationID
+	})
+}
+
+func generatedDomainRetainedV1AssertRebindSelectionRefused(t *testing.T,
+	fixture generatedDomainRetainedV1RebindFixture, expected generatedDomainGatewayExpectation, beforeCommands int,
+) {
+	t.Helper()
+	if expected.retainedV1 != nil {
+		t.Fatalf("invalid protected chain populated retained projection: %#v", expected.retainedV1)
+	}
+	if _, status := generatedDomainColdRetainedGatewaySelectedAuthority(expected); status != generatedDomainColdRetainedGatewaySelectionUnsupported {
+		t.Fatalf("invalid protected chain selection status = %d, want unsupported", status)
+	}
+	before := generatedDomainRetainedV1RebindProtection(t, fixture)
+	proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), nil, nil,
+		generatedDomainDockerStartupSnapshot{daemonID: fixture.runner.delegate.daemonID,
+			objects: fixture.runner.delegate.objects}, expected)
+	assertGeneratedDomainConstructionDiagnostic(t, err, generatedDomainConstructionStageColdConstruction,
+		generatedDomainConstructionReasonColdRetainedGatewaySelectionKind,
+		"generated domain construction was refused: stage=cold_construction reason=cold_retained_gateway_selection_kind")
+	if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
+		t.Fatalf("invalid protected chain populated retained proof: %#v", proof)
+	}
+	if commands := fixture.runner.snapshot()[beforeCommands:]; len(commands) != 0 {
+		t.Fatalf("invalid protected chain dispatched commands: %#v", commands)
+	}
+	after := generatedDomainRetainedV1RebindProtection(t, fixture)
+	if !reflect.DeepEqual(before.database, after.database) ||
+		!sameGatewayHistorySnapshot(before.history, after.history) ||
+		!sameGeneratedDomainProtectedStartup(before.protected, after.protected) {
+		t.Fatal("invalid protected chain changed SQL or protected files")
+	}
+}
+
+func generatedDomainRetainedV1RebindAttestors(fixture generatedDomainRetainedV1RebindFixture) (
+	*Manager, *GeneratedCandidateAuthority,
+) {
+	options := fixture.identity.options
+	manager := &Manager{runner: fixture.runner, options: Options{
+		DockerExecutable: options.DockerExecutable, DockerEndpoint: options.DockerEndpoint,
+		DockerConfigDirectory: options.DockerConfigDirectory, WorkingDirectory: options.WorkingDirectory,
+		DataRoot: options.DataRoot, HostPort: options.HostPort, CommandTimeout: options.CommandTimeout,
+		PullTimeout: options.PullTimeout, OutputLimit: options.OutputLimit,
+	}}
+	authority := &GeneratedCandidateAuthority{process: fixture.runner, options: GeneratedCandidateProcessOptions{
+		DockerExecutable: options.DockerExecutable, DockerEndpoint: options.DockerEndpoint,
+		DockerConfigDirectory: options.DockerConfigDirectory, WorkingDirectory: options.WorkingDirectory,
+		CommandTimeout: options.CommandTimeout, OutputLimit: options.OutputLimit,
+	}}
+	return manager, authority
 }
 
 func generatedDomainRetainedV1CurrentGatewayObjects(t *testing.T,
@@ -847,7 +1082,7 @@ func TestGeneratedDomainColdRetainedGatewaySelectionTripleAndReadAttribution(t *
 		reason generatedDomainConstructionReason
 		run    func(*testing.T)
 	}{
-		{name: "present_unsupported_selection", reason: generatedDomainConstructionReasonColdRetainedGatewaySelectionKind, run: func(t *testing.T) {
+		{name: "present_missing_rebind_chain", reason: generatedDomainConstructionReasonColdRetainedGatewaySelectionKind, run: func(t *testing.T) {
 			fixture := newGeneratedDomainRetainedV1RebindFixture(t)
 			database, err := fixture.identity.stores.GeneratedDomainStartupSnapshot(context.Background())
 			if err != nil {
@@ -857,9 +1092,10 @@ func TestGeneratedDomainColdRetainedGatewaySelectionTripleAndReadAttribution(t *
 			if err != nil {
 				t.Fatal(err)
 			}
+			protected.rebind.Checkpoints = nil
 			expected, err := resolveGeneratedDomainColdGatewayExpectation(database, protected)
-			if err != nil {
-				t.Fatal(err)
+			if err != nil || expected.retainedV1 != nil {
+				t.Fatalf("missing-chain expectation = %#v, %v", expected, err)
 			}
 			before := len(fixture.runner.snapshot())
 			proof, err := attestGeneratedDomainColdRetainedGateway(context.Background(), nil, nil,
@@ -868,12 +1104,15 @@ func TestGeneratedDomainColdRetainedGatewaySelectionTripleAndReadAttribution(t *
 				generatedDomainConstructionReasonColdRetainedGatewaySelectionKind,
 				"generated domain construction was refused: stage=cold_construction reason=cold_retained_gateway_selection_kind")
 			if !reflect.DeepEqual(proof, generatedDomainColdRetainedGatewayProof{}) {
-				t.Fatalf("unsupported retained selection populated proof: %#v", proof)
+				t.Fatalf("missing-chain retained selection populated proof: %#v", proof)
 			}
 			commands := fixture.runner.snapshot()[before:]
+			if len(commands) != 0 {
+				t.Fatalf("missing-chain retained selection dispatched commands: %#v", commands)
+			}
 			for _, command := range commands {
 				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
-					t.Fatalf("unsupported retained selection dispatched effect/capacity probe: %#v", command)
+					t.Fatalf("missing-chain retained selection dispatched effect/capacity probe: %#v", command)
 				}
 			}
 			generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)

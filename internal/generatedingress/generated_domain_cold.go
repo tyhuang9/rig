@@ -1065,7 +1065,7 @@ func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *M
 				if _, found, err := authority.inspectCandidate(ctx, identity); err != nil || found {
 					return generatedDomainConstructionBoundaryDiagnostic(
 						generatedDomainConstructionStageColdConstruction,
-						generatedDomainConstructionReasonColdGroupCorrespondence,
+						generatedDomainConstructionReasonColdGroupComponentAbsence,
 						errors.Join(errGeneratedDomainConstructionRefused, err))
 				}
 			}
@@ -1117,7 +1117,7 @@ func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *M
 			if !ok || expected.name != name {
 				return generatedDomainConstructionBoundaryDiagnostic(
 					generatedDomainConstructionStageColdConstruction,
-					generatedDomainConstructionReasonColdGroupCorrespondence,
+					generatedDomainConstructionReasonColdGroupContainerCorrespondence,
 					errGeneratedDomainConstructionRefused)
 			}
 			seenContainers[object.id] = struct{}{}
@@ -1127,7 +1127,7 @@ func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *M
 			if !ok {
 				return generatedDomainConstructionBoundaryDiagnostic(
 					generatedDomainConstructionStageColdConstruction,
-					generatedDomainConstructionReasonColdGroupCorrespondence,
+					generatedDomainConstructionReasonColdGroupNetworkCorrespondence,
 					errGeneratedDomainConstructionRefused)
 			}
 			if object.data.driver != "bridge" || object.data.scope != "local" {
@@ -1149,14 +1149,14 @@ func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *M
 			if !ok || object.data.contentID != object.id {
 				return generatedDomainConstructionBoundaryDiagnostic(
 					generatedDomainConstructionStageColdConstruction,
-					generatedDomainConstructionReasonColdGroupCorrespondence,
+					generatedDomainConstructionReasonColdGroupImageCorrespondence,
 					errGeneratedDomainConstructionRefused)
 			}
 			seenImages[object.id] = struct{}{}
 		default:
 			return generatedDomainConstructionBoundaryDiagnostic(
 				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdGroupCorrespondence,
+				generatedDomainConstructionReasonColdGroupOtherCorrespondence,
 				errGeneratedDomainConstructionRefused)
 		}
 		if !generatedDomainExactRigLabels(object.labels, expected.labels) {

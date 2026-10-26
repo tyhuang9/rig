@@ -623,7 +623,7 @@ func generatedDomainTwoComponentColdCases(t *testing.T) []generatedDomainTwoComp
 				}
 			}
 			t.Fatal("frontend container is absent from the cold census")
-		}, reason: generatedDomainConstructionReasonColdGroupCorrespondence},
+		}, reason: generatedDomainConstructionReasonColdGroupContainerCorrespondence},
 		{name: "cold_group_image_attestation_failure", mutate: func(fixture *generatedDomainTwoComponentColdFixture) {
 			roster := fixture.runner.roster.(*generatedDomainCandidateRosterRunner)
 			roster.failKind = candidateOwnerImageInspect
@@ -1044,6 +1044,86 @@ func TestGeneratedDomainColdGroupStructuralAttribution(t *testing.T) {
 				for _, command := range commands {
 					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
 						t.Fatalf("cold group structural refusal dispatched effect/capacity probe: %#v", command)
+					}
+				}
+				generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)
+			})
+		})
+	}
+}
+
+func TestGeneratedDomainColdGroupCorrespondenceAttribution(t *testing.T) {
+	testGeneratedDomainColdGroupCorrespondenceAttribution(t, []generatedDomainColdGroupCorrespondenceCase{
+		{name: "component_absence", reason: generatedDomainConstructionReasonColdGroupComponentAbsence,
+			beforeRetained: true,
+			mutate: func(_ *generatedDomainStartupObservation, groups []generatedDomainColdGroup) {
+				groups[0].snapshot.components[0].state = generatedruntimestate.ComponentStopped
+			}},
+		{name: "network_correspondence", reason: generatedDomainConstructionReasonColdGroupNetworkCorrespondence,
+			mutate: func(observed *generatedDomainStartupObservation, _ []generatedDomainColdGroup) {
+				observed.docker.objects = append(observed.docker.objects, generatedDomainDockerObject{
+					kind: "network", id: strings.Repeat("d", 64), name: "rig-a-unowned-correspondence-network"})
+			}},
+		{name: "image_correspondence", reason: generatedDomainConstructionReasonColdGroupImageCorrespondence,
+			mutate: func(observed *generatedDomainStartupObservation, _ []generatedDomainColdGroup) {
+				id := strings.Repeat("e", 64)
+				observed.docker.objects = append(observed.docker.objects, generatedDomainDockerObject{
+					kind: "image", id: id, data: generatedDomainDockerObjectData{contentID: id}})
+			}},
+	})
+}
+
+func TestGeneratedDomainColdGroupCorrespondenceAttributionPart2(t *testing.T) {
+	testGeneratedDomainColdGroupCorrespondenceAttribution(t, []generatedDomainColdGroupCorrespondenceCase{
+		{name: "other_correspondence", reason: generatedDomainConstructionReasonColdGroupOtherCorrespondence,
+			mutate: func(observed *generatedDomainStartupObservation, _ []generatedDomainColdGroup) {
+				observed.docker.objects = append(observed.docker.objects, generatedDomainDockerObject{
+					kind: "volume", name: "rig-a-unowned-correspondence-volume"})
+			}},
+	})
+}
+
+type generatedDomainColdGroupCorrespondenceCase struct {
+	name           string
+	reason         generatedDomainConstructionReason
+	beforeRetained bool
+	mutate         func(*generatedDomainStartupObservation, []generatedDomainColdGroup)
+}
+
+func testGeneratedDomainColdGroupCorrespondenceAttribution(t *testing.T,
+	cases []generatedDomainColdGroupCorrespondenceCase,
+) {
+	t.Helper()
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture, result, observed, groups := generatedDomainTwoComponentColdAttestationFixture(t)
+				test.mutate(&observed, groups)
+				before := len(fixture.runner.snapshot())
+				var retained generatedDomainColdRetainedGatewayProof
+				err := attestGeneratedDomainColdGroupsWithRetained(context.Background(), result.manager,
+					result.candidates, observed, groups, &retained)
+				assertGeneratedDomainConstructionDiagnostic(t, err,
+					generatedDomainConstructionStageColdConstruction, test.reason,
+					"generated domain construction was refused: stage=cold_construction reason="+string(test.reason))
+				if !errors.Is(err, errGeneratedDomainConstructionRefused) {
+					t.Fatal("cold group correspondence attribution lost the refusal sentinel")
+				}
+				if test.beforeRetained {
+					if !reflect.DeepEqual(retained, generatedDomainColdRetainedGatewayProof{}) {
+						t.Fatalf("pre-retained correspondence refusal populated retained proof: %#v", retained)
+					}
+				} else if retained.presence != generatedDomainColdRetainedGatewayAbsent || retained.authority != nil ||
+					len(retained.objects) != 0 || retained.digest == "" {
+					t.Fatalf("post-retained correspondence refusal lost the exact absent proof: %#v", retained)
+				}
+				commands := fixture.runner.snapshot()[before:]
+				for _, command := range commands {
+					if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
+						t.Fatalf("cold group correspondence refusal dispatched effect/capacity probe: %#v", command)
 					}
 				}
 				generatedDomainA0AssertNoInteractiveGatewayCommands(t, commands)

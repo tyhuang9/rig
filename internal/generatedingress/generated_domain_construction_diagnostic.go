@@ -78,6 +78,11 @@ const (
 	generatedDomainConstructionReasonColdGroupNetworkAttestation           generatedDomainConstructionReason = "cold_group_network_attestation"
 	generatedDomainConstructionReasonColdGroupCensus                       generatedDomainConstructionReason = "cold_group_census"
 	generatedDomainConstructionReasonColdGroupCorrespondence               generatedDomainConstructionReason = "cold_group_correspondence"
+	generatedDomainConstructionReasonColdGroupComponentAbsence             generatedDomainConstructionReason = "cold_group_component_absence"
+	generatedDomainConstructionReasonColdGroupContainerCorrespondence      generatedDomainConstructionReason = "cold_group_container_correspondence"
+	generatedDomainConstructionReasonColdGroupNetworkCorrespondence        generatedDomainConstructionReason = "cold_group_network_correspondence"
+	generatedDomainConstructionReasonColdGroupImageCorrespondence          generatedDomainConstructionReason = "cold_group_image_correspondence"
+	generatedDomainConstructionReasonColdGroupOtherCorrespondence          generatedDomainConstructionReason = "cold_group_other_correspondence"
 	generatedDomainConstructionReasonColdGroupLabels                       generatedDomainConstructionReason = "cold_group_labels"
 	generatedDomainConstructionReasonColdGroupNetworkShape                 generatedDomainConstructionReason = "cold_group_network_shape"
 	generatedDomainConstructionReasonColdGroupNetworkOptions               generatedDomainConstructionReason = "cold_group_network_options"
@@ -226,6 +231,11 @@ func validGeneratedDomainConstructionReason(reason generatedDomainConstructionRe
 		generatedDomainConstructionReasonColdGroupNetworkAttestation,
 		generatedDomainConstructionReasonColdGroupCensus,
 		generatedDomainConstructionReasonColdGroupCorrespondence,
+		generatedDomainConstructionReasonColdGroupComponentAbsence,
+		generatedDomainConstructionReasonColdGroupContainerCorrespondence,
+		generatedDomainConstructionReasonColdGroupNetworkCorrespondence,
+		generatedDomainConstructionReasonColdGroupImageCorrespondence,
+		generatedDomainConstructionReasonColdGroupOtherCorrespondence,
 		generatedDomainConstructionReasonColdGroupLabels,
 		generatedDomainConstructionReasonColdGroupNetworkShape,
 		generatedDomainConstructionReasonColdGroupNetworkOptions,
