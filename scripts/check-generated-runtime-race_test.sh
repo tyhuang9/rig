@@ -69,6 +69,8 @@ completed='^TestGatewayRebindTyped(Completed|Committed|Recovery|Undurable)'
 handover='^TestGatewayRebindTypedHandover'
 rebind_history_heavy='^Test(GatewayRebindCommitReplayRequiresUniqueExactReviewedHistory|GatewayRebindAbortedTerminalProofCoreIsFreshAndReadOnly|GatewayRebindRollbackTerminalObserverBindsCheckpointRoutesDigest|GatewayRebindHistoricalTerminalWithNewActiveReturnsUnavailableProofs|GatewayRebindAbortedTerminalExportedWrapperRejectsMissingPredecessorInventory|GatewayRebindTerminalAttestationWithdrawsOnlyRetainedOwner|GatewayRebindAdmissionCurrentPredecessorRejectsClosingConfigDrift)$'
 domain='^TestGeneratedDomain'
+domain_all_cold='^TestGeneratedDomainCold'
+domain_retained='^TestGeneratedDomainCold.*Retained'
 domain_startup='^TestGeneratedDomain(Startup|ProtectedStartup)'
 domain_stable='^TestGeneratedDomainStartupClassifiesStableGateway'
 domain_a0='^TestGeneratedDomainA0(CommittedV2NamespaceRequiresColdAccounting|CommittedV2NamespaceRequiresColdAccountingPart2|GatewayOnlyNamespaceRemainsExact|GatewayOnlyNamespaceRemainsExactPart2)'
@@ -80,7 +82,7 @@ remainder_skip="$old_remainder_skip|$domain|$capacity|$gateway_operations"
 typed_suites=(rebind-typed-withdrawal rebind-typed-completed rebind-typed-handover rebind-typed-runtime)
 composition_suites=(rebind-composition-native rebind-composition-startup rebind-composition-transferred rebind-composition-second-generation rebind-composition-legacy-source)
 history_suites=(rebind-history-heavy rebind-history)
-remainder_suites=(domain-construction domain-a0 domain-cold domain-startup-stable domain-startup ingress-capacity gateway-operations ingress-remainder)
+remainder_suites=(domain-construction domain-cold-retained domain-cold-remainder domain-a0 domain-cold domain-startup-stable domain-startup ingress-capacity gateway-operations ingress-remainder)
 suites=("${history_suites[@]}" "${typed_suites[@]}" "${composition_suites[@]}" "${remainder_suites[@]}")
 runtime_packages=(
   ./internal/projectanalysis
@@ -123,6 +125,8 @@ ingress_suites=(
   current-serving-predecessor
   current-serving
   domain-construction
+  domain-cold-retained
+  domain-cold-remainder
   domain-a0
   domain-cold
   domain-startup-stable
@@ -184,7 +188,9 @@ for mode in default race plain; do
       rebind-composition-transferred) expected+=("$transferred") ;;
       rebind-composition-second-generation) expected+=("$second") ;;
       rebind-composition-legacy-source) expected+=("$legacy") ;;
-      domain-construction) expected+=("$domain" -skip "$domain_startup|$domain_a0|$domain_cold") ;;
+      domain-construction) expected+=("$domain" -skip "$domain_startup|$domain_a0|$domain_all_cold") ;;
+      domain-cold-retained) expected+=("$domain_retained" -skip "$domain_cold") ;;
+      domain-cold-remainder) expected+=("$domain_all_cold" -skip "$domain_cold|$domain_retained") ;;
       domain-a0) expected+=("$domain_a0") ;;
       domain-cold) expected+=("$domain_cold") ;;
       domain-startup-stable) expected+=("$domain_stable") ;;
@@ -245,7 +251,21 @@ TestInspectGatewayRebindFutureControl rebind-history
 TestGeneratedDomainEmptyBootstrapEffectBoundaries domain-construction
 TestGeneratedDomainConstructionReconstructsColdAccounting domain-construction
 TestGeneratedDomainRegistryFutureControl domain-construction
-TestGeneratedDomainColdBuilderContainerProjectionHonorsDockerTypedAndRawFallbackFields domain-construction
+TestGeneratedDomainColdBuilderContainerProjectionHonorsDockerTypedAndRawFallbackFields domain-cold-remainder
+TestGeneratedDomainColdAcceptsCompleteRetainedV1UnderRebindOrigin domain-cold-retained
+TestGeneratedDomainColdRejectsCompleteRetainedV1UnderRebindOrigin domain-cold-retained
+TestGeneratedDomainColdRetainedGatewaySelectionTripleAndReadAttribution domain-cold-retained
+TestGeneratedDomainColdRetainedGatewaySelectionAuthorityAndReaderAttribution domain-cold-retained
+TestGeneratedDomainColdRetainedFutureControl domain-cold-retained
+TestGeneratedDomainColdFutureRetainedControl domain-cold-retained
+TestGeneratedDomainColdRetainedFutureControl/child domain-cold-retained
+TestGeneratedDomainColdGroupCorrespondenceAttribution domain-cold-remainder
+TestGeneratedDomainColdGroupCorrespondenceAttributionPart2 domain-cold-remainder
+TestGeneratedDomainColdGroupStructuralAttribution domain-cold-remainder
+TestGeneratedDomainColdRuntimeBoundary domain-cold-remainder
+TestGeneratedDomainColdFutureControl domain-cold-remainder
+TestGeneratedDomainColdFutureControl/child domain-cold-remainder
+TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRosterRetainedFuture domain-cold
 TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccounting domain-a0
 TestGeneratedDomainA0CommittedV2NamespaceRequiresColdAccountingPart2 domain-a0
 TestGeneratedDomainA0GatewayOnlyNamespaceRemainsExact domain-a0
@@ -427,4 +447,4 @@ export RIG_INGRESS_SELECTOR_FAIL_TEE=1
 must_fail run rebind-composition-native
 for suite in "${partition_suites[@]}"; do must_fail run "$suite"; done
 unset RIG_INGRESS_SELECTOR_FAIL_TEE
-printf 'Generated runtime selector contract passed: 60 argument checks, 24 partition controls, three matrices, 40 refusal/failure cases.\n'
+printf 'Generated runtime selector contract passed: argument, partition, three-matrix and refusal/failure controls.\n'

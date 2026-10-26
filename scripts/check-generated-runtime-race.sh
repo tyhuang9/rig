@@ -58,6 +58,11 @@ current_serving_predecessor_pattern='^TestGatewayCurrentPredecessor'
 # complete construction, startup, capacity and gateway-operation parent trees
 # in complementary groups; new tests in each family inherit the same split.
 domain_pattern='^TestGeneratedDomain'
+# Cold retained proofs exhausted the construction package budget. Separate
+# their complete parent trees and other cold cases without changing deadlines.
+# The established domain-cold prefixes retain priority in both new groups.
+domain_all_cold_pattern='^TestGeneratedDomainCold'
+domain_retained_pattern='^TestGeneratedDomainCold.*Retained'
 domain_startup_pattern='^TestGeneratedDomain(Startup|ProtectedStartup)'
 domain_stable_pattern='^TestGeneratedDomainStartupClassifiesStableGateway'
 domain_a0_pattern='^TestGeneratedDomainA0(CommittedV2NamespaceRequiresColdAccounting|CommittedV2NamespaceRequiresColdAccountingPart2|GatewayOnlyNamespaceRemainsExact|GatewayOnlyNamespaceRemainsExactPart2)'
@@ -207,7 +212,15 @@ case "$suite" in
     ;;
   domain-construction)
     packages=(./internal/generatedingress)
-    filter=(-run "$domain_pattern" -skip "$domain_startup_pattern|$domain_a0_pattern|$domain_cold_pattern")
+    filter=(-run "$domain_pattern" -skip "$domain_startup_pattern|$domain_a0_pattern|$domain_all_cold_pattern")
+    ;;
+  domain-cold-retained)
+    packages=(./internal/generatedingress)
+    filter=(-run "$domain_retained_pattern" -skip "$domain_cold_pattern")
+    ;;
+  domain-cold-remainder)
+    packages=(./internal/generatedingress)
+    filter=(-run "$domain_all_cold_pattern" -skip "$domain_cold_pattern|$domain_retained_pattern")
     ;;
   domain-a0)
     packages=(./internal/generatedingress)
