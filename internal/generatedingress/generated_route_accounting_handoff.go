@@ -49,28 +49,41 @@ func (a *GeneratedRouteAuthority) recoverAccountingHandoff(ctx context.Context,
 	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
 	evidence generatedRecoveredRouteCompletionEvidence,
 ) (*candidateRecoveredAccountingHandoffHold, generatedruntimestate.RouteAccountingHandoffReceipt, error) {
+	return a.recoverAccountingHandoffHeld(ctx, pinned, claim, evidence, nil)
+}
+
+func (a *GeneratedRouteAuthority) recoverAccountingHandoffHeld(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	evidence generatedRecoveredRouteCompletionEvidence, hold *candidateRecoveredAccountingHandoffHold,
+) (*candidateRecoveredAccountingHandoffHold, generatedruntimestate.RouteAccountingHandoffReceipt, error) {
 	var empty generatedruntimestate.RouteAccountingHandoffReceipt
-	if a == nil || pinned == nil || evidence.replay || !evidence.recoverHandoff ||
-		evidence.activation.PredecessorDeploymentID == "" || len(evidence.receipts) == 0 ||
-		len(evidence.predecessorReceipts) == 0 {
-		return nil, empty, deploymentexecution.ErrInvalidConfiguration
-	}
-	activation, err := a.readRecoveredRouteActivation(ctx, evidence.activation)
-	if err != nil {
-		return nil, empty, err
-	}
-	hold, err := a.candidates.ledger.holdRecoveredAccountingHandoff(
-		generatedDomainColdGroupSpec(a.candidates, evidence.group),
-		generatedDomainColdGroupSpec(a.candidates, evidence.predecessorGroup),
-		evidence.receipts, evidence.predecessorReceipts)
-	if err != nil {
-		return nil, empty, err
-	}
 	fail := func(cause error) (*candidateRecoveredAccountingHandoffHold,
 		generatedruntimestate.RouteAccountingHandoffReceipt, error,
 	) {
-		hold.leave()
+		if hold != nil {
+			hold.leave()
+		}
 		return nil, empty, cause
+	}
+	if a == nil || pinned == nil || evidence.replay || !evidence.recoverHandoff ||
+		evidence.activation.PredecessorDeploymentID == "" || len(evidence.receipts) == 0 ||
+		len(evidence.predecessorReceipts) == 0 {
+		return fail(deploymentexecution.ErrInvalidConfiguration)
+	}
+	activation, err := a.readRecoveredRouteActivation(ctx, evidence.activation)
+	if err != nil {
+		return fail(err)
+	}
+	if hold == nil {
+		hold, err = a.candidates.ledger.holdRecoveredAccountingHandoff(
+			generatedDomainColdGroupSpec(a.candidates, evidence.group),
+			generatedDomainColdGroupSpec(a.candidates, evidence.predecessorGroup),
+			evidence.receipts, evidence.predecessorReceipts)
+		if err != nil {
+			return nil, empty, err
+		}
+	} else if !hold.recoveredRetirementComplete() {
+		return fail(deploymentexecution.ErrAuthorityStale)
 	}
 
 	release, tx, err := a.lockRecoveredAccountingHandoffProof(ctx, pinned, claim, activation,

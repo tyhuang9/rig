@@ -2074,6 +2074,85 @@ func TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedRetirement
 			value.Runtime.RouteCompletionReceipts...)
 		return copy
 	}
+	cloneGroups := func() []generatedDomainColdGroup {
+		values := append([]generatedDomainColdGroup(nil), groups...)
+		values[0].snapshot.components = append([]candidateAdmissionComponent(nil),
+			groups[0].snapshot.components...)
+		values[0].snapshot.runtime.phase = generatedruntimestate.PhaseSucceeded
+		values[0].snapshot.main.status = Succeeded
+		for index := range values[0].snapshot.components {
+			values[0].snapshot.components[index].state = generatedruntimestate.ComponentDraining
+		}
+		return values
+	}
+	prefixGroups := cloneGroups()
+	if prefix, found, err := generatedDomainColdPredecessorRetirementPrefix(
+		database, prefixGroups[1], prefixGroups); err != nil || !found ||
+		len(prefix.componentRetirements) != 0 {
+		t.Fatalf("zero-observation retirement prefix found=%t observations=%d error=%v",
+			found, len(prefix.componentRetirements), err)
+	}
+	if kind, _, _, _, err := classifyGeneratedDomainColdGroup(prefixGroups[0].pins,
+		prefixGroups[0].snapshot, prefixGroups, database); err != nil || kind != generatedDomainColdRisky {
+		t.Fatalf("all-Draining predecessor classification=%d error=%v", kind, err)
+	}
+	partialDatabase := clone(database)
+	partialDatabase.Runtime.PredecessorRetirementComponents = []generatedruntimestate.PredecessorRetirementObservation{
+		observation,
+	}
+	partialGroups := cloneGroups()
+	partialGroups[0].snapshot.components[0].state = generatedruntimestate.ComponentStopped
+	if prefix, found, err := generatedDomainColdPredecessorRetirementPrefix(
+		partialDatabase, partialGroups[1], partialGroups); err != nil || !found ||
+		len(prefix.componentRetirements) != 1 {
+		t.Fatalf("strict partial retirement prefix found=%t observations=%d error=%v",
+			found, len(prefix.componentRetirements), err)
+	}
+	if kind, _, _, _, err := classifyGeneratedDomainColdGroup(partialGroups[0].pins,
+		partialGroups[0].snapshot, partialGroups, partialDatabase); err != nil || kind != generatedDomainColdRisky {
+		t.Fatalf("mixed retirement predecessor classification=%d error=%v", kind, err)
+	}
+	allRowsDatabase := clone(partialDatabase)
+	allRowsDatabase.Runtime.PredecessorRetirementComponents = append(
+		allRowsDatabase.Runtime.PredecessorRetirementComponents, workerObservation)
+	allStoppedGroups := cloneGroups()
+	for index := range allStoppedGroups[0].snapshot.components {
+		allStoppedGroups[0].snapshot.components[index].state = generatedruntimestate.ComponentStopped
+	}
+	if prefix, found, err := generatedDomainColdPredecessorRetirementPrefix(
+		allRowsDatabase, allStoppedGroups[1], allStoppedGroups); err != nil || !found ||
+		len(prefix.componentRetirements) != 2 {
+		t.Fatalf("all-row retirement prefix found=%t observations=%d error=%v",
+			found, len(prefix.componentRetirements), err)
+	}
+	if kind, _, _, _, err := classifyGeneratedDomainColdGroup(allStoppedGroups[0].pins,
+		allStoppedGroups[0].snapshot, allStoppedGroups, allRowsDatabase); err != nil ||
+		kind != generatedDomainColdHistorical {
+		t.Fatalf("all-Stopped no-aggregate predecessor classification=%d error=%v", kind, err)
+	}
+	for _, malformed := range []struct {
+		name   string
+		mutate func(*deployments.GeneratedDomainStartupSnapshot)
+	}{
+		{name: "crossed partial row", mutate: func(value *deployments.GeneratedDomainStartupSnapshot) {
+			value.Runtime.PredecessorRetirementComponents[0].ActivationReceiptID = uuid.NewString()
+		}},
+		{name: "duplicate partial row", mutate: func(value *deployments.GeneratedDomainStartupSnapshot) {
+			value.Runtime.PredecessorRetirementComponents = append(
+				value.Runtime.PredecessorRetirementComponents,
+				value.Runtime.PredecessorRetirementComponents[0])
+		}},
+	} {
+		t.Run("prefix "+malformed.name, func(t *testing.T) {
+			invalid := clone(partialDatabase)
+			malformed.mutate(&invalid)
+			if _, found, err := generatedDomainColdPredecessorRetirementPrefix(
+				invalid, partialGroups[1], partialGroups); found ||
+				!errors.Is(err, errGeneratedDomainConstructionRefused) {
+				t.Fatalf("malformed partial prefix found=%t error=%v", found, err)
+			}
+		})
+	}
 	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); restored || err != nil {
 		t.Fatalf("activation-only Risky evidence=(%v, %v)", restored, err)
 	}
@@ -2087,26 +2166,28 @@ func TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedRetirement
 		t.Fatalf("component-only retirement Risky evidence=(%v, %v)", restored, err)
 	}
 	database.Runtime.PredecessorRetirementReceipts = append(database.Runtime.PredecessorRetirementReceipts, retirement)
-	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); !restored || err != nil {
+	retiredGroups := allStoppedGroups
+	retiredSuccessor := retiredGroups[1]
+	if restored, err := generatedDomainColdDrainingDebtEvidence(database, retiredSuccessor, retiredGroups); !restored || err != nil {
 		t.Fatalf("retirement-only Risky evidence=(%v, %v)", restored, err)
 	}
-	if restored, err := generatedDomainColdDrainingDebtDeployments(database, successor, groups); err != nil ||
+	if restored, err := generatedDomainColdDrainingDebtDeployments(database, retiredSuccessor, retiredGroups); err != nil ||
 		!reflect.DeepEqual(restored, []string{successorID, predecessorID}) {
 		t.Fatalf("retirement-only restored deployments=%v error=%v", restored, err)
 	}
 	database.Runtime.AccountingHandoffAuthorizations = append(database.Runtime.AccountingHandoffAuthorizations, authorization)
-	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); !restored || err != nil {
+	if restored, err := generatedDomainColdDrainingDebtEvidence(database, retiredSuccessor, retiredGroups); !restored || err != nil {
 		t.Fatalf("authorized Risky evidence=(%v, %v)", restored, err)
 	}
-	if restored, err := generatedDomainColdDrainingDebtDeployments(database, successor, groups); err != nil ||
+	if restored, err := generatedDomainColdDrainingDebtDeployments(database, retiredSuccessor, retiredGroups); err != nil ||
 		!reflect.DeepEqual(restored, []string{successorID, predecessorID}) {
 		t.Fatalf("authorized restored deployments=%v error=%v", restored, err)
 	}
 	database.Runtime.AccountingHandoffReceipts = append(database.Runtime.AccountingHandoffReceipts, handoff)
-	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); !restored || err != nil {
+	if restored, err := generatedDomainColdDrainingDebtEvidence(database, retiredSuccessor, retiredGroups); !restored || err != nil {
 		t.Fatalf("complete Draining handoff evidence=(%v, %v)", restored, err)
 	}
-	if restored, err := generatedDomainColdDrainingDebtDeployments(database, successor, groups); err != nil ||
+	if restored, err := generatedDomainColdDrainingDebtDeployments(database, retiredSuccessor, retiredGroups); err != nil ||
 		!reflect.DeepEqual(restored, []string{successorID}) {
 		t.Fatalf("completed handoff restored deployments=%v error=%v", restored, err)
 	}
@@ -2114,7 +2195,7 @@ func TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedRetirement
 	unrelatedCompletion.Runtime.RouteCompletionReceipts = append(unrelatedCompletion.Runtime.RouteCompletionReceipts,
 		generatedruntimestate.RouteCompletionReceipt{ActivationReceiptID: uuid.NewString(),
 			SuccessorDeploymentID: uuid.NewString()})
-	if restored, err := generatedDomainColdDrainingDebtEvidence(unrelatedCompletion, successor, groups); !restored || err != nil {
+	if restored, err := generatedDomainColdDrainingDebtEvidence(unrelatedCompletion, retiredSuccessor, retiredGroups); !restored || err != nil {
 		t.Fatalf("unrelated historical completion changed Draining evidence=(%v, %v)", restored, err)
 	}
 
@@ -2159,9 +2240,123 @@ func TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedRetirement
 		t.Run(test.name, func(t *testing.T) {
 			copy := clone(database)
 			test.mutate(&copy)
-			if restored, err := generatedDomainColdDrainingDebtEvidence(copy, successor, groups); restored ||
+			if restored, err := generatedDomainColdDrainingDebtEvidence(copy, retiredSuccessor, retiredGroups); restored ||
 				!errors.Is(err, errGeneratedDomainConstructionRefused) {
 				t.Fatalf("invalid Draining evidence=(%v, %v)", restored, err)
+			}
+		})
+	}
+}
+
+func TestGeneratedDomainColdInitialDrainingDebtEvidenceFallsThroughExactZeroPredecessorChain(t *testing.T) {
+	appID, deploymentID := uuid.NewString(), uuid.NewString()
+	releaseID, jobID, activationID := uuid.NewString(), uuid.NewString(), uuid.NewString()
+	stamp := time.Date(2026, 10, 26, 19, 0, 0, 0, time.UTC)
+	component := candidateAdmissionComponent{plan: deploymentplans.Component{Name: "api"}, slot: "blue",
+		state: generatedruntimestate.ComponentActive, containerName: "api-blue",
+		containerID: strings.Repeat("a", 64), artifact: &candidateArtifactSnapshot{id: uuid.NewString()},
+		receipt: &candidateIntentSnapshot{id: uuid.NewString(), creatorJobID: jobID,
+			creatorWorkerAttempt: 1, policyDigest: strings.Repeat("b", 64)}}
+	group := generatedDomainColdGroup{pins: candidateValidationPins{
+		identity:     candidateValidationIdentity{applicationID: appID, jobID: jobID, attempt: 1},
+		deploymentID: deploymentID, releaseID: releaseID, candidateSlot: "blue",
+	}, snapshot: candidateAdmissionSnapshot{
+		pins: candidateImmutablePins{jobID: jobID, releaseID: releaseID, candidateSlot: "blue"},
+		headPins: candidateHeadPins{appID: appID, deploymentID: deploymentID,
+			releaseID: releaseID, slot: "blue"},
+		observedHead: candidateHeadSnapshot{appID: appID, deploymentID: deploymentID,
+			releaseID: releaseID, slot: "blue", activationReceiptID: activationID, generation: 1},
+		runtime:    candidateRuntimeSnapshot{phase: generatedruntimestate.PhaseDraining},
+		components: []candidateAdmissionComponent{component},
+	}, kind: generatedDomainColdRisky}
+	groups := []generatedDomainColdGroup{group}
+	roster, ok := generatedDomainColdActivationRoster(group.snapshot)
+	if !ok {
+		t.Fatal("initial Draining activation roster is invalid")
+	}
+	emptyRosterDigest := generatedRouteActivationRosterDigest(nil)
+	activation := generatedruntimestate.GeneratedDomainStartupRouteActivation{
+		ReceiptID: activationID, AppID: appID, SuccessorDeploymentID: deploymentID,
+		SuccessorReleaseID: releaseID, SuccessorSlot: "blue", SuccessorGeneration: 1,
+		CreatorJobID: jobID, CreatorWorkerAttempt: 1,
+		CandidateRosterDigest:   generatedRouteActivationRosterDigest(roster),
+		PredecessorRosterDigest: emptyRosterDigest, RouteIntentDigest: strings.Repeat("c", 64),
+		CommittedRouteProofDigest: strings.Repeat("d", 64),
+	}
+	retirement := generatedruntimestate.PredecessorRetirementReceipt{
+		ActivationReceiptID: activationID, AppID: appID, SuccessorDeploymentID: deploymentID,
+		PredecessorRosterDigest: emptyRosterDigest, ComponentCount: 0, RetiredAt: stamp,
+	}
+	authorization := generatedruntimestate.RouteAccountingHandoffAuthorization{
+		ActivationReceiptID: activationID, AppID: appID, SuccessorDeploymentID: deploymentID,
+		CandidateRosterDigest:   activation.CandidateRosterDigest,
+		PredecessorRosterDigest: emptyRosterDigest, SuccessorComponentCount: 1,
+		PredecessorComponentCount: 0, AuthorizedAt: stamp.Add(time.Second),
+	}
+	handoff := generatedruntimestate.RouteAccountingHandoffReceipt{
+		ActivationReceiptID: activationID, AppID: appID, SuccessorDeploymentID: deploymentID,
+		CandidateRosterDigest:   activation.CandidateRosterDigest,
+		PredecessorRosterDigest: emptyRosterDigest, SuccessorComponentCount: 1,
+		PredecessorComponentCount: 0, HandedOffAt: stamp.Add(2 * time.Second),
+	}
+	database := deployments.GeneratedDomainStartupSnapshot{}
+	database.Runtime.RouteActivations = []generatedruntimestate.GeneratedDomainStartupRouteActivation{activation}
+	database.Runtime.PredecessorRetirementReceipts = []generatedruntimestate.PredecessorRetirementReceipt{retirement}
+	database.Runtime.AccountingHandoffAuthorizations = []generatedruntimestate.RouteAccountingHandoffAuthorization{authorization}
+	database.Runtime.AccountingHandoffReceipts = []generatedruntimestate.RouteAccountingHandoffReceipt{handoff}
+	if _, found, err := generatedDomainColdPredecessorRetirementPrefix(database, group, groups); found || err != nil {
+		t.Fatalf("initial activation was not an inapplicable predecessor prefix found=%t error=%v", found, err)
+	}
+	if restored, err := generatedDomainColdDrainingDebtEvidence(database, group, groups); !restored || err != nil {
+		t.Fatalf("exact initial Draining chain evidence=(%v, %v)", restored, err)
+	}
+	if restored, err := generatedDomainColdDrainingDebtDeployments(database, group, groups); err != nil ||
+		!reflect.DeepEqual(restored, []string{deploymentID}) {
+		t.Fatalf("exact initial Draining debt=%v error=%v", restored, err)
+	}
+
+	clone := func() deployments.GeneratedDomainStartupSnapshot {
+		copy := database
+		copy.Runtime.RouteActivations = append([]generatedruntimestate.GeneratedDomainStartupRouteActivation(nil),
+			database.Runtime.RouteActivations...)
+		copy.Runtime.PredecessorRetirementComponents = append([]generatedruntimestate.PredecessorRetirementObservation(nil),
+			database.Runtime.PredecessorRetirementComponents...)
+		copy.Runtime.PredecessorRetirementReceipts = append([]generatedruntimestate.PredecessorRetirementReceipt(nil),
+			database.Runtime.PredecessorRetirementReceipts...)
+		copy.Runtime.AccountingHandoffAuthorizations = append([]generatedruntimestate.RouteAccountingHandoffAuthorization(nil),
+			database.Runtime.AccountingHandoffAuthorizations...)
+		copy.Runtime.AccountingHandoffReceipts = append([]generatedruntimestate.RouteAccountingHandoffReceipt(nil),
+			database.Runtime.AccountingHandoffReceipts...)
+		return copy
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*deployments.GeneratedDomainStartupSnapshot)
+	}{
+		{name: "crossed component", mutate: func(value *deployments.GeneratedDomainStartupSnapshot) {
+			value.Runtime.PredecessorRetirementComponents = append(value.Runtime.PredecessorRetirementComponents,
+				generatedruntimestate.PredecessorRetirementObservation{ActivationReceiptID: activationID,
+					AppID: appID, SuccessorDeploymentID: deploymentID,
+					PredecessorDeploymentID: uuid.NewString(), ComponentName: "foreign",
+					CandidateReceiptID: uuid.NewString(), ContainerID: strings.Repeat("e", 64),
+					CandidatePolicyDigest: strings.Repeat("f", 64), ObservedAbsentAt: stamp})
+		}},
+		{name: "crossed aggregate", mutate: func(value *deployments.GeneratedDomainStartupSnapshot) {
+			value.Runtime.PredecessorRetirementReceipts[0].AppID = uuid.NewString()
+		}},
+		{name: "nonzero predecessor count", mutate: func(value *deployments.GeneratedDomainStartupSnapshot) {
+			value.Runtime.PredecessorRetirementReceipts[0].ComponentCount = 1
+		}},
+		{name: "nonempty predecessor digest", mutate: func(value *deployments.GeneratedDomainStartupSnapshot) {
+			value.Runtime.RouteActivations[0].PredecessorRosterDigest = strings.Repeat("1", 64)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := clone()
+			test.mutate(&invalid)
+			if restored, err := generatedDomainColdDrainingDebtEvidence(invalid, group, groups); restored ||
+				!errors.Is(err, errGeneratedDomainConstructionRefused) {
+				t.Fatalf("invalid initial Draining evidence=(%v, %v)", restored, err)
 			}
 		})
 	}

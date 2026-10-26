@@ -370,6 +370,7 @@ type candidateRecoveredAccountingHandoffHold struct {
 	predecessorSpec     candidateGroupSpec
 	successorReceipts   map[string]string
 	predecessorReceipts map[string]string
+	predecessorPhysical map[string]candidatePhysicalState
 	successorTokens     []candidateRosterToken
 	predecessorTokens   []candidateRosterToken
 	successor           []candidateAccountingHandoffEntry
@@ -555,6 +556,26 @@ func (l *candidateCapacityLedger) holdRecoveredCompletionRoster(spec candidateGr
 func (l *candidateCapacityLedger) holdRecoveredAccountingHandoff(successorSpec,
 	predecessorSpec candidateGroupSpec, successorReceipts, predecessorReceipts map[string]string,
 ) (*candidateRecoveredAccountingHandoffHold, error) {
+	physical := make(map[string]candidatePhysicalState, len(predecessorReceipts))
+	for name := range predecessorReceipts {
+		physical[name] = candidatePhysicalConfirmedAbsent
+	}
+	return l.holdRecoveredAccountingHandoffPhysical(successorSpec, predecessorSpec,
+		successorReceipts, predecessorReceipts, physical)
+}
+
+func (l *candidateCapacityLedger) holdRecoveredRetirementHandoff(successorSpec,
+	predecessorSpec candidateGroupSpec, successorReceipts, predecessorReceipts map[string]string,
+	predecessorPhysical map[string]candidatePhysicalState,
+) (*candidateRecoveredAccountingHandoffHold, error) {
+	return l.holdRecoveredAccountingHandoffPhysical(successorSpec, predecessorSpec,
+		successorReceipts, predecessorReceipts, predecessorPhysical)
+}
+
+func (l *candidateCapacityLedger) holdRecoveredAccountingHandoffPhysical(successorSpec,
+	predecessorSpec candidateGroupSpec, successorReceipts, predecessorReceipts map[string]string,
+	predecessorPhysical map[string]candidatePhysicalState,
+) (*candidateRecoveredAccountingHandoffHold, error) {
 	if l == nil || l.budget == nil || l.coordinator == nil {
 		return nil, errCandidateCapacityInvalid
 	}
@@ -566,7 +587,8 @@ func (l *candidateCapacityLedger) holdRecoveredAccountingHandoff(successorSpec,
 	if err != nil || successor.appID != predecessor.appID ||
 		successor.deploymentID == predecessor.deploymentID ||
 		len(successorReceipts) != len(successor.components) ||
-		len(predecessorReceipts) != len(predecessor.components) {
+		len(predecessorReceipts) != len(predecessor.components) ||
+		len(predecessorPhysical) != len(predecessor.components) {
 		return nil, errCandidateCapacityInvalid
 	}
 	l.mu.Lock()
@@ -583,6 +605,7 @@ func (l *candidateCapacityLedger) holdRecoveredAccountingHandoff(successorSpec,
 		predecessorGroup: predecessorGroup, successorSpec: successor, predecessorSpec: predecessor,
 		successorReceipts:   cloneCandidateReceiptIDs(successorReceipts),
 		predecessorReceipts: cloneCandidateReceiptIDs(predecessorReceipts),
+		predecessorPhysical: cloneCandidatePhysicalStates(predecessorPhysical),
 		successorTokens:     make([]candidateRosterToken, 0, len(successor.components)),
 		predecessorTokens:   make([]candidateRosterToken, 0, len(predecessor.components)),
 		successor:           make([]candidateAccountingHandoffEntry, 0, len(successor.components)),
@@ -596,18 +619,26 @@ func (l *candidateCapacityLedger) holdRecoveredAccountingHandoff(successorSpec,
 		return nil, errCandidateCapacityPinsChanged
 	}
 	for _, value := range []struct {
-		group    *candidateCapacityGroup
-		receipts map[string]string
-		physical candidatePhysicalState
-		entries  *[]candidateAccountingHandoffEntry
-	}{{successorGroup, hold.successorReceipts, candidatePhysicalHandedToRoute,
+		group          *candidateCapacityGroup
+		receipts       map[string]string
+		physicalByName map[string]candidatePhysicalState
+		physical       candidatePhysicalState
+		entries        *[]candidateAccountingHandoffEntry
+	}{{successorGroup, hold.successorReceipts, nil, candidatePhysicalHandedToRoute,
 		&hold.successor},
-		{predecessorGroup, hold.predecessorReceipts, candidatePhysicalConfirmedAbsent,
+		{predecessorGroup, hold.predecessorReceipts, hold.predecessorPhysical, candidatePhysicalUnused,
 			&hold.predecessor}} {
 		for _, name := range value.group.components {
 			component := value.group.byName[name]
+			physical := value.physical
+			if value.physicalByName != nil {
+				physical = value.physicalByName[name]
+				if physical != candidatePhysicalHandedToRoute && physical != candidatePhysicalConfirmedAbsent {
+					return nil, errCandidateCapacityInvalid
+				}
+			}
 			entry, ok := candidateRecoveredAccountingEntryLocked(component, value.group,
-				value.receipts[name], value.physical, l.coordinator)
+				value.receipts[name], physical, l.coordinator)
 			if !ok || component.tokenHeld {
 				return nil, errCandidateCapacityStale
 			}
@@ -632,6 +663,14 @@ func (l *candidateCapacityLedger) holdRecoveredAccountingHandoff(successorSpec,
 		}
 	}
 	return hold, nil
+}
+
+func cloneCandidatePhysicalStates(values map[string]candidatePhysicalState) map[string]candidatePhysicalState {
+	result := make(map[string]candidatePhysicalState, len(values))
+	for name, value := range values {
+		result[name] = value
+	}
+	return result
 }
 
 func cloneCandidateReceiptIDs(values map[string]string) map[string]string {
@@ -682,6 +721,11 @@ func (h *candidateRecoveredAccountingHandoffHold) beginAccountingHandoff() (
 	if !h.validPreparedLocked() {
 		return nil, errCandidateCapacityStale
 	}
+	for _, name := range h.predecessorGroup.components {
+		if h.predecessorPhysical[name] != candidatePhysicalConfirmedAbsent {
+			return nil, errCandidatePhysicalTransition
+		}
+	}
 	for index := range h.successor {
 		h.successor[index].charge.explicitRetained = true
 		h.successor[index].charge.owner = candidateAccountingTransferring
@@ -718,19 +762,121 @@ func (h *candidateRecoveredAccountingHandoffHold) validPreparedLocked() bool {
 		return false
 	}
 	for _, value := range []struct {
-		entries  []candidateAccountingHandoffEntry
-		group    *candidateCapacityGroup
-		receipts map[string]string
-		physical candidatePhysicalState
-	}{{h.successor, h.successorGroup, h.successorReceipts, candidatePhysicalHandedToRoute},
-		{h.predecessor, h.predecessorGroup, h.predecessorReceipts, candidatePhysicalConfirmedAbsent}} {
+		entries        []candidateAccountingHandoffEntry
+		group          *candidateCapacityGroup
+		receipts       map[string]string
+		physicalByName map[string]candidatePhysicalState
+		physical       candidatePhysicalState
+	}{{h.successor, h.successorGroup, h.successorReceipts, nil, candidatePhysicalHandedToRoute},
+		{h.predecessor, h.predecessorGroup, h.predecessorReceipts,
+			h.predecessorPhysical, candidatePhysicalUnused}} {
 		for _, entry := range value.entries {
+			physical := value.physical
+			if value.physicalByName != nil {
+				physical = value.physicalByName[entry.component.name]
+			}
 			current, ok := candidateRecoveredAccountingEntryLocked(entry.component, value.group,
-				value.receipts[entry.component.name], value.physical, h.coordinator)
+				value.receipts[entry.component.name], physical, h.coordinator)
 			if !ok || current.charge != entry.charge || current.receipt != entry.receipt ||
 				current.epoch != entry.epoch || current.token != entry.token || current.lease != entry.lease {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) enterRecoveredRetirementCommand(
+	componentName string, command candidateCommand,
+) error {
+	if h == nil || (command != candidateCommandStop && command != candidateCommandRemove) {
+		return errCandidateCapacityInvalid
+	}
+	unlock := lockCandidateAccountingGroups(h.successorGroup, h.predecessorGroup)
+	defer unlock()
+	if !h.validPreparedLocked() {
+		return errCandidateCapacityStale
+	}
+	component := h.predecessorGroup.byName[componentName]
+	if component == nil || component.receipt == nil {
+		return errCandidateCapacityStale
+	}
+	marker, _ := candidateCommandMarker(command)
+	for {
+		word := component.receipt.state.Load()
+		if word&candidateReceiptUnquiesced != 0 {
+			return errCandidateMutationUnquiesced
+		}
+		if word&marker != 0 {
+			return errCandidateCommandEntered
+		}
+		physical := candidatePhysicalFromWord(word)
+		if physical != candidatePhysicalHandedToRoute && physical != candidatePhysicalPresent {
+			return errCandidatePhysicalTransition
+		}
+		if component.receipt.state.CompareAndSwap(word, word|marker) {
+			return nil
+		}
+	}
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) markRecoveredPredecessorAbsent(
+	componentName string,
+) error {
+	if h == nil {
+		return errCandidateCapacityInvalid
+	}
+	unlock := lockCandidateAccountingGroups(h.successorGroup, h.predecessorGroup)
+	defer unlock()
+	if !h.validPreparedLocked() {
+		return errCandidateCapacityStale
+	}
+	component := h.predecessorGroup.byName[componentName]
+	if component == nil || component.receipt == nil || component.charge == nil ||
+		component.receipt.state.Load()&candidateReceiptUnquiesced != 0 {
+		return errCandidateCapacityStale
+	}
+	if err := candidateTransitionPhysical(&component.receipt.state, candidatePhysicalConfirmedAbsent,
+		candidatePhysicalPresent, candidatePhysicalHandedToRoute, candidatePhysicalConfirmedAbsent); err != nil {
+		return err
+	}
+	h.predecessorPhysical[componentName] = candidatePhysicalConfirmedAbsent
+	return nil
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) latchRecoveredRetirementUnquiesced(
+	componentName string,
+) {
+	if h == nil {
+		return
+	}
+	unlock := lockCandidateAccountingGroups(h.successorGroup, h.predecessorGroup)
+	defer unlock()
+	if !h.validPreparedLocked() {
+		return
+	}
+	component := h.predecessorGroup.byName[componentName]
+	if component == nil || component.receipt == nil || component.charge == nil {
+		return
+	}
+	word := component.receipt.state.Load()
+	if word&(candidateReceiptStop|candidateReceiptRemove) != 0 {
+		candidateAtomicSet(&component.receipt.state, candidateReceiptUnquiesced)
+	}
+}
+
+func (h *candidateRecoveredAccountingHandoffHold) recoveredRetirementComplete() bool {
+	if h == nil {
+		return false
+	}
+	unlock := lockCandidateAccountingGroups(h.successorGroup, h.predecessorGroup)
+	defer unlock()
+	if !h.validPreparedLocked() {
+		return false
+	}
+	for _, name := range h.predecessorGroup.components {
+		if h.predecessorPhysical[name] != candidatePhysicalConfirmedAbsent {
+			return false
 		}
 	}
 	return true

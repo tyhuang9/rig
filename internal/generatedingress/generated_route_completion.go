@@ -25,8 +25,10 @@ type generatedRecoveredRouteCompletionEvidence struct {
 	predecessorRoster   []generatedruntimestate.RouteActivationComponent
 	receipts            map[string]string
 	predecessorReceipts map[string]string
+	predecessorPhysical map[string]candidatePhysicalState
 	replay              bool
 	recoverHandoff      bool
+	recoverRetirement   bool
 }
 
 // CompleteRecovered completes only the exact interrupted Draining handoff
@@ -79,7 +81,20 @@ func (a *GeneratedRouteAuthority) CompleteRecovered(ctx context.Context,
 	} else if err := a.AttestPublished(ctx, claim, deploymentID); err != nil {
 		return err
 	}
-	if evidence.recoverHandoff {
+	if evidence.recoverRetirement {
+		var recovered *candidateRecoveredAccountingHandoffHold
+		recovered, evidence, err = a.recoverPredecessorRetirement(ctx, pinned, claim, evidence)
+		if err != nil {
+			return err
+		}
+		handoffHold, handoff, handoffErr := a.recoverAccountingHandoffHeld(
+			ctx, pinned, claim, evidence, recovered)
+		if handoffErr != nil {
+			return handoffErr
+		}
+		evidence.handoff = handoff
+		hold = handoffHold
+	} else if evidence.recoverHandoff {
 		recovered, handoff, err := a.recoverAccountingHandoff(ctx, pinned, claim, evidence)
 		if err != nil {
 			return err
@@ -132,9 +147,24 @@ func recoveredRouteCompletionEvidence(observed generatedDomainStartupObservation
 		claim.Attempt() < result.group.pins.attempt() {
 		return result, deploymentexecution.ErrIdentityLost
 	}
-	restored, err := generatedDomainColdDrainingDebtEvidence(observed.database, result.group, groups)
+	prefix, pendingRetirement, err := generatedDomainColdPredecessorRetirementPrefix(
+		observed.database, result.group, groups)
 	if err != nil {
 		return result, errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	restored := pendingRetirement
+	if pendingRetirement {
+		result.recoverRetirement = true
+		result.activation = prefix.activation
+		result.predecessorGroup = prefix.predecessorGroup
+		result.predecessorRoster = append([]generatedruntimestate.RouteActivationComponent(nil),
+			prefix.predecessorRoster...)
+	}
+	if !restored {
+		restored, err = generatedDomainColdDrainingDebtEvidence(observed.database, result.group, groups)
+		if err != nil {
+			return result, errors.Join(deploymentexecution.ErrIdentityLost, err)
+		}
 	}
 	if !restored {
 		completed, completedErr := generatedDomainColdCurrentDebtEvidence(observed.database, result.group, groups)
@@ -200,7 +230,8 @@ func recoveredRouteCompletionEvidence(observed generatedDomainStartupObservation
 	} else {
 		result.predecessorRoster = []generatedruntimestate.RouteActivationComponent{}
 	}
-	if activationCount != 1 || retirementCount != 1 || authorizationCount > 1 || handoffCount > 1 ||
+	if activationCount != 1 || !result.recoverRetirement && retirementCount != 1 ||
+		result.recoverRetirement && retirementCount != 0 || authorizationCount > 1 || handoffCount > 1 ||
 		(result.replay && (authorizationCount != 1 || handoffCount != 1)) ||
 		(!result.replay && handoffCount == 1 && authorizationCount != 1) ||
 		len(result.candidateRoster) == 0 ||
@@ -218,11 +249,17 @@ func recoveredRouteCompletionEvidence(observed generatedDomainStartupObservation
 		return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrIdentityLost
 	}
 	result.predecessorReceipts = make(map[string]string, len(result.predecessorGroup.receipts))
+	result.predecessorPhysical = make(map[string]candidatePhysicalState, len(result.predecessorGroup.receipts))
 	for name, receipt := range result.predecessorGroup.receipts {
-		if name == "" || receipt.id == "" || receipt.physical != candidatePhysicalConfirmedAbsent || receipt.unknown {
+		physical := receipt.physical
+		if name == "" || receipt.id == "" || receipt.unknown ||
+			result.recoverRetirement && physical != candidatePhysicalHandedToRoute &&
+				physical != candidatePhysicalConfirmedAbsent ||
+			!result.recoverRetirement && physical != candidatePhysicalConfirmedAbsent {
 			return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrIdentityLost
 		}
 		result.predecessorReceipts[name] = receipt.id
+		result.predecessorPhysical[name] = physical
 	}
 	if len(result.predecessorReceipts) != len(result.predecessorRoster) {
 		return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrIdentityLost

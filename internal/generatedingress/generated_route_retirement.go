@@ -40,6 +40,300 @@ type generatedPredecessorRetirementState struct {
 	completion          *generatedRouteCompletionOperation
 }
 
+// recoverPredecessorRetirement completes only the fixed predecessor roster
+// authenticated by one cold construction and one fresh scoped worker. The
+// returned hold remains live for the immediately following accounting handoff.
+func (a *GeneratedRouteAuthority) recoverPredecessorRetirement(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	evidence generatedRecoveredRouteCompletionEvidence,
+) (*candidateRecoveredAccountingHandoffHold, generatedRecoveredRouteCompletionEvidence, error) {
+	if a == nil || pinned == nil || ctx == nil || !evidence.recoverRetirement || evidence.replay ||
+		evidence.activation.PredecessorDeploymentID == "" || len(evidence.predecessorRoster) == 0 ||
+		len(evidence.predecessorReceipts) != len(evidence.predecessorRoster) ||
+		len(evidence.predecessorPhysical) != len(evidence.predecessorRoster) ||
+		a.waitRecoveredRetirement == nil {
+		return nil, evidence, deploymentexecution.ErrInvalidConfiguration
+	}
+	activation, err := a.readRecoveredRouteActivation(ctx, evidence.activation)
+	if err != nil {
+		return nil, evidence, err
+	}
+	hold, err := a.candidates.ledger.holdRecoveredRetirementHandoff(
+		generatedDomainColdGroupSpec(a.candidates, evidence.group),
+		generatedDomainColdGroupSpec(a.candidates, evidence.predecessorGroup),
+		evidence.receipts, evidence.predecessorReceipts, evidence.predecessorPhysical)
+	if err != nil {
+		return nil, evidence, err
+	}
+	fail := func(cause error) (*candidateRecoveredAccountingHandoffHold,
+		generatedRecoveredRouteCompletionEvidence, error,
+	) {
+		hold.leave()
+		return nil, evidence, cause
+	}
+	if !hold.validPrepared() {
+		return fail(deploymentexecution.ErrAuthorityStale)
+	}
+	if err := a.waitRecoveredRetirement(ctx, maximumDrain); err != nil {
+		return fail(err)
+	}
+	for _, component := range evidence.predecessorRoster {
+		policy, ok := evidence.predecessorGroup.policies[component.ComponentName]
+		if !ok || component.ContainerID == "" {
+			return fail(deploymentexecution.ErrIdentityLost)
+		}
+		if evidence.predecessorPhysical[component.ComponentName] == candidatePhysicalConfirmedAbsent {
+			absent, _, boundaryErr := a.recoveredRetirementComponentBoundary(ctx, pinned, claim,
+				activation, evidence, hold, component, policy, true, false, false)
+			if boundaryErr != nil || !absent {
+				return fail(errors.Join(deploymentexecution.ErrIdentityLost, boundaryErr))
+			}
+			continue
+		}
+		absent, running, boundaryErr := a.recoveredRetirementComponentBoundary(ctx, pinned, claim,
+			activation, evidence, hold, component, policy, false, false, true)
+		if boundaryErr != nil {
+			return fail(boundaryErr)
+		}
+		if absent {
+			if err := hold.markRecoveredPredecessorAbsent(component.ComponentName); err != nil {
+				return fail(err)
+			}
+			continue
+		}
+		if running {
+			if err := hold.enterRecoveredRetirementCommand(component.ComponentName, candidateCommandStop); err != nil {
+				return fail(err)
+			}
+			if err := a.runRecoveredRetirementCommand(ctx, hold, component.ComponentName,
+				[]string{"container", "stop", "--time", "10", component.ContainerID}); err != nil {
+				return fail(err)
+			}
+		}
+		absent, _, boundaryErr = a.recoveredRetirementComponentBoundary(ctx, pinned, claim,
+			activation, evidence, hold, component, policy, false, true, true)
+		if boundaryErr != nil {
+			return fail(boundaryErr)
+		}
+		if !absent {
+			if err := hold.enterRecoveredRetirementCommand(component.ComponentName, candidateCommandRemove); err != nil {
+				return fail(err)
+			}
+			if err := a.runRecoveredRetirementCommand(ctx, hold, component.ComponentName,
+				[]string{"container", "rm", component.ContainerID}); err != nil {
+				return fail(err)
+			}
+			absent, _, boundaryErr = a.recoveredRetirementComponentBoundary(ctx, pinned, claim,
+				activation, evidence, hold, component, policy, true, false, true)
+			if boundaryErr != nil || !absent {
+				return fail(errors.Join(deploymentexecution.ErrIdentityLost, boundaryErr))
+			}
+		}
+		if err := hold.markRecoveredPredecessorAbsent(component.ComponentName); err != nil {
+			return fail(err)
+		}
+	}
+	retirement, err := a.recordRecoveredPredecessorRetirement(ctx, pinned, claim, activation, evidence, hold)
+	if err != nil {
+		return fail(err)
+	}
+	evidence, err = a.refreshRecoveredRetirementHandoffEvidence(ctx, claim, evidence, retirement, hold)
+	if err != nil {
+		return fail(err)
+	}
+	return hold, evidence, nil
+}
+
+// refreshRecoveredRetirementHandoffEvidence authenticates the durable post-043
+// transition without reusing the now-stale pre-retirement cold manifest. The
+// same fresh Claim and continuously held restored rosters remain mandatory.
+func (a *GeneratedRouteAuthority) refreshRecoveredRetirementHandoffEvidence(ctx context.Context,
+	claim deploymentexecution.Claim, before generatedRecoveredRouteCompletionEvidence,
+	retirement generatedruntimestate.PredecessorRetirementReceipt,
+	hold *candidateRecoveredAccountingHandoffHold,
+) (generatedRecoveredRouteCompletionEvidence, error) {
+	if a == nil || a.construction == nil || a.construction.reservation == nil ||
+		hold == nil || !hold.recoveredRetirementComplete() {
+		return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrAuthorityStale
+	}
+	input := a.construction.reservation.input
+	observed, err := inspectGeneratedDomainStartupObservation(ctx, input.stores, input.runner, input.options)
+	if err != nil {
+		return generatedRecoveredRouteCompletionEvidence{}, err
+	}
+	groups, err := readGeneratedDomainColdGroups(ctx, a.candidates, observed)
+	if err != nil {
+		return generatedRecoveredRouteCompletionEvidence{}, err
+	}
+	after, err := recoveredRouteCompletionEvidence(observed, groups, claim,
+		before.activation.SuccessorDeploymentID)
+	if err != nil || after.replay || after.recoverRetirement || !after.recoverHandoff ||
+		after.activation != before.activation || after.retirement != retirement ||
+		!reflect.DeepEqual(after.candidateRoster, before.candidateRoster) ||
+		!reflect.DeepEqual(after.predecessorRoster, before.predecessorRoster) ||
+		!reflect.DeepEqual(after.receipts, before.receipts) ||
+		!reflect.DeepEqual(after.predecessorReceipts, before.predecessorReceipts) ||
+		!hold.recoveredRetirementComplete() {
+		return generatedRecoveredRouteCompletionEvidence{}, errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	return after, nil
+}
+
+func (a *GeneratedRouteAuthority) runRecoveredRetirementCommand(ctx context.Context,
+	hold *candidateRecoveredAccountingHandoffHold, component string, args []string,
+) error {
+	command, err := a.candidates.prepareCandidateCommand(args)
+	if err != nil {
+		return err
+	}
+	result, runErr := a.candidates.process.Run(ctx, command)
+	defer clearGeneratedCandidateResult(&result)
+	if errors.Is(runErr, runtimeprocess.ErrTerminationFailed) {
+		hold.latchRecoveredRetirementUnquiesced(component)
+		return candidateFailure("process_termination_failed", runErr)
+	}
+	return candidateProcessFailure(ctx, result, runErr, "candidate_cleanup_failed")
+}
+
+func (a *GeneratedRouteAuthority) recoveredRetirementComponentBoundary(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	activation generatedruntimestate.RouteActivationReceipt,
+	evidence generatedRecoveredRouteCompletionEvidence, hold *candidateRecoveredAccountingHandoffHold,
+	component generatedruntimestate.RouteActivationComponent, policy candidatePolicy,
+	requireAbsent, requireRemovable, recordAbsent bool,
+) (absent, running bool, resultErr error) {
+	release, err := a.manager.lockGateway(ctx)
+	if err != nil {
+		return false, false, err
+	}
+	defer releaseGatewayLock(release, &resultErr)
+	if err := a.attestRecoveredRetirementRouteAndSuccessor(ctx, claim, activation, evidence); err != nil {
+		return false, false, err
+	}
+	observed, found, err := a.candidates.inspectCandidate(ctx, component.ContainerID)
+	if err != nil {
+		return false, false, err
+	}
+	if found {
+		expected := policy.identity
+		expected.ContainerID = component.ContainerID
+		if !generatedcontainer.MatchesConfigured(observed, expected, policy.limits) ||
+			(requireRemovable && !candidateRemovableState(observed)) || requireAbsent {
+			return false, false, deploymentexecution.ErrIdentityLost
+		}
+	}
+	tx, err := a.stores.Database().BeginTx(ctx, nil)
+	if err != nil {
+		return false, false, gateDatabaseError(ctx, err)
+	}
+	defer tx.Rollback()
+	if err := a.validateRecoveredRetirementTx(ctx, tx, pinned, claim, activation, evidence, hold); err != nil {
+		return false, false, err
+	}
+	if !found && recordAbsent {
+		if _, _, err := a.runtime.RecordPredecessorRetirementComponentTx(
+			ctx, tx, activation, component, time.Now().UTC()); err != nil {
+			return false, false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, false, gateDatabaseError(ctx, err)
+	}
+	return !found, found && generatedcontainer.CurrentlyRunning(observed), nil
+}
+
+func (a *GeneratedRouteAuthority) attestRecoveredRetirementRouteAndSuccessor(ctx context.Context,
+	claim deploymentexecution.Claim, activation generatedruntimestate.RouteActivationReceipt,
+	evidence generatedRecoveredRouteCompletionEvidence,
+) error {
+	expected, err := a.readPublishedRouteAttestation(ctx, claim, activation.SuccessorDeploymentID)
+	if err != nil {
+		return err
+	}
+	observation, err := a.manager.observeGeneratedRetirementLocked(ctx, activation.AppID)
+	if err != nil || !sameRoute(expected, routeRecord{Slot: observation.Slot, Endpoints: observation.Endpoints}) {
+		return errors.Join(deploymentexecution.ErrAuthorityStale, err)
+	}
+	for _, component := range evidence.group.snapshot.components {
+		policy, ok := evidence.group.policies[component.plan.Name]
+		if !ok || component.containerID == "" {
+			return deploymentexecution.ErrIdentityLost
+		}
+		if err := a.candidates.attestCandidateImage(ctx, policy); err != nil {
+			return err
+		}
+		if err := a.candidates.attestCandidateNetwork(ctx, policy); err != nil {
+			return err
+		}
+		expected := policy.identity
+		expected.ContainerID = component.containerID
+		observed, found, err := a.candidates.inspectCandidate(ctx, component.containerID)
+		if err != nil || !found || !generatedcontainer.MatchesConfigured(observed, expected, policy.limits) ||
+			!generatedcontainer.CurrentlyRunning(observed) || observed.Health != "healthy" {
+			return errors.Join(deploymentexecution.ErrIdentityLost, err)
+		}
+	}
+	return nil
+}
+
+func (a *GeneratedRouteAuthority) validateRecoveredRetirementTx(ctx context.Context, tx *sql.Tx,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	activation generatedruntimestate.RouteActivationReceipt,
+	evidence generatedRecoveredRouteCompletionEvidence, hold *candidateRecoveredAccountingHandoffHold,
+) error {
+	if hold == nil || !hold.validPrepared() {
+		return deploymentexecution.ErrAuthorityStale
+	}
+	if err := pinned.CheckGeneratedRouteRetirementTx(tx, claim, activation); err != nil ||
+		!routeRetirementRosterMatchesTx(ctx, tx, evidence.candidateRoster,
+			generatedruntimestate.ComponentActive, false) ||
+		!routeRetirementRosterMatchesTx(ctx, tx, evidence.predecessorRoster,
+			generatedruntimestate.ComponentDraining, true) || !hold.validPrepared() {
+		return errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	return nil
+}
+
+func (a *GeneratedRouteAuthority) recordRecoveredPredecessorRetirement(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	activation generatedruntimestate.RouteActivationReceipt,
+	evidence generatedRecoveredRouteCompletionEvidence, hold *candidateRecoveredAccountingHandoffHold,
+) (result generatedruntimestate.PredecessorRetirementReceipt, resultErr error) {
+	if hold == nil || !hold.recoveredRetirementComplete() {
+		return result, deploymentexecution.ErrAuthorityStale
+	}
+	release, err := a.manager.lockGateway(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer releaseGatewayLock(release, &resultErr)
+	if err := a.attestRecoveredRetirementRouteAndSuccessor(ctx, claim, activation, evidence); err != nil {
+		return result, err
+	}
+	for _, component := range evidence.predecessorRoster {
+		if _, found, inspectErr := a.candidates.inspectCandidate(ctx, component.ContainerID); inspectErr != nil || found {
+			return result, errors.Join(deploymentexecution.ErrIdentityLost, inspectErr)
+		}
+	}
+	tx, err := a.stores.Database().BeginTx(ctx, nil)
+	if err != nil {
+		return result, gateDatabaseError(ctx, err)
+	}
+	defer tx.Rollback()
+	if err := a.validateRecoveredRetirementTx(ctx, tx, pinned, claim, activation, evidence, hold); err != nil {
+		return result, err
+	}
+	result, _, err = a.runtime.RecordPredecessorRetirementReceiptTx(
+		ctx, tx, activation, evidence.predecessorRoster, time.Now().UTC())
+	if err != nil {
+		return generatedruntimestate.PredecessorRetirementReceipt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return generatedruntimestate.PredecessorRetirementReceipt{}, gateDatabaseError(ctx, err)
+	}
+	return result, nil
+}
+
 func (e *GeneratedRouteExecution) mintPredecessorRetirement(ctx context.Context,
 	result generatedRouteActivationResult, successor map[string]candidatePolicy,
 ) (*GeneratedPredecessorRetirement, error) {

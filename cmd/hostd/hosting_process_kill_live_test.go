@@ -951,8 +951,8 @@ func controllerProcessKillMatrix(
 	state := generatedruntimestate.New(db)
 	previousMarker := "controller-journey"
 	for index, boundary := range []controllerProcessKillBoundary{
-		controllerKillAfterRetire, controllerKillBeforeBuild, controllerKillBeforeStart, controllerKillAfterRoute,
-		controllerKillBeforeDrain, controllerKillAfterHandoff, controllerKillAfterSuccess, controllerKillAfterMain,
+		controllerKillBeforeDrain, controllerKillAfterRetire, controllerKillBeforeBuild, controllerKillBeforeStart,
+		controllerKillAfterRoute, controllerKillAfterHandoff, controllerKillAfterSuccess, controllerKillAfterMain,
 	} {
 		if !t.Run(string(boundary), func(t *testing.T) {
 			if index > 0 {
