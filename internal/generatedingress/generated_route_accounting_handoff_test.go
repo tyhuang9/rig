@@ -260,6 +260,297 @@ func TestGeneratedRouteAccountingHandoffResolvesDurableLostAcknowledgement(t *te
 	}
 }
 
+func TestGeneratedRouteRecoveredAccountingHandoffResolvesDurableReceiptLostAcknowledgement(t *testing.T) {
+	lost := errors.New("test recovered accounting handoff receipt acknowledgement lost")
+	fault := &generatedRouteAccountingLostAckFault{
+		target: "generated_route_accounting_handoff_receipts", cause: lost,
+	}
+	db := openGeneratedRouteAccountingLostAckDatabase(t, fault)
+	fixture := newGeneratedRouteRecoveredAccountingHandoffFixture(t, db)
+	fault.armed.Store(true)
+
+	hold, receipt, err := fixture.authority.recoverAccountingHandoff(fixture.ctx, fixture.pinned,
+		fixture.claim, fixture.evidence)
+	if err != nil || hold == nil || !hold.valid() || receipt.ActivationReceiptID == "" ||
+		fault.hits.Load() != 1 || fault.writes.Load() != 1 {
+		t.Fatalf("recovered lost acknowledgement hold=%#v receipt=%#v hits=%d writes=%d error=%v",
+			hold, receipt, fault.hits.Load(), fault.writes.Load(), err)
+	}
+	assertGeneratedRouteAccountingRows(t, fixture.route, 1, 1)
+	hold.leave()
+	assertGeneratedRouteRecoveredAccountingDebt(t, fixture)
+
+	if replay, replayReceipt, replayErr := fixture.authority.recoverAccountingHandoff(
+		fixture.ctx, fixture.pinned, fixture.claim, fixture.evidence,
+	); replay != nil || replayReceipt.ActivationReceiptID != "" || replayErr == nil {
+		t.Fatalf("recovered lost acknowledgement remained retryable hold=%#v receipt=%#v error=%v",
+			replay, replayReceipt, replayErr)
+	}
+	if fault.hits.Load() != 1 || fault.writes.Load() != 1 {
+		t.Fatalf("recovered lost acknowledgement duplicated durable write hits=%d writes=%d",
+			fault.hits.Load(), fault.writes.Load())
+	}
+	assertGeneratedRouteAccountingRows(t, fixture.route, 1, 1)
+}
+
+func TestGeneratedRouteRecoveredAccountingHandoffFinalProofFailureIsTerminal(t *testing.T) {
+	fault := &generatedRouteAccountingLostAckFault{target: "generated_route_accounting_handoff_receipts"}
+	db := openGeneratedRouteAccountingLostAckDatabase(t, fault)
+	fixture := newGeneratedRouteRecoveredAccountingHandoffFixture(t, db)
+	fixture.route.manager.gatewayRebindFailStop = &atomic.Bool{}
+	predecessorID := fixture.evidence.predecessorRoster[0].ContainerID
+	predecessorReads := 0
+	fixture.route.candidateRunner.beforeInspect = func(target string) {
+		if target != predecessorID {
+			return
+		}
+		predecessorReads++
+		if predecessorReads == 2 {
+			physical := fixture.route.candidateRunner.physical[target]
+			physical.exists = true
+			physical.running = false
+			fixture.route.candidateRunner.physical[target] = physical
+		}
+	}
+
+	hold, receipt, err := fixture.authority.recoverAccountingHandoff(fixture.ctx, fixture.pinned,
+		fixture.claim, fixture.evidence)
+	if err == nil || hold != nil || receipt.ActivationReceiptID != "" || predecessorReads != 2 ||
+		!fixture.route.manager.gatewayRebindAdmissionBlocked() {
+		t.Fatalf("recovered final proof failure hold=%#v receipt=%#v reads=%d failStop=%t error=%v",
+			hold, receipt, predecessorReads, fixture.route.manager.gatewayRebindAdmissionBlocked(), err)
+	}
+	assertGeneratedRouteAccountingRows(t, fixture.route, 1, 0)
+	assertGeneratedRouteRecoveredAccountingDebt(t, fixture)
+
+	if replay, replayReceipt, replayErr := fixture.authority.recoverAccountingHandoff(
+		fixture.ctx, fixture.pinned, fixture.claim, fixture.evidence,
+	); replay != nil || replayReceipt.ActivationReceiptID != "" || replayErr == nil {
+		t.Fatalf("recovered final proof failure remained retryable hold=%#v receipt=%#v error=%v",
+			replay, replayReceipt, replayErr)
+	}
+	assertGeneratedRouteAccountingRows(t, fixture.route, 1, 0)
+	assertGeneratedRouteRecoveredAccountingDebt(t, fixture)
+}
+
+type generatedRouteRecoveredAccountingHandoffFixture struct {
+	route       *generatedRoutePredecessorFixture
+	authority   *GeneratedRouteAuthority
+	pinned      *deploymentexecution.Pinned
+	ctx         context.Context
+	claim       deploymentexecution.Claim
+	evidence    generatedRecoveredRouteCompletionEvidence
+	coordinator *generatedDomainCapacityCoordinator
+	tokens      []*generatedDomainCapacityDebtToken
+}
+
+func newGeneratedRouteRecoveredAccountingHandoffFixture(t *testing.T,
+	db *sql.DB,
+) generatedRouteRecoveredAccountingHandoffFixture {
+	t.Helper()
+	route := newGeneratedRouteAccountingFixtureOnDatabase(t, db)
+	retirement := activateGeneratedRouteAccountingFixture(t, route)
+	state := retirement.state
+	if state == nil || state.execution == nil || state.execution.authority == nil ||
+		state.execution.candidate == nil || state.execution.candidate.state == nil || state.retired == nil {
+		t.Fatal("recovered accounting fixture omitted authentic retirement state")
+	}
+	authority := state.execution.authority
+	claim := state.execution.candidate.state.pins.claim
+	scope := state.execution.candidate.state.ctx
+	pinned, err := authority.stores.ExecutionGuard().PinScope(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pinned.Leave)
+
+	successor := generatedRouteRecoveredAccountingColdGroup(t, authority.candidates,
+		state.receipt.SuccessorDeploymentID, state.successorPolicies, state.execution.candidateRoster,
+		candidatePhysicalHandedToRoute, generatedDomainColdRisky)
+	predecessor := generatedRouteRecoveredAccountingColdGroup(t, authority.candidates,
+		state.receipt.PredecessorDeploymentID, state.predecessorPolicies, state.execution.predecessorRoster,
+		candidatePhysicalConfirmedAbsent, generatedDomainColdHistorical)
+	limits := generatedcapacity.Limits{MemoryBytes: uint64(authority.candidates.options.MemoryBytes),
+		DiskBytes: authority.candidates.options.ReplacementDiskBytes}
+	coordinator, err := newGeneratedDomainCapacityCoordinator(route.manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens, err := coordinator.installBootstrapBatch([]generatedcapacity.Limits{limits, limits})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.sealBootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	budget, err := generatedcapacity.New(coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := newCandidateCapacityLedger(budget, coordinator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.seedColdOwnershipWithDebt(generatedDomainColdGroupSpec(authority.candidates, predecessor),
+		predecessor.receipts, tokens[:1]); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.seedColdOwnershipWithDebt(generatedDomainColdGroupSpec(authority.candidates, successor),
+		successor.receipts, tokens[1:]); err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.publishRestoredOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	authority.candidates.budget = budget
+	authority.candidates.coordinator = coordinator
+	authority.candidates.ledger = ledger
+
+	evidence := generatedRecoveredRouteCompletionEvidence{
+		group: successor, predecessorGroup: predecessor,
+		activation: generatedRouteRecoveredStartupActivation(state.receipt), retirement: *state.retired,
+		candidateRoster: append([]generatedruntimestate.RouteActivationComponent(nil),
+			state.execution.candidateRoster...),
+		predecessorRoster: append([]generatedruntimestate.RouteActivationComponent(nil),
+			state.execution.predecessorRoster...),
+		receipts: cloneCandidateReceiptIDs(generatedRouteRecoveredAccountingReceipts(state.execution.candidateRoster)),
+		predecessorReceipts: cloneCandidateReceiptIDs(
+			generatedRouteRecoveredAccountingReceipts(state.execution.predecessorRoster)),
+		recoverHandoff: true,
+	}
+	return generatedRouteRecoveredAccountingHandoffFixture{route: route, authority: authority,
+		pinned: pinned, ctx: scope, claim: claim, evidence: evidence, coordinator: coordinator, tokens: tokens}
+}
+
+func generatedRouteRecoveredAccountingColdGroup(t *testing.T, authority *GeneratedCandidateAuthority,
+	deploymentID string, policies map[string]candidatePolicy,
+	roster []generatedruntimestate.RouteActivationComponent, physical candidatePhysicalState,
+	kind generatedDomainColdGroupKind,
+) generatedDomainColdGroup {
+	t.Helper()
+	database, err := authority.stores.GeneratedDomainStartupSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mainIndex, runtimeIndex = -1, -1
+	for index := range database.GeneratedDeployments {
+		if database.GeneratedDeployments[index].ID == deploymentID {
+			mainIndex = index
+		}
+	}
+	for index := range database.Runtime.Deployments {
+		if database.Runtime.Deployments[index].DeploymentID == deploymentID {
+			runtimeIndex = index
+		}
+	}
+	if mainIndex < 0 || runtimeIndex < 0 {
+		t.Fatalf("recovered accounting deployment %s is absent", deploymentID)
+	}
+	main := database.GeneratedDeployments[mainIndex]
+	runtimeValue := database.Runtime.Deployments[runtimeIndex]
+	pins := candidateValidationPins{identity: candidateValidationIdentity{applicationID: main.AppID,
+		jobID: main.JobID, attempt: main.JobAttempt}, deploymentID: main.ID, releaseID: main.ReleaseID,
+		configurationRevisionID:      main.ActualConfigurationRevisionID,
+		configurationRevisionNumber:  main.ActualConfigurationRevisionNumber,
+		deploymentPlanRevisionID:     main.DeploymentPlanRevisionID,
+		deploymentPlanRevisionNumber: main.DeploymentPlanRevisionNumber,
+		candidateSlot:                runtimeValue.CandidateSlot}
+	protected, err := authority.loadCandidateProtectedSnapshotIdentity(context.Background(), pins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := authority.stores.Database().BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, readErr := readCandidateAdmissionSnapshotIdentityTx(context.Background(), tx, pins, protected)
+	if readErr == nil {
+		readErr = tx.Commit()
+	} else {
+		_ = tx.Rollback()
+	}
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	receipts := make(map[string]candidateColdReceiptSeed, len(roster))
+	for _, component := range roster {
+		receipts[component.ComponentName] = candidateColdReceiptSeed{id: component.CandidateReceiptID,
+			physical: physical}
+	}
+	return generatedDomainColdGroup{pins: pins, protected: protected, snapshot: snapshot, kind: kind,
+		policies: policies, receipts: receipts, restoredDebt: true}
+}
+
+func generatedRouteRecoveredAccountingReceipts(
+	roster []generatedruntimestate.RouteActivationComponent,
+) map[string]string {
+	result := make(map[string]string, len(roster))
+	for _, component := range roster {
+		result[component.ComponentName] = component.CandidateReceiptID
+	}
+	return result
+}
+
+func generatedRouteRecoveredStartupActivation(
+	value generatedruntimestate.RouteActivationReceipt,
+) generatedruntimestate.GeneratedDomainStartupRouteActivation {
+	return generatedruntimestate.GeneratedDomainStartupRouteActivation{
+		ReceiptID: value.ReceiptID, AppID: value.AppID,
+		SuccessorDeploymentID: value.SuccessorDeploymentID, SuccessorReleaseID: value.SuccessorReleaseID,
+		SuccessorSlot: value.SuccessorSlot, SuccessorGeneration: value.SuccessorGeneration,
+		PredecessorDeploymentID: value.PredecessorDeploymentID,
+		PredecessorReleaseID:    value.PredecessorReleaseID, PredecessorSlot: value.PredecessorSlot,
+		PredecessorGeneration:          value.PredecessorGeneration,
+		PredecessorActivationReceiptID: value.PredecessorActivationReceiptID,
+		CreatorJobID:                   value.CreatorJobID, CreatorWorkerAttempt: value.CreatorWorkerAttempt,
+		CandidateRosterDigest:     value.CandidateRosterDigest,
+		PredecessorRosterDigest:   value.PredecessorRosterDigest,
+		RouteIntentDigest:         value.RouteIntentDigest,
+		CommittedRouteProofDigest: value.CommittedRouteProofDigest,
+	}
+}
+
+func assertGeneratedRouteRecoveredAccountingDebt(t *testing.T,
+	fixture generatedRouteRecoveredAccountingHandoffFixture,
+) {
+	t.Helper()
+	fixture.coordinator.mu.Lock()
+	configured := len(fixture.coordinator.tokens)
+	memory := fixture.coordinator.memory
+	disk := fixture.coordinator.disk
+	predecessorConfigured := fixture.tokens[0].active
+	successorConfigured := fixture.tokens[1].active
+	fixture.coordinator.mu.Unlock()
+	limits := fixture.tokens[1].limits
+	if configured != 1 || memory != limits.MemoryBytes || disk != limits.DiskBytes ||
+		predecessorConfigured || !successorConfigured {
+		t.Fatalf("recovered accounting debt configured=%d memory=%d disk=%d predecessor=%t successor=%t",
+			configured, memory, disk, predecessorConfigured, successorConfigured)
+	}
+	ledger := fixture.authority.candidates.ledger
+	ledger.mu.Lock()
+	successor := ledger.groups[candidateCapacityGroupKey{appID: fixture.evidence.activation.AppID,
+		deploymentID: fixture.evidence.activation.SuccessorDeploymentID}]
+	predecessor := ledger.groups[candidateCapacityGroupKey{appID: fixture.evidence.activation.AppID,
+		deploymentID: fixture.evidence.activation.PredecessorDeploymentID}]
+	ledger.mu.Unlock()
+	if successor == nil || predecessor == nil {
+		t.Fatal("recovered accounting groups are absent")
+	}
+	unlock := lockCandidateAccountingGroups(successor, predecessor)
+	defer unlock()
+	successorCharge := successor.byName[successor.components[0]].charge
+	predecessorCharge := predecessor.byName[predecessor.components[0]].charge
+	if successorCharge == nil || successorCharge.owner != candidateAccountingRouteActive ||
+		successorCharge.state != candidateChargeActive || successorCharge.logicallyRetired ||
+		successorCharge.token != fixture.tokens[1] || successor.byName[successor.components[0]].tokenHeld ||
+		predecessorCharge == nil || predecessorCharge.owner != candidateAccountingPredecessorRetired ||
+		predecessorCharge.state != candidateChargeReleased || !predecessorCharge.logicallyRetired ||
+		predecessorCharge.token != nil || predecessor.byName[predecessor.components[0]].tokenHeld {
+		t.Fatalf("recovered accounting successor=%+v predecessor=%+v", successorCharge, predecessorCharge)
+	}
+}
+
 func TestGeneratedRouteAccountingHandoffRetriesCancellationAfterTransfer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	fault := &generatedRouteAccountingLostAckFault{

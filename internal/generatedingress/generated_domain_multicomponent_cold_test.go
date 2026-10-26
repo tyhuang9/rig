@@ -1962,7 +1962,7 @@ func generatedDomainColdLegacyCurrentDebtFixture(t *testing.T) (deployments.Gene
 	return database, current, []generatedDomainColdGroup{predecessor, current}
 }
 
-func TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedHandoff(t *testing.T) {
+func TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedRetirementPrefix(t *testing.T) {
 	appID := uuid.NewString()
 	predecessorID, successorID := uuid.NewString(), uuid.NewString()
 	predecessorRelease, successorRelease := uuid.NewString(), uuid.NewString()
@@ -2087,16 +2087,28 @@ func TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedHandoff(t 
 		t.Fatalf("component-only retirement Risky evidence=(%v, %v)", restored, err)
 	}
 	database.Runtime.PredecessorRetirementReceipts = append(database.Runtime.PredecessorRetirementReceipts, retirement)
-	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); restored || err != nil {
+	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); !restored || err != nil {
 		t.Fatalf("retirement-only Risky evidence=(%v, %v)", restored, err)
 	}
+	if restored, err := generatedDomainColdDrainingDebtDeployments(database, successor, groups); err != nil ||
+		!reflect.DeepEqual(restored, []string{successorID, predecessorID}) {
+		t.Fatalf("retirement-only restored deployments=%v error=%v", restored, err)
+	}
 	database.Runtime.AccountingHandoffAuthorizations = append(database.Runtime.AccountingHandoffAuthorizations, authorization)
-	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); restored || err != nil {
+	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); !restored || err != nil {
 		t.Fatalf("authorized Risky evidence=(%v, %v)", restored, err)
+	}
+	if restored, err := generatedDomainColdDrainingDebtDeployments(database, successor, groups); err != nil ||
+		!reflect.DeepEqual(restored, []string{successorID, predecessorID}) {
+		t.Fatalf("authorized restored deployments=%v error=%v", restored, err)
 	}
 	database.Runtime.AccountingHandoffReceipts = append(database.Runtime.AccountingHandoffReceipts, handoff)
 	if restored, err := generatedDomainColdDrainingDebtEvidence(database, successor, groups); !restored || err != nil {
 		t.Fatalf("complete Draining handoff evidence=(%v, %v)", restored, err)
+	}
+	if restored, err := generatedDomainColdDrainingDebtDeployments(database, successor, groups); err != nil ||
+		!reflect.DeepEqual(restored, []string{successorID}) {
+		t.Fatalf("completed handoff restored deployments=%v error=%v", restored, err)
 	}
 	unrelatedCompletion := clone(database)
 	unrelatedCompletion.Runtime.RouteCompletionReceipts = append(unrelatedCompletion.Runtime.RouteCompletionReceipts,

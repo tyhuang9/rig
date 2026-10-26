@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/generatedcontainer"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
 
@@ -42,6 +43,278 @@ type generatedRouteAccountingHandoffOperation struct {
 	receipt       generatedruntimestate.RouteAccountingHandoffReceipt
 	closed        bool
 	rostersLeft   bool
+}
+
+func (a *GeneratedRouteAuthority) recoverAccountingHandoff(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	evidence generatedRecoveredRouteCompletionEvidence,
+) (*candidateRecoveredAccountingHandoffHold, generatedruntimestate.RouteAccountingHandoffReceipt, error) {
+	var empty generatedruntimestate.RouteAccountingHandoffReceipt
+	if a == nil || pinned == nil || evidence.replay || !evidence.recoverHandoff ||
+		evidence.activation.PredecessorDeploymentID == "" || len(evidence.receipts) == 0 ||
+		len(evidence.predecessorReceipts) == 0 {
+		return nil, empty, deploymentexecution.ErrInvalidConfiguration
+	}
+	activation, err := a.readRecoveredRouteActivation(ctx, evidence.activation)
+	if err != nil {
+		return nil, empty, err
+	}
+	hold, err := a.candidates.ledger.holdRecoveredAccountingHandoff(
+		generatedDomainColdGroupSpec(a.candidates, evidence.group),
+		generatedDomainColdGroupSpec(a.candidates, evidence.predecessorGroup),
+		evidence.receipts, evidence.predecessorReceipts)
+	if err != nil {
+		return nil, empty, err
+	}
+	fail := func(cause error) (*candidateRecoveredAccountingHandoffHold,
+		generatedruntimestate.RouteAccountingHandoffReceipt, error,
+	) {
+		hold.leave()
+		return nil, empty, cause
+	}
+
+	release, tx, err := a.lockRecoveredAccountingHandoffProof(ctx, pinned, claim, activation,
+		evidence, hold.validPrepared)
+	if err != nil {
+		return fail(err)
+	}
+	authorization, changed, err := a.runtime.RecordRouteAccountingHandoffAuthorizationTx(
+		ctx, tx, activation, evidence.retirement, evidence.candidateRoster,
+		evidence.predecessorRoster, time.Now().UTC())
+	if err != nil || evidence.authorization.ActivationReceiptID == "" && !changed ||
+		evidence.authorization.ActivationReceiptID != "" && (changed || authorization != evidence.authorization) {
+		_ = tx.Rollback()
+		return fail(a.releaseRecoveredAccountingHandoffLock(release,
+			errors.Join(deploymentexecution.ErrIdentityLost, err)))
+	}
+	if err := tx.Commit(); err != nil {
+		return fail(a.releaseRecoveredAccountingHandoffLock(release, gateDatabaseError(ctx, err)))
+	}
+	accounting, err := hold.beginAccountingHandoff()
+	if err != nil {
+		return fail(a.releaseRecoveredAccountingHandoffLock(release, err))
+	}
+	failTransferred := func(release func() error, cause error) (*candidateRecoveredAccountingHandoffHold,
+		generatedruntimestate.RouteAccountingHandoffReceipt, error,
+	) {
+		if release != nil {
+			if releaseErr := release(); releaseErr != nil {
+				cause = &Error{Code: DiagnosticRouteUnresolved}
+			}
+		}
+		a.manager.gatewayRebindFailStopLatch().Store(true)
+		accounting.close()
+		hold.leave()
+		return nil, empty, cause
+	}
+	if err := release(); err != nil {
+		return failTransferred(nil, &Error{Code: DiagnosticRouteUnresolved})
+	}
+
+	finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx),
+		generatedRouteAccountingHandoffFinalizationTimeout)
+	defer cancel()
+	if err := accounting.markGatewayUnlocked(); err != nil {
+		return failTransferred(nil, err)
+	}
+	if err := accounting.releasePredecessorOnce(); err != nil {
+		return failTransferred(nil, err)
+	}
+	release, tx, err = a.lockRecoveredAccountingHandoffProof(finalCtx, pinned, claim, activation,
+		evidence, func() bool { return accounting.validateFinalState() == nil })
+	if err != nil {
+		return failTransferred(nil, err)
+	}
+	handedOffAt := time.Now().UTC()
+	expectedReceipt := recoveredAccountingHandoffReceipt(authorization, handedOffAt)
+	receipt, changed, err := a.runtime.RecordRouteAccountingHandoffReceiptTx(
+		finalCtx, tx, authorization, handedOffAt)
+	if err == nil && (!changed || receipt != expectedReceipt || !hold.valid()) {
+		err = deploymentexecution.ErrIdentityLost
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		receipt, err = a.retryRecoveredAccountingHandoffReceipt(finalCtx, pinned, claim, activation,
+			evidence, hold, accounting, authorization, handedOffAt)
+		if err != nil {
+			return failTransferred(release, err)
+		}
+	}
+	if err := release(); err != nil {
+		return failTransferred(nil, &Error{Code: DiagnosticRouteUnresolved})
+	}
+	if !hold.valid() {
+		return failTransferred(nil, deploymentexecution.ErrAuthorityStale)
+	}
+	return hold, receipt, nil
+}
+
+func (a *GeneratedRouteAuthority) lockRecoveredAccountingHandoffProof(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	activation generatedruntimestate.RouteActivationReceipt,
+	evidence generatedRecoveredRouteCompletionEvidence, valid func() bool,
+) (func() error, *sql.Tx, error) {
+	if valid == nil || !valid() {
+		return nil, nil, deploymentexecution.ErrAuthorityStale
+	}
+	release, err := a.manager.lockGateway(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	fail := func(cause error) (func() error, *sql.Tx, error) {
+		return nil, nil, a.releaseRecoveredAccountingHandoffLock(release, cause)
+	}
+	expected, err := a.readPublishedRouteAttestation(ctx, claim, activation.SuccessorDeploymentID)
+	if err != nil {
+		return fail(err)
+	}
+	observation, err := a.manager.observeGeneratedRetirementLocked(ctx, activation.AppID)
+	if err != nil || !sameRoute(expected, routeRecord{Slot: observation.Slot, Endpoints: observation.Endpoints}) {
+		return fail(errors.Join(deploymentexecution.ErrAuthorityStale, err))
+	}
+	if err := a.attestRecoveredAccountingHandoffPhysical(ctx, evidence); err != nil {
+		return fail(err)
+	}
+	tx, err := a.stores.Database().BeginTx(ctx, nil)
+	if err != nil {
+		return fail(gateDatabaseError(ctx, err))
+	}
+	if err := a.validateRecoveredAccountingHandoffTx(ctx, tx, pinned, claim, activation,
+		evidence, valid); err != nil {
+		_ = tx.Rollback()
+		return fail(err)
+	}
+	return release, tx, nil
+}
+
+func (a *GeneratedRouteAuthority) attestRecoveredAccountingHandoffPhysical(ctx context.Context,
+	evidence generatedRecoveredRouteCompletionEvidence,
+) error {
+	if a == nil || a.candidates == nil || len(evidence.group.snapshot.components) == 0 ||
+		len(evidence.predecessorRoster) == 0 {
+		return deploymentexecution.ErrIdentityLost
+	}
+	for _, component := range evidence.group.snapshot.components {
+		policy, ok := evidence.group.policies[component.plan.Name]
+		if !ok || component.containerID == "" {
+			return deploymentexecution.ErrIdentityLost
+		}
+		if err := a.candidates.attestCandidateImage(ctx, policy); err != nil {
+			return err
+		}
+		if err := a.candidates.attestCandidateNetwork(ctx, policy); err != nil {
+			return err
+		}
+		expected := policy.identity
+		expected.ContainerID = component.containerID
+		observed, found, err := a.candidates.inspectCandidate(ctx, component.containerID)
+		if err != nil || !found || !generatedcontainer.MatchesConfigured(observed, expected, policy.limits) ||
+			!generatedcontainer.CurrentlyRunning(observed) {
+			return errors.Join(deploymentexecution.ErrIdentityLost, err)
+		}
+	}
+	for _, component := range evidence.predecessorRoster {
+		if component.ContainerID == "" {
+			return deploymentexecution.ErrIdentityLost
+		}
+		if _, found, err := a.candidates.inspectCandidate(ctx, component.ContainerID); err != nil || found {
+			return errors.Join(deploymentexecution.ErrIdentityLost, err)
+		}
+	}
+	return nil
+}
+
+func (a *GeneratedRouteAuthority) validateRecoveredAccountingHandoffTx(ctx context.Context,
+	tx *sql.Tx, pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	activation generatedruntimestate.RouteActivationReceipt,
+	evidence generatedRecoveredRouteCompletionEvidence, valid func() bool,
+) error {
+	if tx == nil || valid == nil || !valid() {
+		return deploymentexecution.ErrAuthorityStale
+	}
+	if err := pinned.CheckGeneratedRouteRetirementTx(tx, claim, activation); err != nil ||
+		!routeRetirementRosterMatchesTx(ctx, tx, evidence.candidateRoster,
+			generatedruntimestate.ComponentActive, false) ||
+		!routeRetirementRosterMatchesTx(ctx, tx, evidence.predecessorRoster,
+			generatedruntimestate.ComponentStopped, false) || !valid() {
+		return errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	return nil
+}
+
+func (a *GeneratedRouteAuthority) retryRecoveredAccountingHandoffReceipt(ctx context.Context,
+	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
+	activation generatedruntimestate.RouteActivationReceipt,
+	evidence generatedRecoveredRouteCompletionEvidence, hold *candidateRecoveredAccountingHandoffHold,
+	accounting *candidateAccountingHandoffOperation,
+	authorization generatedruntimestate.RouteAccountingHandoffAuthorization, handedOffAt time.Time,
+) (generatedruntimestate.RouteAccountingHandoffReceipt, error) {
+	var empty generatedruntimestate.RouteAccountingHandoffReceipt
+	if accounting == nil || hold == nil || accounting.validateFinalState() != nil || !hold.valid() {
+		return empty, deploymentexecution.ErrAuthorityStale
+	}
+	expected, err := a.readPublishedRouteAttestation(ctx, claim, activation.SuccessorDeploymentID)
+	if err != nil {
+		return empty, err
+	}
+	observation, err := a.manager.observeGeneratedRetirementLocked(ctx, activation.AppID)
+	if err != nil || !sameRoute(expected, routeRecord{Slot: observation.Slot, Endpoints: observation.Endpoints}) {
+		return empty, errors.Join(deploymentexecution.ErrAuthorityStale, err)
+	}
+	if err := a.attestRecoveredAccountingHandoffPhysical(ctx, evidence); err != nil {
+		return empty, err
+	}
+	tx, err := a.stores.Database().BeginTx(ctx, nil)
+	if err != nil {
+		return empty, gateDatabaseError(ctx, err)
+	}
+	defer tx.Rollback()
+	if err := a.validateRecoveredAccountingHandoffTx(ctx, tx, pinned, claim, activation,
+		evidence, func() bool { return accounting.validateFinalState() == nil && hold.valid() }); err != nil {
+		return empty, err
+	}
+	receipt, _, err := a.runtime.RecordRouteAccountingHandoffReceiptTx(ctx, tx, authorization, handedOffAt)
+	if err != nil || receipt != recoveredAccountingHandoffReceipt(authorization, handedOffAt) ||
+		accounting.validateFinalState() != nil || !hold.valid() {
+		return empty, errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return empty, gateDatabaseError(ctx, err)
+	}
+	return receipt, nil
+}
+
+func recoveredAccountingHandoffReceipt(authorization generatedruntimestate.RouteAccountingHandoffAuthorization,
+	handedOffAt time.Time,
+) generatedruntimestate.RouteAccountingHandoffReceipt {
+	return generatedruntimestate.RouteAccountingHandoffReceipt{
+		ActivationReceiptID: authorization.ActivationReceiptID, AppID: authorization.AppID,
+		SuccessorDeploymentID:     authorization.SuccessorDeploymentID,
+		PredecessorDeploymentID:   authorization.PredecessorDeploymentID,
+		CandidateRosterDigest:     authorization.CandidateRosterDigest,
+		PredecessorRosterDigest:   authorization.PredecessorRosterDigest,
+		SuccessorComponentCount:   authorization.SuccessorComponentCount,
+		PredecessorComponentCount: authorization.PredecessorComponentCount,
+		HandedOffAt:               handedOffAt,
+	}
+}
+
+func (a *GeneratedRouteAuthority) releaseRecoveredAccountingHandoffLock(release func() error,
+	cause error,
+) error {
+	if release == nil {
+		return cause
+	}
+	if err := release(); err != nil {
+		if a != nil && a.manager != nil {
+			a.manager.gatewayRebindFailStopLatch().Store(true)
+		}
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	return cause
 }
 
 // completeAccountingHandoff is deliberately package private and accepts only

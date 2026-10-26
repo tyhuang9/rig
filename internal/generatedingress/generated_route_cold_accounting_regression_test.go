@@ -280,6 +280,139 @@ func TestGeneratedDomainRestartAccountingInterruptedDrainingRestoresConfiguredDe
 	})
 }
 
+func TestGeneratedDomainRestartAccountingRetiredPredecessorRecoversHandoffWithoutSecondShare(t *testing.T) {
+	testGeneratedDomainRestartAccountingRecoversHandoff(t,
+		newGeneratedRouteColdAccountingRetiredFixture, assertGeneratedRouteColdAccountingRetiredSnapshot, false)
+}
+
+func TestGeneratedDomainRestartAccountingAuthorizedHandoffRecoversWithoutSecondShare(t *testing.T) {
+	testGeneratedDomainRestartAccountingRecoversHandoff(t,
+		newGeneratedRouteColdAccountingAuthorizedFixture, assertGeneratedRouteColdAccountingAuthorizedSnapshot, true)
+}
+
+func testGeneratedDomainRestartAccountingRecoversHandoff(t *testing.T,
+	fixtureFactory func(*testing.T) generatedRouteColdAccountingFixture,
+	assertPrefix func(*testing.T, generatedRouteColdAccountingFixture), preserveAuthorization bool,
+) {
+	t.Helper()
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	generatedDomainConstructionCase(t, func(t *testing.T) {
+		fixture := fixtureFactory(t)
+		assertPrefix(t, fixture)
+		var authorization generatedruntimestate.RouteAccountingHandoffAuthorization
+		if preserveAuthorization {
+			authorization = generatedRouteColdAccountingAuthorization(t, fixture)
+		}
+		beforeProtection := generatedRouteColdAccountingProtection(t, fixture)
+		beforeCommands := fixture.construction.snapshot()
+		beforeStop := fixture.predecessor.count(candidateOwnerStop)
+		beforeRemove := fixture.predecessor.count(candidateOwnerRemove)
+
+		result, err := newGeneratedDomainConstruction(context.Background(), fixture.identity.stores,
+			fixture.process, fixture.environment, fixture.identity.options)
+		if err != nil {
+			var diagnostic *generatedDomainConstructionDiagnostic
+			if result != nil || !errors.As(err, &diagnostic) || diagnostic == nil ||
+				diagnostic.stage != generatedDomainConstructionStageColdConstruction ||
+				diagnostic.reason != generatedDomainConstructionReasonColdReservation {
+				t.Fatalf("retired predecessor cold construction result=%#v diagnostic=%#v error=%v",
+					result, diagnostic, err)
+			}
+			assertPrefix(t, fixture)
+			assertGeneratedRouteColdAccountingProtectionUnchanged(t, beforeProtection, fixture)
+			if fixture.predecessor.count(candidateOwnerStop) != beforeStop ||
+				fixture.predecessor.count(candidateOwnerRemove) != beforeRemove {
+				t.Fatal("retired predecessor cold refusal replayed candidate effects")
+			}
+			if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+				generatedRouteColdAccountingCapacityProbeCount(beforeCommands)+1 {
+				t.Fatal("retired predecessor target refusal did not make exactly one fresh capacity acquisition")
+			}
+			t.Fatalf("retired predecessor cold construction reached the expected reservation refusal: %v", err)
+		}
+		if result == nil || result.candidates == nil || result.routes == nil || result.cold == nil {
+			t.Fatalf("retired predecessor cold construction result=%#v", result)
+		}
+		assertGeneratedRouteColdAccountingRestoredCurrent(t, result, fixture)
+		assertPrefix(t, fixture)
+		assertGeneratedRouteColdAccountingProtectionUnchanged(t, beforeProtection, fixture)
+		if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+			generatedRouteColdAccountingCapacityProbeCount(beforeCommands) {
+			t.Fatal("retired predecessor cold reconstruction acquired a fresh capacity share")
+		}
+		fixture.process.setRoutes(fixture.routes)
+
+		var beforeAttempt int
+		if err := fixture.identity.database.QueryRow(`SELECT attempt FROM jobs WHERE id=?`,
+			fixture.migration.claim.JobID()).Scan(&beforeAttempt); err != nil {
+			t.Fatalf("read retired predecessor worker before recovery: %v", err)
+		}
+		recovered, err := generatedrecovery.RecoverRuntime(context.Background(), fixture.identity.database,
+			time.Now().UTC(), fixture.migration.bindings)
+		if err != nil || recovered.Jobs.RequeuedGenerated != 1 {
+			t.Fatalf("recover retired predecessor worker: result=%+v error=%v", recovered, err)
+		}
+		var claimed jobs.Job
+		var claimedProofErr error
+		runGeneratedColdBoundaryWorker(t, fixture.jobs,
+			generatedColdBoundaryExecutor(func(ctx context.Context, job jobs.Job, _ jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+				claimed = job
+				observed, observeErr := inspectGeneratedDomainStartupObservation(ctx, fixture.identity.stores,
+					fixture.process, fixture.identity.options)
+				if observeErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim retired startup observation: %w", observeErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				if attestErr := reattestGeneratedDomainCold(ctx, result.manager, result.candidates,
+					observed, *result.cold); attestErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim retired cold manifest: %w", attestErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				binding, bindingErr := fixture.migration.bindings.Read(ctx, job.ID)
+				if bindingErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim retired deployment binding: %w", bindingErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				claim, claimErr := deploymentexecution.NewClaim(binding, job.ID, job.ResourceID, job.Attempt)
+				if claimErr != nil {
+					claimedProofErr = fmt.Errorf("post-claim retired execution claim: %w", claimErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				if completionErr := result.routes.CompleteRecovered(ctx, claim,
+					fixture.migration.request.DeploymentID); completionErr != nil {
+					claimedProofErr = fmt.Errorf("recover accounting handoff and complete route: %w", completionErr)
+					return jobs.ExecutionResult{}, claimedProofErr
+				}
+				return jobs.ExecutionResult{CompletionCode: "deployment_completed"}, nil
+			}), fixture.migration.claim.JobID(), jobs.Succeeded,
+			fixture.identity.options.WorkingDirectory, func() string { return boundedErrorText(claimedProofErr) })
+		if claimedProofErr != nil {
+			t.Fatalf("fresh retired predecessor worker proof: %v", claimedProofErr)
+		}
+		if claimed.ID != fixture.migration.claim.JobID() || claimed.ResourceID != fixture.migration.guarded.appID ||
+			claimed.Attempt != beforeAttempt+1 {
+			t.Fatalf("fresh retired predecessor worker=%+v before attempt=%d", claimed, beforeAttempt)
+		}
+		assertGeneratedRouteColdAccountingRecoveredHandoffSnapshot(t, fixture)
+		if preserveAuthorization {
+			if after := generatedRouteColdAccountingAuthorization(t, fixture); !reflect.DeepEqual(after, authorization) {
+				t.Fatalf("recovered accounting handoff changed durable authorization before=%#v after=%#v",
+					authorization, after)
+			}
+		}
+		if generatedRouteColdAccountingCapacityProbeCount(fixture.construction.snapshot()) !=
+			generatedRouteColdAccountingCapacityProbeCount(beforeCommands) {
+			t.Fatal("fresh retired predecessor worker acquired a second capacity share")
+		}
+		if fixture.predecessor.count(candidateOwnerStop) != beforeStop ||
+			fixture.predecessor.count(candidateOwnerRemove) != beforeRemove {
+			t.Fatal("fresh retired predecessor worker replayed predecessor effects")
+		}
+	})
+}
+
 func TestGeneratedDomainRestartAccountingInterruptedDrainingClaimsFreshWorkerWithoutSecondShare(t *testing.T) {
 	if !generatedDomainRegistryIsolated(t) {
 		return
@@ -820,6 +953,171 @@ func assertGeneratedRouteColdAccountingDrainingSnapshot(t *testing.T,
 	}
 }
 
+func assertGeneratedRouteColdAccountingRetiredSnapshot(t *testing.T,
+	fixture generatedRouteColdAccountingFixture,
+) {
+	t.Helper()
+	db := fixture.identity.database
+	count := func(query string, arguments ...any) int {
+		t.Helper()
+		var value int
+		if err := db.QueryRow(query, arguments...).Scan(&value); err != nil {
+			t.Fatalf("read retired predecessor durable count: %v", err)
+		}
+		return value
+	}
+	receiptID := fixture.firstReceipt.ReceiptID
+	intents := count(`SELECT COUNT(*) FROM generated_candidate_intents WHERE id=?`, fixture.componentReceipt)
+	activations := count(`SELECT COUNT(*) FROM generated_route_activations WHERE id=?`, receiptID)
+	retirementComponents := count(`SELECT COUNT(*) FROM generated_route_predecessor_retirements
+		WHERE activation_receipt_id=?`, receiptID)
+	retirementReceipts := count(`SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	authorizations := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations
+		WHERE activation_receipt_id=?`, receiptID)
+	handoffs := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	completions := count(`SELECT COUNT(*) FROM generated_route_completion_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	state, err := generatedruntimestate.New(db).Get(context.Background(), fixture.migration.guarded.appID,
+		fixture.migration.request.DeploymentID)
+	if err != nil || state.Phase != generatedruntimestate.PhaseDraining || intents != 1 || activations != 1 ||
+		retirementComponents != 1 || retirementReceipts != 1 || authorizations != 0 || handoffs != 0 ||
+		completions != 0 {
+		t.Fatalf("retired predecessor state phase=%s receipts=%d/%d/%d/%d/%d/%d/%d error=%v",
+			state.Phase, intents, activations, retirementComponents, retirementReceipts, authorizations, handoffs,
+			completions, err)
+	}
+	componentState := ""
+	if err := db.QueryRow(`SELECT state FROM generated_runtime_components
+		WHERE deployment_id=? AND component_name=?`, fixture.migration.request.DeploymentID,
+		fixture.componentName).Scan(&componentState); err != nil ||
+		componentState != string(generatedruntimestate.ComponentActive) {
+		t.Fatalf("retired predecessor successor component state=%q error=%v", componentState, err)
+	}
+	predecessor, predecessorFound := fixture.process.predecessor.physical[fixture.retiredContainerID]
+	successor, successorFound := fixture.process.predecessor.physical[fixture.currentContainerID]
+	if !predecessorFound || predecessor.exists || predecessor.running || !successorFound || !successor.exists ||
+		!successor.running || successor.policy.identity.ReceiptID != fixture.componentReceipt {
+		t.Fatalf("retired predecessor physical=%#v/%t successor=%#v/%t", predecessor, predecessorFound,
+			successor, successorFound)
+	}
+	expectedCapacity := fmt.Sprintf("%d %d\n", fixture.identity.options.MemoryBytes-1,
+		fixture.identity.options.ReplacementDiskBytes)
+	if string(fixture.construction.capacity) != expectedCapacity {
+		t.Fatalf("retired predecessor constrained capacity=%q want=%q", fixture.construction.capacity,
+			expectedCapacity)
+	}
+}
+
+func assertGeneratedRouteColdAccountingAuthorizedSnapshot(t *testing.T,
+	fixture generatedRouteColdAccountingFixture,
+) {
+	t.Helper()
+	db := fixture.identity.database
+	count := func(query string, arguments ...any) int {
+		t.Helper()
+		var value int
+		if err := db.QueryRow(query, arguments...).Scan(&value); err != nil {
+			t.Fatalf("read authorized accounting handoff durable count: %v", err)
+		}
+		return value
+	}
+	receiptID := fixture.firstReceipt.ReceiptID
+	intents := count(`SELECT COUNT(*) FROM generated_candidate_intents WHERE id=?`, fixture.componentReceipt)
+	activations := count(`SELECT COUNT(*) FROM generated_route_activations WHERE id=?`, receiptID)
+	retirementComponents := count(`SELECT COUNT(*) FROM generated_route_predecessor_retirements
+		WHERE activation_receipt_id=?`, receiptID)
+	retirementReceipts := count(`SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	authorizations := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations
+		WHERE activation_receipt_id=?`, receiptID)
+	handoffs := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	completions := count(`SELECT COUNT(*) FROM generated_route_completion_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	state, err := generatedruntimestate.New(db).Get(context.Background(), fixture.migration.guarded.appID,
+		fixture.migration.request.DeploymentID)
+	if err != nil || state.Phase != generatedruntimestate.PhaseDraining || intents != 1 || activations != 1 ||
+		retirementComponents != 1 || retirementReceipts != 1 || authorizations != 1 || handoffs != 0 ||
+		completions != 0 {
+		t.Fatalf("authorized accounting handoff state phase=%s receipts=%d/%d/%d/%d/%d/%d/%d error=%v",
+			state.Phase, intents, activations, retirementComponents, retirementReceipts, authorizations, handoffs,
+			completions, err)
+	}
+	componentState := ""
+	if err := db.QueryRow(`SELECT state FROM generated_runtime_components
+		WHERE deployment_id=? AND component_name=?`, fixture.migration.request.DeploymentID,
+		fixture.componentName).Scan(&componentState); err != nil ||
+		componentState != string(generatedruntimestate.ComponentActive) {
+		t.Fatalf("authorized accounting handoff successor component state=%q error=%v", componentState, err)
+	}
+	predecessor, predecessorFound := fixture.process.predecessor.physical[fixture.retiredContainerID]
+	successor, successorFound := fixture.process.predecessor.physical[fixture.currentContainerID]
+	if !predecessorFound || predecessor.exists || predecessor.running || !successorFound || !successor.exists ||
+		!successor.running || successor.policy.identity.ReceiptID != fixture.componentReceipt {
+		t.Fatalf("authorized accounting handoff predecessor=%#v/%t successor=%#v/%t", predecessor,
+			predecessorFound, successor, successorFound)
+	}
+}
+
+func generatedRouteColdAccountingAuthorization(t *testing.T,
+	fixture generatedRouteColdAccountingFixture,
+) generatedruntimestate.RouteAccountingHandoffAuthorization {
+	t.Helper()
+	var snapshot generatedruntimestate.GeneratedDomainStartupSnapshot
+	err := withGeneratedRouteColdAccountingTransaction(context.Background(), fixture.identity.database,
+		func(tx *sql.Tx) error {
+			var err error
+			snapshot, err = generatedruntimestate.New(fixture.identity.database).
+				GeneratedDomainStartupSnapshotTx(context.Background(), tx)
+			return err
+		})
+	if err != nil {
+		t.Fatalf("read accounting handoff authorization: %v", err)
+	}
+	var matched []generatedruntimestate.RouteAccountingHandoffAuthorization
+	for _, authorization := range snapshot.AccountingHandoffAuthorizations {
+		if authorization.ActivationReceiptID == fixture.firstReceipt.ReceiptID {
+			matched = append(matched, authorization)
+		}
+	}
+	if len(matched) != 1 {
+		t.Fatalf("accounting handoff authorizations=%#v", matched)
+	}
+	return matched[0]
+}
+
+func assertGeneratedRouteColdAccountingRecoveredHandoffSnapshot(t *testing.T,
+	fixture generatedRouteColdAccountingFixture,
+) {
+	t.Helper()
+	db := fixture.identity.database
+	count := func(query string, arguments ...any) int {
+		t.Helper()
+		var value int
+		if err := db.QueryRow(query, arguments...).Scan(&value); err != nil {
+			t.Fatalf("read recovered handoff durable count: %v", err)
+		}
+		return value
+	}
+	receiptID := fixture.firstReceipt.ReceiptID
+	authorizations := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations
+		WHERE activation_receipt_id=?`, receiptID)
+	handoffs := count(`SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	completions := count(`SELECT COUNT(*) FROM generated_route_completion_receipts
+		WHERE activation_receipt_id=?`, receiptID)
+	state, err := generatedruntimestate.New(db).Get(context.Background(), fixture.migration.guarded.appID,
+		fixture.migration.request.DeploymentID)
+	if err != nil || state.Phase != generatedruntimestate.PhaseSucceeded || authorizations != 1 || handoffs != 1 ||
+		completions != 1 {
+		t.Fatalf("recovered handoff state phase=%s receipts=%d/%d/%d error=%v", state.Phase,
+			authorizations, handoffs, completions, err)
+	}
+	assertGeneratedRouteCompletionState(t, db, fixture.firstReceipt, 1)
+}
+
 func assertGeneratedRouteColdAccountingInitialLegacyCurrentSnapshot(t *testing.T,
 	fixture generatedRouteColdAccountingFixture,
 ) {
@@ -875,44 +1173,70 @@ func assertGeneratedRouteColdAccountingRestoredCurrent(t *testing.T, result *gen
 		t.Fatal("cold construction did not publish one shared capacity coordinator")
 	}
 	ledger := result.candidates.ledger
-	ledger.mu.Lock()
-	group := ledger.groups[candidateCapacityGroupKey{appID: fixture.migration.guarded.appID,
-		deploymentID: fixture.migration.request.DeploymentID}]
-	ledger.mu.Unlock()
-	if group == nil {
-		t.Fatal("cold construction omitted the completed Current accounting group")
+	type debt struct {
+		token  *generatedDomainCapacityDebtToken
+		limits generatedcapacity.Limits
 	}
-	group.mu.Lock()
-	component := group.byName[fixture.componentName]
-	if group.ledger != ledger || len(group.components) != 1 || group.components[0] != fixture.componentName ||
-		component == nil || component.receipt == nil || component.receipt.id != fixture.componentReceipt ||
-		component.tokenHeld || component.charge == nil {
+	readDebt := func(deploymentID, receiptID string, physical candidatePhysicalState) debt {
+		t.Helper()
+		ledger.mu.Lock()
+		group := ledger.groups[candidateCapacityGroupKey{appID: fixture.migration.guarded.appID,
+			deploymentID: deploymentID}]
+		ledger.mu.Unlock()
+		if group == nil {
+			t.Fatalf("cold construction omitted restored accounting group %s", deploymentID)
+		}
+		group.mu.Lock()
+		component := group.byName[fixture.componentName]
+		if group.ledger != ledger || len(group.components) != 1 || group.components[0] != fixture.componentName ||
+			component == nil || component.receipt == nil || component.receipt.id != receiptID ||
+			component.tokenHeld || component.charge == nil {
+			group.mu.Unlock()
+			t.Fatalf("cold construction published incomplete restored accounting component %s", deploymentID)
+		}
+		receiptWord := component.receipt.state.Load()
+		charge := component.charge
+		token, restored := charge.token.(*generatedDomainCapacityDebtToken)
+		value := debt{token: token, limits: group.limits}
+		validCharge := restored && token != nil && charge.state == candidateChargeActive &&
+			charge.owner == candidateAccountingRouteActive && charge.lease == nil && !charge.logicallyRetired &&
+			candidatePhysicalFromWord(receiptWord) == physical &&
+			receiptWord&candidateReceiptAcknowledged != 0 && receiptWord&candidateReceiptObserved != 0 &&
+			receiptWord&candidateReceiptUnquiesced == 0
 		group.mu.Unlock()
-		t.Fatal("cold construction published an incomplete completed Current accounting component")
+		if !validCharge || value.limits.MemoryBytes == 0 || value.limits.DiskBytes == 0 ||
+			!token.configured() || !token.published() {
+			t.Fatalf("cold construction did not restore exact accounting debt %s", deploymentID)
+		}
+		return value
 	}
-	receiptWord := component.receipt.state.Load()
-	charge := component.charge
-	token, restored := charge.token.(*generatedDomainCapacityDebtToken)
-	limits, epoch := group.limits, charge.epoch
-	validCharge := restored && token != nil && charge.state == candidateChargeActive &&
-		charge.owner == candidateAccountingRouteActive && charge.lease == nil && !charge.logicallyRetired &&
-		candidatePhysicalFromWord(receiptWord) == candidatePhysicalHandedToRoute &&
-		receiptWord&candidateReceiptAcknowledged != 0 && receiptWord&candidateReceiptObserved != 0 &&
-		receiptWord&candidateReceiptUnquiesced == 0
-	group.mu.Unlock()
-	if !validCharge || limits.MemoryBytes == 0 || limits.DiskBytes == 0 {
-		t.Fatal("cold construction did not restore the exact route-active Current charge")
+	debts := []debt{readDebt(fixture.migration.request.DeploymentID, fixture.componentReceipt,
+		candidatePhysicalHandedToRoute)}
+	if fixture.restoresPredecessor {
+		if fixture.lifecycleDeploymentID == "" || fixture.predecessorReceipt == "" {
+			t.Fatal("cold construction omitted predecessor restored-debt identity")
+		}
+		debts = append(debts, readDebt(fixture.lifecycleDeploymentID, fixture.predecessorReceipt,
+			candidatePhysicalConfirmedAbsent))
 	}
-	configured, published := token.configured(), token.published()
+	var memory uint64
+	var disk uint64
+	for _, value := range debts {
+		memory += value.limits.MemoryBytes
+		disk += value.limits.DiskBytes
+	}
 	result.capacity.mu.Lock()
-	_, exactToken := result.capacity.tokens[token]
 	validDebt := result.capacity.phase == generatedDomainCapacityPublished && result.capacity.borrows == 0 &&
-		result.capacity.memory == limits.MemoryBytes && result.capacity.disk == limits.DiskBytes &&
-		len(result.capacity.tokens) == 1 && exactToken && token.owner == result.capacity && token.active &&
-		token.epoch == epoch && token.limits == limits
+		result.capacity.memory == memory && result.capacity.disk == disk &&
+		len(result.capacity.tokens) == len(debts)
+	for _, value := range debts {
+		_, exactToken := result.capacity.tokens[value.token]
+		validDebt = validDebt && exactToken && value.token.owner == result.capacity && value.token.active &&
+			value.token.epoch != 0 && value.token.limits == value.limits
+	}
 	result.capacity.mu.Unlock()
-	if !configured || !published || !validDebt {
-		t.Fatal("cold construction did not publish exactly one configured Current debt token")
+	if !validDebt {
+		t.Fatalf("cold construction did not publish exact restored debt tokens count=%d", len(debts))
 	}
 }
 
@@ -1059,7 +1383,11 @@ type generatedRouteColdAccountingFixture struct {
 	firstReceipt          generatedruntimestate.RouteActivationReceipt
 	componentName         string
 	componentReceipt      string
+	predecessorReceipt    string
 	lifecycleDeploymentID string
+	restoresPredecessor   bool
+	retiredContainerID    string
+	currentContainerID    string
 }
 
 type generatedRouteColdAccountingRunner struct {
@@ -1225,6 +1553,8 @@ const (
 	generatedRouteColdAccountingInitialComplete generatedRouteColdAccountingCompletionStage = iota + 1
 	generatedRouteColdAccountingLifecycleComplete
 	generatedRouteColdAccountingLifecycleDraining
+	generatedRouteColdAccountingLifecycleRetired
+	generatedRouteColdAccountingLifecycleAuthorized
 )
 
 func newGeneratedRouteColdAccountingFixture(t *testing.T) generatedRouteColdAccountingFixture {
@@ -1233,6 +1563,14 @@ func newGeneratedRouteColdAccountingFixture(t *testing.T) generatedRouteColdAcco
 
 func newGeneratedRouteColdAccountingDrainingFixture(t *testing.T) generatedRouteColdAccountingFixture {
 	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, generatedRouteColdAccountingLifecycleDraining)
+}
+
+func newGeneratedRouteColdAccountingRetiredFixture(t *testing.T) generatedRouteColdAccountingFixture {
+	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, generatedRouteColdAccountingLifecycleRetired)
+}
+
+func newGeneratedRouteColdAccountingAuthorizedFixture(t *testing.T) generatedRouteColdAccountingFixture {
+	return newGeneratedRouteColdAccountingFixtureAtCompletion(t, generatedRouteColdAccountingLifecycleAuthorized)
 }
 
 func newGeneratedRouteColdAccountingInitialCurrentFixture(t *testing.T) generatedRouteColdAccountingFixture {
@@ -1245,7 +1583,9 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 	t.Helper()
 	if stage != generatedRouteColdAccountingInitialComplete &&
 		stage != generatedRouteColdAccountingLifecycleComplete &&
-		stage != generatedRouteColdAccountingLifecycleDraining {
+		stage != generatedRouteColdAccountingLifecycleDraining &&
+		stage != generatedRouteColdAccountingLifecycleRetired &&
+		stage != generatedRouteColdAccountingLifecycleAuthorized {
 		t.Fatal("cold accounting fixture requires an exact completion stage")
 	}
 	identity := newGeneratedDomainIdentityFixture(t)
@@ -1313,8 +1653,12 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 	}
 	currentReceipt := retirement.state.receipt
 	lifecycleDeploymentID := ""
+	predecessorReceipt := ""
+	retiredContainerID := ""
 	effectsMigration := migration
 	if stage != generatedRouteColdAccountingInitialComplete {
+		retiredContainerID = candidateIdentity.ContainerID
+		predecessorReceipt = candidateIdentity.ReceiptID
 		establishGeneratedRoutePredecessorLifecycle(t, owner, firstHead)
 
 		secondMigration := newGeneratedRouteSuccessorMigration(t, migration, jobService)
@@ -1353,10 +1697,26 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 				retired.SuccessorDeploymentID != secondMigration.request.DeploymentID {
 				t.Fatalf("retire interrupted Draining predecessor=%#v error=%v", retired, err)
 			}
-			handoff, err := secondRetirement.completeAccountingHandoff(context.Background())
-			if err != nil || handoff.ActivationReceiptID != secondRetirement.state.receipt.ReceiptID ||
-				handoff.SuccessorDeploymentID != secondMigration.request.DeploymentID {
-				t.Fatalf("complete interrupted Draining accounting handoff=%#v error=%v", handoff, err)
+			if stage == generatedRouteColdAccountingLifecycleDraining {
+				handoff, err := secondRetirement.completeAccountingHandoff(context.Background())
+				if err != nil || handoff.ActivationReceiptID != secondRetirement.state.receipt.ReceiptID ||
+					handoff.SuccessorDeploymentID != secondMigration.request.DeploymentID {
+					t.Fatalf("complete interrupted Draining accounting handoff=%#v error=%v", handoff, err)
+				}
+			} else if stage == generatedRouteColdAccountingLifecycleAuthorized {
+				const trigger = "generated_route_cold_authorized_handoff_fault"
+				if _, err := identity.database.Exec(`CREATE TRIGGER ` + trigger + `
+					BEFORE INSERT ON generated_route_accounting_handoff_receipts
+					BEGIN SELECT RAISE(ABORT, 'fixed authorized handoff interruption'); END`); err != nil {
+					t.Fatalf("install authorized handoff interruption: %v", err)
+				}
+				if handoff, err := secondRetirement.completeAccountingHandoff(context.Background()); err == nil ||
+					handoff.ActivationReceiptID != "" {
+					t.Fatalf("interrupt authorized accounting handoff=%#v error=%v", handoff, err)
+				}
+				if _, err := identity.database.Exec(`DROP TRIGGER ` + trigger); err != nil {
+					t.Fatalf("remove authorized handoff interruption: %v", err)
+				}
 			}
 		}
 		currentReceipt = secondRetirement.state.receipt
@@ -1427,7 +1787,9 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 	identity.options.HostPort = journal.Source.LocalHostPort
 	cold := &generatedDomainConstructionRunner{roster: candidateRunner, delegate: &generatedDomainRecoveryCensusRunner{
 		daemonID: "generated-domain-cold-accounting", objects: objects, imageID: observation.Image.ID, gateway: gateway}}
-	if stage == generatedRouteColdAccountingLifecycleDraining {
+	if stage == generatedRouteColdAccountingLifecycleDraining ||
+		stage == generatedRouteColdAccountingLifecycleRetired ||
+		stage == generatedRouteColdAccountingLifecycleAuthorized {
 		if identity.options.MemoryBytes <= 1 || identity.options.ReplacementDiskBytes == 0 {
 			t.Fatal("interrupted Draining fixture has invalid capacity limits")
 		}
@@ -1442,7 +1804,11 @@ func newGeneratedRouteColdAccountingFixtureAtCompletion(t *testing.T,
 		process: process, routes: physicalRoutes, predecessor: owner.runner, construction: cold,
 		environment: &candidateFactoryEnvironment{path: t.TempDir()}, firstReceipt: currentReceipt,
 		componentName: physicalCandidate.policy.identity.Component, componentReceipt: candidateIdentity.ReceiptID,
-		lifecycleDeploymentID: lifecycleDeploymentID}
+		predecessorReceipt: predecessorReceipt, lifecycleDeploymentID: lifecycleDeploymentID,
+		restoresPredecessor: stage == generatedRouteColdAccountingLifecycleRetired ||
+			stage == generatedRouteColdAccountingLifecycleAuthorized,
+		retiredContainerID: retiredContainerID,
+		currentContainerID: candidateIdentity.ContainerID}
 }
 
 func newGeneratedRouteColdAccountingSequentialOwner(t *testing.T, validation *candidateValidationFixture,

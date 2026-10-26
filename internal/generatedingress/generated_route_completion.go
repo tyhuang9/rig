@@ -14,14 +14,19 @@ import (
 )
 
 type generatedRecoveredRouteCompletionEvidence struct {
-	group             generatedDomainColdGroup
-	activation        generatedruntimestate.GeneratedDomainStartupRouteActivation
-	handoff           generatedruntimestate.RouteAccountingHandoffReceipt
-	completion        generatedruntimestate.RouteCompletionReceipt
-	candidateRoster   []generatedruntimestate.RouteActivationComponent
-	predecessorRoster []generatedruntimestate.RouteActivationComponent
-	receipts          map[string]string
-	replay            bool
+	group               generatedDomainColdGroup
+	predecessorGroup    generatedDomainColdGroup
+	activation          generatedruntimestate.GeneratedDomainStartupRouteActivation
+	retirement          generatedruntimestate.PredecessorRetirementReceipt
+	authorization       generatedruntimestate.RouteAccountingHandoffAuthorization
+	handoff             generatedruntimestate.RouteAccountingHandoffReceipt
+	completion          generatedruntimestate.RouteCompletionReceipt
+	candidateRoster     []generatedruntimestate.RouteActivationComponent
+	predecessorRoster   []generatedruntimestate.RouteActivationComponent
+	receipts            map[string]string
+	predecessorReceipts map[string]string
+	replay              bool
+	recoverHandoff      bool
 }
 
 // CompleteRecovered completes only the exact interrupted Draining handoff
@@ -61,15 +66,7 @@ func (a *GeneratedRouteAuthority) CompleteRecovered(ctx context.Context,
 	if err != nil {
 		return err
 	}
-	hold, err := construction.candidates.ledger.holdRecoveredCompletionRoster(
-		generatedDomainColdGroupSpec(construction.candidates, evidence.group), evidence.receipts)
-	if err != nil {
-		return err
-	}
-	defer hold.leave()
-	if !hold.valid() {
-		return deploymentexecution.ErrAuthorityStale
-	}
+	var hold candidateRecoveredCompletionGuard
 	if evidence.replay {
 		activation, err := a.readRecoveredRouteActivation(ctx, evidence.activation)
 		if err != nil {
@@ -81,6 +78,24 @@ func (a *GeneratedRouteAuthority) CompleteRecovered(ctx context.Context,
 		}
 	} else if err := a.AttestPublished(ctx, claim, deploymentID); err != nil {
 		return err
+	}
+	if evidence.recoverHandoff {
+		recovered, handoff, err := a.recoverAccountingHandoff(ctx, pinned, claim, evidence)
+		if err != nil {
+			return err
+		}
+		evidence.handoff = handoff
+		hold = recovered
+	} else {
+		hold, err = construction.candidates.ledger.holdRecoveredCompletionRoster(
+			generatedDomainColdGroupSpec(construction.candidates, evidence.group), evidence.receipts)
+		if err != nil {
+			return err
+		}
+	}
+	defer hold.leave()
+	if !hold.valid() {
+		return deploymentexecution.ErrAuthorityStale
 	}
 	return a.completeRecovered(ctx, pinned, claim, evidence, hold)
 }
@@ -144,6 +159,20 @@ func recoveredRouteCompletionEvidence(observed generatedDomainStartupObservation
 			result.handoff, handoffCount = handoff, handoffCount+1
 		}
 	}
+	retirementCount := 0
+	for _, retirement := range observed.database.Runtime.PredecessorRetirementReceipts {
+		if retirement.ActivationReceiptID == receiptID && retirement.AppID == claim.ApplicationID() &&
+			retirement.SuccessorDeploymentID == deploymentID {
+			result.retirement, retirementCount = retirement, retirementCount+1
+		}
+	}
+	authorizationCount := 0
+	for _, authorization := range observed.database.Runtime.AccountingHandoffAuthorizations {
+		if authorization.ActivationReceiptID == receiptID && authorization.AppID == claim.ApplicationID() &&
+			authorization.SuccessorDeploymentID == deploymentID {
+			result.authorization, authorizationCount = authorization, authorizationCount+1
+		}
+	}
 	completionCount := 0
 	for _, completion := range observed.database.Runtime.RouteCompletionReceipts {
 		if completion.ActivationReceiptID == receiptID && completion.AppID == claim.ApplicationID() &&
@@ -166,11 +195,15 @@ func recoveredRouteCompletionEvidence(observed generatedDomainStartupObservation
 		if !found {
 			return result, deploymentexecution.ErrIdentityLost
 		}
+		result.predecessorGroup = predecessor
 		result.predecessorRoster, _ = generatedDomainColdActivationRoster(predecessor.snapshot)
 	} else {
 		result.predecessorRoster = []generatedruntimestate.RouteActivationComponent{}
 	}
-	if activationCount != 1 || handoffCount != 1 || len(result.candidateRoster) == 0 ||
+	if activationCount != 1 || retirementCount != 1 || authorizationCount > 1 || handoffCount > 1 ||
+		(result.replay && (authorizationCount != 1 || handoffCount != 1)) ||
+		(!result.replay && handoffCount == 1 && authorizationCount != 1) ||
+		len(result.candidateRoster) == 0 ||
 		(result.activation.PredecessorDeploymentID != "" && len(result.predecessorRoster) == 0) {
 		return result, deploymentexecution.ErrIdentityLost
 	}
@@ -184,12 +217,23 @@ func recoveredRouteCompletionEvidence(observed generatedDomainStartupObservation
 	if len(result.receipts) != len(result.candidateRoster) {
 		return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrIdentityLost
 	}
+	result.predecessorReceipts = make(map[string]string, len(result.predecessorGroup.receipts))
+	for name, receipt := range result.predecessorGroup.receipts {
+		if name == "" || receipt.id == "" || receipt.physical != candidatePhysicalConfirmedAbsent || receipt.unknown {
+			return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrIdentityLost
+		}
+		result.predecessorReceipts[name] = receipt.id
+	}
+	if len(result.predecessorReceipts) != len(result.predecessorRoster) {
+		return generatedRecoveredRouteCompletionEvidence{}, deploymentexecution.ErrIdentityLost
+	}
+	result.recoverHandoff = !result.replay && handoffCount == 0
 	return result, nil
 }
 
 func (a *GeneratedRouteAuthority) completeRecovered(ctx context.Context, pinned *deploymentexecution.Pinned,
 	claim deploymentexecution.Claim, evidence generatedRecoveredRouteCompletionEvidence,
-	hold *candidateRecoveredCompletionHold,
+	hold candidateRecoveredCompletionGuard,
 ) error {
 	tx, err := a.stores.Database().BeginTx(ctx, nil)
 	if err != nil {
@@ -272,7 +316,7 @@ func (a *GeneratedRouteAuthority) completeRecovered(ctx context.Context, pinned 
 
 func (a *GeneratedRouteAuthority) readRecoveredCompletion(ctx context.Context,
 	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim,
-	evidence generatedRecoveredRouteCompletionEvidence, hold *candidateRecoveredCompletionHold,
+	evidence generatedRecoveredRouteCompletionEvidence, hold candidateRecoveredCompletionGuard,
 	input generatedruntimestate.RouteCompletionInput,
 ) error {
 	tx, err := a.stores.Database().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})

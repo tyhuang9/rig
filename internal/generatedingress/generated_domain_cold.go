@@ -107,23 +107,36 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 	// handoff from the same typed startup snapshot, then install their configured
 	// debt as one closed bootstrap batch. No Budget snapshot is available until
 	// the whole batch and its ledger tokens exist.
-	var debtLimits []generatedcapacity.Limits
+	restoredDeployments := make(map[string]struct{})
 	for index := range groups {
-		var restore bool
-		var evidenceErr error
 		switch groups[index].kind {
 		case generatedDomainColdCurrent:
-			restore, evidenceErr = generatedDomainColdCurrentDebtEvidence(observed.database, groups[index], groups)
+			restore, evidenceErr := generatedDomainColdCurrentDebtEvidence(observed.database, groups[index], groups)
+			if evidenceErr != nil {
+				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdOwnership, evidenceErr)
+			}
+			if restore {
+				restoredDeployments[groups[index].pins.deploymentID] = struct{}{}
+			}
 		case generatedDomainColdRisky:
-			restore, evidenceErr = generatedDomainColdDrainingDebtEvidence(observed.database, groups[index], groups)
+			deployments, evidenceErr := generatedDomainColdDrainingDebtDeployments(
+				observed.database, groups[index], groups)
+			if evidenceErr != nil {
+				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdOwnership, evidenceErr)
+			}
+			for _, deploymentID := range deployments {
+				restoredDeployments[deploymentID] = struct{}{}
+			}
 		}
-		if evidenceErr != nil {
-			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
-				generatedDomainConstructionStageColdConstruction,
-				generatedDomainConstructionReasonColdOwnership, evidenceErr)
-		}
-		groups[index].restoredDebt = restore
-		if restore {
+	}
+	var debtLimits []generatedcapacity.Limits
+	for index := range groups {
+		_, groups[index].restoredDebt = restoredDeployments[groups[index].pins.deploymentID]
+		if groups[index].restoredDebt {
 			limit := generatedDomainColdGroupSpec(result.candidates, groups[index]).limits
 			for range groups[index].snapshot.components {
 				debtLimits = append(debtLimits, limit)
@@ -1302,12 +1315,14 @@ func generatedDomainColdAuthorizerLineage(groups []generatedDomainColdGroup,
 	return false
 }
 
-// generatedDomainColdDrainingDebtEvidence recognizes only the durable prefix
-// after predecessor retirement and the private accounting handoff have both
-// completed, but before route completion advances the deployment from
-// Draining. Earlier valid prefixes keep the existing Risky raw-reservation
-// behavior. Once a relevant row is present, crossed or non-prefix evidence is
-// refused rather than treated as absence.
+// generatedDomainColdDrainingDebtEvidence recognizes the closed durable prefix
+// after predecessor retirement has completed and before route completion
+// advances the deployment from Draining. The exact no-044 and authorization-
+// only prefixes restore both successor and predecessor debt; a complete 044
+// restores only successor debt because its predecessor release is durable.
+// Earlier valid prefixes keep the existing Risky raw-reservation behavior.
+// Once a relevant row is present, crossed or non-prefix evidence is refused
+// rather than treated as absence.
 func generatedDomainColdDrainingDebtEvidence(database deployments.GeneratedDomainStartupSnapshot,
 	group generatedDomainColdGroup, groups []generatedDomainColdGroup,
 ) (bool, error) {
@@ -1467,18 +1482,53 @@ func generatedDomainColdDrainingDebtEvidence(database deployments.GeneratedDomai
 		if handoffCount != 0 {
 			return false, errGeneratedDomainConstructionRefused
 		}
-		return false, nil
+		return true, nil
 	}
 	if retirement.RetiredAt.After(authorization.AuthorizedAt) {
 		return false, errGeneratedDomainConstructionRefused
 	}
 	if handoffCount == 0 {
-		return false, nil
+		return true, nil
 	}
 	if authorization.AuthorizedAt.After(handoff.HandedOffAt) {
 		return false, errGeneratedDomainConstructionRefused
 	}
 	return true, nil
+}
+
+func generatedDomainColdDrainingDebtDeployments(database deployments.GeneratedDomainStartupSnapshot,
+	group generatedDomainColdGroup, groups []generatedDomainColdGroup,
+) ([]string, error) {
+	restored, err := generatedDomainColdDrainingDebtEvidence(database, group, groups)
+	if err != nil || !restored {
+		return nil, err
+	}
+	receiptID := group.snapshot.observedHead.activationReceiptID
+	var activation generatedruntimestate.GeneratedDomainStartupRouteActivation
+	activationCount := 0
+	for _, value := range database.Runtime.RouteActivations {
+		if value.ReceiptID == receiptID && value.AppID == group.pins.applicationID() &&
+			value.SuccessorDeploymentID == group.pins.deploymentID {
+			activation, activationCount = value, activationCount+1
+		}
+	}
+	if activationCount != 1 {
+		return nil, errGeneratedDomainConstructionRefused
+	}
+	handoffCount := 0
+	for _, value := range database.Runtime.AccountingHandoffReceipts {
+		if value.ActivationReceiptID == receiptID || value.SuccessorDeploymentID == group.pins.deploymentID {
+			handoffCount++
+		}
+	}
+	result := []string{group.pins.deploymentID}
+	if handoffCount == 0 && activation.PredecessorDeploymentID != "" {
+		if _, found := generatedDomainColdGroupByDeployment(groups, activation.PredecessorDeploymentID); !found {
+			return nil, errGeneratedDomainConstructionRefused
+		}
+		result = append(result, activation.PredecessorDeploymentID)
+	}
+	return result, nil
 }
 
 // generatedDomainColdCurrentDebtEvidence classifies only the independently

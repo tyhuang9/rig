@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -58,6 +59,8 @@ const (
 	controllerKillBeforeStart  controllerProcessKillBoundary = "before_candidate_start"
 	controllerKillAfterRoute   controllerProcessKillBoundary = "after_route_commit"
 	controllerKillBeforeDrain  controllerProcessKillBoundary = "before_drain_stop"
+	controllerKillAfterRetire  controllerProcessKillBoundary = "after_predecessor_retirement_before_handoff"
+	controllerKillAfterAuth    controllerProcessKillBoundary = "after_handoff_authorization_before_receipt"
 	controllerKillAfterHandoff controllerProcessKillBoundary = "after_predecessor_handoff_before_completion"
 	controllerKillAfterSuccess controllerProcessKillBoundary = "after_runtime_success"
 	controllerKillAfterMain    controllerProcessKillBoundary = "after_main_success"
@@ -254,6 +257,22 @@ func TestControllerProcessKillBoundaryControls(t *testing.T) {
 	if err != nil || json.Unmarshal(body, &signal) != nil || signal.Boundary != controllerKillAfterRoute {
 		t.Fatal("process-kill marker did not preserve the exact boundary")
 	}
+	for _, boundary := range []controllerProcessKillBoundary{
+		controllerKillAfterRetire, controllerKillAfterAuth, controllerKillAfterHandoff,
+	} {
+		create, drop, ok := controllerProcessKillFaultStatements(boundary)
+		if !ok || !strings.Contains(create, "BEFORE INSERT ON generated_route_") ||
+			!strings.HasPrefix(drop, "DROP TRIGGER controller_process_kill_") {
+			t.Fatalf("handoff boundary %q has no closed fault pair", boundary)
+		}
+	}
+	for _, boundary := range []controllerProcessKillBoundary{
+		"unknown", controllerKillAfterRoute, controllerKillAfterSuccess,
+	} {
+		if create, drop, ok := controllerProcessKillFaultStatements(boundary); ok || create != "" || drop != "" {
+			t.Fatalf("non-handoff boundary %q selected a fault", boundary)
+		}
+	}
 	for _, reason := range []string{
 		"cold_retained_gateway_final_identity",
 		"cold_retained_gateway_final_labels",
@@ -275,22 +294,23 @@ func (e controllerProcessKillExecutor) Execute(ctx context.Context, job jobs.Job
 	if e.delegate == nil {
 		return jobs.ExecutionResult{}, errors.New("process-kill executor delegate is required")
 	}
-	if e.barrier != nil && e.barrier.boundary == controllerKillAfterHandoff {
-		if _, err := e.barrier.db.ExecContext(ctx, `CREATE TRIGGER controller_process_kill_completion_fault
-			BEFORE INSERT ON generated_route_completion_receipts
-			BEGIN SELECT RAISE(ABORT, 'fixed process-kill completion fault'); END`); err != nil {
-			return jobs.ExecutionResult{}, err
+	if e.barrier != nil && (e.barrier.boundary == controllerKillAfterRetire ||
+		e.barrier.boundary == controllerKillAfterAuth || e.barrier.boundary == controllerKillAfterHandoff) {
+		result, err := controllerProcessKillExecuteWithFixedFault(ctx, e.delegate, job,
+			controllerProcessKillReporter{delegate: reporter, barrier: e.barrier}, e.barrier)
+		wantAuthorization, wantHandoff := 0, 0
+		if e.barrier.boundary == controllerKillAfterAuth {
+			wantAuthorization = 1
 		}
-		result, err := e.delegate.Execute(ctx, job,
-			controllerProcessKillReporter{delegate: reporter, barrier: e.barrier})
-		if _, dropErr := e.barrier.db.ExecContext(ctx,
-			`DROP TRIGGER controller_process_kill_completion_fault`); dropErr != nil {
-			return jobs.ExecutionResult{}, dropErr
+		if e.barrier.boundary == controllerKillAfterHandoff {
+			wantAuthorization, wantHandoff = 1, 1
 		}
 		if err != nil || result.Disposition != jobs.ExecutionWaitingUser ||
-			result.PauseDisposition != jobs.PauseRouteReconciliationRequired ||
-			!e.barrier.completedHandoffWithoutCompletion(ctx) {
-			return jobs.ExecutionResult{}, errors.New("process-kill completion fault missed the exact durable handoff")
+			result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
+			return jobs.ExecutionResult{}, errors.New("process-kill handoff fault did not pause for reconciliation")
+		}
+		if _, ok := e.barrier.accountingHandoffPrefix(ctx, wantAuthorization, wantHandoff, 0); !ok {
+			return jobs.ExecutionResult{}, errors.New("process-kill handoff fault missed its exact durable prefix")
 		}
 		if waitErr := e.barrier.wait(ctx, generatedruntimestate.PhaseDraining,
 			func(generatedruntimestate.Deployment) bool { return true }); waitErr != nil {
@@ -312,37 +332,190 @@ func (e controllerProcessKillExecutor) Execute(ctx context.Context, job jobs.Job
 	return result, err
 }
 
-func (b *controllerProcessKillBarrier) completedHandoffWithoutCompletion(ctx context.Context) bool {
+func controllerProcessKillExecuteWithFixedFault(ctx context.Context, delegate jobs.Executor, job jobs.Job,
+	reporter jobs.ProgressReporter, barrier *controllerProcessKillBarrier,
+) (result jobs.ExecutionResult, resultErr error) {
+	if delegate == nil || barrier == nil || barrier.db == nil {
+		return jobs.ExecutionResult{}, errors.New("process-kill handoff fault is incomplete")
+	}
+	create, drop, ok := controllerProcessKillFaultStatements(barrier.boundary)
+	if !ok {
+		return jobs.ExecutionResult{}, errors.New("process-kill handoff fault boundary is unknown")
+	}
+	if _, err := barrier.db.ExecContext(ctx, create); err != nil {
+		return jobs.ExecutionResult{}, err
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if _, err := barrier.db.ExecContext(cleanupCtx, drop); err != nil {
+			result = jobs.ExecutionResult{}
+			resultErr = errors.Join(resultErr, err)
+		}
+	}()
+	return delegate.Execute(ctx, job, reporter)
+}
+
+func controllerProcessKillFaultStatements(boundary controllerProcessKillBoundary) (string, string, bool) {
+	switch boundary {
+	case controllerKillAfterRetire:
+		return `CREATE TRIGGER controller_process_kill_handoff_authorization_fault
+			BEFORE INSERT ON generated_route_accounting_handoff_authorizations
+			BEGIN SELECT RAISE(ABORT, 'fixed process-kill handoff authorization fault'); END`,
+			`DROP TRIGGER controller_process_kill_handoff_authorization_fault`, true
+	case controllerKillAfterAuth:
+		return `CREATE TRIGGER controller_process_kill_handoff_receipt_fault
+			BEFORE INSERT ON generated_route_accounting_handoff_receipts
+			BEGIN SELECT RAISE(ABORT, 'fixed process-kill handoff receipt fault'); END`,
+			`DROP TRIGGER controller_process_kill_handoff_receipt_fault`, true
+	case controllerKillAfterHandoff:
+		return `CREATE TRIGGER controller_process_kill_completion_fault
+			BEFORE INSERT ON generated_route_completion_receipts
+			BEGIN SELECT RAISE(ABORT, 'fixed process-kill completion fault'); END`,
+			`DROP TRIGGER controller_process_kill_completion_fault`, true
+	default:
+		return "", "", false
+	}
+}
+
+type controllerProcessKillAccountingPrefix struct {
+	activation generatedruntimestate.GeneratedDomainStartupRouteActivation
+	components []generatedruntimestate.PredecessorRetirementObservation
+	retirement generatedruntimestate.PredecessorRetirementReceipt
+	authorize  []generatedruntimestate.RouteAccountingHandoffAuthorization
+	handoff    []generatedruntimestate.RouteAccountingHandoffReceipt
+	completion []generatedruntimestate.RouteCompletionReceipt
+}
+
+func (b *controllerProcessKillBarrier) accountingHandoffPrefix(ctx context.Context,
+	wantAuthorization, wantHandoff, wantCompletion int,
+) (controllerProcessKillAccountingPrefix, bool) {
+	var result controllerProcessKillAccountingPrefix
 	if b == nil || b.db == nil || b.appID == "" || b.jobID == "" {
-		return false
+		return result, false
 	}
 	deploymentID := b.resolveDeploymentID(ctx)
 	if deploymentID == "" {
-		return false
+		return result, false
 	}
-	var activationID string
-	var activations, retirements, authorizations, handoffs, completions int
-	err := b.db.QueryRowContext(ctx, `SELECT a.id,
-		(SELECT COUNT(*) FROM generated_route_activations value
-		 WHERE value.app_id=a.app_id AND value.successor_deployment_id=a.successor_deployment_id),
-		(SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts value
-		 WHERE value.activation_receipt_id=a.id),
-		(SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations value
-		 WHERE value.activation_receipt_id=a.id),
-		(SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts value
-		 WHERE value.activation_receipt_id=a.id),
-		(SELECT COUNT(*) FROM generated_route_completion_receipts value
-		 WHERE value.activation_receipt_id=a.id)
-		FROM generated_route_activations a
-		WHERE a.app_id=? AND a.successor_deployment_id=? AND a.creator_job_id=?`,
-		b.appID, deploymentID, b.jobID).Scan(&activationID, &activations, &retirements,
-		&authorizations, &handoffs, &completions)
-	if err != nil || activationID == "" || activations != 1 || retirements != 1 ||
-		authorizations != 1 || handoffs != 1 || completions != 0 {
-		return false
+	tx, err := b.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return result, false
+	}
+	defer tx.Rollback()
+	snapshot, err := b.state.GeneratedDomainStartupSnapshotTx(ctx, tx)
+	if err != nil || tx.Commit() != nil {
+		return result, false
+	}
+	activations := 0
+	for _, value := range snapshot.RouteActivations {
+		if value.AppID == b.appID && value.SuccessorDeploymentID == deploymentID &&
+			value.CreatorJobID == b.jobID {
+			result.activation, activations = value, activations+1
+		}
+	}
+	if activations != 1 || result.activation.ReceiptID == "" ||
+		result.activation.PredecessorDeploymentID == "" {
+		return controllerProcessKillAccountingPrefix{}, false
+	}
+	successorComponents := 0
+	for _, value := range snapshot.Components {
+		if value.DeploymentID == result.activation.SuccessorDeploymentID {
+			successorComponents++
+		}
+	}
+	if successorComponents == 0 {
+		return controllerProcessKillAccountingPrefix{}, false
+	}
+	for _, value := range snapshot.PredecessorRetirementComponents {
+		if value.ActivationReceiptID == result.activation.ReceiptID {
+			result.components = append(result.components, value)
+		}
+	}
+	retirements := 0
+	for _, value := range snapshot.PredecessorRetirementReceipts {
+		if value.ActivationReceiptID == result.activation.ReceiptID {
+			result.retirement, retirements = value, retirements+1
+		}
+	}
+	for _, value := range snapshot.AccountingHandoffAuthorizations {
+		if value.ActivationReceiptID == result.activation.ReceiptID {
+			result.authorize = append(result.authorize, value)
+		}
+	}
+	for _, value := range snapshot.AccountingHandoffReceipts {
+		if value.ActivationReceiptID == result.activation.ReceiptID {
+			result.handoff = append(result.handoff, value)
+		}
+	}
+	for _, value := range snapshot.RouteCompletionReceipts {
+		if value.ActivationReceiptID == result.activation.ReceiptID {
+			result.completion = append(result.completion, value)
+		}
+	}
+	if retirements != 1 || len(result.components) == 0 ||
+		result.retirement.AppID != result.activation.AppID ||
+		result.retirement.SuccessorDeploymentID != result.activation.SuccessorDeploymentID ||
+		result.retirement.PredecessorDeploymentID != result.activation.PredecessorDeploymentID ||
+		result.retirement.PredecessorRosterDigest != result.activation.PredecessorRosterDigest ||
+		result.retirement.ComponentCount != len(result.components) || result.retirement.RetiredAt.IsZero() ||
+		len(result.authorize) != wantAuthorization || len(result.handoff) != wantHandoff ||
+		len(result.completion) != wantCompletion {
+		return controllerProcessKillAccountingPrefix{}, false
+	}
+	seen := make(map[string]struct{}, len(result.components))
+	for _, value := range result.components {
+		if value.AppID != result.activation.AppID ||
+			value.SuccessorDeploymentID != result.activation.SuccessorDeploymentID ||
+			value.PredecessorDeploymentID != result.activation.PredecessorDeploymentID ||
+			value.ComponentName == "" || value.CandidateReceiptID == "" || value.ContainerID == "" ||
+			value.CandidatePolicyDigest == "" || value.ObservedAbsentAt.IsZero() ||
+			value.ObservedAbsentAt.After(result.retirement.RetiredAt) {
+			return controllerProcessKillAccountingPrefix{}, false
+		}
+		if _, duplicate := seen[value.ComponentName]; duplicate {
+			return controllerProcessKillAccountingPrefix{}, false
+		}
+		seen[value.ComponentName] = struct{}{}
+	}
+	if len(result.authorize) == 1 {
+		value := result.authorize[0]
+		if value.AppID != result.activation.AppID ||
+			value.SuccessorDeploymentID != result.activation.SuccessorDeploymentID ||
+			value.PredecessorDeploymentID != result.activation.PredecessorDeploymentID ||
+			value.CandidateRosterDigest != result.activation.CandidateRosterDigest ||
+			value.PredecessorRosterDigest != result.activation.PredecessorRosterDigest ||
+			value.SuccessorComponentCount != successorComponents ||
+			value.PredecessorComponentCount != len(result.components) || value.AuthorizedAt.IsZero() ||
+			value.AuthorizedAt.Before(result.retirement.RetiredAt) {
+			return controllerProcessKillAccountingPrefix{}, false
+		}
+	}
+	if len(result.handoff) == 1 && (len(result.authorize) != 1 ||
+		result.handoff[0].ActivationReceiptID != result.authorize[0].ActivationReceiptID ||
+		result.handoff[0].AppID != result.authorize[0].AppID ||
+		result.handoff[0].SuccessorDeploymentID != result.authorize[0].SuccessorDeploymentID ||
+		result.handoff[0].PredecessorDeploymentID != result.authorize[0].PredecessorDeploymentID ||
+		result.handoff[0].CandidateRosterDigest != result.authorize[0].CandidateRosterDigest ||
+		result.handoff[0].PredecessorRosterDigest != result.authorize[0].PredecessorRosterDigest ||
+		result.handoff[0].SuccessorComponentCount != result.authorize[0].SuccessorComponentCount ||
+		result.handoff[0].PredecessorComponentCount != result.authorize[0].PredecessorComponentCount ||
+		result.handoff[0].HandedOffAt.Before(result.authorize[0].AuthorizedAt)) {
+		return controllerProcessKillAccountingPrefix{}, false
+	}
+	if len(result.completion) == 1 && (len(result.handoff) != 1 ||
+		result.completion[0].AppID != result.activation.AppID ||
+		result.completion[0].SuccessorDeploymentID != result.activation.SuccessorDeploymentID ||
+		result.completion[0].CreatorJobID != result.activation.CreatorJobID ||
+		result.completion[0].CreatorWorkerAttempt != result.activation.CreatorWorkerAttempt ||
+		result.completion[0].CurrentJobID != b.jobID || result.completion[0].CurrentWorkerAttempt < 1 ||
+		result.completion[0].CompletedAt.IsZero() ||
+		result.completion[0].CompletedAt.Before(result.handoff[0].HandedOffAt)) {
+		return controllerProcessKillAccountingPrefix{}, false
 	}
 	runtime, err := b.state.Get(ctx, b.appID, deploymentID)
-	return err == nil && runtime.Phase == generatedruntimestate.PhaseDraining
+	return result, err == nil && ((wantCompletion == 0 && runtime.Phase == generatedruntimestate.PhaseDraining) ||
+		(wantCompletion == 1 && runtime.Phase == generatedruntimestate.PhaseSucceeded))
 }
 
 type controllerProcessKillReporter struct {
@@ -778,7 +951,7 @@ func controllerProcessKillMatrix(
 	state := generatedruntimestate.New(db)
 	previousMarker := "controller-journey"
 	for index, boundary := range []controllerProcessKillBoundary{
-		controllerKillBeforeBuild, controllerKillBeforeStart, controllerKillAfterRoute,
+		controllerKillAfterRetire, controllerKillBeforeBuild, controllerKillBeforeStart, controllerKillAfterRoute,
 		controllerKillBeforeDrain, controllerKillAfterHandoff, controllerKillAfterSuccess, controllerKillAfterMain,
 	} {
 		if !t.Run(string(boundary), func(t *testing.T) {
@@ -853,10 +1026,22 @@ func controllerProcessKillMatrix(
 			if err != nil || json.Unmarshal(body, &signal) != nil || signal.Boundary != boundary {
 				t.Fatal("process-kill child signaled the wrong durable boundary")
 			}
-			if boundary == controllerKillAfterHandoff && !(&controllerProcessKillBarrier{
+			prefixBarrier := &controllerProcessKillBarrier{
 				state: state, db: db, appID: appID, jobID: mutation.Job.ID,
-			}).completedHandoffWithoutCompletion(ctx) {
-				t.Fatal("fault/restart boundary omitted the exact durable handoff prefix")
+			}
+			var firstPrefix controllerProcessKillAccountingPrefix
+			var authorizedPrefix controllerProcessKillAccountingPrefix
+			if boundary == controllerKillAfterRetire {
+				var ok bool
+				firstPrefix, ok = prefixBarrier.accountingHandoffPrefix(ctx, 0, 0, 0)
+				if !ok {
+					t.Fatal("fault/restart boundary omitted the exact durable retirement prefix")
+				}
+			}
+			if boundary == controllerKillAfterHandoff {
+				if _, ok := prefixBarrier.accountingHandoffPrefix(ctx, 1, 1, 0); !ok {
+					t.Fatal("fault/restart boundary omitted the exact durable handoff prefix")
+				}
 			}
 			before, err := jobStore.Get(mutation.Job.ID)
 			if err != nil || before.Status != string(jobs.Running) || before.Attempt != 1 {
@@ -914,6 +1099,57 @@ func controllerProcessKillMatrix(
 					t.Fatal("pre-route process kill changed the active serving head")
 				}
 			}
+			if boundary == controllerKillAfterRetire {
+				for _, component := range oldRuntime.Components {
+					if component.State != generatedruntimestate.ComponentStopped ||
+						controllerJourneyExists(t, ctx, docker, "container", component.ContainerName) {
+						t.Fatal("retirement-prefix process retained the predecessor physical identity")
+					}
+				}
+				middleFolder := t.TempDir()
+				middleMarker := filepath.Join(middleFolder, "ready")
+				manifest.Boundary = controllerKillAfterAuth
+				manifest.APIMarker = controllerProcessKillAPIReadyPath(t, middleFolder, "middle")
+				encoded, err = json.Marshal(manifest)
+				if err != nil || os.WriteFile(manifestPath, encoded, 0o600) != nil {
+					t.Fatal("write authorization-only restart manifest")
+				}
+				middle := controllerProcessKillChild(t, middleMarker, []string{
+					"RIG_LIVE_PROCESS_KILL_CHILD=1", "RIG_LIVE_PROCESS_KILL_MANIFEST=" + manifestPath,
+				})
+				middleStopped := false
+				t.Cleanup(func() {
+					controllerProcessKillCleanupChild(middle)
+					if t.Failed() && !middleStopped {
+						controllerProcessKillReportClosedDiagnostic(t, middle)
+					}
+				})
+				controllerProcessKillWaitMarker(t, manifest.APIMarker, middle)
+				controllerProcessKillAssertAuthenticated(t, administratorID, request)
+				controllerProcessKillWaitMarker(t, middleMarker, middle)
+				body, err := os.ReadFile(middleMarker)
+				if err != nil || json.Unmarshal(body, &signal) != nil ||
+					signal.Boundary != controllerKillAfterAuth {
+					t.Fatal("middle process did not signal the exact authorization-only boundary")
+				}
+				var ok bool
+				authorizedPrefix, ok = prefixBarrier.accountingHandoffPrefix(ctx, 1, 0, 0)
+				if !ok || !reflect.DeepEqual(firstPrefix.activation, authorizedPrefix.activation) ||
+					!reflect.DeepEqual(firstPrefix.components, authorizedPrefix.components) ||
+					!reflect.DeepEqual(firstPrefix.retirement, authorizedPrefix.retirement) {
+					t.Fatal("authorization-only recovery changed the immutable retirement prefix")
+				}
+				middleJob, err := jobStore.Get(mutation.Job.ID)
+				if err != nil || middleJob.Status != string(jobs.Running) || middleJob.Attempt != before.Attempt+1 ||
+					string(middleJob.Input) != string(before.Input) || middleJob.ID != before.ID {
+					t.Fatal("authorization-only recovery changed the immutable job or wrong attempt")
+				}
+				controllerProcessKillAssertRoute(t, ctx, ingress, appID, phase)
+				controllerJourneyRoutedRequest(t, ctx, appID, http.MethodGet, "/api/version", "",
+					http.StatusOK, candidateMarker)
+				controllerProcessKillTerminate(t, middle)
+				middleStopped = true
+			}
 			manifest.Boundary = ""
 			manifest.APIMarker = controllerProcessKillAPIReadyPath(t, folder, "restarted")
 			encoded, err = json.Marshal(manifest)
@@ -945,7 +1181,11 @@ func controllerProcessKillMatrix(
 					t.Fatal("read original job during process restart")
 				}
 				if current.Status == string(jobs.Succeeded) {
-					if current.Attempt != before.Attempt+1 || string(current.Input) != string(before.Input) || current.ID != before.ID {
+					wantAttempt := before.Attempt + 1
+					if boundary == controllerKillAfterRetire {
+						wantAttempt = before.Attempt + 2
+					}
+					if current.Attempt != wantAttempt || string(current.Input) != string(before.Input) || current.ID != before.ID {
 						t.Fatal("restart changed the original immutable job or attempt")
 					}
 					break
@@ -981,6 +1221,15 @@ func controllerProcessKillMatrix(
 			if err != nil || finalRuntime.Phase != generatedruntimestate.PhaseSucceeded || len(finalRuntime.Components) == 0 {
 				t.Fatal("process restart did not commit the exact runtime success")
 			}
+			if boundary == controllerKillAfterRetire {
+				finalPrefix, ok := prefixBarrier.accountingHandoffPrefix(ctx, 1, 1, 1)
+				if !ok || !reflect.DeepEqual(firstPrefix.activation, finalPrefix.activation) ||
+					!reflect.DeepEqual(firstPrefix.components, finalPrefix.components) ||
+					!reflect.DeepEqual(firstPrefix.retirement, finalPrefix.retirement) ||
+					!reflect.DeepEqual(authorizedPrefix.authorize, finalPrefix.authorize) {
+					t.Fatal("final recovery changed the immutable retirement or authorization lineage")
+				}
+			}
 			for _, component := range finalRuntime.Components {
 				if component.State != generatedruntimestate.ComponentActive || component.ContainerID == "" ||
 					(componentIDs[component.Name] != "" && componentIDs[component.Name] != component.ContainerID) ||
@@ -1002,7 +1251,11 @@ func controllerProcessKillMatrix(
 			controllerJourneyRoutedRequest(t, ctx, appID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 			controllerJourneyRoutedRequest(t, ctx, appID, http.MethodGet, "/api/version", "", http.StatusOK, candidateMarker)
 			previousMarker = candidateMarker
-			if boundary == controllerKillAfterHandoff {
+			if boundary == controllerKillAfterRetire {
+				t.Logf("controller dual-prefix fault/restart boundary=%s job=%s deployment=%s release=%s prior=%s active=%s",
+					boundary, mutation.Job.ID, pinned.DeploymentID, pinned.ReleaseID,
+					previous.DeploymentID, finalHead.DeploymentID)
+			} else if boundary == controllerKillAfterHandoff {
 				t.Logf("controller completion fault/restart boundary=%s job=%s deployment=%s release=%s prior=%s active=%s",
 					boundary, mutation.Job.ID, pinned.DeploymentID, pinned.ReleaseID,
 					previous.DeploymentID, finalHead.DeploymentID)
