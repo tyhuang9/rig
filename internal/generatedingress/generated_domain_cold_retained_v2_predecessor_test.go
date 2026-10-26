@@ -310,35 +310,33 @@ func TestGeneratedDomainColdFirstRecoveryAccountsAuthenticatedRetainedNativeV2Pr
 	if !generatedDomainRegistryIsolated(t) {
 		return
 	}
-	generatedDomainConstructionCase(t, func(t *testing.T) {
-		fixture := newGeneratedDomainRetainedV2A0Fixture(t, nil)
-		beforeCommands := len(fixture.runner.snapshot())
-		first, err := generatedDomainRetainedV2AttestColdBoundary(t, fixture)
-		commands := fixture.runner.snapshot()
-		generatedDomainRetainedV2AssertProtectedUnchanged(t, fixture)
-		if err != nil {
-			generatedDomainRetainedV2AssertNoEffects(t, fixture, commands[beforeCommands:], false)
-			t.Fatalf("authentic retained NativeV2 first recovery failed: %v", err)
-		}
-		generatedDomainRetainedV2RequireProofs(t, first)
-		generatedDomainRetainedV2AssertNoEffects(t, fixture, commands[beforeCommands:], true)
-		secondBefore := len(commands)
-		second, err := generatedDomainRetainedV2AttestColdBoundary(t, fixture)
-		secondCommands := fixture.runner.snapshot()
-		if err != nil {
-			generatedDomainRetainedV2AssertNoEffects(t, fixture, secondCommands[secondBefore:], false)
-			t.Fatalf("fresh accepted retained NativeV2 cold-group attestation failed: %v", err)
-		}
-		if !reflect.DeepEqual(first, second) {
-			t.Fatalf("accepted retained NativeV2 first recovery did not survive a fresh cold-group attestation: %v", err)
-		}
-		generatedDomainRetainedV2RequireProofs(t, second)
-		generatedDomainRetainedV2AssertNoEffects(t, fixture, secondCommands[secondBefore:], true)
-		if len(fixture.runner.snapshot()) <= beforeCommands {
-			t.Fatal("retained NativeV2 cold-group attestation performed no authenticated reads")
-		}
-		generatedDomainRetainedV2AssertProtectedUnchanged(t, fixture)
-	})
+	fixture := newGeneratedDomainRetainedV2A0Fixture(t, nil)
+	beforeCommands := len(fixture.runner.snapshot())
+	first, err := generatedDomainRetainedV2AttestColdBoundary(t, fixture)
+	commands := fixture.runner.snapshot()
+	generatedDomainRetainedV2AssertProtectedUnchanged(t, fixture)
+	if err != nil {
+		generatedDomainRetainedV2AssertNoEffects(t, fixture, commands[beforeCommands:], false)
+		t.Fatalf("authentic retained NativeV2 first recovery failed: %v", err)
+	}
+	generatedDomainRetainedV2RequireProofs(t, first)
+	generatedDomainRetainedV2AssertNoEffects(t, fixture, commands[beforeCommands:], true)
+	secondBefore := len(commands)
+	second, err := generatedDomainRetainedV2AttestColdBoundary(t, fixture)
+	secondCommands := fixture.runner.snapshot()
+	if err != nil {
+		generatedDomainRetainedV2AssertNoEffects(t, fixture, secondCommands[secondBefore:], false)
+		t.Fatalf("fresh accepted retained NativeV2 cold-group attestation failed: %v", err)
+	}
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("accepted retained NativeV2 first recovery did not survive a fresh cold-group attestation: %v", err)
+	}
+	generatedDomainRetainedV2RequireProofs(t, second)
+	generatedDomainRetainedV2AssertNoEffects(t, fixture, secondCommands[secondBefore:], true)
+	if len(fixture.runner.snapshot()) <= beforeCommands {
+		t.Fatal("retained NativeV2 cold-group attestation performed no authenticated reads")
+	}
+	generatedDomainRetainedV2AssertProtectedUnchanged(t, fixture)
 }
 
 func TestGeneratedDomainColdFirstRecoveryRefusesInvalidRetainedNativeV2Predecessor(t *testing.T) {
@@ -381,20 +379,18 @@ func TestGeneratedDomainColdFirstRecoveryRefusesInvalidRetainedNativeV2Predecess
 			if !generatedDomainRegistryIsolated(t) {
 				return
 			}
-			generatedDomainConstructionCase(t, func(t *testing.T) {
-				fixture := newGeneratedDomainRetainedV2A0Fixture(t, test.mutate)
-				beforeCommands := len(fixture.runner.snapshot())
-				proofs, err := generatedDomainRetainedV2AttestColdBoundary(t, fixture)
-				commands := fixture.runner.snapshot()
-				generatedDomainRetainedV2AssertProtectedUnchanged(t, fixture)
-				generatedDomainRetainedV2AssertNoEffects(t, fixture, commands[beforeCommands:], false)
-				if !errors.Is(err, errGeneratedDomainConstructionRefused) ||
-					proofs.retainedV1.presence != generatedDomainColdRetainedGatewayPresent ||
-					proofs.retainedV1.authority == nil || !validSHA256(proofs.retainedV1.digest) ||
-					!reflect.DeepEqual(proofs.retainedV2, generatedDomainColdRetainedV2Proof{}) {
-					t.Fatalf("invalid retained NativeV2 predecessor error=%v", err)
-				}
-			})
+			fixture := newGeneratedDomainRetainedV2A0Fixture(t, test.mutate)
+			beforeCommands := len(fixture.runner.snapshot())
+			proofs, err := generatedDomainRetainedV2AttestColdBoundary(t, fixture)
+			commands := fixture.runner.snapshot()
+			generatedDomainRetainedV2AssertProtectedUnchanged(t, fixture)
+			generatedDomainRetainedV2AssertNoEffects(t, fixture, commands[beforeCommands:], false)
+			if !errors.Is(err, errGeneratedDomainConstructionRefused) ||
+				proofs.retainedV1.presence != generatedDomainColdRetainedGatewayPresent ||
+				proofs.retainedV1.authority == nil || !validSHA256(proofs.retainedV1.digest) ||
+				!reflect.DeepEqual(proofs.retainedV2, generatedDomainColdRetainedV2Proof{}) {
+				t.Fatalf("invalid retained NativeV2 predecessor error=%v", err)
+			}
 		})
 	}
 }
