@@ -253,6 +253,16 @@ func TestControllerProcessKillBoundaryControls(t *testing.T) {
 	if err != nil || json.Unmarshal(body, &signal) != nil || signal.Boundary != controllerKillAfterRoute {
 		t.Fatal("process-kill marker did not preserve the exact boundary")
 	}
+	for _, reason := range []string{
+		"cold_retained_gateway_final_identity",
+		"cold_retained_gateway_final_labels",
+		"cold_retained_gateway_final_projection",
+	} {
+		if !controllerChildConstructionDiagnosticKnownPair("cold_construction", reason) ||
+			controllerChildConstructionDiagnosticKnownPair("empty_construction", reason) {
+			t.Fatalf("retained final construction pair %q crossed its closed stage", reason)
+		}
+	}
 }
 
 type controllerProcessKillExecutor struct {
@@ -496,6 +506,8 @@ func controllerChildConstructionDiagnosticKnownPair(stage, reason string) bool {
 			"cold_group_gateway_attestation", "cold_retained_gateway_selection",
 			"cold_retained_gateway_triple", "cold_retained_gateway_read",
 			"cold_retained_gateway_policy", "cold_retained_gateway_protected_digest",
+			"cold_retained_gateway_final_identity", "cold_retained_gateway_final_labels",
+			"cold_retained_gateway_final_projection",
 			"cold_retained_gateway_final_consistency",
 			"cold_manifest", "lock", "release", "final_validation":
 			return true

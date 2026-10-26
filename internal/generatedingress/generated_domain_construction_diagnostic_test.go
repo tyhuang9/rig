@@ -137,6 +137,9 @@ func TestGeneratedDomainConstructionDiagnosticClosedAttribution(t *testing.T) {
 			generatedDomainConstructionReasonColdRetainedGatewayRead,
 			generatedDomainConstructionReasonColdRetainedGatewayPolicy,
 			generatedDomainConstructionReasonColdRetainedGatewayDigest,
+			generatedDomainConstructionReasonColdRetainedGatewayFinalIdentity,
+			generatedDomainConstructionReasonColdRetainedGatewayFinalLabels,
+			generatedDomainConstructionReasonColdRetainedGatewayFinalProjection,
 			generatedDomainConstructionReasonColdRetainedGatewayFinal,
 			generatedDomainConstructionReasonColdManifest,
 		} {
