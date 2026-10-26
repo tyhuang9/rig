@@ -71,10 +71,11 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	}
 
 	handler, server := relayOutageServer(t, relay)
-	firstRun, stopFirst, firstSupervisor := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil)
+	initialSyncObservation := newRelayOutageInitialSyncObservationRecorder(setupStarted, time.Now)
+	firstRun, stopFirst, firstSupervisor := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil, initialSyncObservation)
 	firstFixture := relayOutageFirstRunFixture{stopSupervisor: stopFirst, server: server, handler: handler, done: firstRun}
 	t.Cleanup(func() { firstFixture.Stop(t) })
-	relayOutageWaitInitialSubscriptionSync(t, setupCtx, db, pool, controllerID, status.SubscriptionID, firstSupervisor)
+	relayOutageWaitInitialSubscriptionSync(t, setupCtx, db, pool, controllerID, status.SubscriptionID, firstSupervisor, initialSyncObservation)
 	deadlineDiagnostic, deadlineExceeded := relayOutageStopFirstFixtureAndObserveSetupDeadline(setupCtx, setupStarted, func() {
 		firstFixture.Stop(t)
 	}, time.Now)
@@ -136,7 +137,7 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	handler, server = relayOutageServer(t, relay)
 	dial := &relayOutageDropACKDial{dropped: make(chan struct{}), release: make(chan struct{})}
 	defer dial.Release()
-	secondRun, stopSecond, _ := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, dial.Dial)
+	secondRun, stopSecond, _ := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, dial.Dial, nil)
 	select {
 	case <-dial.dropped:
 	case <-time.After(5 * time.Second):
@@ -152,7 +153,7 @@ func TestPostgreSQLRelayOutageConvergesDurablyAcrossRelayAndControllerRestart(t 
 	relayOutageAssertDurableSource(t, ctx, db, controllerID, status.SubscriptionID)
 	dial.Release()
 	relayOutageWaitRun(t, secondRun)
-	thirdRun, stopThird, _ := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil)
+	thirdRun, stopThird, _ := relayOutageSupervisor(t, server.URL, server, controllerRepository, controllerID, keyID, privateKey, publicKey, nil, nil)
 	defer func() {
 		stopThird()
 		server.Close()
@@ -456,6 +457,28 @@ func TestRelayOutageSetupFailureDiagnosticIsClosedAndSanitized(t *testing.T) {
 		})
 	}
 
+	phases := []relayOutageSetupFailurePhase{
+		relayOutageSetupFailureControllerSeed,
+		relayOutageSetupFailureEnrollmentCreate,
+		relayOutageSetupFailureEnrollmentClaim,
+		relayOutageSetupFailureEnrollmentComplete,
+	}
+	classes := []relayOutageSetupFailureClass{
+		relayOutageSetupFailureDeadline,
+		relayOutageSetupFailureCanceled,
+		relayOutageSetupFailureConstraint,
+		relayOutageSetupFailureOther,
+	}
+	for _, phase := range phases {
+		for _, class := range classes {
+			diagnostic := relayOutageFormatSetupFailureDiagnostic(phase, class)
+			want := fmt.Sprintf("relay_outage_setup_failure phase=%s error_class=%s", phase, class)
+			if diagnostic != want {
+				t.Fatalf("phase=%q class=%q diagnostic=%q want=%q", phase, class, diagnostic, want)
+			}
+		}
+	}
+
 	for _, invalid := range []struct {
 		phase relayOutageSetupFailurePhase
 		class relayOutageSetupFailureClass
@@ -591,6 +614,157 @@ func TestRelayOutageBoundedElapsedMilliseconds(t *testing.T) {
 	}
 }
 
+func TestRelayOutageInitialSyncWaitConditionRecordsActualArm(t *testing.T) {
+	t.Run("setup context done", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		condition, failed := relayOutageSelectInitialSyncWaitCondition(ctx, make(chan time.Time), make(chan time.Time))
+		if !failed || condition != relayOutageSetupContextDoneSelected {
+			t.Fatalf("failed=%t condition=%q", failed, condition)
+		}
+	})
+
+	t.Run("initial sync timeout", func(t *testing.T) {
+		deadline := make(chan time.Time, 1)
+		deadline <- time.Unix(100, 0)
+		condition, failed := relayOutageSelectInitialSyncWaitCondition(context.Background(), deadline, make(chan time.Time))
+		if !failed || condition != relayOutageInitialSyncTimeoutSelected {
+			t.Fatalf("failed=%t condition=%q", failed, condition)
+		}
+	})
+
+	t.Run("poll tick is not failure", func(t *testing.T) {
+		tick := make(chan time.Time, 1)
+		tick <- time.Unix(100, 0)
+		condition, failed := relayOutageSelectInitialSyncWaitCondition(context.Background(), make(chan time.Time), tick)
+		if failed || condition != "" {
+			t.Fatalf("failed=%t condition=%q", failed, condition)
+		}
+	})
+}
+
+func TestRelayOutageInitialSyncObservationRecorderIsBoundedAndClosed(t *testing.T) {
+	started := time.Unix(100, 0)
+	now := started.Add(time.Second)
+	recorder := newRelayOutageInitialSyncObservationRecorder(started, func() time.Time { return now })
+
+	t.Run("transport milestones retain first bounded callback time", func(t *testing.T) {
+		for range relayOutageDiagnosticCountLimit + 5 {
+			if err := recorder.ObserveTransport(context.Background(), controllerrelay.SessionTransportEvent{Stage: controllerrelay.SessionTransportConnecting}); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(time.Millisecond)
+		}
+		now = started.Add(2 * time.Second)
+		_ = recorder.ObserveTransport(context.Background(), controllerrelay.SessionTransportEvent{Stage: controllerrelay.SessionTransportAuthenticating})
+		now = started.Add(relayOutageSetupDeadline + time.Second)
+		_ = recorder.ObserveTransport(context.Background(), controllerrelay.SessionTransportEvent{Stage: controllerrelay.SessionTransportReady})
+		_ = recorder.ObserveTransport(context.Background(), controllerrelay.SessionTransportEvent{Stage: "private transport stage"})
+		value := recorder.Snapshot(0)
+		if value.connecting.count != relayOutageDiagnosticCountLimit || value.connecting.elapsedMS != 1000 || value.authenticating != (relayOutageTransportMilestone{count: 1, elapsedMS: 2000}) || value.ready != (relayOutageTransportMilestone{count: 1, elapsedMS: 20000}) {
+			t.Fatalf("observation=%+v", value)
+		}
+	})
+
+	t.Run("supervisor enums are finite and aggregates cap", func(t *testing.T) {
+		kinds := []string{controllerrelay.SupervisorHandshake, controllerrelay.SupervisorFallback, controllerrelay.SupervisorReady, controllerrelay.SupervisorDisconnect, controllerrelay.SupervisorBackoff, controllerrelay.SupervisorAttention, controllerrelay.SupervisorStopped, controllerrelay.SupervisorRecovery, controllerrelay.SupervisorDiagnostics}
+		stages := []string{"", controllerrelay.SessionDisconnected, controllerrelay.SessionConnecting, controllerrelay.SessionAuthenticating, controllerrelay.SessionReady, controllerrelay.SessionBackoff, controllerrelay.SessionNeedsAttention, controllerrelay.SessionStopped}
+		outcomes := []string{"", "relay_unavailable", "connection_closed", "protocol_error", "persistence_unavailable", "credential_unavailable", "identity_unavailable", "queue_saturated", "session_expired"}
+		for index := range max(len(kinds), len(stages), len(outcomes)) {
+			kind := kinds[index%len(kinds)]
+			stage := stages[index%len(stages)]
+			outcome := outcomes[index%len(outcomes)]
+			_ = recorder.ObserveSupervisor(context.Background(), controllerrelay.SupervisorEvent{Kind: kind, Stage: stage, Outcome: outcome, Attempt: uint32(relayOutageObserverAggregateLimit)})
+			value := recorder.Snapshot(relayOutageObserverAggregateLimit)
+			expectedStage := relayOutagePrintableClosedValue(stage)
+			expectedOutcome := relayOutagePrintableClosedValue(outcome)
+			if value.supervisorKind != kind || value.supervisorStage != expectedStage || value.supervisorOutcome != expectedOutcome || value.supervisorAttempt != relayOutageObserverAggregateLimit || value.observerDropped != relayOutageObserverAggregateLimit {
+				t.Fatalf("observation=%+v", value)
+			}
+		}
+		_ = recorder.ObserveSupervisor(context.Background(), controllerrelay.SupervisorEvent{Kind: "private kind", Stage: "private stage", Outcome: "private outcome", Attempt: ^uint32(0)})
+		value := recorder.Snapshot(^uint64(0))
+		if value.supervisorKind != "unavailable" || value.supervisorStage != "unavailable" || value.supervisorOutcome != "unavailable" || value.supervisorAttempt != relayOutageObserverAggregateLimit || value.observerDropped != relayOutageObserverAggregateLimit {
+			t.Fatalf("observation=%+v", value)
+		}
+	})
+
+	t.Run("snapshot is immutable after later callbacks", func(t *testing.T) {
+		first := recorder.Snapshot(3)
+		now = started.Add(3 * time.Second)
+		_ = recorder.ObserveTransport(context.Background(), controllerrelay.SessionTransportEvent{Stage: controllerrelay.SessionTransportReady})
+		_ = recorder.ObserveSupervisor(context.Background(), controllerrelay.SupervisorEvent{Kind: controllerrelay.SupervisorReady, Stage: controllerrelay.SessionReady})
+		second := recorder.Snapshot(4)
+		if first.observerDropped != 3 || second.observerDropped != 4 || first.supervisorKind == second.supervisorKind || first.ready.count == second.ready.count {
+			t.Fatalf("first=%+v second=%+v", first, second)
+		}
+	})
+}
+
+func TestRelayOutageInitialSyncFailureDiagnosticIsClosedAndStable(t *testing.T) {
+	base := relayOutageInitialSyncDiagnostic{
+		sqliteActiveControllerSubscriptions: 1,
+		sqliteSubscriptionSyncHeads:         1,
+		sqliteInflightSyncSets:              0,
+		postgresRelaySessions:               0,
+		postgresControllerLeases:            0,
+		postgresSubscriptionsSyncCommands:   0,
+		postgresCurrentRelaySubscriptions:   0,
+		supervisor:                          relayOutageSafeSnapshot{state: controllerrelay.SessionConnecting},
+		observation: relayOutageInitialSyncObservation{
+			connecting:        relayOutageTransportMilestone{count: 1, elapsedMS: 10},
+			authenticating:    relayOutageTransportMilestone{elapsedMS: relayOutageDiagnosticUnavailable},
+			ready:             relayOutageTransportMilestone{elapsedMS: relayOutageDiagnosticUnavailable},
+			supervisorKind:    controllerrelay.SupervisorHandshake,
+			supervisorStage:   controllerrelay.SessionConnecting,
+			supervisorOutcome: "empty",
+		},
+	}
+
+	t.Run("initial timeout", func(t *testing.T) {
+		value := base
+		value.waitCondition = relayOutageInitialSyncTimeoutSelected
+		got := relayOutageFormatInitialSyncDiagnostic(value)
+		if !strings.Contains(got, "wait_condition=initial_sync_timeout") || !strings.Contains(got, "transport_connecting_count=1") || strings.Contains(got, "private") {
+			t.Fatalf("diagnostic=%q", got)
+		}
+	})
+
+	t.Run("setup context and boundary values", func(t *testing.T) {
+		value := base
+		value.waitCondition = relayOutageSetupContextDoneSelected
+		value.sqliteActiveControllerSubscriptions = relayOutageDiagnosticUnavailable
+		value.postgresCurrentRelaySubscriptions = relayOutageDiagnosticCountLimit
+		value.observation.ready = relayOutageTransportMilestone{count: relayOutageDiagnosticCountLimit, elapsedMS: int64(relayOutageSetupDeadline / time.Millisecond)}
+		value.observation.supervisorAttempt = relayOutageObserverAggregateLimit
+		value.observation.observerDropped = relayOutageObserverAggregateLimit
+		got := relayOutageFormatInitialSyncDiagnostic(value)
+		if !strings.Contains(got, "wait_condition=setup_context_done") || !strings.Contains(got, "supervisor_observer_dropped=1000000") {
+			t.Fatalf("diagnostic=%q", got)
+		}
+	})
+
+	t.Run("unknown and inconsistent values refuse", func(t *testing.T) {
+		for _, mutate := range []func(*relayOutageInitialSyncDiagnostic){
+			func(value *relayOutageInitialSyncDiagnostic) { value.waitCondition = "private wait" },
+			func(value *relayOutageInitialSyncDiagnostic) {
+				value.sqliteSubscriptionSyncHeads = relayOutageDiagnosticCountLimit + 1
+			},
+			func(value *relayOutageInitialSyncDiagnostic) { value.observation.supervisorKind = "private kind" },
+			func(value *relayOutageInitialSyncDiagnostic) {
+				value.observation.connecting = relayOutageTransportMilestone{}
+			},
+		} {
+			value := base
+			value.waitCondition = relayOutageInitialSyncTimeoutSelected
+			mutate(&value)
+			if got := relayOutageFormatInitialSyncDiagnostic(value); got != "" {
+				t.Fatalf("diagnostic=%q", got)
+			}
+		}
+	})
+}
+
 func relayOutageSQLiteBusyError(t *testing.T) error {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "busy.db")
@@ -677,12 +851,15 @@ func relayOutageServer(t *testing.T, relay *store.Store) (*wss.Handler, *httptes
 	return handler, server
 }
 
-func relayOutageSupervisor(t *testing.T, url string, server *httptest.Server, repository *controllerrelay.Repository, controllerID, keyID string, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey, dial controllerrelay.SessionDialFunc) (<-chan error, func(), *controllerrelay.Supervisor) {
+func relayOutageSupervisor(t *testing.T, url string, server *httptest.Server, repository *controllerrelay.Repository, controllerID, keyID string, privateKey ed25519.PrivateKey, publicKey ed25519.PublicKey, dial controllerrelay.SessionDialFunc, observation *relayOutageInitialSyncObservationRecorder) (<-chan error, func(), *controllerrelay.Supervisor) {
 	t.Helper()
 	transportConfig := controllerrelay.DefaultSessionTransportConfig()
 	transportConfig.HandshakeTimeout = time.Second
 	transportConfig.WriteTimeout = time.Second
 	transportConfig.PersistenceTimeout = time.Second
+	if observation != nil {
+		transportConfig.Observer = observation.ObserveTransport
+	}
 	transport, err := controllerrelay.NewSessionTransport(url, repository, &relayOutageCredentials{controllerID: controllerID, keyID: keyID, privateKey: privateKey, publicKey: publicKey}, server.Client().Transport, dial, transportConfig)
 	if err != nil {
 		t.Fatal(err)
@@ -691,6 +868,9 @@ func relayOutageSupervisor(t *testing.T, url string, server *httptest.Server, re
 	config.InitialBackoff = 5 * time.Millisecond
 	config.MaximumBackoff = 25 * time.Millisecond
 	config.Jitter = func(delay time.Duration, _ uint32) time.Duration { return delay }
+	if observation != nil {
+		config.Observer = observation.ObserveSupervisor
+	}
 	supervisor, err := controllerrelay.NewSupervisor(transport, repository, relayOutageRecovery{}, relayOutageCompleter{}, config)
 	if err != nil {
 		t.Fatal(err)
@@ -710,15 +890,15 @@ func relayOutageEnrollRelay(t *testing.T, ctx context.Context, relay *store.Stor
 		StateHash: stateHash, PollHash: bytes.Repeat([]byte{0x12}, 32), PKCECiphertext: bytes.Repeat([]byte{0x13}, 29), PKCESealNonce: bytes.Repeat([]byte{0x14}, 12), RequestNonce: bytes.Repeat([]byte{0x15}, 32), ExpiresAt: at.Add(10 * time.Minute),
 	})
 	if err != nil {
-		t.Fatal(err)
+		relayOutageFatalSetupFailure(t, ctx, relayOutageSetupFailureEnrollmentCreate, err)
 	}
 	claim, err := relay.ClaimEnrollmentState(ctx, stateHash)
 	if err != nil {
-		t.Fatal(err)
+		relayOutageFatalSetupFailure(t, ctx, relayOutageSetupFailureEnrollmentClaim, err)
 	}
 	claim.Destroy()
 	if err = relay.CompleteEnrollment(ctx, enrollmentID); err != nil {
-		t.Fatal(err)
+		relayOutageFatalSetupFailure(t, ctx, relayOutageSetupFailureEnrollmentComplete, err)
 	}
 }
 
@@ -827,7 +1007,133 @@ const (
 	relayOutageDiagnosticQueryTimeout = 100 * time.Millisecond
 	relayOutageDiagnosticCountLimit   = 1000
 	relayOutageDiagnosticUnavailable  = -1
+	relayOutageObserverAggregateLimit = 1_000_000
 )
+
+type relayOutageInitialSyncWaitCondition string
+
+const (
+	relayOutageInitialSyncTimeoutSelected relayOutageInitialSyncWaitCondition = "initial_sync_timeout"
+	relayOutageSetupContextDoneSelected   relayOutageInitialSyncWaitCondition = "setup_context_done"
+)
+
+type relayOutageTransportMilestone struct {
+	count     int
+	elapsedMS int64
+}
+
+type relayOutageInitialSyncObservation struct {
+	connecting        relayOutageTransportMilestone
+	authenticating    relayOutageTransportMilestone
+	ready             relayOutageTransportMilestone
+	supervisorKind    string
+	supervisorStage   string
+	supervisorOutcome string
+	supervisorAttempt uint64
+	observerDropped   uint64
+}
+
+type relayOutageInitialSyncObservationRecorder struct {
+	mu      sync.Mutex
+	started time.Time
+	now     func() time.Time
+	value   relayOutageInitialSyncObservation
+}
+
+func newRelayOutageInitialSyncObservationRecorder(started time.Time, now func() time.Time) *relayOutageInitialSyncObservationRecorder {
+	if now == nil {
+		now = time.Now
+	}
+	return &relayOutageInitialSyncObservationRecorder{
+		started: started,
+		now:     now,
+		value: relayOutageInitialSyncObservation{
+			connecting:        relayOutageTransportMilestone{elapsedMS: relayOutageDiagnosticUnavailable},
+			authenticating:    relayOutageTransportMilestone{elapsedMS: relayOutageDiagnosticUnavailable},
+			ready:             relayOutageTransportMilestone{elapsedMS: relayOutageDiagnosticUnavailable},
+			supervisorKind:    "empty",
+			supervisorStage:   "empty",
+			supervisorOutcome: "empty",
+		},
+	}
+}
+
+func (recorder *relayOutageInitialSyncObservationRecorder) ObserveTransport(_ context.Context, event controllerrelay.SessionTransportEvent) error {
+	if recorder == nil {
+		return nil
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	elapsed := relayOutageBoundedElapsedMilliseconds(recorder.started, recorder.now())
+	switch event.Stage {
+	case controllerrelay.SessionTransportConnecting:
+		relayOutageRecordTransportMilestone(&recorder.value.connecting, elapsed)
+	case controllerrelay.SessionTransportAuthenticating:
+		relayOutageRecordTransportMilestone(&recorder.value.authenticating, elapsed)
+	case controllerrelay.SessionTransportReady:
+		relayOutageRecordTransportMilestone(&recorder.value.ready, elapsed)
+	}
+	return nil
+}
+
+func relayOutageRecordTransportMilestone(value *relayOutageTransportMilestone, elapsed int64) {
+	if value.count == 0 {
+		value.elapsedMS = elapsed
+	}
+	if value.count < relayOutageDiagnosticCountLimit {
+		value.count++
+	}
+}
+
+func (recorder *relayOutageInitialSyncObservationRecorder) ObserveSupervisor(_ context.Context, event controllerrelay.SupervisorEvent) error {
+	if recorder == nil {
+		return nil
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.value.supervisorKind = relayOutageSafeSupervisorEventKind(event.Kind)
+	recorder.value.supervisorStage = relayOutagePrintableClosedValue(relayOutageSafeSupervisorState(event.Stage))
+	recorder.value.supervisorOutcome = relayOutagePrintableClosedValue(relayOutageSafeSupervisorOutcome(event.Outcome))
+	recorder.value.supervisorAttempt = min(uint64(event.Attempt), uint64(relayOutageObserverAggregateLimit))
+	return nil
+}
+
+func (recorder *relayOutageInitialSyncObservationRecorder) Snapshot(observerDropped uint64) relayOutageInitialSyncObservation {
+	if recorder == nil {
+		return relayOutageInitialSyncObservation{
+			connecting:        relayOutageTransportMilestone{elapsedMS: relayOutageDiagnosticUnavailable},
+			authenticating:    relayOutageTransportMilestone{elapsedMS: relayOutageDiagnosticUnavailable},
+			ready:             relayOutageTransportMilestone{elapsedMS: relayOutageDiagnosticUnavailable},
+			supervisorKind:    "empty",
+			supervisorStage:   "empty",
+			supervisorOutcome: "empty",
+			observerDropped:   min(observerDropped, uint64(relayOutageObserverAggregateLimit)),
+		}
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	value := recorder.value
+	value.observerDropped = min(observerDropped, uint64(relayOutageObserverAggregateLimit))
+	return value
+}
+
+func relayOutageSafeSupervisorEventKind(value string) string {
+	switch value {
+	case "":
+		return "empty"
+	case controllerrelay.SupervisorHandshake, controllerrelay.SupervisorFallback, controllerrelay.SupervisorReady, controllerrelay.SupervisorDisconnect, controllerrelay.SupervisorBackoff, controllerrelay.SupervisorAttention, controllerrelay.SupervisorStopped, controllerrelay.SupervisorRecovery, controllerrelay.SupervisorDiagnostics:
+		return value
+	default:
+		return "unavailable"
+	}
+}
+
+func relayOutagePrintableClosedValue(value string) string {
+	if value == "" {
+		return "empty"
+	}
+	return value
+}
 
 const relayOutageSetupDeadlineDiagnosticPrefix = "relay_outage_setup_deadline"
 
@@ -835,7 +1141,12 @@ const relayOutageSetupFailureDiagnosticPrefix = "relay_outage_setup_failure"
 
 type relayOutageSetupFailurePhase string
 
-const relayOutageSetupFailureControllerSeed relayOutageSetupFailurePhase = "controller_seed"
+const (
+	relayOutageSetupFailureControllerSeed     relayOutageSetupFailurePhase = "controller_seed"
+	relayOutageSetupFailureEnrollmentCreate   relayOutageSetupFailurePhase = "relay_enrollment_create"
+	relayOutageSetupFailureEnrollmentClaim    relayOutageSetupFailurePhase = "relay_enrollment_claim"
+	relayOutageSetupFailureEnrollmentComplete relayOutageSetupFailurePhase = "relay_enrollment_complete"
+)
 
 type relayOutageSetupFailureClass string
 
@@ -878,7 +1189,9 @@ func relayOutageClassifySetupFailure(ctx context.Context, err error) relayOutage
 }
 
 func relayOutageFormatSetupFailureDiagnostic(phase relayOutageSetupFailurePhase, class relayOutageSetupFailureClass) string {
-	if phase != relayOutageSetupFailureControllerSeed {
+	switch phase {
+	case relayOutageSetupFailureControllerSeed, relayOutageSetupFailureEnrollmentCreate, relayOutageSetupFailureEnrollmentClaim, relayOutageSetupFailureEnrollmentComplete:
+	default:
 		return ""
 	}
 	switch class {
@@ -988,7 +1301,7 @@ func (fixture *relayOutageFirstRunFixture) Stop(t *testing.T) {
 	})
 }
 
-func relayOutageWaitInitialSubscriptionSync(t *testing.T, parent context.Context, db *sql.DB, pool *pgxpool.Pool, controllerID, subscriptionID string, supervisor *controllerrelay.Supervisor) {
+func relayOutageWaitInitialSubscriptionSync(t *testing.T, parent context.Context, db *sql.DB, pool *pgxpool.Pool, controllerID, subscriptionID string, supervisor *controllerrelay.Supervisor, observation *relayOutageInitialSyncObservationRecorder) {
 	t.Helper()
 	deadline := time.NewTimer(relayOutageInitialSyncTimeout)
 	defer deadline.Stop()
@@ -998,28 +1311,137 @@ func relayOutageWaitInitialSubscriptionSync(t *testing.T, parent context.Context
 		if relayOutagePostgresDiagnosticCount(parent, pool, `SELECT COUNT(*) FROM relay_subscriptions WHERE controller_id=$1 AND subscription_id=$2`, controllerID, subscriptionID) == 1 {
 			return
 		}
-		select {
-		case <-parent.Done():
-			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor)
-		case <-deadline.C:
-			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor)
-		case <-ticker.C:
+		condition, failed := relayOutageSelectInitialSyncWaitCondition(parent, deadline.C, ticker.C)
+		if failed {
+			relayOutageFatalInitialSubscriptionSync(t, db, pool, controllerID, supervisor, observation, condition)
 		}
 	}
 }
 
-func relayOutageFatalInitialSubscriptionSync(t *testing.T, db *sql.DB, pool *pgxpool.Pool, controllerID string, supervisor *controllerrelay.Supervisor) {
+func relayOutageSelectInitialSyncWaitCondition(parent context.Context, deadline, ticker <-chan time.Time) (relayOutageInitialSyncWaitCondition, bool) {
+	select {
+	case <-parent.Done():
+		return relayOutageSetupContextDoneSelected, true
+	case <-deadline:
+		return relayOutageInitialSyncTimeoutSelected, true
+	case <-ticker:
+		return "", false
+	}
+}
+
+type relayOutageInitialSyncDiagnostic struct {
+	waitCondition                       relayOutageInitialSyncWaitCondition
+	sqliteActiveControllerSubscriptions int
+	sqliteSubscriptionSyncHeads         int
+	sqliteInflightSyncSets              int
+	postgresRelaySessions               int
+	postgresControllerLeases            int
+	postgresSubscriptionsSyncCommands   int
+	postgresCurrentRelaySubscriptions   int
+	supervisor                          relayOutageSafeSnapshot
+	observation                         relayOutageInitialSyncObservation
+}
+
+func relayOutageFatalInitialSubscriptionSync(t *testing.T, db *sql.DB, pool *pgxpool.Pool, controllerID string, supervisor *controllerrelay.Supervisor, recorder *relayOutageInitialSyncObservationRecorder, waitCondition relayOutageInitialSyncWaitCondition) {
 	t.Helper()
 	snapshot := relayOutageSafeSupervisorSnapshot(supervisor)
-	t.Fatalf("timed out waiting for initial authenticated subscription sync: sqlite_active_controller_subscriptions=%d sqlite_subscription_sync_heads=%d sqlite_inflight_sync_sets=%d postgres_relay_sessions=%d postgres_controller_leases=%d postgres_subscriptions_sync_commands=%d postgres_current_relay_subscriptions=%d supervisor_state=%s supervisor_outcome=%s supervisor_paused=%t",
-		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_controller_subscriptions WHERE controller_id=? AND state='active'`, controllerID),
-		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_subscription_sync_heads WHERE controller_id=?`, controllerID),
-		relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_subscription_sync_sets WHERE controller_id=? AND state='inflight'`, controllerID),
-		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_sessions WHERE controller_id=$1 AND revoked_at IS NULL`, controllerID),
-		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_controller_leases WHERE controller_id=$1`, controllerID),
-		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_session_commands WHERE controller_id=$1 AND command_type='subscriptions.sync'`, controllerID),
-		relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_subscriptions WHERE controller_id=$1 AND retired_generation IS NULL`, controllerID),
-		snapshot.state, snapshot.outcome, snapshot.paused)
+	observation := recorder.Snapshot(snapshot.observerDropped)
+	diagnostic := relayOutageInitialSyncDiagnostic{
+		waitCondition:                       waitCondition,
+		sqliteActiveControllerSubscriptions: relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_controller_subscriptions WHERE controller_id=? AND state='active'`, controllerID),
+		sqliteSubscriptionSyncHeads:         relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_subscription_sync_heads WHERE controller_id=?`, controllerID),
+		sqliteInflightSyncSets:              relayOutageSQLiteDiagnosticCount(context.Background(), db, `SELECT COUNT(*) FROM relay_subscription_sync_sets WHERE controller_id=? AND state='inflight'`, controllerID),
+		postgresRelaySessions:               relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_sessions WHERE controller_id=$1 AND revoked_at IS NULL`, controllerID),
+		postgresControllerLeases:            relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_controller_leases WHERE controller_id=$1`, controllerID),
+		postgresSubscriptionsSyncCommands:   relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_session_commands WHERE controller_id=$1 AND command_type='subscriptions.sync'`, controllerID),
+		postgresCurrentRelaySubscriptions:   relayOutagePostgresDiagnosticCount(context.Background(), pool, `SELECT COUNT(*) FROM relay_subscriptions WHERE controller_id=$1 AND retired_generation IS NULL`, controllerID),
+		supervisor:                          snapshot,
+		observation:                         observation,
+	}
+	formatted := relayOutageFormatInitialSyncDiagnostic(diagnostic)
+	if formatted == "" {
+		formatted = "timed out waiting for initial authenticated subscription sync: diagnostic unavailable"
+	}
+	t.Fatal(formatted)
+}
+
+func relayOutageFormatInitialSyncDiagnostic(value relayOutageInitialSyncDiagnostic) string {
+	if !relayOutageKnownInitialSyncWaitCondition(value.waitCondition) || !relayOutageValidDiagnosticCount(value.sqliteActiveControllerSubscriptions) || !relayOutageValidDiagnosticCount(value.sqliteSubscriptionSyncHeads) || !relayOutageValidDiagnosticCount(value.sqliteInflightSyncSets) || !relayOutageValidDiagnosticCount(value.postgresRelaySessions) || !relayOutageValidDiagnosticCount(value.postgresControllerLeases) || !relayOutageValidDiagnosticCount(value.postgresSubscriptionsSyncCommands) || !relayOutageValidDiagnosticCount(value.postgresCurrentRelaySubscriptions) || !relayOutageValidInitialSyncObservation(value.observation) {
+		return ""
+	}
+	state := relayOutagePrintableClosedValue(value.supervisor.state)
+	outcome := relayOutagePrintableClosedValue(value.supervisor.outcome)
+	if !relayOutageKnownSupervisorState(state) || !relayOutageKnownSupervisorOutcome(outcome) {
+		return ""
+	}
+	return fmt.Sprintf("timed out waiting for initial authenticated subscription sync: wait_condition=%s sqlite_active_controller_subscriptions=%d sqlite_subscription_sync_heads=%d sqlite_inflight_sync_sets=%d postgres_relay_sessions=%d postgres_controller_leases=%d postgres_subscriptions_sync_commands=%d postgres_current_relay_subscriptions=%d supervisor_state=%s supervisor_outcome=%s supervisor_paused=%t transport_connecting_count=%d transport_connecting_observer_elapsed_ms=%d transport_authenticating_count=%d transport_authenticating_observer_elapsed_ms=%d transport_ready_count=%d transport_ready_observer_elapsed_ms=%d supervisor_event_kind=%s supervisor_event_stage=%s supervisor_event_outcome=%s supervisor_event_attempt=%d supervisor_observer_dropped=%d",
+		value.waitCondition,
+		value.sqliteActiveControllerSubscriptions,
+		value.sqliteSubscriptionSyncHeads,
+		value.sqliteInflightSyncSets,
+		value.postgresRelaySessions,
+		value.postgresControllerLeases,
+		value.postgresSubscriptionsSyncCommands,
+		value.postgresCurrentRelaySubscriptions,
+		state,
+		outcome,
+		value.supervisor.paused,
+		value.observation.connecting.count,
+		value.observation.connecting.elapsedMS,
+		value.observation.authenticating.count,
+		value.observation.authenticating.elapsedMS,
+		value.observation.ready.count,
+		value.observation.ready.elapsedMS,
+		value.observation.supervisorKind,
+		value.observation.supervisorStage,
+		value.observation.supervisorOutcome,
+		value.observation.supervisorAttempt,
+		value.observation.observerDropped,
+	)
+}
+
+func relayOutageKnownInitialSyncWaitCondition(value relayOutageInitialSyncWaitCondition) bool {
+	return value == relayOutageInitialSyncTimeoutSelected || value == relayOutageSetupContextDoneSelected
+}
+
+func relayOutageValidDiagnosticCount(value int) bool {
+	return value >= relayOutageDiagnosticUnavailable && value <= relayOutageDiagnosticCountLimit
+}
+
+func relayOutageValidInitialSyncObservation(value relayOutageInitialSyncObservation) bool {
+	for _, milestone := range []relayOutageTransportMilestone{value.connecting, value.authenticating, value.ready} {
+		if milestone.count < 0 || milestone.count > relayOutageDiagnosticCountLimit || milestone.elapsedMS < relayOutageDiagnosticUnavailable || milestone.elapsedMS > int64(relayOutageSetupDeadline/time.Millisecond) || (milestone.count == 0) != (milestone.elapsedMS == relayOutageDiagnosticUnavailable) {
+			return false
+		}
+	}
+	return relayOutageKnownSupervisorKind(value.supervisorKind) && relayOutageKnownSupervisorState(value.supervisorStage) && relayOutageKnownSupervisorOutcome(value.supervisorOutcome) && value.supervisorAttempt <= relayOutageObserverAggregateLimit && value.observerDropped <= relayOutageObserverAggregateLimit
+}
+
+func relayOutageKnownSupervisorKind(value string) bool {
+	switch value {
+	case "empty", "unavailable", controllerrelay.SupervisorHandshake, controllerrelay.SupervisorFallback, controllerrelay.SupervisorReady, controllerrelay.SupervisorDisconnect, controllerrelay.SupervisorBackoff, controllerrelay.SupervisorAttention, controllerrelay.SupervisorStopped, controllerrelay.SupervisorRecovery, controllerrelay.SupervisorDiagnostics:
+		return true
+	default:
+		return false
+	}
+}
+
+func relayOutageKnownSupervisorState(value string) bool {
+	switch value {
+	case "empty", "unavailable", controllerrelay.SessionDisconnected, controllerrelay.SessionConnecting, controllerrelay.SessionAuthenticating, controllerrelay.SessionReady, controllerrelay.SessionBackoff, controllerrelay.SessionNeedsAttention, controllerrelay.SessionStopped:
+		return true
+	default:
+		return false
+	}
+}
+
+func relayOutageKnownSupervisorOutcome(value string) bool {
+	switch value {
+	case "empty", "unavailable", "relay_unavailable", "connection_closed", "protocol_error", "persistence_unavailable", "credential_unavailable", "identity_unavailable", "queue_saturated", "session_expired":
+		return true
+	default:
+		return false
+	}
 }
 
 func relayOutageSQLiteDiagnosticCount(parent context.Context, db *sql.DB, query string, args ...any) int {
@@ -1058,9 +1480,10 @@ func relayOutageDiagnosticCount(parent context.Context, load func(context.Contex
 }
 
 type relayOutageSafeSnapshot struct {
-	state   string
-	outcome string
-	paused  bool
+	state           string
+	outcome         string
+	paused          bool
+	observerDropped uint64
 }
 
 func relayOutageSafeSupervisorSnapshot(supervisor *controllerrelay.Supervisor) relayOutageSafeSnapshot {
@@ -1068,7 +1491,7 @@ func relayOutageSafeSupervisorSnapshot(supervisor *controllerrelay.Supervisor) r
 		return relayOutageSafeSnapshot{state: "unavailable", outcome: "unavailable"}
 	}
 	snapshot := supervisor.Snapshot()
-	return relayOutageSafeSnapshot{state: relayOutageSafeSupervisorState(snapshot.State), outcome: relayOutageSafeSupervisorOutcome(snapshot.Outcome), paused: snapshot.Paused}
+	return relayOutageSafeSnapshot{state: relayOutageSafeSupervisorState(snapshot.State), outcome: relayOutageSafeSupervisorOutcome(snapshot.Outcome), paused: snapshot.Paused, observerDropped: min(snapshot.ObserverDropped, uint64(relayOutageObserverAggregateLimit))}
 }
 
 func relayOutageSafeSupervisorState(state string) string {
