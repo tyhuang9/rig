@@ -93,6 +93,7 @@ func TestLiveHostdRebindControlProcessHelper(t *testing.T) {
 func TestLiveHostdRebindChildStartupControls(t *testing.T) {
 	t.Run("readiness budget", func(t *testing.T) {
 		now := time.Date(2026, time.October, 15, 18, 0, 0, 0, time.UTC)
+		lateThirdElapsed := 8*time.Minute + time.Second
 		for _, test := range []struct {
 			name        string
 			deadline    time.Time
@@ -104,6 +105,8 @@ func TestLiveHostdRebindChildStartupControls(t *testing.T) {
 			{name: "ample test deadline", deadline: now.Add(time.Hour), hasDeadline: true, want: liveHostdRebindStartupReadinessCap},
 			{name: "inherited shorter deadline", deadline: now.Add(liveHostdRebindStartupCleanupReserve + 90*time.Second), hasDeadline: true, want: 90 * time.Second},
 			{name: "cleanup reserve exhausts deadline", deadline: now.Add(liveHostdRebindStartupCleanupReserve), hasDeadline: true, wantErr: true},
+			{name: "late third under former envelope", deadline: now.Add(18*time.Minute - lateThirdElapsed), hasDeadline: true, wantErr: true},
+			{name: "late third under expanded envelope", deadline: now.Add(32*time.Minute - lateThirdElapsed), hasDeadline: true, want: liveHostdRebindStartupReadinessCap},
 		} {
 			t.Run(test.name, func(t *testing.T) {
 				got, err := liveHostdRebindStartupReadinessBudget(now, test.deadline, test.hasDeadline)
