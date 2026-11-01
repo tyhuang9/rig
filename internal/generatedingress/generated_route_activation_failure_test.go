@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -45,18 +46,11 @@ func TestGeneratedRouteActivationTransactionFailuresRollBackAllSQL(t *testing.T)
 				t.Fatalf("activation at %s result=%#v error=%v", test.name, deployment, err)
 			}
 			assertGeneratedRouteActivationInitialSQL(t, fixture)
-
-			stored, err := sealed.authority.manager.store.load()
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, exists := stored.Active[runner.appID]; !exists {
-				t.Fatalf("physical route disappeared after %s failure", test.name)
-			}
+			assertGeneratedRouteActivationPendingPhysical(t, sealed, runner)
 		})
 	}
 	t.Run("commit", func(t *testing.T) {
-		fixture, sealed, _, _ := newGeneratedRouteActivationFailureFixture(t)
+		fixture, sealed, _, runner := newGeneratedRouteActivationFailureFixture(t)
 		database := fixture.validation.migration.repository.db
 		if _, err := database.Exec(`CREATE TABLE route_activation_commit_fault(
 			id TEXT PRIMARY KEY, missing_app TEXT NOT NULL,
@@ -82,6 +76,7 @@ func TestGeneratedRouteActivationTransactionFailuresRollBackAllSQL(t *testing.T)
 		if faultCount != 0 {
 			t.Fatalf("deferred commit fault row survived rollback: %d", faultCount)
 		}
+		assertGeneratedRouteActivationPendingPhysical(t, sealed, runner)
 	})
 }
 
@@ -257,7 +252,7 @@ func newGeneratedRouteActivationFailureFixture(t *testing.T) (*candidateOwnerFix
 ) {
 	t.Helper()
 	fixture, execution, identity := generatedRouteCandidateFixture(t)
-	manager, runner := newManagerFixture(t, false)
+	manager, runner := newGeneratedRouteLostAckManagerFixture(t)
 	runner.appID = fixture.validation.migration.guarded.appID
 	runner.network = identity.NetworkName
 	runner.endpoint = generatedRouteEndpoint(identity)
@@ -336,6 +331,30 @@ func assertGeneratedRouteActivationInitialSQL(t *testing.T, fixture *candidateOw
 		head.Slot != "" || head.ActivationReceiptID != "" || phase != generatedruntimestate.PhaseSwitchingRoute ||
 		state != generatedruntimestate.ComponentHealthy {
 		t.Fatalf("partial activation receipts=%d head=%#v phase=%q state=%q", receiptCount, head, phase, state)
+	}
+}
+
+func assertGeneratedRouteActivationPendingPhysical(t *testing.T, sealed *GeneratedRouteExecution,
+	runner *ingressRunner,
+) {
+	t.Helper()
+	if sealed == nil || sealed.authority == nil || sealed.authority.manager == nil || runner == nil {
+		t.Fatal("activation fault fixture lacks sealed physical authority")
+	}
+	stored, err := sealed.authority.manager.store.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	proposed := routeRecord{Slot: sealed.request.ToSlot,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), sealed.request.Endpoints...)}
+	if stored.Pending == nil || stored.Pending.AppID != sealed.request.AppID || stored.Pending.Previous != nil ||
+		!sameRoute(stored.Pending.Proposed, proposed) || len(stored.Active) != 0 {
+		t.Fatalf("SQL activation fault did not retain exact initial Pending route: %#v", stored)
+	}
+	wantConfig := expectedConfig(t, runner, map[string]routeRecord{sealed.request.AppID: proposed})
+	if !reflect.DeepEqual(runner.liveConfig, wantConfig) ||
+		!reflect.DeepEqual(runner.files[caddyContainerName+":/config/active.json"], wantConfig) {
+		t.Fatal("SQL activation fault did not retain exact physical Proposed route")
 	}
 }
 

@@ -24,7 +24,7 @@ BEGIN SELECT RAISE(ABORT, 'generated route activations are immutable'); END`
 
 func TestGeneratedRouteAuthorityCommitsReceiptHeadAndRosterWithOriginalClaim(t *testing.T) {
 	fixture, execution, identity := generatedRouteCandidateFixture(t)
-	manager, runner := newManagerFixture(t, false)
+	manager, runner := newGeneratedRouteLostAckManagerFixture(t)
 	runner.appID = fixture.validation.migration.guarded.appID
 	runner.network = identity.NetworkName
 	runner.endpoint = generatedRouteEndpoint(identity)
@@ -113,7 +113,7 @@ func TestGeneratedRouteAuthorityCommitsReceiptHeadAndRosterWithOriginalClaim(t *
 
 func TestGeneratedRouteAuthorityRejectsChangedOriginalClaimWithoutPartialSQLCommit(t *testing.T) {
 	fixture, execution, identity := generatedRouteCandidateFixture(t)
-	manager, runner := newManagerFixture(t, false)
+	manager, runner := newGeneratedRouteLostAckManagerFixture(t)
 	runner.appID = fixture.validation.migration.guarded.appID
 	runner.network = identity.NetworkName
 	runner.endpoint = generatedRouteEndpoint(identity)
@@ -182,8 +182,16 @@ func TestGeneratedRouteAuthorityRejectsChangedOriginalClaimWithoutPartialSQLComm
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, exists := stored.Active[runner.appID]; !exists {
-		t.Fatal("first physical route was discarded without a durable predecessor")
+	proposed := routeRecord{Slot: sealed.request.ToSlot,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), sealed.request.Endpoints...)}
+	if stored.Pending == nil || stored.Pending.AppID != runner.appID || stored.Pending.Previous != nil ||
+		!sameRoute(stored.Pending.Proposed, proposed) || len(stored.Active) != 0 {
+		t.Fatalf("failed activation did not retain exact initial Pending route: %#v", stored)
+	}
+	wantConfig := expectedConfig(t, runner, map[string]routeRecord{runner.appID: proposed})
+	if !reflect.DeepEqual(runner.liveConfig, wantConfig) ||
+		!reflect.DeepEqual(runner.files[caddyContainerName+":/config/active.json"], wantConfig) {
+		t.Fatal("failed activation did not retain exact physical Proposed route")
 	}
 }
 
@@ -290,13 +298,13 @@ func TestGeneratedRouteAuthorityAttestPublishedRejectsReceiptCreatorLineage(t *t
 				t.Fatalf("active route head = %#v, %v", head, err)
 			}
 			test.mutate(t, fixture, head.ActivationReceiptID)
-			before := fixture.snapshot(t)
+			before := fixture.corruptedReceiptSnapshot(t)
 			commandCount := len(fixture.runner.commands)
 			err = fixture.authority.AttestPublished(fixture.context, fixture.claim, fixture.deploymentID)
 			if !errors.Is(err, deploymentexecution.ErrAuthorityStale) || !errors.Is(err, generatedruntimestate.ErrConflict) {
 				t.Fatalf("%s error = %v", test.name, err)
 			}
-			fixture.assertUnchanged(t, before, commandCount)
+			fixture.assertCorruptedReceiptUnchanged(t, before, commandCount)
 		})
 	}
 }
@@ -314,7 +322,7 @@ type generatedRouteAttestationFixture struct {
 func newGeneratedRouteAttestationFixture(t *testing.T) *generatedRouteAttestationFixture {
 	t.Helper()
 	candidate, execution, identity := generatedRouteCandidateFixture(t)
-	manager, runner := newManagerFixture(t, false)
+	manager, runner := newGeneratedRouteLostAckManagerFixture(t)
 	runner.appID = candidate.validation.migration.guarded.appID
 	runner.network = identity.NetworkName
 	runner.endpoint = generatedRouteEndpoint(identity)
@@ -360,6 +368,29 @@ type generatedRouteAttestationRunnerSnapshot struct {
 	restartInstalls         int
 }
 
+type generatedRouteAttestationCorruptedReceiptSnapshot struct {
+	receipt struct {
+		receiptID, appID, successorDeploymentID, successorReleaseID, successorSlot string
+		successorGeneration                                                        int64
+		predecessorDeploymentID, predecessorReleaseID, predecessorSlot             string
+		predecessorGeneration                                                      int64
+		predecessorActivationReceiptID, creatorJobID                               string
+		creatorWorkerAttempt                                                       int
+		writerJobID                                                                sql.NullString
+		writerWorkerAttempt                                                        sql.NullInt64
+		candidateRosterDigest, predecessorRosterDigest                             string
+		routeIntentDigest, committedRouteProofDigest, activatedAt                  string
+	}
+	head    generatedruntimestate.ActiveHead
+	roster  []generatedruntimestate.RouteActivationComponent
+	runtime generatedruntimestate.Deployment
+	job     struct {
+		status, phase string
+		attempt       int
+	}
+	runner generatedRouteAttestationRunnerSnapshot
+}
+
 func (fixture *generatedRouteAttestationFixture) snapshot(t *testing.T) generatedRouteAttestationSnapshot {
 	t.Helper()
 	tx, err := fixture.database.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
@@ -370,7 +401,7 @@ func (fixture *generatedRouteAttestationFixture) snapshot(t *testing.T) generate
 	value := generatedRouteAttestationSnapshot{}
 	value.head, err = readGeneratedRouteActivationHeadTx(context.Background(), tx, fixture.claim.ApplicationID())
 	if err == nil {
-		value.receipt, err = readGeneratedRouteActivationReceiptTx(context.Background(), tx, value.head.ActivationReceiptID)
+		value.receipt, err = fixture.authority.runtime.ReadRouteActivationReceiptTx(context.Background(), tx, value.head.ActivationReceiptID)
 	}
 	if err == nil {
 		value.roster, err = readGeneratedRouteActivationRosterTx(context.Background(), tx, fixture.deploymentID,
@@ -406,6 +437,78 @@ func (fixture *generatedRouteAttestationFixture) assertUnchanged(t *testing.T,
 	for _, command := range fixture.runner.commands[commandCount:] {
 		if !fixture.generatedRouteAttestationCommandReadOnly(command) {
 			t.Fatalf("published route attestation dispatched a command outside the read-only allowlist: %#v", command)
+		}
+	}
+}
+
+// corruptedReceiptSnapshot deliberately avoids the validated receipt decoder:
+// these tests have already crossed creator lineage under the test-only trigger
+// seam and must prove that rejection is non-mutating without making the forged
+// receipt look valid to production readers.
+func (fixture *generatedRouteAttestationFixture) corruptedReceiptSnapshot(
+	t *testing.T,
+) generatedRouteAttestationCorruptedReceiptSnapshot {
+	t.Helper()
+	tx, err := fixture.database.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	value := generatedRouteAttestationCorruptedReceiptSnapshot{}
+	value.head, err = readGeneratedRouteActivationHeadTx(context.Background(), tx, fixture.claim.ApplicationID())
+	if err == nil {
+		err = tx.QueryRowContext(context.Background(), `SELECT id,app_id,successor_deployment_id,
+			successor_release_id,successor_slot,successor_generation,predecessor_deployment_id,
+			predecessor_release_id,predecessor_slot,predecessor_generation,
+			predecessor_activation_receipt_id,creator_job_id,creator_worker_attempt,
+			writer_job_id,writer_worker_attempt,candidate_roster_digest,
+			predecessor_roster_digest,route_intent_digest,committed_route_proof_digest,
+			CAST(activated_at AS TEXT) FROM generated_route_activations WHERE id=?`,
+			value.head.ActivationReceiptID).Scan(&value.receipt.receiptID, &value.receipt.appID,
+			&value.receipt.successorDeploymentID, &value.receipt.successorReleaseID,
+			&value.receipt.successorSlot, &value.receipt.successorGeneration,
+			&value.receipt.predecessorDeploymentID, &value.receipt.predecessorReleaseID,
+			&value.receipt.predecessorSlot, &value.receipt.predecessorGeneration,
+			&value.receipt.predecessorActivationReceiptID, &value.receipt.creatorJobID,
+			&value.receipt.creatorWorkerAttempt, &value.receipt.writerJobID,
+			&value.receipt.writerWorkerAttempt, &value.receipt.candidateRosterDigest,
+			&value.receipt.predecessorRosterDigest, &value.receipt.routeIntentDigest,
+			&value.receipt.committedRouteProofDigest, &value.receipt.activatedAt)
+	}
+	if err == nil {
+		value.roster, err = readGeneratedRouteActivationRosterTx(context.Background(), tx,
+			fixture.deploymentID, generatedruntimestate.ComponentActive)
+	}
+	if err == nil {
+		err = tx.QueryRowContext(context.Background(), `SELECT status,phase,attempt FROM jobs WHERE id=?`,
+			fixture.claim.JobID()).Scan(&value.job.status, &value.job.phase, &value.job.attempt)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	value.runtime, err = generatedruntimestate.New(fixture.database).
+		Get(context.Background(), fixture.claim.ApplicationID(), fixture.deploymentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.runner = generatedRouteAttestationRunnerState(fixture.runner)
+	return value
+}
+
+func (fixture *generatedRouteAttestationFixture) assertCorruptedReceiptUnchanged(t *testing.T,
+	before generatedRouteAttestationCorruptedReceiptSnapshot, commandCount int,
+) {
+	t.Helper()
+	after := fixture.corruptedReceiptSnapshot(t)
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("rejected corrupted receipt mutated durable or physical state:\nbefore=%#v\nafter=%#v", before, after)
+	}
+	for _, command := range fixture.runner.commands[commandCount:] {
+		if !fixture.generatedRouteAttestationCommandReadOnly(command) {
+			t.Fatalf("corrupted receipt rejection dispatched a command outside the read-only allowlist: %#v", command)
 		}
 	}
 }

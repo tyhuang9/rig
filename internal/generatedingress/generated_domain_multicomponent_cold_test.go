@@ -1320,13 +1320,14 @@ func newGeneratedDomainTwoComponentColdFixture(t *testing.T, builderOptions ...b
 	}
 	routeRunner := &generatedDomainTwoComponentRouteRunner{daemonID: "generated-domain-two-component-cold",
 		delegate: physicalRoutes}
+	reader := &generatedRouteColdAccountingRouteReadRunner{routes: physicalRoutes, delegate: routeRunner}
 	manager, err := assembleGeneratedDomainManager(generatedDomainReservationInput{database: identity.database,
-		stores: identity.stores, runner: routeRunner, options: identity.options}, store)
+		stores: identity.stores, runner: reader, options: identity.options}, store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	physical, _, err := inspectGeneratedDomainPhysicalIdentity(context.Background(), identity.stores,
-		routeRunner, identity.options)
+		reader, identity.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1736,7 +1737,7 @@ func TestGeneratedDomainColdCurrentDebtEvidenceRequiresTotalAbsenceOrExactChain(
 	activation := generatedruntimestate.GeneratedDomainStartupRouteActivation{
 		ReceiptID: receiptID, AppID: appID, SuccessorDeploymentID: deploymentID,
 		SuccessorReleaseID: releaseID, SuccessorSlot: "blue", SuccessorGeneration: 1,
-		CreatorJobID: jobID, CreatorWorkerAttempt: 1,
+		CreatorJobID: jobID, CreatorWorkerAttempt: 1, WriterJobID: jobID, WriterWorkerAttempt: 1,
 		CandidateRosterDigest:     generatedRouteActivationRosterDigest(roster),
 		PredecessorRosterDigest:   generatedRouteActivationRosterDigest(nil),
 		RouteIntentDigest:         strings.Repeat("b", 64),
@@ -1911,7 +1912,7 @@ func generatedDomainColdLegacyCurrentDebtFixture(t *testing.T) (deployments.Gene
 	predecessorActivation := generatedruntimestate.GeneratedDomainStartupRouteActivation{
 		ReceiptID: predecessorReceipt, AppID: appID, SuccessorDeploymentID: predecessorID,
 		SuccessorReleaseID: predecessorRelease, SuccessorSlot: "blue", SuccessorGeneration: 1,
-		CreatorJobID: predecessorJob, CreatorWorkerAttempt: 1,
+		CreatorJobID: predecessorJob, CreatorWorkerAttempt: 1, WriterJobID: predecessorJob, WriterWorkerAttempt: 1,
 		CandidateRosterDigest:   generatedRouteActivationRosterDigest(predecessorRoster),
 		PredecessorRosterDigest: generatedRouteActivationRosterDigest(nil),
 		RouteIntentDigest:       strings.Repeat("1", 64), CommittedRouteProofDigest: strings.Repeat("2", 64),
@@ -1921,7 +1922,7 @@ func generatedDomainColdLegacyCurrentDebtFixture(t *testing.T) (deployments.Gene
 		SuccessorReleaseID: currentRelease, SuccessorSlot: "green", SuccessorGeneration: 2,
 		PredecessorDeploymentID: predecessorID, PredecessorReleaseID: predecessorRelease,
 		PredecessorSlot: "blue", PredecessorGeneration: 1, PredecessorActivationReceiptID: predecessorReceipt,
-		CreatorJobID: currentJob, CreatorWorkerAttempt: 1,
+		CreatorJobID: currentJob, CreatorWorkerAttempt: 1, WriterJobID: currentJob, WriterWorkerAttempt: 1,
 		CandidateRosterDigest:   generatedRouteActivationRosterDigest(currentRoster),
 		PredecessorRosterDigest: generatedRouteActivationRosterDigest(predecessorRoster),
 		RouteIntentDigest:       strings.Repeat("3", 64), CommittedRouteProofDigest: strings.Repeat("4", 64),
@@ -2021,7 +2022,7 @@ func TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedRetirement
 		SuccessorReleaseID: successorRelease, SuccessorSlot: "green", SuccessorGeneration: 2,
 		PredecessorDeploymentID: predecessorID, PredecessorReleaseID: predecessorRelease,
 		PredecessorSlot: "blue", PredecessorGeneration: 1,
-		CreatorJobID: successorJob, CreatorWorkerAttempt: 1,
+		CreatorJobID: successorJob, CreatorWorkerAttempt: 1, WriterJobID: successorJob, WriterWorkerAttempt: 1,
 		CandidateRosterDigest:     generatedRouteActivationRosterDigest(successorRoster),
 		PredecessorRosterDigest:   generatedRouteActivationRosterDigest(predecessorRoster),
 		RouteIntentDigest:         strings.Repeat("e", 64),
@@ -2278,7 +2279,7 @@ func TestGeneratedDomainColdInitialDrainingDebtEvidenceFallsThroughExactZeroPred
 	activation := generatedruntimestate.GeneratedDomainStartupRouteActivation{
 		ReceiptID: activationID, AppID: appID, SuccessorDeploymentID: deploymentID,
 		SuccessorReleaseID: releaseID, SuccessorSlot: "blue", SuccessorGeneration: 1,
-		CreatorJobID: jobID, CreatorWorkerAttempt: 1,
+		CreatorJobID: jobID, CreatorWorkerAttempt: 1, WriterJobID: jobID, WriterWorkerAttempt: 1,
 		CandidateRosterDigest:   generatedRouteActivationRosterDigest(roster),
 		PredecessorRosterDigest: emptyRosterDigest, RouteIntentDigest: strings.Repeat("c", 64),
 		CommittedRouteProofDigest: strings.Repeat("d", 64),
@@ -2424,6 +2425,7 @@ func TestGeneratedDomainColdAuthorizerAncestryRequiresEveryCompletedHop(t *testi
 			PredecessorSlot:       group.snapshot.headPins.previousSlot,
 			PredecessorGeneration: predecessorGeneration, PredecessorActivationReceiptID: predecessorReceiptID,
 			CreatorJobID: group.pins.jobID(), CreatorWorkerAttempt: 1,
+			WriterJobID: group.pins.jobID(), WriterWorkerAttempt: 1,
 			CandidateRosterDigest:   generatedRouteActivationRosterDigest(roster),
 			PredecessorRosterDigest: generatedRouteActivationRosterDigest(predecessorRoster),
 		}

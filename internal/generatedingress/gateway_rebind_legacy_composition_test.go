@@ -27,8 +27,8 @@ func gatewayRebindLegacyCommittedSeed(t *testing.T) (gatewayRebindPredecessorFix
 	t.Helper()
 	legacy := newGatewayCurrentStateFixture(t)
 	canonical := legacy.canonicalPredecessor
-	routeRunner, ok := canonical.manager.runner.(*generatedRoutePredecessorRunner)
-	if canonical.migration == nil || canonical.runner == nil || !ok {
+	routeRunner := canonical.routes
+	if canonical.migration == nil || canonical.runner == nil || routeRunner == nil {
 		t.Fatal("legacy fixture lacks its original canonical predecessor family")
 	}
 	db, err := database.Open(legacy.dataRoot)
@@ -41,7 +41,8 @@ func gatewayRebindLegacyCommittedSeed(t *testing.T) (gatewayRebindPredecessorFix
 	if err != nil {
 		t.Fatal(err)
 	}
-	manager, err := New(routeRunner, Options{DataRoot: legacy.dataRoot,
+	managerRunner := &generatedRouteColdAccountingRouteReadRunner{routes: routeRunner, delegate: routeRunner}
+	manager, err := New(managerRunner, Options{DataRoot: legacy.dataRoot,
 		DockerExecutable:      filepath.Join(legacy.dataRoot, "docker-test"),
 		DockerConfigDirectory: directories.DockerConfigDirectory, WorkingDirectory: directories.WorkingDirectory,
 		HostPort:         legacy.history.Predecessor.Journal.Source.LocalHostPort,
@@ -49,7 +50,7 @@ func gatewayRebindLegacyCommittedSeed(t *testing.T) (gatewayRebindPredecessorFix
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := gatewayRebindPredecessorFixture{manager: manager, repository: repository, db: db,
+	f := gatewayRebindPredecessorFixture{manager: manager, routes: routeRunner, repository: repository, db: db,
 		migration: canonical.migration, runner: canonical.runner,
 		state: legacy.predecessor, journal: legacy.history.Predecessor.Journal, store: legacy.history.Predecessor.Store}
 	ctx := context.Background()

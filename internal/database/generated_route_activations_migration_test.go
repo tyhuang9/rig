@@ -225,20 +225,28 @@ type generatedRouteActivationRow struct {
 }
 
 type generatedRouteActivationFixture struct {
-	appID        string
-	planID       string
-	configID     string
-	releaseID    string
-	jobID        string
-	deploymentID string
-	artifactID   string
-	intentID     string
-	activationID string
-	stamp        string
+	appID          string
+	planID         string
+	configID       string
+	releaseID      string
+	jobID          string
+	deploymentID   string
+	artifactID     string
+	intentID       string
+	activationID   string
+	stamp          string
+	creatorAttempt int
 }
 
 func seedGeneratedRouteActivationFixture(t *testing.T, db *sql.DB, name string) generatedRouteActivationFixture {
+	return seedGeneratedRouteActivationFixtureAtAttempt(t, db, name, 1)
+}
+
+func seedGeneratedRouteActivationFixtureAtAttempt(t *testing.T, db *sql.DB, name string, creatorAttempt int) generatedRouteActivationFixture {
 	t.Helper()
+	if creatorAttempt < 1 {
+		t.Fatalf("creator attempt=%d", creatorAttempt)
+	}
 	ids := map[string][2]string{
 		"primary": {"10000000-0000-4000-8000-000000000001", "10000000-0000-4000-8000-000000000002"},
 		"other":   {"30000000-0000-4000-8000-000000000001", "30000000-0000-4000-8000-000000000002"},
@@ -249,16 +257,17 @@ func seedGeneratedRouteActivationFixture(t *testing.T, db *sql.DB, name string) 
 		t.Fatalf("unknown generated route activation fixture %q", name)
 	}
 	fixture := generatedRouteActivationFixture{
-		appID:        "route-activation-" + name + "-app",
-		planID:       "route-activation-" + name + "-plan",
-		configID:     "route-activation-" + name + "-config",
-		releaseID:    "route-activation-" + name + "-release",
-		jobID:        "route-activation-" + name + "-job",
-		deploymentID: "route-activation-" + name + "-deployment",
-		artifactID:   "route-activation-" + name + "-artifact",
-		activationID: pair[0],
-		intentID:     pair[1],
-		stamp:        time.Now().UTC().Format(time.RFC3339Nano),
+		appID:          "route-activation-" + name + "-app",
+		planID:         "route-activation-" + name + "-plan",
+		configID:       "route-activation-" + name + "-config",
+		releaseID:      "route-activation-" + name + "-release",
+		jobID:          "route-activation-" + name + "-job",
+		deploymentID:   "route-activation-" + name + "-deployment",
+		artifactID:     "route-activation-" + name + "-artifact",
+		activationID:   pair[0],
+		intentID:       pair[1],
+		stamp:          time.Now().UTC().Format(time.RFC3339Nano),
+		creatorAttempt: creatorAttempt,
 	}
 	mustExec := func(query string, args ...any) {
 		t.Helper()
@@ -292,8 +301,13 @@ func seedGeneratedRouteActivationFixture(t *testing.T, db *sql.DB, name string) 
 		fixture.releaseID, fixture.appID, fixture.stamp, strings.Repeat("b", 64), strings.Repeat("e", 64), fixture.configID, fixture.planID)
 	mustExec(`INSERT INTO jobs(
 		id,type,resource_type,resource_id,status,phase,attempt,requested_by,input_json,created_at,started_at,updated_at
-	) VALUES(?,'deploy','application',?,'running','running',1,?,'{}',?,?,?)`,
-		fixture.jobID, fixture.appID, "route-activation-"+name+"-owner", fixture.stamp, fixture.stamp, fixture.stamp)
+	) VALUES(?,'deploy','application',?,'queued','queued',0,?,'{}',?,NULL,?)`,
+		fixture.jobID, fixture.appID, "route-activation-"+name+"-owner", fixture.stamp, fixture.stamp)
+	mustExec(`INSERT INTO application_deployment_lifecycle_bindings(
+		job_id,app_id,desired_revision,mode,authorizing_lifecycle_job_id,created_at
+	) VALUES(?,?,0,'legacy_uninitialized',NULL,?)`, fixture.jobID, fixture.appID, fixture.stamp)
+	mustExec(`UPDATE jobs SET status='running',phase='running',attempt=?,started_at=?,updated_at=?
+		WHERE id=? AND status='queued' AND phase='queued' AND attempt=0`, fixture.creatorAttempt, fixture.stamp, fixture.stamp, fixture.jobID)
 	mustExec(`INSERT INTO deployments(
 		id,app_id,release_id,job_id,status,started_at,configuration_mode,actual_configuration_revision_id,
 		actual_configuration_revision_number,provenance_initialized,runtime_strategy,
@@ -320,8 +334,9 @@ func seedGeneratedRouteActivationFixture(t *testing.T, db *sql.DB, name string) 
 		id,deployment_id,component_name,creator_job_id,creator_worker_attempt,
 		configuration_revision_id,configuration_revision_number,image_artifact_id,image_artifact_attempt,
 		environment_operation_id,environment_staging_attempt,candidate_policy_version,candidate_policy_digest,created_at
-	) VALUES(?,?, 'api', ?,1, ?,1, ?,1, ?,1,'generated-candidate-v1',?,?)`,
-		fixture.intentID, fixture.deploymentID, fixture.jobID, fixture.configID, fixture.artifactID, fixture.artifactID,
+	) VALUES(?,?, 'api', ?,?, ?,1, ?,1, ?,?,'generated-candidate-v1',?,?)`,
+		fixture.intentID, fixture.deploymentID, fixture.jobID, fixture.creatorAttempt, fixture.configID, fixture.artifactID, fixture.artifactID,
+		fixture.creatorAttempt,
 		strings.Repeat("d", 64), fixture.stamp)
 	mustExec(`UPDATE generated_runtime_components
 		SET state='starting',container_name=?,updated_at=? WHERE deployment_id=? AND component_name='api'`,
@@ -346,7 +361,7 @@ func (f generatedRouteActivationFixture) activation() generatedRouteActivationRo
 		successorSlot:             "blue",
 		successorGeneration:       1,
 		creatorJobID:              f.jobID,
-		creatorWorkerAttempt:      1,
+		creatorWorkerAttempt:      f.creatorAttempt,
 		candidateRosterDigest:     strings.Repeat("2", 64),
 		predecessorRosterDigest:   strings.Repeat("3", 64),
 		routeIntentDigest:         strings.Repeat("4", 64),

@@ -266,8 +266,14 @@ func newDeploymentRouteCompletionFixture(t *testing.T) *deploymentRouteCompletio
 		strings.Repeat("b", 64), strings.Repeat("e", 64), releaseConfigurationID, planID)
 	execCompletionSQL(t, db, `INSERT INTO jobs(
 		id,type,resource_type,resource_id,status,phase,attempt,requested_by,input_json,created_at,started_at,updated_at
-	) VALUES(?,'deploy','application',?,'running','running',?,?,'{}',?,?,?)`,
-		jobID, appID, jobAttempt, actorID, stamp, stamp, stamp)
+	) VALUES(?,'deploy','application',?,'queued','queued',0,?,'{}',?,NULL,?)`,
+		jobID, appID, actorID, stamp, stamp)
+	execCompletionSQL(t, db, `INSERT INTO application_deployment_lifecycle_bindings(
+		job_id,app_id,desired_revision,mode,authorizing_lifecycle_job_id,created_at
+	) VALUES(?,?,0,'legacy_uninitialized',NULL,?)`, jobID, appID, stamp)
+	execCompletionSQL(t, db, `UPDATE jobs SET status='running',phase='running',attempt=?,started_at=?,updated_at=?
+		WHERE id=? AND status='queued' AND phase='queued' AND attempt=0`,
+		jobAttempt, stamp, stamp, jobID)
 	execCompletionSQL(t, db, `INSERT INTO deployments(
 		id,app_id,release_id,job_id,status,started_at,configuration_mode,actual_configuration_revision_id,
 		actual_configuration_revision_number,provenance_initialized,runtime_strategy,
@@ -321,6 +327,7 @@ func newDeploymentRouteCompletionFixture(t *testing.T) *deploymentRouteCompletio
 		ReceiptID: uuid.NewString(), AppID: appID, SuccessorDeploymentID: deploymentID,
 		SuccessorReleaseID: releaseID, SuccessorSlot: "blue", SuccessorGeneration: 1,
 		CreatorJobID: jobID, CreatorWorkerAttempt: jobAttempt,
+		WriterJobID: jobID, WriterWorkerAttempt: jobAttempt,
 		CandidateRosterDigest:   completionRosterDigest(candidate),
 		PredecessorRosterDigest: completionRosterDigest(nil), RouteIntentDigest: strings.Repeat("4", 64),
 		CommittedRouteProofDigest: strings.Repeat("5", 64), ActivatedAt: now,

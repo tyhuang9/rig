@@ -18,7 +18,8 @@ func TestCheckGeneratedRouteCompletionReplayTxRefusesUnsealedAndCrossed(t *testi
 		PredecessorDeploymentID: uuid.NewString(), PredecessorReleaseID: uuid.NewString(),
 		PredecessorSlot: "green", PredecessorGeneration: 1,
 		PredecessorActivationReceiptID: uuid.NewString(), CreatorJobID: jobID,
-		CreatorWorkerAttempt: 2, CandidateRosterDigest: "candidate", PredecessorRosterDigest: "predecessor",
+		CreatorWorkerAttempt: 2, WriterJobID: jobID, WriterWorkerAttempt: 3,
+		CandidateRosterDigest: "candidate", PredecessorRosterDigest: "predecessor",
 		RouteIntentDigest: "intent", CommittedRouteProofDigest: "proof", ActivatedAt: time.Now().UTC(),
 	}
 	completion := generatedruntimestate.RouteCompletionReceipt{

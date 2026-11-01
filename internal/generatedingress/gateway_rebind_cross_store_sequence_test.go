@@ -217,7 +217,8 @@ func TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	physical := &gatewayCurrentStateMachineDriver{t: t, terminal: *selection.Terminal}
+	physical := &gatewayCurrentStateMachineDriver{t: t, terminal: *selection.Terminal,
+		pendingAttestOutcome: gatewayCurrentPhysicalRecoveryEffective}
 	f.manager.gatewayCurrentPhysicalDriver = physical
 	head := gatewayRebindSequenceRedeploy(t, f, *selection.State, entry)
 	redeployed, err := selection.Store.load()
@@ -317,8 +318,8 @@ func gatewayRebindSequenceRedeploy(t *testing.T, f gatewayRebindPredecessorFixtu
 		authority: authority, runner: candidateRunner.delegate}
 	execution, identity := prepareGeneratedRouteSequentialCandidate(t, owner)
 	defer execution.Leave()
-	routeRunner, ok := f.manager.runner.(*generatedRoutePredecessorRunner)
-	if !ok {
+	routeRunner := f.routes
+	if routeRunner == nil {
 		t.Fatal("redeploy requires the canonical route observation runner")
 	}
 	routeRunner.endpoints[identity.ContainerID] = generatedRouteEndpointSnapshot{appID: entry.AppID,

@@ -69,6 +69,19 @@ func (a *GeneratedRouteAuthority) activateRoute(ctx context.Context, pinned *dep
 	if !ok {
 		return generatedRouteActivationResult{}, fmt.Errorf("generated route activation proof: %w", generatedruntimestate.ErrInvalidState)
 	}
+	tx, err := a.stores.Database().BeginTx(ctx, nil)
+	if err != nil {
+		return generatedRouteActivationResult{}, err
+	}
+	defer tx.Rollback()
+	if err := pinned.CheckRouteActivationTx(tx, claim, input.successorDeploymentID); err != nil {
+		return generatedRouteActivationResult{}, fmt.Errorf("generated route activation claim: %w", err)
+	}
+	creatorJobID, creatorWorkerAttempt, err := readGeneratedRouteActivationCreatorTx(ctx, tx,
+		input.successorDeploymentID, candidate, claim)
+	if err != nil {
+		return generatedRouteActivationResult{}, fmt.Errorf("generated route activation creator: %w", err)
+	}
 	receipt := generatedruntimestate.RouteActivationReceipt{
 		ReceiptID: input.receiptID, AppID: input.appID,
 		SuccessorDeploymentID: input.successorDeploymentID, SuccessorReleaseID: input.successorReleaseID,
@@ -77,20 +90,12 @@ func (a *GeneratedRouteAuthority) activateRoute(ctx context.Context, pinned *dep
 		PredecessorReleaseID:    input.expectedHead.ReleaseID, PredecessorSlot: input.expectedHead.Slot,
 		PredecessorGeneration:          input.expectedHead.Generation,
 		PredecessorActivationReceiptID: input.expectedHead.ActivationReceiptID,
-		CreatorJobID:                   claim.JobID(), CreatorWorkerAttempt: claim.Attempt(),
+		CreatorJobID:                   creatorJobID, CreatorWorkerAttempt: creatorWorkerAttempt,
+		WriterJobID: claim.JobID(), WriterWorkerAttempt: claim.Attempt(),
 		CandidateRosterDigest:     generatedRouteActivationRosterDigest(candidate),
 		PredecessorRosterDigest:   generatedRouteActivationRosterDigest(predecessor),
 		RouteIntentDigest:         generatedRouteActivationDocumentDigest(intent),
 		CommittedRouteProofDigest: generatedRouteActivationDocumentDigest(proof),
-	}
-
-	tx, err := a.stores.Database().BeginTx(ctx, nil)
-	if err != nil {
-		return generatedRouteActivationResult{}, err
-	}
-	defer tx.Rollback()
-	if err := pinned.CheckRouteActivationTx(tx, claim, input.successorDeploymentID); err != nil {
-		return generatedRouteActivationResult{}, fmt.Errorf("generated route activation claim: %w", err)
 	}
 	current, err := readGeneratedRouteActivationHeadTx(ctx, tx, input.appID)
 	if err != nil {
@@ -123,13 +128,15 @@ func (a *GeneratedRouteAuthority) activateRoute(ctx context.Context, pinned *dep
 	if _, err := tx.ExecContext(ctx, `INSERT INTO generated_route_activations(
 		id,app_id,successor_deployment_id,successor_release_id,successor_slot,successor_generation,
 		predecessor_deployment_id,predecessor_release_id,predecessor_slot,predecessor_generation,
-		predecessor_activation_receipt_id,creator_job_id,creator_worker_attempt,candidate_roster_digest,
-		predecessor_roster_digest,route_intent_digest,committed_route_proof_digest,activated_at
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		predecessor_activation_receipt_id,creator_job_id,creator_worker_attempt,writer_job_id,
+		writer_worker_attempt,candidate_roster_digest,predecessor_roster_digest,route_intent_digest,
+		committed_route_proof_digest,activated_at
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		receipt.ReceiptID, receipt.AppID, receipt.SuccessorDeploymentID, receipt.SuccessorReleaseID,
 		receipt.SuccessorSlot, receipt.SuccessorGeneration, receipt.PredecessorDeploymentID,
 		receipt.PredecessorReleaseID, receipt.PredecessorSlot, receipt.PredecessorGeneration,
 		receipt.PredecessorActivationReceiptID, receipt.CreatorJobID, receipt.CreatorWorkerAttempt,
+		receipt.WriterJobID, receipt.WriterWorkerAttempt,
 		receipt.CandidateRosterDigest, receipt.PredecessorRosterDigest, receipt.RouteIntentDigest,
 		receipt.CommittedRouteProofDigest, stamp); err != nil {
 		return generatedRouteActivationResult{}, err
@@ -175,6 +182,55 @@ func (a *GeneratedRouteAuthority) activateRoute(ctx context.Context, pinned *dep
 	return generatedRouteActivationResult{head: head, receipt: receipt, changed: true}, nil
 }
 
+// readGeneratedRouteActivationCreatorTx derives the uniform immutable 041
+// creator from the exact candidate roster. It is read-only: the current Claim
+// remains the 042 writer and is checked at both transaction boundaries.
+func readGeneratedRouteActivationCreatorTx(ctx context.Context, tx *sql.Tx, deploymentID string,
+	candidate []generatedruntimestate.RouteActivationComponent, claim deploymentexecution.Claim,
+) (string, int, error) {
+	if ctx == nil || tx == nil || !validAppID(deploymentID) || len(candidate) == 0 ||
+		claim.JobID() == "" || claim.Attempt() < 1 {
+		return "", 0, generatedruntimestate.ErrInvalidState
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT c.component_name,i.id,i.creator_job_id,i.creator_worker_attempt
+		FROM generated_runtime_components c
+		JOIN generated_candidate_intents i
+		  ON i.deployment_id=c.deployment_id AND i.component_name=c.component_name
+		WHERE c.deployment_id=? ORDER BY c.component_name`, deploymentID)
+	if err != nil {
+		return "", 0, err
+	}
+	defer rows.Close()
+	creatorJobID, creatorWorkerAttempt := "", 0
+	index := 0
+	for rows.Next() {
+		var componentName, receiptID, observedJobID string
+		var observedAttempt int
+		if err := rows.Scan(&componentName, &receiptID, &observedJobID, &observedAttempt); err != nil {
+			return "", 0, err
+		}
+		if index >= len(candidate) || candidate[index].DeploymentID != deploymentID ||
+			candidate[index].ComponentName != componentName ||
+			candidate[index].CandidateReceiptID != receiptID || observedJobID != claim.JobID() ||
+			observedAttempt < 1 || observedAttempt > claim.Attempt() {
+			return "", 0, generatedruntimestate.ErrConflict
+		}
+		if index == 0 {
+			creatorJobID, creatorWorkerAttempt = observedJobID, observedAttempt
+		} else if creatorJobID != observedJobID || creatorWorkerAttempt != observedAttempt {
+			return "", 0, generatedruntimestate.ErrConflict
+		}
+		index++
+	}
+	if err := rows.Err(); err != nil {
+		return "", 0, err
+	}
+	if index != len(candidate) || creatorJobID == "" || creatorWorkerAttempt < 1 {
+		return "", 0, generatedruntimestate.ErrConflict
+	}
+	return creatorJobID, creatorWorkerAttempt, nil
+}
+
 func (a *GeneratedRouteAuthority) resolveRouteActivationReplay(ctx context.Context, tx *sql.Tx,
 	pinned *deploymentexecution.Pinned, claim deploymentexecution.Claim, input generatedRouteActivationInput,
 	candidate, predecessor []generatedruntimestate.RouteActivationComponent,
@@ -185,7 +241,7 @@ func (a *GeneratedRouteAuthority) resolveRouteActivationReplay(ctx context.Conte
 		current.Slot != input.successorSlot {
 		return generatedRouteActivationResult{}, generatedruntimestate.ErrConflict
 	}
-	receipt, err := readGeneratedRouteActivationReceiptTx(ctx, tx, input.receiptID)
+	receipt, err := a.runtime.ReadRouteActivationReceiptTx(ctx, tx, input.receiptID)
 	if err != nil || !sameGeneratedRouteActivationReceiptExceptTime(receipt, expected) {
 		return generatedRouteActivationResult{}, errors.Join(generatedruntimestate.ErrConflict, err)
 	}
@@ -400,49 +456,4 @@ func sameGeneratedRouteActivationReceiptExceptTime(left, right generatedruntimes
 	left.ActivatedAt = time.Time{}
 	right.ActivatedAt = time.Time{}
 	return left == right
-}
-
-func readGeneratedRouteActivationReceiptTx(ctx context.Context, tx *sql.Tx,
-	receiptID string,
-) (generatedruntimestate.RouteActivationReceipt, error) {
-	var value generatedruntimestate.RouteActivationReceipt
-	var activatedAt string
-	err := tx.QueryRowContext(ctx, `SELECT id,app_id,successor_deployment_id,successor_release_id,successor_slot,
-		successor_generation,predecessor_deployment_id,predecessor_release_id,predecessor_slot,
-		predecessor_generation,predecessor_activation_receipt_id,creator_job_id,creator_worker_attempt,
-		candidate_roster_digest,predecessor_roster_digest,route_intent_digest,committed_route_proof_digest,
-		activated_at FROM generated_route_activations WHERE id=?`, receiptID).Scan(
-		&value.ReceiptID, &value.AppID, &value.SuccessorDeploymentID, &value.SuccessorReleaseID,
-		&value.SuccessorSlot, &value.SuccessorGeneration, &value.PredecessorDeploymentID,
-		&value.PredecessorReleaseID, &value.PredecessorSlot, &value.PredecessorGeneration,
-		&value.PredecessorActivationReceiptID, &value.CreatorJobID, &value.CreatorWorkerAttempt,
-		&value.CandidateRosterDigest, &value.PredecessorRosterDigest, &value.RouteIntentDigest,
-		&value.CommittedRouteProofDigest, &activatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return value, generatedruntimestate.ErrNotFound
-	}
-	if err != nil {
-		return value, err
-	}
-	value.ActivatedAt, err = time.Parse(time.RFC3339Nano, activatedAt)
-	if err != nil || !validGeneratedRouteActivationReceipt(value) {
-		return generatedruntimestate.RouteActivationReceipt{}, generatedruntimestate.ErrInvalidState
-	}
-	return value, nil
-}
-
-func validGeneratedRouteActivationReceipt(value generatedruntimestate.RouteActivationReceipt) bool {
-	return validAppID(value.ReceiptID) && validAppID(value.AppID) && validAppID(value.SuccessorDeploymentID) &&
-		validReleaseID(value.SuccessorReleaseID) &&
-		(value.SuccessorSlot == "blue" || value.SuccessorSlot == "green") && value.SuccessorGeneration > 0 &&
-		value.PredecessorGeneration == value.SuccessorGeneration-1 &&
-		((value.PredecessorGeneration == 0 && value.PredecessorDeploymentID == "" && value.PredecessorReleaseID == "" &&
-			value.PredecessorSlot == "" && value.PredecessorActivationReceiptID == "") ||
-			(value.PredecessorGeneration > 0 && validAppID(value.PredecessorDeploymentID) &&
-				validReleaseID(value.PredecessorReleaseID) && (value.PredecessorSlot == "blue" || value.PredecessorSlot == "green") &&
-				(value.PredecessorActivationReceiptID == "" || validAppID(value.PredecessorActivationReceiptID)))) &&
-		validAppID(value.CreatorJobID) && value.CreatorWorkerAttempt > 0 &&
-		lowerHex(value.CandidateRosterDigest, 64) && lowerHex(value.PredecessorRosterDigest, 64) &&
-		lowerHex(value.RouteIntentDigest, 64) && lowerHex(value.CommittedRouteProofDigest, 64) &&
-		!value.ActivatedAt.IsZero()
 }
