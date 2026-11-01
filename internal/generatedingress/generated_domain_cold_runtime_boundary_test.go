@@ -39,6 +39,44 @@ func (e generatedColdBoundaryExecutor) Execute(ctx context.Context, job jobs.Job
 	return e(ctx, job, progress)
 }
 
+// generatedColdCreatedCandidateStartRunner preserves one immutable process
+// dependency across construction and recovery. Construction sees only the
+// established read/census runner. A repaired cold manifest may later enable
+// only explicitly frozen candidate argv for the revalidated continuation.
+type generatedColdCreatedCandidateStartRunner struct {
+	mu          sync.RWMutex
+	delegate    runtimeprocess.CommandRunner
+	candidate   runtimeprocess.CommandRunner
+	containerID string
+	allowed     map[string]struct{}
+}
+
+func (r *generatedColdCreatedCandidateStartRunner) enableStart() {
+	r.allow([]string{"container", "start", r.containerID})
+}
+
+func (r *generatedColdCreatedCandidateStartRunner) allow(args []string) {
+	r.mu.Lock()
+	if r.allowed == nil {
+		r.allowed = make(map[string]struct{})
+	}
+	r.allowed[strings.Join(args, "\x00")] = struct{}{}
+	r.mu.Unlock()
+}
+
+func (r *generatedColdCreatedCandidateStartRunner) Run(ctx context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	r.mu.RLock()
+	_, allowed := r.allowed[strings.Join(request.Args, "\x00")]
+	candidate, delegate := r.candidate, r.delegate
+	r.mu.RUnlock()
+	if allowed && candidate != nil {
+		return candidate.Run(ctx, request)
+	}
+	return delegate.Run(ctx, request)
+}
+
 func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 	if !generatedDomainRegistryIsolated(t) {
 		return
@@ -429,6 +467,952 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 			}
 		})
 	})
+	t.Run("initial_created_candidate_adopts_same_identity_and_starts_once_without_second_capacity_charge", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			identity := newGeneratedDomainIdentityFixture(t)
+			migration := newGeneratedMigrationFixtureOnDomainWithComponents(t, identity, []string{"api"}, []string{"api"})
+			identity.stores = migration.repository.stores
+			validation := newCandidateOwnerValidationFixtureWithMigration(t, migration)
+			candidate := newCandidateOwnerFixtureWithValidationAndOptions(t, validation, generatedDomainCandidateOptions(identity.options))
+			reservation := candidate.reserve(t)
+			execution := candidate.pin(t, reservation)
+			invocation := candidate.beginCreate(t, execution)
+			candidate.bindInvocation(t, invocation)
+			candidateIdentity, err := execution.CreateAndRecord(invocation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			created := validation.read(t)
+			physicalCreated := candidate.runner.snapshot()
+			expectedIdentity := physicalCreated.policy.identity
+			expectedIdentity.ContainerID = candidateIdentity.ContainerID
+			if created.runtime.phase != generatedruntimestate.PhaseStartingCandidate ||
+				len(created.components) != 1 || created.components[0].state != generatedruntimestate.ComponentRunning ||
+				created.components[0].receipt == nil || created.components[0].receipt.id != candidateIdentity.ReceiptID ||
+				created.components[0].containerID != candidateIdentity.ContainerID ||
+				created.components[0].containerName != candidateIdentity.ContainerName ||
+				!physicalCreated.exists || physicalCreated.containerID != candidateIdentity.ContainerID ||
+				!generatedcontainer.MatchesConfigured(candidateOwnerPhysicalInspection(physicalCreated), expectedIdentity, physicalCreated.policy.limits) ||
+				!generatedcontainer.NeverStarted(candidateOwnerPhysicalInspection(physicalCreated)) ||
+				candidate.runner.count(candidateOwnerCreate) != 1 || candidate.runner.count(candidateOwnerStart) != 0 ||
+				candidate.runner.count(candidateOwnerStop) != 0 || candidate.runner.count(candidateOwnerRemove) != 0 {
+				t.Fatalf("durable never-started candidate: admission=%#v identity=%#v physical=%#v create=%d start=%d stop=%d remove=%d",
+					created, candidateIdentity, physicalCreated, candidate.runner.count(candidateOwnerCreate),
+					candidate.runner.count(candidateOwnerStart), candidate.runner.count(candidateOwnerStop),
+					candidate.runner.count(candidateOwnerRemove))
+			}
+
+			// The interrupted worker owns no scope when cold construction begins.
+			execution.Leave()
+			reservation.Release()
+			if err := migration.releaseEffects(); err != nil {
+				t.Fatal(err)
+			}
+			recovered, err := generatedrecovery.RecoverRuntime(context.Background(), identity.database,
+				time.Now().UTC(), migration.bindings)
+			if err != nil || recovered.Jobs.RequeuedGenerated != 1 {
+				t.Fatalf("recover created-candidate job: result=%+v err=%v", recovered, err)
+			}
+			runGeneratedColdBoundaryWorker(t, migration.jobService,
+				generatedColdBoundaryExecutor(func(context.Context, jobs.Job, jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+					return jobs.ExecutionResult{Disposition: jobs.ExecutionWaitingUser,
+						PauseDisposition: jobs.PauseInsufficientReplacementCapacity}, nil
+				}), migration.claim.JobID(), jobs.WaitingUser, identity.options.WorkingDirectory, nil)
+
+			store, err := newStateStore(identity.dataRoot)
+			if err != nil || store.createInitialEmpty() != nil {
+				t.Fatalf("install empty gateway state: %v", err)
+			}
+			state, err := store.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Version != stateVersion || len(state.Active) != 0 || state.Pending != nil {
+				t.Fatalf("created-candidate gateway baseline=%#v", state)
+			}
+			_, v2, journal := gatewayV2IdentityTestState(t)
+			observation := gatewayV2IdentityTestObservation(t, state, v2, journal, gatewayTopologyExactV1Only)
+			observation.V1Container.ID = strings.Repeat("d", 64)
+			observation.V1NetworkID = strings.Repeat("e", 64)
+			for id, member := range observation.V1Network.Containers {
+				delete(observation.V1Network.Containers, id)
+				observation.V1Network.Containers[observation.V1Container.ID] = member
+			}
+			gateway := generatedDomainNativeV1OuterGatewayRunner(observation)
+			objects := generatedDomainDockerObjectsForDescriptors(generatedDomainNativeV1DockerDescriptors())
+			for index := range objects {
+				switch objects[index].name {
+				case caddyContainerName:
+					objects[index].id = observation.V1Container.ID
+				case caddyNetworkName:
+					objects[index].id = observation.V1NetworkID
+					objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Network.Driver,
+						scope: observation.V1Network.Scope, options: cloneStringMap(observation.V1Network.Options)}
+				case caddyVolumeName:
+					objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Volume.Driver,
+						scope: observation.V1Volume.Scope, options: cloneStringMap(observation.V1Volume.Options),
+						mountpoint: observation.V1VolumeIdentity.Mountpoint, createdAt: observation.V1VolumeIdentity.CreatedAt}
+				}
+			}
+			policy := physicalCreated.policy
+			objects = append(objects,
+				generatedDomainDockerObject{kind: "image", id: policy.identity.ImageContentID, labels: map[string]string{
+					"io.rig.managed": "generated-image", "io.rig.application": policy.identity.AppID,
+					"io.rig.release": policy.identity.ReleaseID, "io.rig.artifact": policy.identity.ArtifactID,
+					"io.rig.plan": policy.identity.DeploymentPlanRevisionID, "io.rig.component": policy.identity.Component,
+					"io.rig.role": policy.identity.Role, "io.rig.definition": policy.buildDefinitionDigest,
+				}, data: generatedDomainDockerObjectData{contentID: policy.identity.ImageContentID}},
+				generatedDomainDockerObject{kind: "network", id: strings.Repeat("6", 64), name: policy.identity.NetworkName,
+					labels: map[string]string{"io.rig.managed": "generated-runtime-network", "io.rig.application": policy.identity.AppID},
+					data:   generatedDomainDockerObjectData{driver: "bridge", scope: "local", options: map[string]string{}}},
+				generatedDomainDockerObject{kind: "container", id: candidateIdentity.ContainerID,
+					name: policy.identity.ContainerName, labels: candidatePolicyContainerLabels(policy)},
+			)
+			identity.options.HostPort = journal.Source.LocalHostPort
+			runner := &generatedDomainConstructionRunner{candidate: candidate.runner, delegate: &generatedDomainRecoveryCensusRunner{
+				daemonID: "generated-cold-runtime-initial-created-candidate", objects: objects,
+				imageID: observation.Image.ID, gateway: gateway,
+			}}
+			process := &generatedColdCreatedCandidateStartRunner{delegate: runner, candidate: candidate.runner,
+				containerID: candidateIdentity.ContainerID}
+			priorManager, err := assembleGeneratedDomainManager(generatedDomainReservationInput{
+				database: identity.database, stores: identity.stores, runner: process, options: identity.options,
+			}, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			releasePriorLock, err := priorManager.lockGateway(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := releasePriorLock(); err != nil {
+				t.Fatal(err)
+			}
+			startupBefore, err := identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(startupBefore.Runtime.ActiveHeads) != 0 || len(startupBefore.Runtime.RouteActivations) != 0 {
+				t.Fatalf("created-candidate baseline is not the canonical empty head: heads=%#v activations=%#v",
+					startupBefore.Runtime.ActiveHeads, startupBefore.Runtime.RouteActivations)
+			}
+			admissionBefore := validation.read(t)
+			gatewayBefore, err := store.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			physicalBefore := candidate.runner.snapshot()
+			createBefore, startBefore := candidate.runner.count(candidateOwnerCreate), candidate.runner.count(candidateOwnerStart)
+			stopBefore, removeBefore := candidate.runner.count(candidateOwnerStop), candidate.runner.count(candidateOwnerRemove)
+
+			domain, constructErr := NewGeneratedDomain(context.Background(), identity.stores, process,
+				&candidateFactoryEnvironment{path: t.TempDir()}, generatedColdBoundaryPublicOptions(identity.options))
+			startupAfter, snapshotErr := identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+			if snapshotErr != nil {
+				t.Fatal(snapshotErr)
+			}
+			gatewayAfter, stateErr := store.load()
+			if stateErr != nil {
+				t.Fatal(stateErr)
+			}
+			admissionAfter := validation.read(t)
+			physicalAfter := candidate.runner.snapshot()
+			if !reflect.DeepEqual(startupBefore, startupAfter) || !reflect.DeepEqual(gatewayBefore, gatewayAfter) ||
+				!reflect.DeepEqual(admissionBefore, admissionAfter) || !reflect.DeepEqual(physicalBefore, physicalAfter) ||
+				candidate.runner.count(candidateOwnerCreate) != createBefore || candidate.runner.count(candidateOwnerStart) != startBefore ||
+				candidate.runner.count(candidateOwnerStop) != stopBefore || candidate.runner.count(candidateOwnerRemove) != removeBefore {
+				t.Fatalf("cold constructor changed created-candidate prefix: startup=%t gateway=%t admission=%t physical=%t commands=%d/%d/%d/%d want=%d/%d/%d/%d",
+					reflect.DeepEqual(startupBefore, startupAfter), reflect.DeepEqual(gatewayBefore, gatewayAfter),
+					reflect.DeepEqual(admissionBefore, admissionAfter), reflect.DeepEqual(physicalBefore, physicalAfter),
+					candidate.runner.count(candidateOwnerCreate), candidate.runner.count(candidateOwnerStart),
+					candidate.runner.count(candidateOwnerStop), candidate.runner.count(candidateOwnerRemove),
+					createBefore, startBefore, stopBefore, removeBefore)
+			}
+			if constructErr != nil {
+				message := "generated domain construction was refused: stage=cold_construction reason=cold_group_container_attestation"
+				assertGeneratedDomainConstructionDiagnostic(t, constructErr,
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupContainerAttestation, message)
+				if domain != nil || generatedColdBoundaryCapacityProbes(runner.snapshot()) != 0 {
+					t.Fatalf("refused created-candidate construction published domain=%v or probed capacity: commands=%#v",
+						domain, runner.snapshot())
+				}
+				t.Fatalf("created configured NeverStarted candidate must reconstruct and remain startable; current base refused at the exact cold container boundary: %v", constructErr)
+			}
+			if domain == nil || domain.construction == nil || domain.construction.cold == nil ||
+				len(domain.construction.cold.groups) != 1 {
+				t.Fatalf("created-candidate cold domain=%#v", domain)
+			}
+			group := domain.construction.cold.groups[0]
+			if group.deploymentID != migration.request.DeploymentID || len(group.components) != 1 ||
+				group.components[0].name != "api" || group.components[0].receiptID != candidateIdentity.ReceiptID ||
+				!group.components[0].charged || !group.components[0].retained {
+				t.Fatalf("created-candidate cold group=%#v", group)
+			}
+			if probes := generatedColdBoundaryCapacityProbes(runner.snapshot()); probes != 0 {
+				t.Fatalf("created-candidate cold capacity probes=%d want 0 commands=%#v", probes, runner.snapshot())
+			}
+
+			ledger := domain.Candidates().ledger
+			ledger.mu.Lock()
+			capacityGroup := ledger.groups[candidateCapacityGroupKey{appID: migration.guarded.appID,
+				deploymentID: migration.request.DeploymentID}]
+			ledger.mu.Unlock()
+			if capacityGroup == nil {
+				t.Fatal("created-candidate cold construction omitted exact accounting group")
+			}
+			capacityGroup.mu.Lock()
+			component := capacityGroup.byName["api"]
+			var retainedCharge *candidateCapacityCharge
+			var retainedDebt *generatedDomainCapacityDebtToken
+			if component != nil && component.charge != nil {
+				retainedDebt, _ = component.charge.token.(*generatedDomainCapacityDebtToken)
+			}
+			validAccounting := component != nil && component.receipt != nil && component.receipt.id == candidateIdentity.ReceiptID &&
+				candidatePhysicalFromWord(component.receipt.state.Load()) == candidatePhysicalPresent &&
+				component.charge != nil && component.charge.state == candidateChargeActive &&
+				component.charge.owner == candidateAccountingCandidate && component.charge.receiptRetained &&
+				!component.charge.explicitRetained && !component.charge.logicallyRetired && component.charge.refs == 0 &&
+				component.charge.lease == nil && retainedDebt != nil && retainedDebt.active &&
+				retainedDebt.limits == capacityGroup.limits && !component.tokenHeld
+			if component != nil {
+				retainedCharge = component.charge
+			}
+			capacityGroup.mu.Unlock()
+			if !validAccounting || !candidateCapacityChargeTokenPublished(retainedDebt) {
+				t.Fatalf("created-candidate cold accounting component=%#v", component)
+			}
+			coordinator := domain.construction.capacity
+			coordinator.mu.Lock()
+			validCoordinator := coordinator.phase == generatedDomainCapacityPublished && coordinator.borrows == 0 &&
+				coordinator.memory == capacityGroup.limits.MemoryBytes && coordinator.disk == capacityGroup.limits.DiskBytes &&
+				len(coordinator.tokens) == 1 && retainedDebt != nil && retainedDebt.owner == coordinator
+			_, debtRegistered := coordinator.tokens[retainedDebt]
+			coordinatorPhase, coordinatorBorrows := coordinator.phase, coordinator.borrows
+			coordinatorMemory, coordinatorDisk, coordinatorTokens := coordinator.memory, coordinator.disk, len(coordinator.tokens)
+			coordinator.mu.Unlock()
+			if !validCoordinator || !debtRegistered {
+				t.Fatalf("created-candidate cold coordinator phase=%d borrows=%d memory=%d disk=%d tokens=%d",
+					coordinatorPhase, coordinatorBorrows, coordinatorMemory, coordinatorDisk, coordinatorTokens)
+			}
+			process.enableStart()
+
+			resumed, err := migration.jobService.Resume(migration.claim.JobID())
+			if err != nil || resumed.Status != string(jobs.Queued) {
+				t.Fatalf("resume created-candidate job=%+v err=%v", resumed, err)
+			}
+			var workerErr error
+			runGeneratedColdBoundaryWorker(t, migration.jobService,
+				generatedColdBoundaryExecutor(func(ctx context.Context, job jobs.Job, _ jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+					claim, err := deploymentexecution.NewClaim(migration.binding, job.ID, migration.guarded.appID, job.Attempt)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					request := GeneratedReplacementRequest(validation.request)
+					request.Claim = claim
+					freshReservation, err := domain.Candidates().ReserveReplacement(ctx, request)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					defer freshReservation.Release()
+					freshExecution, err := domain.Candidates().PinCandidates(ctx, GeneratedCandidateRequest(request), freshReservation)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					defer freshExecution.Leave()
+					adopted, err := freshExecution.AdoptCandidate("api")
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					permit, ok := adopted.(*generatedCandidateInvocationPermit)
+					if !ok || permit == nil || permit.containerID != candidateIdentity.ContainerID ||
+						adopted.Identity().ReceiptID != candidateIdentity.ReceiptID {
+						workerErr = fmt.Errorf("adopted created candidate = %T %#v", adopted, adopted.Identity())
+						return jobs.ExecutionResult{}, workerErr
+					}
+					if err := freshExecution.StartCandidate(adopted); err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					return jobs.ExecutionResult{}, nil
+				}), migration.claim.JobID(), jobs.Succeeded, identity.options.WorkingDirectory,
+				func() string { return boundedErrorText(workerErr) })
+			if workerErr != nil {
+				t.Fatalf("fresh created-candidate worker: %v", workerErr)
+			}
+			physicalRunning := candidate.runner.snapshot()
+			if physicalRunning.containerID != candidateIdentity.ContainerID ||
+				!generatedcontainer.MatchesRunning(candidateOwnerPhysicalInspection(physicalRunning), expectedIdentity, policy.limits) ||
+				!generatedcontainer.CurrentlyRunning(candidateOwnerPhysicalInspection(physicalRunning)) ||
+				candidate.runner.count(candidateOwnerCreate) != 1 || candidate.runner.count(candidateOwnerStart) != 1 ||
+				candidate.runner.count(candidateOwnerStop) != 0 || candidate.runner.count(candidateOwnerRemove) != 0 ||
+				generatedColdBoundaryCapacityProbes(runner.snapshot()) != 0 {
+				t.Fatalf("fresh worker did not start exact created candidate once: physical=%#v create=%d start=%d stop=%d remove=%d probes=%d",
+					physicalRunning, candidate.runner.count(candidateOwnerCreate), candidate.runner.count(candidateOwnerStart),
+					candidate.runner.count(candidateOwnerStop), candidate.runner.count(candidateOwnerRemove),
+					generatedColdBoundaryCapacityProbes(runner.snapshot()))
+			}
+			capacityGroup.mu.Lock()
+			component = capacityGroup.byName["api"]
+			retainedAfterStart := component != nil && component.charge == retainedCharge && component.charge != nil &&
+				component.charge.state == candidateChargeActive && component.charge.owner == candidateAccountingCandidate &&
+				component.charge.receiptRetained && component.charge.refs == 0 && component.charge.lease == nil &&
+				component.charge.token == retainedDebt && component.receipt != nil &&
+				candidatePhysicalFromWord(component.receipt.state.Load()) == candidatePhysicalPresent
+			capacityGroup.mu.Unlock()
+			if !retainedAfterStart || !candidateCapacityChargeTokenPublished(retainedDebt) {
+				t.Fatalf("fresh worker replaced or released created-candidate accounting: %#v", component)
+			}
+		})
+	})
+	t.Run("replacement_sequential_created_prefix_recovers_without_new_capacity_or_forged_provenance", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			components := []string{"api", "frontend"}
+			identity := newGeneratedDomainIdentityFixture(t)
+			migration := newGeneratedMigrationFixtureOnDomainWithComponents(t, identity, components, components,
+				generatedDomainTwoComponentPlan())
+			identity.stores = migration.repository.stores
+			validation := newGeneratedRouteSuccessorValidation(t, migration)
+			owner, candidateMux := newGeneratedRouteColdAccountingSequentialOwnerWithCapacity(t, validation,
+				generatedDomainCandidateOptions(identity.options), 4)
+			predecessorReservation, predecessorExecution, predecessorIdentities :=
+				prepareGeneratedRouteSequentialCandidates(t, owner, components,
+					[]string{strings.Repeat("7", 64), strings.Repeat("8", 64)})
+			predecessorReleased := false
+			var predecessorRetirement *GeneratedPredecessorRetirement
+			defer func() {
+				if predecessorReleased {
+					return
+				}
+				if predecessorRetirement != nil {
+					predecessorRetirement.Leave()
+				}
+				predecessorExecution.Leave()
+				predecessorReservation.Release()
+				_ = migration.releaseEffects()
+			}()
+			predecessorByName := generatedRouteColdAccountingIdentityMap(t, components, predecessorIdentities)
+
+			store, err := newStateStore(identity.dataRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, ingressIP := ingressNetworkCandidate(0)
+			ingress := &ingressRunner{appID: migration.guarded.appID,
+				network: predecessorByName["api"].NetworkName, endpoint: generatedRouteEndpoint(predecessorByName["api"]),
+				caddyNetworks: map[string]*networkAttachment{caddyNetworkName: {
+					GwPriority: caddyGatewayPriority, IPAddress: ingressIP}},
+				ingressContainers: map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {
+					Name: caddyContainerName, IPv4Address: ingressIP + "/28"}}, files: map[string][]byte{}}
+			physicalRoutes := &generatedRoutePredecessorRunner{ingressRunner: ingress,
+				slot:      generatedidentity.Slot(predecessorByName["api"].Slot),
+				endpoints: make(map[string]generatedRouteEndpointSnapshot)}
+			predecessorEndpoints := make([]generatedroute.RouteEndpoint, 0, len(components))
+			for _, component := range components {
+				value := predecessorByName[component]
+				endpoint := generatedRouteEndpoint(value)
+				predecessorEndpoints = append(predecessorEndpoints, endpoint)
+				physicalRoutes.endpoints[value.ContainerID] = generatedRouteEndpointSnapshot{
+					appID: migration.guarded.appID, endpoint: endpoint, slot: generatedidentity.Slot(value.Slot)}
+			}
+			routeRunner := &generatedDomainTwoComponentRouteRunner{
+				daemonID: "generated-cold-runtime-created-prefix-seed", delegate: physicalRoutes}
+			routeReader := &generatedRouteColdAccountingRouteReadRunner{routes: physicalRoutes, delegate: routeRunner}
+			manager, err := assembleGeneratedDomainManager(generatedDomainReservationInput{
+				database: identity.database, stores: identity.stores, runner: routeReader, options: identity.options,
+			}, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			physical, _, err := inspectGeneratedDomainPhysicalIdentity(context.Background(), identity.stores,
+				routeReader, identity.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := bindGeneratedDomainManagerView(manager, physical.manager); err != nil {
+				t.Fatal(err)
+			}
+			routes, err := newGeneratedRouteAuthority(manager, owner.authority, owner.authority.stores)
+			if err != nil {
+				t.Fatal(err)
+			}
+			predecessorSealed, err := routes.Pin(migration.guarded.context, predecessorExecution,
+				generatedroute.RouteSwitchRequest{AppID: migration.guarded.appID,
+					ToSlot: generatedidentity.Slot(predecessorByName["api"].Slot), Endpoints: predecessorEndpoints})
+			if err != nil {
+				t.Fatal(err)
+			}
+			activated, predecessorRetirement, err := predecessorSealed.ActivateWithPredecessorRetirement(
+				migration.guarded.context)
+			if err != nil || predecessorRetirement == nil || activated.Phase != generatedruntimestate.PhaseDraining {
+				t.Fatalf("activate served two-component predecessor state=%#v retirement=%#v error=%v",
+					activated, predecessorRetirement, err)
+			}
+			if err := predecessorRetirement.Complete(context.Background()); err != nil {
+				t.Fatalf("complete served two-component predecessor: %v", err)
+			}
+			predecessorHead, err := generatedruntimestate.New(identity.database).Active(context.Background(),
+				migration.guarded.appID)
+			if err != nil || predecessorHead.DeploymentID != migration.request.DeploymentID ||
+				predecessorHead.ActivationReceiptID == "" {
+				t.Fatalf("served two-component predecessor head=%#v error=%v", predecessorHead, err)
+			}
+			runtimeState := generatedruntimestate.New(identity.database)
+			predecessorJob, err := migration.jobService.Get(migration.claim.JobID())
+			if err != nil || predecessorJob.Status != string(jobs.Succeeded) {
+				t.Fatalf("served predecessor completion job=%#v error=%v", predecessorJob, err)
+			}
+			predecessorRetirement.Leave()
+			predecessorExecution.Leave()
+			predecessorReservation.Release()
+			if err := migration.releaseEffects(); err != nil {
+				t.Fatal(err)
+			}
+			predecessorReleased = true
+
+			successorScope, releaseSuccessor, err := deploymenteffects.AcquireScoped(context.Background(),
+				identity.options.WorkingDirectory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			successorEffectsReleased := false
+			defer func() {
+				if !successorEffectsReleased {
+					_ = releaseSuccessor()
+				}
+			}()
+			t.Cleanup(func() {
+				if err := releaseSuccessor(); err != nil {
+					t.Errorf("release sequential-prefix successor effects: %v", err)
+				}
+			})
+			restartedGuarded := *migration.guarded
+			restartedGuarded.context = deploymenteffects.WithScope(context.Background(), successorScope)
+			restartedMigration := *migration
+			restartedMigration.guarded = &restartedGuarded
+			restartedMigration.releaseEffects = releaseSuccessor
+			successorMigration := newGeneratedRouteColdAccountingMultiSuccessorMigration(t,
+				&restartedMigration, components)
+			successorValidation := newGeneratedRouteSuccessorValidation(t, successorMigration)
+			owner.validation = successorValidation
+			successorReservation := owner.reserve(t)
+			_, originalCapacityCalls := owner.source.observed()
+			successorExecution := owner.pin(t, successorReservation)
+			successorReleased := false
+			defer func() {
+				if !successorReleased {
+					successorExecution.Leave()
+					successorReservation.Release()
+				}
+			}()
+			apiInvocation, err := successorExecution.BeginCreate("api")
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner.runner.containerID = strings.Repeat("9", 64)
+			owner.bindInvocation(t, apiInvocation)
+			apiIdentity, err := successorExecution.CreateAndRecord(apiInvocation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if apiIdentity.ComponentName != "api" || apiIdentity.ContainerID != strings.Repeat("9", 64) ||
+				apiIdentity.ReceiptID == "" {
+				t.Fatalf("created api prefix identity=%#v", apiIdentity)
+			}
+			successorAdmission := successorValidation.read(t)
+			if successorAdmission.runtime.phase != generatedruntimestate.PhaseStartingCandidate ||
+				len(successorAdmission.components) != 2 ||
+				successorAdmission.components[0].plan.Name != "api" ||
+				successorAdmission.components[0].state != generatedruntimestate.ComponentRunning ||
+				successorAdmission.components[0].receipt == nil ||
+				successorAdmission.components[0].receipt.id != apiIdentity.ReceiptID ||
+				successorAdmission.components[0].containerID != apiIdentity.ContainerID ||
+				successorAdmission.components[1].plan.Name != "frontend" ||
+				successorAdmission.components[1].state != generatedruntimestate.ComponentImageReady ||
+				successorAdmission.components[1].receipt != nil ||
+				successorAdmission.components[1].containerName != "" ||
+				successorAdmission.components[1].containerID != "" {
+				t.Fatalf("durable sequential created prefix=%#v", successorAdmission)
+			}
+			apiPhysical := candidateMux.physical[apiIdentity.ContainerID]
+			apiExpected := apiPhysical.policy.identity
+			apiExpected.ContainerID = apiIdentity.ContainerID
+			if !apiPhysical.exists || apiPhysical.running ||
+				!generatedcontainer.MatchesConfigured(candidateOwnerPhysicalInspection(apiPhysical),
+					apiExpected, apiPhysical.policy.limits) ||
+				!generatedcontainer.NeverStarted(candidateOwnerPhysicalInspection(apiPhysical)) {
+				t.Fatalf("created api physical prefix=%#v", apiPhysical)
+			}
+			for _, physical := range candidateMux.physical {
+				if physical.policy.identity.DeploymentID == successorMigration.request.DeploymentID &&
+					physical.policy.identity.Component == "frontend" {
+					t.Fatalf("frontend unexpectedly existed in created prefix: %#v", physical)
+				}
+			}
+			var apiCreatorAttempt, successorIntentCount int
+			if err := identity.database.QueryRow(`SELECT creator_worker_attempt FROM generated_candidate_intents WHERE id=?`,
+				apiIdentity.ReceiptID).Scan(&apiCreatorAttempt); err != nil {
+				t.Fatal(err)
+			}
+			if err := identity.database.QueryRow(`SELECT COUNT(*) FROM generated_candidate_intents WHERE deployment_id=?`,
+				successorMigration.request.DeploymentID).Scan(&successorIntentCount); err != nil {
+				t.Fatal(err)
+			}
+			if apiCreatorAttempt != successorMigration.claim.Attempt() || successorIntentCount != 1 {
+				t.Fatalf("created prefix provenance attempt=%d want=%d intents=%d",
+					apiCreatorAttempt, successorMigration.claim.Attempt(), successorIntentCount)
+			}
+
+			successorExecution.Leave()
+			successorReservation.Release()
+			successorReleased = true
+			if err := releaseSuccessor(); err != nil {
+				t.Fatal(err)
+			}
+			successorEffectsReleased = true
+			recovered, err := generatedrecovery.RecoverRuntime(context.Background(), identity.database,
+				time.Now().UTC(), successorMigration.bindings)
+			if err != nil || recovered.Jobs.RequeuedGenerated != 1 {
+				t.Fatalf("recover sequential created-prefix job: result=%+v err=%v", recovered, err)
+			}
+			var pausedAttempt int
+			runGeneratedColdBoundaryWorker(t, successorMigration.jobService,
+				generatedColdBoundaryExecutor(func(_ context.Context, job jobs.Job, _ jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+					pausedAttempt = job.Attempt
+					return jobs.ExecutionResult{Disposition: jobs.ExecutionWaitingUser,
+						PauseDisposition: jobs.PauseInsufficientReplacementCapacity}, nil
+				}), successorMigration.claim.JobID(), jobs.WaitingUser, identity.options.WorkingDirectory, nil)
+			if pausedAttempt <= apiCreatorAttempt {
+				t.Fatalf("recovered created-prefix attempt=%d original=%d", pausedAttempt, apiCreatorAttempt)
+			}
+
+			stateBefore, err := store.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			activeBefore, found := stateBefore.Active[migration.guarded.appID]
+			predecessorRoute := routeRecord{Slot: generatedidentity.Slot(predecessorByName["api"].Slot),
+				Endpoints: predecessorEndpoints}
+			if stateBefore.Pending != nil || !found || !sameRoute(activeBefore, predecessorRoute) {
+				t.Fatalf("served predecessor route before sequential-prefix recovery=%#v", stateBefore)
+			}
+			startupBefore, err := identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(startupBefore.Runtime.ActiveHeads) != 1 || len(startupBefore.Runtime.RouteActivations) != 1 {
+				t.Fatalf("sequential-prefix baseline head/history=%#v/%#v",
+					startupBefore.Runtime.ActiveHeads, startupBefore.Runtime.RouteActivations)
+			}
+			for _, activation := range startupBefore.Runtime.RouteActivations {
+				if activation.SuccessorDeploymentID == successorMigration.request.DeploymentID {
+					t.Fatalf("sequential created prefix already had successor activation=%#v", activation)
+				}
+			}
+			var successorLaterReceipts int
+			if err := identity.database.QueryRow(`SELECT
+				(SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts r JOIN generated_route_activations a ON a.id=r.activation_receipt_id WHERE a.successor_deployment_id=?) +
+				(SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts h JOIN generated_route_activations a ON a.id=h.activation_receipt_id WHERE a.successor_deployment_id=?) +
+				(SELECT COUNT(*) FROM generated_route_completion_receipts c JOIN generated_route_activations a ON a.id=c.activation_receipt_id WHERE a.successor_deployment_id=?)`,
+				successorMigration.request.DeploymentID, successorMigration.request.DeploymentID,
+				successorMigration.request.DeploymentID).Scan(&successorLaterReceipts); err != nil {
+				t.Fatal(err)
+			}
+			if successorLaterReceipts != 0 {
+				t.Fatalf("sequential created prefix had 043-045 rows=%d", successorLaterReceipts)
+			}
+			predecessorPhysical := generatedRouteColdAccountingPhysicalRoster(candidateMux, predecessorIdentities)
+			processRunner, construction := generatedRouteColdAccountingPartialRestartProcess(t, identity, store,
+				physicalRoutes, candidateMux, append(append([]CandidateIdentity(nil), predecessorIdentities...), apiIdentity))
+			process := &generatedColdCreatedCandidateStartRunner{delegate: processRunner, candidate: candidateMux,
+				containerID: apiIdentity.ContainerID}
+			census := construction.delegate
+			if census == nil {
+				t.Fatalf("sequential created-prefix census=%T", construction.delegate)
+			}
+			var successorAPIContainers, successorFrontendContainers int
+			for _, object := range census.objects {
+				if object.kind != "container" || object.labels["io.rig.deployment"] != successorMigration.request.DeploymentID {
+					continue
+				}
+				switch object.labels["io.rig.component"] {
+				case "api":
+					successorAPIContainers++
+				case "frontend":
+					successorFrontendContainers++
+				}
+			}
+			if successorAPIContainers != 1 || successorFrontendContainers != 0 {
+				t.Fatalf("sequential created-prefix census api=%d frontend=%d",
+					successorAPIContainers, successorFrontendContainers)
+			}
+			admissionBefore := successorValidation.read(t)
+			apiPhysicalBefore := candidateMux.physical[apiIdentity.ContainerID]
+			liveBefore := append([]byte(nil), ingress.liveConfig...)
+			restartBefore := append([]byte(nil), ingress.files[caddyContainerName+":/config/active.json"]...)
+			if len(liveBefore) == 0 || !bytes.Equal(liveBefore, restartBefore) {
+				t.Fatal("served two-component predecessor lacked exact live/restart route")
+			}
+			createBefore := owner.runner.count(candidateOwnerCreate)
+			startBefore := owner.runner.count(candidateOwnerStart)
+			stopBefore := owner.runner.count(candidateOwnerStop)
+			removeBefore := owner.runner.count(candidateOwnerRemove)
+
+			domain, constructErr := NewGeneratedDomain(context.Background(), identity.stores, process,
+				&candidateFactoryEnvironment{path: t.TempDir()}, generatedColdBoundaryPublicOptions(identity.options))
+			startupAfter, snapshotErr := identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+			if snapshotErr != nil {
+				t.Fatal(snapshotErr)
+			}
+			stateAfter, stateErr := store.load()
+			if stateErr != nil {
+				t.Fatal(stateErr)
+			}
+			admissionAfter := successorValidation.read(t)
+			apiPhysicalAfter := candidateMux.physical[apiIdentity.ContainerID]
+			activeHeadAfter, headErr := runtimeState.Active(context.Background(), migration.guarded.appID)
+			if headErr != nil || !reflect.DeepEqual(activeHeadAfter, predecessorHead) ||
+				!reflect.DeepEqual(startupBefore, startupAfter) || !reflect.DeepEqual(stateBefore, stateAfter) ||
+				!reflect.DeepEqual(admissionBefore, admissionAfter) ||
+				!reflect.DeepEqual(apiPhysicalBefore, apiPhysicalAfter) ||
+				!reflect.DeepEqual(predecessorPhysical,
+					generatedRouteColdAccountingPhysicalRoster(candidateMux, predecessorIdentities)) ||
+				!bytes.Equal(liveBefore, ingress.liveConfig) ||
+				!bytes.Equal(restartBefore, ingress.files[caddyContainerName+":/config/active.json"]) ||
+				owner.runner.count(candidateOwnerCreate) != createBefore ||
+				owner.runner.count(candidateOwnerStart) != startBefore ||
+				owner.runner.count(candidateOwnerStop) != stopBefore ||
+				owner.runner.count(candidateOwnerRemove) != removeBefore {
+				t.Fatalf("cold construction changed sequential created prefix: head=%t startup=%t gateway=%t admission=%t api=%t predecessor=%t live=%t restart=%t commands=%d/%d/%d/%d want=%d/%d/%d/%d",
+					reflect.DeepEqual(activeHeadAfter, predecessorHead), reflect.DeepEqual(startupBefore, startupAfter),
+					reflect.DeepEqual(stateBefore, stateAfter), reflect.DeepEqual(admissionBefore, admissionAfter),
+					reflect.DeepEqual(apiPhysicalBefore, apiPhysicalAfter),
+					reflect.DeepEqual(predecessorPhysical,
+						generatedRouteColdAccountingPhysicalRoster(candidateMux, predecessorIdentities)),
+					bytes.Equal(liveBefore, ingress.liveConfig),
+					bytes.Equal(restartBefore, ingress.files[caddyContainerName+":/config/active.json"]),
+					owner.runner.count(candidateOwnerCreate), owner.runner.count(candidateOwnerStart),
+					owner.runner.count(candidateOwnerStop), owner.runner.count(candidateOwnerRemove),
+					createBefore, startBefore, stopBefore, removeBefore)
+			}
+			if constructErr != nil {
+				message := "generated domain construction was refused: stage=cold_construction reason=cold_group_container_attestation"
+				assertGeneratedDomainConstructionDiagnostic(t, constructErr,
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupContainerAttestation, message)
+				if domain != nil || generatedColdBoundaryCapacityProbes(construction.snapshot()) != 0 {
+					t.Fatalf("refused sequential created-prefix construction published domain=%v or probed capacity: commands=%#v",
+						domain, construction.snapshot())
+				}
+				t.Fatalf("authenticated StartingCandidate prefix (api durable Running/configured NeverStarted, frontend ImageReady/absent) must reconstruct without new capacity; current base refused at the exact cold container boundary: %v",
+					constructErr)
+			}
+			if domain == nil || domain.construction == nil || domain.construction.cold == nil ||
+				len(domain.construction.cold.groups) != 2 {
+				t.Fatalf("sequential created-prefix cold domain=%#v", domain)
+			}
+			if probes := generatedColdBoundaryCapacityProbes(construction.snapshot()); probes != 0 {
+				t.Fatalf("sequential created-prefix capacity probes=%d want 0 commands=%#v",
+					probes, construction.snapshot())
+			}
+			manifestByDeployment := make(map[string]generatedDomainColdManifestGroup, 2)
+			for _, group := range domain.construction.cold.groups {
+				manifestByDeployment[group.deploymentID] = group
+			}
+			predecessorManifest, predecessorFound := manifestByDeployment[migration.request.DeploymentID]
+			successorManifest, successorFound := manifestByDeployment[successorMigration.request.DeploymentID]
+			if !predecessorFound || !successorFound || len(predecessorManifest.components) != 2 ||
+				len(successorManifest.components) != 2 ||
+				predecessorManifest.components[0].name != "api" ||
+				predecessorManifest.components[0].receiptID != predecessorByName["api"].ReceiptID ||
+				predecessorManifest.components[1].name != "frontend" ||
+				predecessorManifest.components[1].receiptID != predecessorByName["frontend"].ReceiptID ||
+				successorManifest.components[0].name != "api" ||
+				successorManifest.components[0].receiptID != apiIdentity.ReceiptID ||
+				successorManifest.components[1].name != "frontend" || successorManifest.components[1].receiptID != "" {
+				t.Fatalf("sequential created-prefix manifests predecessor=%#v successor=%#v",
+					predecessorManifest, successorManifest)
+			}
+			for _, component := range predecessorManifest.components {
+				if !component.charged || !component.retained {
+					t.Fatalf("sequential created-prefix predecessor manifest component=%#v", component)
+				}
+			}
+			if !successorManifest.components[0].charged || !successorManifest.components[0].retained ||
+				!successorManifest.components[1].charged || !successorManifest.components[1].retained {
+				t.Fatalf("sequential created-prefix successor manifest=%#v", successorManifest)
+			}
+
+			type expectedDebt struct {
+				deploymentID   string
+				component      string
+				receiptID      string
+				owner          candidateAccountingOwner
+				physical       candidatePhysicalState
+				receiptPresent bool
+				explicit       bool
+			}
+			expectedDebts := []expectedDebt{
+				{migration.request.DeploymentID, "api", predecessorByName["api"].ReceiptID,
+					candidateAccountingRouteActive, candidatePhysicalHandedToRoute, true, false},
+				{migration.request.DeploymentID, "frontend", predecessorByName["frontend"].ReceiptID,
+					candidateAccountingRouteActive, candidatePhysicalHandedToRoute, true, false},
+				{successorMigration.request.DeploymentID, "api", apiIdentity.ReceiptID,
+					candidateAccountingCandidate, candidatePhysicalPresent, true, false},
+				{successorMigration.request.DeploymentID, "frontend", "",
+					candidateAccountingCandidate, candidatePhysicalUnused, false, true},
+			}
+			ledger := domain.Candidates().ledger
+			var memory, disk uint64
+			debts := make([]*generatedDomainCapacityDebtToken, 0, len(expectedDebts))
+			for _, expected := range expectedDebts {
+				ledger.mu.Lock()
+				group := ledger.groups[candidateCapacityGroupKey{appID: migration.guarded.appID,
+					deploymentID: expected.deploymentID}]
+				ledger.mu.Unlock()
+				if group == nil {
+					t.Fatalf("sequential created-prefix omitted accounting group %s", expected.deploymentID)
+				}
+				group.mu.Lock()
+				component := group.byName[expected.component]
+				var receiptID string
+				physical := candidatePhysicalUnused
+				if component != nil && component.receipt != nil {
+					receiptID = component.receipt.id
+					physical = candidatePhysicalFromWord(component.receipt.state.Load())
+				}
+				var debt *generatedDomainCapacityDebtToken
+				if component != nil && component.charge != nil {
+					debt, _ = component.charge.token.(*generatedDomainCapacityDebtToken)
+				}
+				receiptValid := expected.receiptPresent && component != nil && component.receipt != nil &&
+					receiptID == expected.receiptID && physical == expected.physical ||
+					!expected.receiptPresent && component != nil && component.receipt == nil && receiptID == ""
+				valid := component != nil && receiptValid &&
+					component.charge != nil && component.charge.state == candidateChargeActive &&
+					component.charge.owner == expected.owner && component.charge.lease == nil &&
+					component.charge.receiptRetained == expected.receiptPresent &&
+					component.charge.explicitRetained == expected.explicit &&
+					!component.charge.logicallyRetired && component.charge.refs == 0 && !component.tokenHeld &&
+					debt != nil && debt.active && debt.limits == group.limits && candidateCapacityChargeTokenPublished(debt)
+				memory += group.limits.MemoryBytes
+				disk += group.limits.DiskBytes
+				group.mu.Unlock()
+				if !valid {
+					t.Fatalf("sequential created-prefix debt %s/%s=%#v", expected.deploymentID,
+						expected.component, component)
+				}
+				debts = append(debts, debt)
+			}
+			coordinator := domain.construction.capacity
+			coordinator.mu.Lock()
+			coordinatorValid := coordinator.phase == generatedDomainCapacityPublished && coordinator.borrows == 0 &&
+				coordinator.memory == memory && coordinator.disk == disk && len(coordinator.tokens) == len(debts)
+			for _, debt := range debts {
+				_, registered := coordinator.tokens[debt]
+				coordinatorValid = coordinatorValid && registered && debt.owner == coordinator
+			}
+			coordinator.mu.Unlock()
+			if !coordinatorValid {
+				t.Fatal("sequential created-prefix capacity coordinator did not retain exact four-component debt")
+			}
+
+			process.allow([]string{"container", "start", apiIdentity.ContainerID})
+			resumed, err := successorMigration.jobService.Resume(successorMigration.claim.JobID())
+			if err != nil || resumed.Status != string(jobs.Queued) {
+				t.Fatalf("resume sequential created-prefix job=%+v err=%v", resumed, err)
+			}
+			frontendContainerID := strings.Repeat("a", 64)
+			var freshAttempt int
+			var frontendIdentity CandidateIdentity
+			var workerErr error
+			runGeneratedColdBoundaryWorker(t, successorMigration.jobService,
+				generatedColdBoundaryExecutor(func(ctx context.Context, job jobs.Job, _ jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+					freshAttempt = job.Attempt
+					claim, err := deploymentexecution.NewClaim(successorMigration.binding, job.ID,
+						successorMigration.guarded.appID, job.Attempt)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					request := GeneratedReplacementRequest(successorValidation.request)
+					request.Claim = claim
+					refusalReservation, err := domain.Candidates().ReserveReplacement(ctx, request)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					crossedRequest := GeneratedCandidateRequest(request)
+					if crossedRequest.CandidateSlot == "blue" {
+						crossedRequest.CandidateSlot = "green"
+					} else {
+						crossedRequest.CandidateSlot = "blue"
+					}
+					crossedExecution, crossedErr := domain.Candidates().PinCandidates(ctx,
+						crossedRequest, refusalReservation)
+					if crossedExecution != nil {
+						crossedExecution.Leave()
+					}
+					refusalReservation.Release()
+					if !errors.Is(crossedErr, deploymentexecution.ErrIdentityLost) {
+						workerErr = fmt.Errorf("crossed helper pin error=%v", crossedErr)
+						return jobs.ExecutionResult{}, workerErr
+					}
+					freshReservation, err := domain.Candidates().ReserveReplacement(ctx, request)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					defer freshReservation.Release()
+					freshExecution, err := domain.Candidates().PinCandidates(ctx,
+						GeneratedCandidateRequest(request), freshReservation)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					defer freshExecution.Leave()
+					adopted, err := freshExecution.AdoptCandidate("api")
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					adoptedPermit, ok := adopted.(*generatedCandidateInvocationPermit)
+					if !ok || adoptedPermit == nil || adoptedPermit.containerID != apiIdentity.ContainerID ||
+						adopted.Identity().ReceiptID != apiIdentity.ReceiptID {
+						workerErr = fmt.Errorf("adopted sequential api=%T %#v", adopted, adopted.Identity())
+						return jobs.ExecutionResult{}, workerErr
+					}
+					if err := freshExecution.StartCandidate(adopted); err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+
+					frontendInvocation, err := freshExecution.BeginCreate("frontend")
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					frontendPermit, ok := frontendInvocation.(*generatedCandidateInvocationPermit)
+					if !ok || frontendPermit == nil {
+						workerErr = fmt.Errorf("frontend invocation=%T", frontendInvocation)
+						return jobs.ExecutionResult{}, workerErr
+					}
+					owner.runner.mu.Lock()
+					owner.runner.containerID = frontendContainerID
+					owner.runner.physical = candidateOwnerPhysical{policy: frontendPermit.policy}
+					owner.runner.mu.Unlock()
+					createArgs, err := frontendPermit.policy.createArgs("")
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					for _, args := range [][]string{
+						{"image", "inspect", "--format", generatedCandidateImageInspectFormat,
+							frontendPermit.policy.identity.ImageContentID},
+						{"network", "inspect", "--format", generatedCandidateNetworkInspectFormat,
+							frontendPermit.policy.identity.NetworkName},
+						{"container", "inspect", "--format", generatedcontainer.InspectFormat,
+							frontendPermit.policy.identity.ContainerName},
+						createArgs,
+						{"container", "inspect", "--format", generatedcontainer.InspectFormat, frontendContainerID},
+						{"container", "start", frontendContainerID},
+					} {
+						process.allow(args)
+					}
+					frontendIdentity, err = freshExecution.CreateAndRecord(frontendInvocation)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					if frontendIdentity.ContainerID != frontendContainerID ||
+						frontendIdentity.ContainerID == apiIdentity.ContainerID || frontendIdentity.ReceiptID == "" {
+						workerErr = fmt.Errorf("created sequential frontend=%#v", frontendIdentity)
+						return jobs.ExecutionResult{}, workerErr
+					}
+					if err := freshExecution.StartCandidate(frontendInvocation); err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					starting, err := freshExecution.FinishStarting()
+					if err != nil || starting.Phase != generatedruntimestate.PhaseWaitingHealth {
+						workerErr = errors.Join(err, fmt.Errorf("finish sequential starting phase=%s", starting.Phase))
+						return jobs.ExecutionResult{}, workerErr
+					}
+					if err := freshExecution.WaitHealthyAndRecord(adopted); err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					if err := freshExecution.WaitHealthyAndRecord(frontendInvocation); err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					if _, err := freshExecution.FinishHealth(); err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					return jobs.ExecutionResult{}, nil
+				}), successorMigration.claim.JobID(), jobs.Succeeded, identity.options.WorkingDirectory,
+				func() string { return boundedErrorText(workerErr) })
+			if workerErr != nil {
+				t.Fatalf("fresh sequential created-prefix worker: %v", workerErr)
+			}
+			if freshAttempt <= apiCreatorAttempt || freshAttempt <= pausedAttempt {
+				t.Fatalf("fresh sequential attempt=%d paused=%d original=%d",
+					freshAttempt, pausedAttempt, apiCreatorAttempt)
+			}
+			var frontendCreatorAttempt int
+			if err := identity.database.QueryRow(`SELECT creator_worker_attempt FROM generated_candidate_intents WHERE id=?`,
+				frontendIdentity.ReceiptID).Scan(&frontendCreatorAttempt); err != nil {
+				t.Fatal(err)
+			}
+			var apiCreatorAttemptAfter, intentCountAfter int
+			if err := identity.database.QueryRow(`SELECT creator_worker_attempt FROM generated_candidate_intents WHERE id=?`,
+				apiIdentity.ReceiptID).Scan(&apiCreatorAttemptAfter); err != nil {
+				t.Fatal(err)
+			}
+			if err := identity.database.QueryRow(`SELECT COUNT(*) FROM generated_candidate_intents WHERE deployment_id=?`,
+				successorMigration.request.DeploymentID).Scan(&intentCountAfter); err != nil {
+				t.Fatal(err)
+			}
+			_, capacityCallsAfter := owner.source.observed()
+			apiRunning := candidateMux.physical[apiIdentity.ContainerID]
+			frontendRunning := candidateMux.physical[frontendIdentity.ContainerID]
+			apiRunningExpected := apiRunning.policy.identity
+			apiRunningExpected.ContainerID = apiIdentity.ContainerID
+			frontendRunningExpected := frontendRunning.policy.identity
+			frontendRunningExpected.ContainerID = frontendIdentity.ContainerID
+			finalState, err := store.load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if apiCreatorAttemptAfter != apiCreatorAttempt || intentCountAfter != 2 ||
+				frontendCreatorAttempt != freshAttempt || frontendCreatorAttempt == apiCreatorAttempt ||
+				!generatedcontainer.MatchesRunning(candidateOwnerPhysicalInspection(apiRunning),
+					apiRunningExpected, apiRunning.policy.limits) ||
+				!generatedcontainer.CurrentlyRunning(candidateOwnerPhysicalInspection(apiRunning)) ||
+				!generatedcontainer.MatchesRunning(candidateOwnerPhysicalInspection(frontendRunning),
+					frontendRunningExpected, frontendRunning.policy.limits) ||
+				!generatedcontainer.CurrentlyRunning(candidateOwnerPhysicalInspection(frontendRunning)) ||
+				owner.runner.count(candidateOwnerCreate) != createBefore+1 ||
+				owner.runner.count(candidateOwnerStart) != startBefore+2 ||
+				owner.runner.count(candidateOwnerStop) != stopBefore ||
+				owner.runner.count(candidateOwnerRemove) != removeBefore ||
+				capacityCallsAfter != originalCapacityCalls ||
+				generatedColdBoundaryCapacityProbes(construction.snapshot()) != 0 ||
+				!reflect.DeepEqual(stateBefore, finalState) {
+				t.Fatalf("fresh sequential continuation effects/provenance: attempts=%d/%d apiAfter=%d intents=%d running=%t/%t commands=%d/%d/%d/%d capacity=%d/%d probes=%d",
+					apiCreatorAttempt, frontendCreatorAttempt, apiCreatorAttemptAfter, intentCountAfter,
+					apiRunning.running, frontendRunning.running,
+					owner.runner.count(candidateOwnerCreate), owner.runner.count(candidateOwnerStart),
+					owner.runner.count(candidateOwnerStop), owner.runner.count(candidateOwnerRemove),
+					originalCapacityCalls, capacityCallsAfter, generatedColdBoundaryCapacityProbes(construction.snapshot()))
+			}
+		})
+	})
 	t.Run("stopped_physical_disagreement_refuses_without_traffic", func(t *testing.T) {
 		generatedDomainConstructionCase(t, func(t *testing.T) {
 			identity := newGeneratedDomainIdentityFixture(t)
@@ -596,6 +1580,414 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 			})
 		}
 	})
+}
+
+type generatedDomainColdStartingCandidatePublicFixture struct {
+	identity   generatedDomainIdentityFixture
+	migration  *generatedMigrationFixture
+	validation *candidateValidationFixture
+	owner      *candidateOwnerFixture
+	candidates *generatedRouteCandidateRunner
+	identities map[string]CandidateIdentity
+	ordered    []CandidateIdentity
+	store      *stateStore
+	runner     *generatedDomainConstructionRunner
+	process    runtimeprocess.CommandRunner
+}
+
+// generatedDomainColdStartingCandidateCensusRunner supplies only the detailed
+// immutable image observation for a not-yet-created suffix component. The
+// startup census uses a different exact format and remains owned by delegate.
+type generatedDomainColdStartingCandidateCensusRunner struct {
+	delegate runtimeprocess.CommandRunner
+	images   map[string]candidatePolicy
+}
+
+func (r *generatedDomainColdStartingCandidateCensusRunner) Run(ctx context.Context,
+	request runtimeprocess.CommandRequest,
+) (runtimeprocess.CommandResult, error) {
+	args := request.Args
+	if len(args) == 5 && reflect.DeepEqual(args[:4],
+		[]string{"image", "inspect", "--format", generatedCandidateImageInspectFormat}) {
+		if policy, found := r.images[args[4]]; found {
+			candidate := &candidateOwnerRunner{physical: candidateOwnerPhysical{policy: policy}}
+			return candidate.defaultResult(candidateOwnerImageInspect, request)
+		}
+	}
+	return r.delegate.Run(ctx, request)
+}
+
+func newGeneratedDomainColdStartingCandidatePublicFixture(t *testing.T, createOrder []string,
+	start map[string]bool,
+) generatedDomainColdStartingCandidatePublicFixture {
+	t.Helper()
+	components := []string{"api", "frontend"}
+	identity := newGeneratedDomainIdentityFixture(t)
+	migration := newGeneratedMigrationFixtureOnDomainWithComponents(t, identity, components, components,
+		generatedDomainTwoComponentPlan())
+	identity.stores = migration.repository.stores
+	validation := newCandidateOwnerValidationFixtureWithMigration(t, migration)
+	owner, candidates := newGeneratedRouteColdAccountingSequentialOwnerWithCapacity(t, validation,
+		generatedDomainCandidateOptions(identity.options), 2)
+	reservation := owner.reserve(t)
+	execution := owner.pin(t, reservation)
+	released := false
+	defer func() {
+		if released {
+			return
+		}
+		execution.Leave()
+		reservation.Release()
+		_ = migration.releaseEffects()
+	}()
+
+	identities := make(map[string]CandidateIdentity, len(createOrder))
+	ordered := make([]CandidateIdentity, 0, len(createOrder))
+	containerIDs := map[string]string{"api": strings.Repeat("7", 64), "frontend": strings.Repeat("8", 64)}
+	for _, component := range createOrder {
+		containerID, known := containerIDs[component]
+		if !known {
+			t.Fatalf("unknown starting-candidate component %q", component)
+		}
+		invocation, err := execution.BeginCreate(component)
+		if err != nil {
+			t.Fatalf("begin %s candidate create: %v", component, err)
+		}
+		permit, ok := invocation.(*generatedCandidateInvocationPermit)
+		if !ok || permit == nil {
+			t.Fatalf("%s candidate invocation=%T", component, invocation)
+		}
+		owner.runner.mu.Lock()
+		owner.runner.containerID = containerID
+		owner.runner.physical = candidateOwnerPhysical{policy: permit.policy}
+		owner.runner.mu.Unlock()
+		created, err := execution.CreateAndRecord(invocation)
+		if err != nil {
+			t.Fatalf("create %s candidate: %v", component, err)
+		}
+		if start[component] {
+			if err := execution.StartCandidate(invocation); err != nil {
+				t.Fatalf("start %s candidate: %v", component, err)
+			}
+		}
+		identities[component] = created
+		ordered = append(ordered, created)
+	}
+	admission := validation.read(t)
+	if admission.runtime.phase != generatedruntimestate.PhaseStartingCandidate ||
+		len(admission.components) != len(components) {
+		t.Fatalf("public starting-candidate prefix=%#v", admission)
+	}
+	execution.Leave()
+	reservation.Release()
+	if err := migration.releaseEffects(); err != nil {
+		t.Fatal(err)
+	}
+	released = true
+	result, err := generatedrecovery.RecoverRuntime(context.Background(), identity.database,
+		time.Now().UTC(), migration.bindings)
+	if err != nil || result.Jobs.RequeuedGenerated != 1 {
+		t.Fatalf("recover public starting-candidate job: result=%+v err=%v", result, err)
+	}
+	runGeneratedColdBoundaryWorker(t, migration.jobService,
+		generatedColdBoundaryExecutor(func(context.Context, jobs.Job, jobs.ProgressReporter) (jobs.ExecutionResult, error) {
+			return jobs.ExecutionResult{Disposition: jobs.ExecutionWaitingUser,
+				PauseDisposition: jobs.PauseInsufficientReplacementCapacity}, nil
+		}), migration.claim.JobID(), jobs.WaitingUser, identity.options.WorkingDirectory, nil)
+
+	store, err := newStateStore(identity.dataRoot)
+	if err != nil {
+		t.Fatalf("install public starting-candidate gateway state: %v", err)
+	}
+	if err := store.createInitialEmpty(); err != nil {
+		t.Fatalf("install public starting-candidate gateway state: %v", err)
+	}
+	state, err := store.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, v2, journal := gatewayV2IdentityTestState(t)
+	observation := gatewayV2IdentityTestObservation(t, state, v2, journal, gatewayTopologyExactV1Only)
+	observation.V1Container.ID = strings.Repeat("d", 64)
+	observation.V1NetworkID = strings.Repeat("e", 64)
+	for id, member := range observation.V1Network.Containers {
+		delete(observation.V1Network.Containers, id)
+		observation.V1Network.Containers[observation.V1Container.ID] = member
+	}
+	gateway := generatedDomainNativeV1OuterGatewayRunner(observation)
+	objects := generatedDomainDockerObjectsForDescriptors(generatedDomainNativeV1DockerDescriptors())
+	for index := range objects {
+		switch objects[index].name {
+		case caddyContainerName:
+			objects[index].id = observation.V1Container.ID
+		case caddyNetworkName:
+			objects[index].id = observation.V1NetworkID
+			objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Network.Driver,
+				scope: observation.V1Network.Scope, options: cloneStringMap(observation.V1Network.Options)}
+		case caddyVolumeName:
+			objects[index].data = generatedDomainDockerObjectData{driver: observation.V1Volume.Driver,
+				scope: observation.V1Volume.Scope, options: cloneStringMap(observation.V1Volume.Options),
+				mountpoint: observation.V1VolumeIdentity.Mountpoint, createdAt: observation.V1VolumeIdentity.CreatedAt}
+		}
+	}
+	physical := generatedRouteColdAccountingPhysicalRoster(candidates, ordered)
+	objects = append(objects, generatedDomainA0ApplicationObjects(t, physical)...)
+	physicalComponents := make(map[string]struct{}, len(physical))
+	for _, value := range physical {
+		physicalComponents[value.policy.identity.Component] = struct{}{}
+	}
+	absentImages := make(map[string]candidatePolicy)
+	for _, component := range admission.components {
+		if _, present := physicalComponents[component.plan.Name]; present || component.artifact == nil {
+			continue
+		}
+		artifact := *component.artifact
+		policy := candidatePolicy{identity: generatedcontainer.Identity{
+			AppID: validation.pins.applicationID(), ReleaseID: validation.pins.releaseID,
+			DeploymentID: validation.pins.deploymentID, ArtifactID: artifact.id,
+			DeploymentPlanRevisionID: validation.pins.deploymentPlanRevisionID,
+			Component:                component.plan.Name, Role: component.plan.Role,
+			ImageContentID: artifact.imageContentID}, buildDefinitionDigest: artifact.buildDefinitionDigest}
+		if previous, duplicate := absentImages[artifact.imageContentID]; duplicate && !reflect.DeepEqual(previous, policy) {
+			t.Fatal("absent starting-candidate images cross immutable policy")
+		}
+		absentImages[artifact.imageContentID] = policy
+		objects = append(objects, generatedDomainDockerObject{kind: "image", id: artifact.imageContentID,
+			labels: generatedDomainColdImageLabels(validation.pins, component, artifact),
+			data:   generatedDomainDockerObjectData{contentID: artifact.imageContentID}})
+	}
+	identity.options.HostPort = journal.Source.LocalHostPort
+	runner := &generatedDomainConstructionRunner{
+		delegate: &generatedDomainRecoveryCensusRunner{daemonID: "generated-cold-starting-candidate-public",
+			objects: objects, imageID: observation.Image.ID, gateway: gateway}}
+	census := &generatedDomainColdStartingCandidateCensusRunner{delegate: runner, images: absentImages}
+	process := &generatedRouteColdAccountingRunner{cold: census, predecessor: candidates,
+		predecessorPhysical: physical}
+	manager, err := assembleGeneratedDomainManager(generatedDomainReservationInput{
+		database: identity.database, stores: identity.stores, runner: process, options: identity.options,
+	}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, err := manager.lockGateway(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := release(); err != nil {
+		t.Fatal(err)
+	}
+	return generatedDomainColdStartingCandidatePublicFixture{identity: identity, migration: migration,
+		validation: validation, owner: owner, candidates: candidates, identities: identities, ordered: ordered,
+		store: store, runner: runner, process: process}
+}
+
+func (f generatedDomainColdStartingCandidatePublicFixture) construct(t *testing.T) (*GeneratedDomain, error) {
+	t.Helper()
+	startupBefore, err := f.identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateBefore, err := f.store.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionBefore := f.validation.read(t)
+	physicalBefore := generatedRouteColdAccountingPhysicalRoster(f.candidates, f.ordered)
+	_, capacityCallsBefore := f.owner.source.observed()
+	createBefore, startBefore := f.owner.runner.count(candidateOwnerCreate), f.owner.runner.count(candidateOwnerStart)
+	stopBefore, removeBefore := f.owner.runner.count(candidateOwnerStop), f.owner.runner.count(candidateOwnerRemove)
+	domain, constructErr := NewGeneratedDomain(context.Background(), f.identity.stores, f.process,
+		&candidateFactoryEnvironment{path: t.TempDir()}, generatedColdBoundaryPublicOptions(f.identity.options))
+	startupAfter, err := f.identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateAfter, err := f.store.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	admissionAfter := f.validation.read(t)
+	physicalAfter := generatedRouteColdAccountingPhysicalRoster(f.candidates, f.ordered)
+	_, capacityCallsAfter := f.owner.source.observed()
+	if !reflect.DeepEqual(startupBefore, startupAfter) || !reflect.DeepEqual(stateBefore, stateAfter) ||
+		!reflect.DeepEqual(admissionBefore, admissionAfter) || !reflect.DeepEqual(physicalBefore, physicalAfter) ||
+		capacityCallsAfter != capacityCallsBefore || f.owner.runner.count(candidateOwnerCreate) != createBefore ||
+		f.owner.runner.count(candidateOwnerStart) != startBefore ||
+		f.owner.runner.count(candidateOwnerStop) != stopBefore ||
+		f.owner.runner.count(candidateOwnerRemove) != removeBefore {
+		t.Fatalf("cold starting-candidate construction mutated source state: startup=%t gateway=%t admission=%t physical=%t capacity=%d/%d commands=%d/%d/%d/%d want=%d/%d/%d/%d",
+			reflect.DeepEqual(startupBefore, startupAfter), reflect.DeepEqual(stateBefore, stateAfter),
+			reflect.DeepEqual(admissionBefore, admissionAfter), reflect.DeepEqual(physicalBefore, physicalAfter),
+			capacityCallsBefore, capacityCallsAfter, f.owner.runner.count(candidateOwnerCreate),
+			f.owner.runner.count(candidateOwnerStart), f.owner.runner.count(candidateOwnerStop),
+			f.owner.runner.count(candidateOwnerRemove), createBefore, startBefore, stopBefore, removeBefore)
+	}
+	return domain, constructErr
+}
+
+func assertGeneratedDomainColdStartingCandidateDebt(t *testing.T,
+	fixture generatedDomainColdStartingCandidatePublicFixture, domain *GeneratedDomain,
+) {
+	t.Helper()
+	if domain == nil || domain.construction == nil || domain.construction.cold == nil ||
+		len(domain.construction.cold.groups) != 1 || generatedColdBoundaryCapacityProbes(fixture.runner.snapshot()) != 0 {
+		t.Fatalf("all-running starting-candidate construction=%#v probes=%d",
+			domain, generatedColdBoundaryCapacityProbes(fixture.runner.snapshot()))
+	}
+	manifest := domain.construction.cold.groups[0]
+	if manifest.deploymentID != fixture.migration.request.DeploymentID || len(manifest.components) != 2 {
+		t.Fatalf("all-running starting-candidate manifest=%#v", manifest)
+	}
+	ledger := domain.Candidates().ledger
+	ledger.mu.Lock()
+	group := ledger.groups[candidateCapacityGroupKey{appID: fixture.migration.guarded.appID,
+		deploymentID: fixture.migration.request.DeploymentID}]
+	ledger.mu.Unlock()
+	if group == nil {
+		t.Fatal("all-running starting-candidate accounting group is absent")
+	}
+	group.mu.Lock()
+	debts := make([]*generatedDomainCapacityDebtToken, 0, len(group.components))
+	valid := reflect.DeepEqual(group.components, []string{"api", "frontend"})
+	for _, name := range group.components {
+		component := group.byName[name]
+		identity, hasReceipt := fixture.identities[name]
+		debt := (*generatedDomainCapacityDebtToken)(nil)
+		if component != nil && component.charge != nil {
+			debt, _ = component.charge.token.(*generatedDomainCapacityDebtToken)
+		}
+		validReceipt := hasReceipt && component != nil && component.receipt != nil &&
+			component.receipt.id == identity.ReceiptID &&
+			candidatePhysicalFromWord(component.receipt.state.Load()) == candidatePhysicalPresent &&
+			component.charge != nil && component.charge.receiptRetained && !component.charge.explicitRetained
+		if !hasReceipt {
+			validReceipt = component != nil && component.receipt == nil && component.charge != nil &&
+				!component.charge.receiptRetained && component.charge.explicitRetained
+		}
+		valid = valid && validReceipt && component.charge.state == candidateChargeActive &&
+			component.charge.owner == candidateAccountingCandidate && !component.charge.logicallyRetired &&
+			component.charge.refs == 0 && component.charge.lease == nil && debt != nil && debt.active &&
+			debt.limits == group.limits && !component.tokenHeld
+		debts = append(debts, debt)
+	}
+	limits := group.limits
+	group.mu.Unlock()
+	coordinator := domain.construction.capacity
+	coordinator.mu.Lock()
+	valid = valid && coordinator.phase == generatedDomainCapacityPublished && coordinator.borrows == 0 &&
+		coordinator.memory == uint64(len(debts))*limits.MemoryBytes &&
+		coordinator.disk == uint64(len(debts))*limits.DiskBytes && len(coordinator.tokens) == len(debts)
+	for _, debt := range debts {
+		_, present := coordinator.tokens[debt]
+		valid = valid && present && debt != nil && debt.owner == coordinator && debt.active
+	}
+	phase, borrows, memory, disk, tokens := coordinator.phase, coordinator.borrows,
+		coordinator.memory, coordinator.disk, len(coordinator.tokens)
+	coordinator.mu.Unlock()
+	if !valid {
+		t.Fatalf("all-running starting-candidate debt is not exact: group=%#v phase=%d borrows=%d memory=%d disk=%d tokens=%d",
+			group, phase, borrows, memory, disk, tokens)
+	}
+}
+
+func TestGeneratedDomainColdStartingCandidatePrefixPublicControls(t *testing.T) {
+	if !generatedDomainRegistryIsolated(t) {
+		return
+	}
+	for _, test := range []struct {
+		name        string
+		createOrder []string
+		start       map[string]bool
+	}{
+		{name: "running_prefix_with_absent_tail_restores_candidate_debt_without_capacity_probe",
+			createOrder: []string{"api"}, start: map[string]bool{"api": true}},
+		{name: "running_prefix_with_never_started_tail_restores_candidate_debt_without_capacity_probe",
+			createOrder: []string{"api", "frontend"}, start: map[string]bool{"api": true}},
+		{name: "all_running_restores_candidate_debt_without_capacity_probe",
+			createOrder: []string{"api", "frontend"}, start: map[string]bool{"api": true, "frontend": true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture := newGeneratedDomainColdStartingCandidatePublicFixture(t, test.createOrder, test.start)
+				domain, err := fixture.construct(t)
+				if err != nil {
+					t.Fatalf("construct valid starting-candidate prefix: %v", err)
+				}
+				assertGeneratedDomainColdStartingCandidateDebt(t, fixture, domain)
+			})
+		})
+	}
+	t.Run("noncontiguous_durable_identity_refuses_before_capacity", func(t *testing.T) {
+		generatedDomainConstructionCase(t, func(t *testing.T) {
+			fixture := newGeneratedDomainColdStartingCandidatePublicFixture(t,
+				[]string{"frontend"}, map[string]bool{"frontend": true})
+			domain, err := fixture.construct(t)
+			assertGeneratedDomainConstructionDiagnostic(t, err,
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdGroupStructure,
+				"generated domain construction was refused: stage=cold_construction reason=cold_group_structure")
+			if domain != nil || generatedColdBoundaryCapacityProbes(fixture.runner.snapshot()) != 0 {
+				t.Fatalf("noncontiguous starting candidate published=%v probes=%d",
+					domain, generatedColdBoundaryCapacityProbes(fixture.runner.snapshot()))
+			}
+		})
+	})
+	for _, test := range []struct {
+		name  string
+		start map[string]bool
+		stop  string
+	}{
+		{name: "earlier_never_started_refuses", start: map[string]bool{"frontend": true}},
+		{name: "multiple_never_started_refuses", start: map[string]bool{}},
+		{name: "final_stopped_refuses", start: map[string]bool{"api": true, "frontend": true}, stop: "frontend"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			generatedDomainConstructionCase(t, func(t *testing.T) {
+				fixture := newGeneratedDomainColdStartingCandidatePublicFixture(t,
+					[]string{"api", "frontend"}, test.start)
+				if test.stop != "" {
+					identity := fixture.identities[test.stop]
+					physical := fixture.candidates.physical[identity.ContainerID]
+					physical.running = false
+					fixture.candidates.physical[identity.ContainerID] = physical
+				}
+				domain, err := fixture.construct(t)
+				assertGeneratedDomainConstructionDiagnostic(t, err,
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdGroupContainerAttestation,
+					"generated domain construction was refused: stage=cold_construction reason=cold_group_container_attestation")
+				if domain != nil || generatedColdBoundaryCapacityProbes(fixture.runner.snapshot()) != 0 {
+					t.Fatalf("invalid starting-candidate physical state published=%v probes=%d",
+						domain, generatedColdBoundaryCapacityProbes(fixture.runner.snapshot()))
+				}
+			})
+		})
+	}
+}
+
+func TestGeneratedDomainColdStartingCandidatePrefixHelperRefusesNoncontiguousDurableIdentity(t *testing.T) {
+	group := generatedDomainColdGroup{
+		kind: generatedDomainColdRisky,
+		snapshot: candidateAdmissionSnapshot{
+			runtime: candidateRuntimeSnapshot{phase: generatedruntimestate.PhaseStartingCandidate},
+			components: []candidateAdmissionComponent{
+				{plan: deploymentplans.Component{Name: "api"}, state: generatedruntimestate.ComponentImageReady},
+				{plan: deploymentplans.Component{Name: "frontend"}, state: generatedruntimestate.ComponentRunning,
+					receipt: &candidateIntentSnapshot{id: "receipt-frontend"}, containerName: "frontend-container",
+					containerID: strings.Repeat("a", 64)},
+			},
+		},
+		policies: map[string]candidatePolicy{"frontend": {}},
+		receipts: map[string]candidateColdReceiptSeed{"frontend": {
+			id: "receipt-frontend", physical: candidatePhysicalPresent,
+		}},
+	}
+	if !generatedDomainColdHasReceipt(group.snapshot.components) {
+		t.Fatal("noncontiguous helper input did not retain durable identity evidence")
+	}
+	if prefix, ok := generatedDomainColdStartingCandidatePrefixLength(group); ok || prefix != 0 {
+		t.Fatalf("noncontiguous starting-candidate prefix=(%d,%t)", prefix, ok)
+	}
 }
 
 func TestGeneratedDomainColdPreActivationHandoffSeeds(t *testing.T) {
