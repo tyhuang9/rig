@@ -1623,6 +1623,349 @@ func TestConfigPromotionRunsAsRootWhileCaddyCommandsRemainNonRoot(t *testing.T) 
 	}
 }
 
+type generatedRoutePreviousLegacyClearFixture struct {
+	manager    *Manager
+	runner     *ingressRunner
+	transition *generatedRouteActivationGatewayTransition
+	before     routeState
+	pending    routeState
+	effective  routeState
+}
+
+func newGeneratedRoutePreviousLegacyClearFixture(t *testing.T) generatedRoutePreviousLegacyClearFixture {
+	t.Helper()
+	manager, runner := newGeneratedRouteLostAckManagerFixture(t)
+	runner.caddyNetworks[runner.network] = &networkAttachment{}
+	previous := routeRecord{Slot: generatedidentity.SlotBlue,
+		Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}
+	proposed := routeRecord{Slot: generatedidentity.SlotGreen,
+		Endpoints: []generatedroute.RouteEndpoint{
+			endpoint("web", "server", runner.network, "web-green", 3000, 'c'),
+		}}
+	before := routeState{Version: stateVersion,
+		Active: map[string]routeRecord{runner.appID: previous}}
+	pending := cloneRouteState(before)
+	pending.Pending = &pendingRoute{AppID: runner.appID, Previous: &previous, Proposed: proposed}
+	effective := cloneRouteState(pending)
+	effective.Active[runner.appID] = proposed
+	effective.Pending = nil
+	request := generatedroute.RouteSwitchRequest{AppID: runner.appID,
+		FromSlot: previous.Slot, ToSlot: proposed.Slot,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), proposed.Endpoints...)}
+	transition := &generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayNativeV1,
+		request: canonicalGeneratedRouteRequest(request),
+		legacy: &generatedRouteActivationLegacyTransition{before: cloneRouteState(before),
+			pending: cloneRouteState(pending), effective: cloneRouteState(effective)}}
+	if !validGeneratedRouteActivationGatewayTransition(transition) {
+		t.Fatal("legacy PreviousExact clear fixture produced an invalid transition")
+	}
+	return generatedRoutePreviousLegacyClearFixture{manager: manager, runner: runner,
+		transition: transition, before: before, pending: pending, effective: effective}
+}
+
+func newGeneratedRoutePreviousInitialLegacyClearFixture(t *testing.T) generatedRoutePreviousLegacyClearFixture {
+	t.Helper()
+	manager, runner := newGeneratedRouteLostAckManagerFixture(t)
+	before := routeState{Version: stateVersion, Active: map[string]routeRecord{}}
+	proposed := routeRecord{Slot: generatedidentity.SlotBlue,
+		Endpoints: []generatedroute.RouteEndpoint{runner.endpoint}}
+	pending := cloneRouteState(before)
+	pending.Pending = &pendingRoute{AppID: runner.appID, Proposed: proposed}
+	effective := cloneRouteState(pending)
+	effective.Active[runner.appID] = proposed
+	effective.Pending = nil
+	request := generatedroute.RouteSwitchRequest{AppID: runner.appID, ToSlot: proposed.Slot,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), proposed.Endpoints...)}
+	transition := &generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayNativeV1,
+		request: canonicalGeneratedRouteRequest(request),
+		legacy: &generatedRouteActivationLegacyTransition{before: cloneRouteState(before),
+			pending: cloneRouteState(pending), effective: cloneRouteState(effective)}}
+	if !validGeneratedRouteActivationGatewayTransition(transition) {
+		t.Fatal("initial legacy PreviousExact clear fixture produced an invalid transition")
+	}
+	return generatedRoutePreviousLegacyClearFixture{manager: manager, runner: runner,
+		transition: transition, before: before, pending: pending, effective: effective}
+}
+
+func (f generatedRoutePreviousLegacyClearFixture) installProtected(t *testing.T, state routeState) {
+	t.Helper()
+	if err := f.manager.store.save(state); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func generatedRoutePreviousLegacySetPhysical(t *testing.T,
+	f generatedRoutePreviousLegacyClearFixture, kind string,
+) {
+	t.Helper()
+	previous := expectedConfig(t, f.runner, f.before.Active)
+	proposed := expectedConfig(t, f.runner, f.effective.Active)
+	switch kind {
+	case "previous":
+		f.runner.liveConfig = append([]byte(nil), previous...)
+		f.runner.files[caddyContainerName+":/config/active.json"] = append([]byte(nil), previous...)
+	case "proposed":
+		f.runner.liveConfig = append([]byte(nil), proposed...)
+		f.runner.files[caddyContainerName+":/config/active.json"] = append([]byte(nil), proposed...)
+	case "mixed":
+		f.runner.liveConfig = append([]byte(nil), proposed...)
+		f.runner.files[caddyContainerName+":/config/active.json"] = append([]byte(nil), previous...)
+	case "unknown":
+		f.runner.liveConfig = []byte(`{"apps":{}}`)
+		f.runner.files[caddyContainerName+":/config/active.json"] = []byte(`{"apps":{}}`)
+	default:
+		t.Fatalf("unknown legacy PreviousExact physical fixture %q", kind)
+	}
+}
+
+func generatedRoutePreviousClearPublicationCommand(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	if args[0] == "network" && (args[1] == "create" || args[1] == "connect" || args[1] == "disconnect") {
+		return true
+	}
+	if args[0] != "container" {
+		return false
+	}
+	switch args[1] {
+	case "create", "start", "stop", "rm":
+		return true
+	case "cp":
+		return len(args) != 4 || args[3] != "-"
+	case "exec":
+		return containsArgument(args, "reload") || containsArgument(args, "validate") ||
+			containsArgument(args, " cp ") || containsArgument(args, " mv ")
+	default:
+		return false
+	}
+}
+
+func generatedRoutePreviousAssertLegacyClearResult(t *testing.T,
+	f generatedRoutePreviousLegacyClearFixture, protected *routeState,
+	physical generatedRouteAttestationRunnerSnapshot, commandsBefore int,
+	transitionBefore *generatedRouteActivationGatewayTransition,
+	protectedBefore *generatedDomainProtectedStartupSnapshot, expectReads bool,
+) {
+	t.Helper()
+	if protected == nil {
+		if _, err := os.Stat(f.manager.store.path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("missing legacy protected state was recreated: %v", err)
+		}
+	} else {
+		state, err := f.manager.store.load()
+		if err != nil || !reflect.DeepEqual(state, *protected) {
+			t.Fatalf("legacy PreviousExact protected state changed: got=%#v want=%#v error=%v",
+				state, *protected, err)
+		}
+	}
+	if after := generatedRouteAttestationRunnerState(f.runner); !reflect.DeepEqual(after, physical) {
+		t.Fatalf("legacy PreviousExact clear changed physical state:\nbefore=%#v\nafter=%#v", physical, after)
+	}
+	for _, command := range f.runner.commands[commandsBefore:] {
+		if generatedRoutePreviousClearPublicationCommand(command) {
+			t.Fatalf("legacy PreviousExact clear issued publication command: %v", command)
+		}
+	}
+	if (len(f.runner.commands) > commandsBefore) != expectReads {
+		t.Fatalf("legacy PreviousExact clear read-command delta=%d wantReads=%t",
+			len(f.runner.commands)-commandsBefore, expectReads)
+	}
+	if protectedBefore != nil {
+		after, err := readGeneratedDomainProtectedStartup(context.Background(), f.manager.options.DataRoot)
+		if err != nil || !generatedRoutePreviousSameProtected(*protectedBefore, after) {
+			t.Fatalf("legacy PreviousExact refusal/idempotent path rewrote protected artifacts: %v", err)
+		}
+	}
+	if !reflect.DeepEqual(f.transition, transitionBefore) {
+		t.Fatal("legacy PreviousExact clear mutated its sealed transition input")
+	}
+}
+
+func generatedRoutePreviousLegacyProtectedSnapshot(t *testing.T,
+	f generatedRoutePreviousLegacyClearFixture,
+) generatedDomainProtectedStartupSnapshot {
+	t.Helper()
+	value, err := readGeneratedDomainProtectedStartup(context.Background(), f.manager.options.DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func generatedRoutePreviousWithoutGatewayLock(value generatedDomainProtectedStartupSnapshot) generatedDomainProtectedStartupSnapshot {
+	filtered := make([]generatedDomainProtectedArtifact, 0, len(value.artifacts))
+	for _, artifact := range value.artifacts {
+		if artifact.name != gatewayLockFilename {
+			filtered = append(filtered, artifact)
+		}
+	}
+	value.artifacts = filtered
+	return value
+}
+
+func generatedRoutePreviousSameProtected(left, right generatedDomainProtectedStartupSnapshot) bool {
+	return sameGeneratedDomainProtectedStartup(generatedRoutePreviousWithoutGatewayLock(left),
+		generatedRoutePreviousWithoutGatewayLock(right))
+}
+
+type generatedRoutePreviousRawProtectedSnapshot struct {
+	directory os.FileInfo
+	entries   []generatedDomainProtectedScanEntry
+}
+
+func generatedRoutePreviousRawProtected(t *testing.T, store *stateStore) generatedRoutePreviousRawProtectedSnapshot {
+	t.Helper()
+	directory, err := store.directoryIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := readGeneratedDomainProtectedDirectoryBounded(store.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanned, err := fingerprintGeneratedDomainProtectedEntries(store, entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	filtered := make([]generatedDomainProtectedScanEntry, 0, len(scanned))
+	for _, entry := range scanned {
+		if entry.name != gatewayLockFilename {
+			filtered = append(filtered, entry)
+		}
+	}
+	return generatedRoutePreviousRawProtectedSnapshot{directory: directory, entries: filtered}
+}
+
+func generatedRoutePreviousSameRawProtected(left, right generatedRoutePreviousRawProtectedSnapshot) bool {
+	if left.directory == nil || right.directory == nil || !os.SameFile(left.directory, right.directory) ||
+		left.directory.Mode() != right.directory.Mode() || len(left.entries) != len(right.entries) {
+		return false
+	}
+	for index := range left.entries {
+		l, r := left.entries[index], right.entries[index]
+		if l.name != r.name || l.path != r.path ||
+			!sameGeneratedDomainProtectedFingerprint(l.fingerprint, r.fingerprint) {
+			return false
+		}
+	}
+	return true
+}
+
+func TestGeneratedRouteActivationPreviousExactLegacyClearMatrix(t *testing.T) {
+	t.Run("exact_previous_clears", func(t *testing.T) {
+		f := newGeneratedRoutePreviousLegacyClearFixture(t)
+		f.installProtected(t, f.pending)
+		generatedRoutePreviousLegacySetPhysical(t, f, "previous")
+		physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+		transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); err != nil {
+			t.Fatal(err)
+		}
+		generatedRoutePreviousAssertLegacyClearResult(t, f, &f.before, physical, commands, transition, nil, true)
+	})
+
+	t.Run("already_cleared_is_idempotent", func(t *testing.T) {
+		f := newGeneratedRoutePreviousInitialLegacyClearFixture(t)
+		f.installProtected(t, f.before)
+		generatedRoutePreviousLegacySetPhysical(t, f, "previous")
+		physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+		transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+		protected := generatedRoutePreviousLegacyProtectedSnapshot(t, f)
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); err != nil {
+			t.Fatal(err)
+		}
+		generatedRoutePreviousAssertLegacyClearResult(t, f, &f.before, physical, commands, transition,
+			&protected, true)
+	})
+
+	t.Run("crossed_protected_state_refuses", func(t *testing.T) {
+		f := newGeneratedRoutePreviousLegacyClearFixture(t)
+		crossed := cloneRouteState(f.pending)
+		crossed.Pending.Proposed.Endpoints = []generatedroute.RouteEndpoint{
+			endpoint("web", "server", f.runner.network, "web-green", 3000, 'f')}
+		f.installProtected(t, crossed)
+		generatedRoutePreviousLegacySetPhysical(t, f, "previous")
+		physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+		transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+		protected := generatedRoutePreviousLegacyProtectedSnapshot(t, f)
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); !IsCode(err, DiagnosticRouteUnresolved) {
+			t.Fatalf("crossed legacy protected state error=%v", err)
+		}
+		generatedRoutePreviousAssertLegacyClearResult(t, f, &crossed, physical, commands, transition,
+			&protected, false)
+	})
+
+	for _, test := range []struct{ name, physical string }{
+		{"physical_proposed_refuses", "proposed"},
+		{"physical_mixed_refuses", "mixed"},
+		{"physical_unknown_refuses", "unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newGeneratedRoutePreviousLegacyClearFixture(t)
+			f.installProtected(t, f.pending)
+			generatedRoutePreviousLegacySetPhysical(t, f, test.physical)
+			physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+			transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+			protected := generatedRoutePreviousLegacyProtectedSnapshot(t, f)
+			if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); !IsCode(err, DiagnosticIngressDrift) {
+				t.Fatalf("legacy %s physical error=%v", test.physical, err)
+			}
+			generatedRoutePreviousAssertLegacyClearResult(t, f, &f.pending, physical, commands, transition,
+				&protected, true)
+		})
+	}
+
+	t.Run("protected_state_missing_refuses", func(t *testing.T) {
+		f := newGeneratedRoutePreviousLegacyClearFixture(t)
+		f.installProtected(t, f.pending)
+		generatedRoutePreviousLegacySetPhysical(t, f, "previous")
+		if err := os.Remove(f.manager.store.path); err != nil {
+			t.Fatal(err)
+		}
+		physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+		transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+		protected := generatedRoutePreviousLegacyProtectedSnapshot(t, f)
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); !IsCode(err, DiagnosticRouteStateFailed) {
+			t.Fatalf("missing legacy protected state error=%v", err)
+		}
+		generatedRoutePreviousAssertLegacyClearResult(t, f, nil, physical, commands, transition,
+			&protected, false)
+
+		missingInitial := newGeneratedRoutePreviousInitialLegacyClearFixture(t)
+		missingInitial.installProtected(t, missingInitial.before)
+		generatedRoutePreviousLegacySetPhysical(t, missingInitial, "previous")
+		if err := os.Remove(missingInitial.manager.store.path); err != nil {
+			t.Fatal(err)
+		}
+		missingPhysical := generatedRouteAttestationRunnerState(missingInitial.runner)
+		missingCommands := len(missingInitial.runner.commands)
+		missingTransition := cloneGeneratedRouteActivationGatewayTransition(missingInitial.transition)
+		missingProtected := generatedRoutePreviousLegacyProtectedSnapshot(t, missingInitial)
+		if err := missingInitial.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), missingInitial.transition); !IsCode(err, DiagnosticRouteStateFailed) {
+			t.Fatalf("missing canonical empty legacy Before error=%v", err)
+		}
+		generatedRoutePreviousAssertLegacyClearResult(t, missingInitial, nil,
+			missingPhysical, missingCommands, missingTransition, &missingProtected, false)
+	})
+
+	t.Run("canceled_context_refuses", func(t *testing.T) {
+		f := newGeneratedRoutePreviousLegacyClearFixture(t)
+		f.installProtected(t, f.pending)
+		generatedRoutePreviousLegacySetPhysical(t, f, "previous")
+		physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+		transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+		protected := generatedRoutePreviousLegacyProtectedSnapshot(t, f)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(ctx, f.transition); !IsCode(err, DiagnosticCancelled) {
+			t.Fatalf("canceled legacy clear error=%v", err)
+		}
+		generatedRoutePreviousAssertLegacyClearResult(t, f, &f.pending, physical, commands, transition,
+			&protected, false)
+	})
+}
+
 func newManagerFixture(t *testing.T, failReload bool) (*Manager, *ingressRunner) {
 	t.Helper()
 	root := t.TempDir()

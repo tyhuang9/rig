@@ -15,6 +15,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
+	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	"modernc.org/sqlite"
 )
 
@@ -45,7 +46,7 @@ func TestGeneratedRouteActivationResolvesLostDurableCommitAcknowledgement(t *tes
 		t.Fatal(err)
 	}
 
-	manager, runner := newManagerFixture(t, false)
+	manager, runner := newGeneratedRouteLostAckManagerFixture(t)
 	runner.appID = migration.guarded.appID
 	runner.network = identity.NetworkName
 	runner.endpoint = generatedRouteEndpoint(identity)
@@ -140,6 +141,47 @@ func TestGeneratedRouteActivationResolvesLostDurableCommitAcknowledgement(t *tes
 		!errors.Is(err, deploymentexecution.ErrScopeUnavailable) {
 		t.Fatalf("used execution replay result=%#v error=%v", replay, err)
 	}
+}
+
+// newGeneratedRouteLostAckManagerFixture preserves the ordinary legacy
+// Manager fixture while giving its new physical attestation the exact Caddy
+// live/restart reader used by recovered-route tests. The adapter is installed
+// before Manager construction, so the authority never changes runner identity;
+// every non-read command still reaches the original ingressRunner.
+func newGeneratedRouteLostAckManagerFixture(t *testing.T) (*Manager, *ingressRunner) {
+	t.Helper()
+	root := t.TempDir()
+	directories, err := runtimedocker.PrepareControllerDirectories(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appID := "11111111-1111-4111-8111-111111111111"
+	initial := endpoint("web", "server", "rig-app-network", "web-blue", 3000, 'b')
+	_, _, ingressIP := ingressNetworkCandidate(0)
+	runner := &ingressRunner{
+		appID: appID, network: initial.NetworkName, endpoint: initial,
+		caddyNetworks: map[string]*networkAttachment{caddyNetworkName: {
+			GwPriority: caddyGatewayPriority, IPAddress: ingressIP}},
+		ingressContainers: map[string]caddyNetworkContainerInspection{strings.Repeat("d", 64): {
+			Name: caddyContainerName, IPv4Address: ingressIP + "/28"}},
+		files: map[string][]byte{},
+	}
+	physicalRoutes := &generatedRoutePredecessorRunner{ingressRunner: runner,
+		endpoints: make(map[string]generatedRouteEndpointSnapshot)}
+	reader := &generatedRouteColdAccountingRouteReadRunner{routes: physicalRoutes, delegate: physicalRoutes}
+	manager, err := New(reader, Options{
+		DockerExecutable:      filepath.Join(root, "docker.exe"),
+		DockerConfigDirectory: directories.DockerConfigDirectory,
+		WorkingDirectory:      directories.WorkingDirectory,
+		DataRoot:              root,
+		RebindFenceCheck:      func(context.Context) error { return nil },
+		RebindCurrentStateRepository: gatewayCurrentSelectionRepositoryFunc(
+			emptyStartupPresenceRepository),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manager, runner
 }
 
 type generatedRouteLostAckFault struct {

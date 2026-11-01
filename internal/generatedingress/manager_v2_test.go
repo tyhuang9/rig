@@ -447,6 +447,277 @@ func TestCommittedV2RejectsUnattachedApplicationNetworkBeforePendingOrReload(t *
 	}
 }
 
+type generatedRoutePreviousCommittedV2ClearFixture struct {
+	manager       *Manager
+	runner        *committedV2Runner
+	store         *gatewayUpgradeStateStore
+	transition    *generatedRouteActivationGatewayTransition
+	before        gatewayV2RouteState
+	pending       gatewayV2RouteState
+	effective     gatewayV2RouteState
+	journal       gatewayMigrationJournal
+	topologyCalls *int
+	mixedCalls    *int
+}
+
+func newGeneratedRoutePreviousCommittedV2ClearFixture(t *testing.T) generatedRoutePreviousCommittedV2ClearFixture {
+	t.Helper()
+	manager, _ := newManagerFixture(t, false)
+	installCommittedV2Pair(t, manager)
+	runner := newCommittedV2Runner()
+	manager.runner = runner
+	store, err := newGatewayUpgradeStateStore(manager.options.DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, journal, err := store.loadBoundUpgrade("55555555-5555-4555-8555-555555555555")
+	if err != nil {
+		t.Fatal(err)
+	}
+	previous := cloneGatewayV2AppRoute(before.Apps[upgradeTestAppA])
+	proposed := cloneGatewayV2AppRoute(previous)
+	proposed.Route = routeRecord{Slot: generatedidentity.SlotGreen,
+		Endpoints: []generatedroute.RouteEndpoint{
+			endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'd'),
+			endpoint("api", "server", "net-a", "api-green", 3000, 'e'),
+		}}
+	pending := cloneGatewayV2RouteState(before)
+	pending.Pending = &gatewayV2PendingRoute{Kind: gatewayV2PendingRouteSwitch,
+		AppID: upgradeTestAppA, Previous: &previous, Proposed: cloneGatewayV2AppRoute(proposed)}
+	effective := cloneGatewayV2RouteState(before)
+	effective.Apps[upgradeTestAppA] = cloneGatewayV2AppRoute(proposed)
+	request := generatedroute.RouteSwitchRequest{AppID: upgradeTestAppA,
+		FromSlot: previous.Route.Slot, ToSlot: proposed.Route.Slot,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), proposed.Route.Endpoints...)}
+	transition := &generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayNativeV2,
+		request: canonicalGeneratedRouteRequest(request),
+		nativeV2: &generatedRouteActivationNativeV2Transition{
+			before: cloneGatewayV2RouteState(before), pending: cloneGatewayV2RouteState(pending),
+			effective: cloneGatewayV2RouteState(effective), journal: journal,
+			operationID: before.OperationID,
+		}}
+	if !validGeneratedRouteActivationGatewayTransition(transition) {
+		t.Fatal("committed V2 PreviousExact clear fixture produced an invalid transition")
+	}
+	return generatedRoutePreviousCommittedV2ClearFixture{manager: manager, runner: runner,
+		store: store, transition: transition, before: before, pending: pending,
+		effective: effective, journal: journal, topologyCalls: new(int), mixedCalls: new(int)}
+}
+
+func (f generatedRoutePreviousCommittedV2ClearFixture) installProtected(t *testing.T,
+	state gatewayV2RouteState,
+) {
+	t.Helper()
+	if err := f.store.saveCommittedV2State(state, f.journal); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f generatedRoutePreviousCommittedV2ClearFixture) setPhysical(kind string) {
+	f.manager.gatewayMixedRestartObserver = nil
+	f.manager.gatewayTopologyObserver = func(_ context.Context, _ routeState,
+		candidate gatewayV2RouteState, _ gatewayMigrationJournal,
+	) gatewayObservedTopology {
+		(*f.topologyCalls)++
+		switch kind {
+		case "previous":
+			if reflect.DeepEqual(candidate, f.before) {
+				return gatewayTopologyExactFinalV2
+			}
+		case "proposed":
+			if reflect.DeepEqual(candidate, f.effective) {
+				return gatewayTopologyExactFinalV2
+			}
+		}
+		return gatewayTopologyUnknownOrDrift
+	}
+	if kind == "mixed" {
+		f.manager.gatewayMixedRestartObserver = func(context.Context, routeState,
+			gatewayV2RouteState, gatewayV2RouteState, gatewayMigrationJournal,
+		) bool {
+			(*f.mixedCalls)++
+			return true
+		}
+	} else if kind == "unknown" {
+		f.manager.gatewayMixedRestartObserver = func(context.Context, routeState,
+			gatewayV2RouteState, gatewayV2RouteState, gatewayMigrationJournal,
+		) bool {
+			(*f.mixedCalls)++
+			return false
+		}
+	}
+}
+
+func generatedRoutePreviousAssertCommittedV2ClearResult(t *testing.T,
+	f generatedRoutePreviousCommittedV2ClearFixture, protected *gatewayV2RouteState,
+	journalBytes []byte, files map[string][]byte, commandsBefore int,
+	transitionBefore *generatedRouteActivationGatewayTransition,
+	protectedBefore *generatedDomainProtectedStartupSnapshot, observerBefore, observerDelta [2]int,
+) {
+	t.Helper()
+	if protected == nil {
+		if _, err := os.Stat(f.store.v2Path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("missing committed V2 protected state was recreated: %v", err)
+		}
+	} else {
+		state, journal, err := f.store.loadBoundUpgrade(f.journal.OperationID)
+		if err != nil || !reflect.DeepEqual(state, *protected) || !reflect.DeepEqual(journal, f.journal) {
+			t.Fatalf("committed V2 PreviousExact protected state changed: state=%#v journal=%#v error=%v",
+				state, journal, err)
+		}
+	}
+	afterJournal, err := os.ReadFile(f.store.journalPath)
+	if err != nil || !reflect.DeepEqual(afterJournal, journalBytes) {
+		t.Fatalf("committed V2 PreviousExact clear changed its journal bytes: %v", err)
+	}
+	if !reflect.DeepEqual(f.runner.files, files) || len(f.runner.commands) != commandsBefore {
+		t.Fatalf("committed V2 PreviousExact clear issued physical work: files=%#v commands=%v",
+			f.runner.files, f.runner.commands[commandsBefore:])
+	}
+	if *f.topologyCalls != observerBefore[0]+observerDelta[0] ||
+		*f.mixedCalls != observerBefore[1]+observerDelta[1] {
+		t.Fatalf("committed V2 PreviousExact observer calls=%d/%d before=%v delta=%v",
+			*f.topologyCalls, *f.mixedCalls, observerBefore, observerDelta)
+	}
+	if protectedBefore != nil {
+		after, err := readGeneratedDomainProtectedStartup(context.Background(), f.manager.options.DataRoot)
+		if err != nil || !generatedRoutePreviousSameProtected(*protectedBefore, after) {
+			t.Fatalf("committed V2 PreviousExact refusal/idempotent path rewrote protected artifacts: %v", err)
+		}
+	}
+	if !reflect.DeepEqual(f.transition, transitionBefore) {
+		t.Fatal("committed V2 PreviousExact clear mutated its sealed transition input")
+	}
+}
+
+func generatedRoutePreviousCommittedV2Snapshots(t *testing.T,
+	f generatedRoutePreviousCommittedV2ClearFixture,
+) ([]byte, map[string][]byte, int, *generatedRouteActivationGatewayTransition, [2]int) {
+	t.Helper()
+	journal, err := os.ReadFile(f.store.journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := make(map[string][]byte, len(f.runner.files))
+	for name, body := range f.runner.files {
+		files[name] = append([]byte(nil), body...)
+	}
+	return journal, files, len(f.runner.commands), cloneGeneratedRouteActivationGatewayTransition(f.transition),
+		[2]int{*f.topologyCalls, *f.mixedCalls}
+}
+
+func generatedRoutePreviousCommittedV2ProtectedSnapshot(t *testing.T,
+	f generatedRoutePreviousCommittedV2ClearFixture,
+) generatedDomainProtectedStartupSnapshot {
+	t.Helper()
+	value, err := readGeneratedDomainProtectedStartup(context.Background(), f.manager.options.DataRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
+func TestGeneratedRouteActivationPreviousExactCommittedV2ClearMatrix(t *testing.T) {
+	t.Run("exact_previous_clears", func(t *testing.T) {
+		f := newGeneratedRoutePreviousCommittedV2ClearFixture(t)
+		f.installProtected(t, f.pending)
+		f.setPhysical("previous")
+		journal, files, commands, transition, observers := generatedRoutePreviousCommittedV2Snapshots(t, f)
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); err != nil {
+			t.Fatal(err)
+		}
+		generatedRoutePreviousAssertCommittedV2ClearResult(t, f, &f.before,
+			journal, files, commands, transition, nil, observers, [2]int{2, 0})
+	})
+
+	t.Run("already_cleared_is_idempotent", func(t *testing.T) {
+		f := newGeneratedRoutePreviousCommittedV2ClearFixture(t)
+		f.installProtected(t, f.pending)
+		f.installProtected(t, f.before)
+		f.setPhysical("previous")
+		journal, files, commands, transition, observers := generatedRoutePreviousCommittedV2Snapshots(t, f)
+		protected := generatedRoutePreviousCommittedV2ProtectedSnapshot(t, f)
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); err != nil {
+			t.Fatal(err)
+		}
+		generatedRoutePreviousAssertCommittedV2ClearResult(t, f, &f.before,
+			journal, files, commands, transition, &protected, observers, [2]int{1, 0})
+	})
+
+	t.Run("crossed_protected_state_refuses", func(t *testing.T) {
+		f := newGeneratedRoutePreviousCommittedV2ClearFixture(t)
+		crossed := cloneGatewayV2RouteState(f.pending)
+		crossed.Pending.Proposed.Route.Endpoints[0] =
+			endpoint("frontend", "static", "net-a", "frontend-green", 4173, 'f')
+		f.installProtected(t, crossed)
+		f.setPhysical("previous")
+		journal, files, commands, transition, observers := generatedRoutePreviousCommittedV2Snapshots(t, f)
+		protected := generatedRoutePreviousCommittedV2ProtectedSnapshot(t, f)
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); !IsCode(err, DiagnosticRouteUnresolved) {
+			t.Fatalf("crossed committed V2 protected state error=%v", err)
+		}
+		generatedRoutePreviousAssertCommittedV2ClearResult(t, f, &crossed,
+			journal, files, commands, transition, &protected, observers, [2]int{})
+	})
+
+	for _, test := range []struct{ name, physical string }{
+		{"physical_proposed_refuses", "proposed"},
+		{"physical_mixed_refuses", "mixed"},
+		{"physical_unknown_refuses", "unknown"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newGeneratedRoutePreviousCommittedV2ClearFixture(t)
+			f.installProtected(t, f.pending)
+			f.setPhysical(test.physical)
+			journal, files, commands, transition, observers := generatedRoutePreviousCommittedV2Snapshots(t, f)
+			protected := generatedRoutePreviousCommittedV2ProtectedSnapshot(t, f)
+			if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); !IsCode(err, DiagnosticRouteUnresolved) {
+				t.Fatalf("committed V2 %s physical error=%v", test.physical, err)
+			}
+			delta := [2]int{2, 0}
+			if test.physical == "mixed" || test.physical == "unknown" {
+				delta[1] = 1
+			}
+			generatedRoutePreviousAssertCommittedV2ClearResult(t, f, &f.pending,
+				journal, files, commands, transition, &protected, observers, delta)
+		})
+	}
+
+	t.Run("protected_state_missing_refuses", func(t *testing.T) {
+		f := newGeneratedRoutePreviousCommittedV2ClearFixture(t)
+		f.installProtected(t, f.pending)
+		f.setPhysical("previous")
+		if err := os.Remove(f.store.v2Path); err != nil {
+			t.Fatal(err)
+		}
+		journal, files, commands, transition, observers := generatedRoutePreviousCommittedV2Snapshots(t, f)
+		protected := generatedRoutePreviousRawProtected(t, f.store.directory)
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(context.Background(), f.transition); !IsCode(err, DiagnosticRouteUnresolved) {
+			t.Fatalf("missing committed V2 protected state error=%v", err)
+		}
+		generatedRoutePreviousAssertCommittedV2ClearResult(t, f, nil,
+			journal, files, commands, transition, nil, observers, [2]int{})
+		if after := generatedRoutePreviousRawProtected(t, f.store.directory); !generatedRoutePreviousSameRawProtected(protected, after) {
+			t.Fatal("missing committed V2 refusal changed remaining protected artifacts")
+		}
+	})
+
+	t.Run("canceled_context_refuses", func(t *testing.T) {
+		f := newGeneratedRoutePreviousCommittedV2ClearFixture(t)
+		f.installProtected(t, f.pending)
+		f.setPhysical("previous")
+		journal, files, commands, transition, observers := generatedRoutePreviousCommittedV2Snapshots(t, f)
+		protected := generatedRoutePreviousCommittedV2ProtectedSnapshot(t, f)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := f.manager.clearPreviousGeneratedDomainRouteActivation(ctx, f.transition); !IsCode(err, DiagnosticCancelled) {
+			t.Fatalf("canceled committed V2 clear error=%v", err)
+		}
+		generatedRoutePreviousAssertCommittedV2ClearResult(t, f, &f.pending,
+			journal, files, commands, transition, &protected, observers, [2]int{})
+	})
+}
+
 func TestObservationBudgetsSeparateLockAcquisitionFromCommittedV2Probes(t *testing.T) {
 	t.Run("committed v2 gets the larger post-lock budget", func(t *testing.T) {
 		manager, _ := newManagerFixture(t, false)

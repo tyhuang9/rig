@@ -1307,6 +1307,75 @@ func (r *generatedDomainStartupReader) readLiveConfig(ctx context.Context, deadl
 	return body, nil
 }
 
+// generatedDomainGatewayConfigObservation is one borrowed live/restart pair
+// for a cold Pending classification. It is deliberately stack-local: neither
+// startup readers nor later worker attestation can reuse its descriptive cold
+// evidence. Consumers receive copies because the normal attestors clear their
+// config buffers after parsing.
+type generatedDomainGatewayConfigObservation struct {
+	reader                *generatedDomainStartupReader
+	containerID, filename string
+	restart, live         []byte
+}
+
+func (r *generatedDomainStartupReader) readGatewayConfigObservation(ctx context.Context, deadline time.Time,
+	containerID, filename string,
+) (*generatedDomainGatewayConfigObservation, error) {
+	if r == nil || !generatedDomainCanonicalDockerID(containerID, false) || !validName(filename, 255) {
+		return nil, errors.New("generated domain gateway config observation is invalid")
+	}
+	restart, err := r.readRestartConfig(ctx, deadline, containerID, filename)
+	if err != nil {
+		return nil, err
+	}
+	live, err := r.readLiveConfig(ctx, deadline, containerID)
+	if err != nil {
+		clear(restart)
+		return nil, err
+	}
+	return &generatedDomainGatewayConfigObservation{reader: r, containerID: containerID, filename: filename,
+		restart: restart, live: live}, nil
+}
+
+func (o *generatedDomainGatewayConfigObservation) clear() {
+	if o == nil {
+		return
+	}
+	clear(o.restart)
+	clear(o.live)
+	o.restart, o.live = nil, nil
+	o.reader, o.containerID, o.filename = nil, "", ""
+}
+
+// readGatewayRestartConfigObserved preserves the ordinary restart-first
+// attestation order. A borrowed value must belong to this reader and exact
+// immutable container/file pair; no fallback is permitted.
+func (r *generatedDomainStartupReader) readGatewayRestartConfigObserved(ctx context.Context, deadline time.Time,
+	containerID, filename string, observation *generatedDomainGatewayConfigObservation,
+) ([]byte, error) {
+	if observation == nil {
+		return r.readRestartConfig(ctx, deadline, containerID, filename)
+	}
+	if r == nil || observation.reader != r || observation.containerID != containerID ||
+		observation.filename != filename || len(observation.restart) == 0 {
+		return nil, errors.New("generated domain gateway config observation does not bind this reader")
+	}
+	return append([]byte(nil), observation.restart...), nil
+}
+
+func (r *generatedDomainStartupReader) readGatewayLiveConfigObserved(ctx context.Context, deadline time.Time,
+	containerID, filename string, observation *generatedDomainGatewayConfigObservation,
+) ([]byte, error) {
+	if observation == nil {
+		return r.readLiveConfig(ctx, deadline, containerID)
+	}
+	if r == nil || observation.reader != r || observation.containerID != containerID ||
+		observation.filename != filename || len(observation.live) == 0 {
+		return nil, errors.New("generated domain gateway config observation does not bind this reader")
+	}
+	return append([]byte(nil), observation.live...), nil
+}
+
 func (r *generatedDomainStartupReader) proveGatewayStaticResponse(ctx context.Context, deadline time.Time,
 	containerID, address string, port uint16, host, token, expectedBody string,
 ) error {
@@ -1333,6 +1402,13 @@ func (r *generatedDomainStartupReader) proveGatewayStaticResponse(ctx context.Co
 func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
 	allowApplicationRoutes bool,
+) (generatedDomainGatewayAttestation, error) {
+	return r.attestNativeV1Observed(ctx, deadline, snapshot, expected, allowApplicationRoutes, nil)
+}
+
+func (r *generatedDomainStartupReader) attestNativeV1Observed(ctx context.Context, deadline time.Time,
+	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool, observation *generatedDomainGatewayConfigObservation,
 ) (generatedDomainGatewayAttestation, error) {
 	if expected.nativeV1 == nil || !allowApplicationRoutes && len(expected.nativeV1.Active) != 0 {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V1 gateway is unsupported")
@@ -1378,7 +1454,7 @@ func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadl
 			errors.New("generated domain native V1 config is invalid"))
 	}
 	defer clear(wanted)
-	restart, err := r.readRestartConfig(ctx, deadline, container.ID, gatewayV2ActiveConfigFile)
+	restart, err := r.readGatewayRestartConfigObserved(ctx, deadline, container.ID, gatewayV2ActiveConfigFile, observation)
 	if err != nil || !sameCaddyConfig(wanted, restart) {
 		clear(restart)
 		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
@@ -1386,7 +1462,7 @@ func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadl
 			errors.New("generated domain native V1 restart config is invalid"))
 	}
 	defer clear(restart)
-	live, err := r.readLiveConfig(ctx, deadline, container.ID)
+	live, err := r.readGatewayLiveConfigObserved(ctx, deadline, container.ID, gatewayV2ActiveConfigFile, observation)
 	if err != nil || !sameCaddyConfig(wanted, live) {
 		clear(live)
 		return generatedDomainGatewayAttestation{}, generatedDomainDockerCollapsedDiagnostic(
@@ -1417,6 +1493,13 @@ func (r *generatedDomainStartupReader) attestNativeV1(ctx context.Context, deadl
 func (r *generatedDomainStartupReader) attestNativeV2(ctx context.Context, deadline time.Time,
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
 	allowApplicationRoutes bool,
+) (generatedDomainGatewayAttestation, error) {
+	return r.attestNativeV2Observed(ctx, deadline, snapshot, expected, allowApplicationRoutes, nil)
+}
+
+func (r *generatedDomainStartupReader) attestNativeV2Observed(ctx context.Context, deadline time.Time,
+	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool, observation *generatedDomainGatewayConfigObservation,
 ) (generatedDomainGatewayAttestation, error) {
 	if expected.nativeV2 == nil || expected.journal == nil || !allowApplicationRoutes && len(expected.nativeV2.Apps) != 0 ||
 		expected.journal.Phase != gatewayPhaseCommitted {
@@ -1450,7 +1533,7 @@ func (r *generatedDomainStartupReader) attestNativeV2(ctx context.Context, deadl
 	if err != nil {
 		return generatedDomainGatewayAttestation{}, err
 	}
-	observation := gatewayV2DockerObservation{
+	dockerObservation := gatewayV2DockerObservation{
 		Image: image, ImageFound: true,
 		ConfigVolume: config, ConfigVolumeIdentity: configID, ConfigVolumeFound: true,
 		DataVolume: data, DataVolumeIdentity: dataID, DataVolumeFound: true,
@@ -1458,8 +1541,8 @@ func (r *generatedDomainStartupReader) attestNativeV2(ctx context.Context, deadl
 		FinalContainer: container, FinalRuntime: runtime, FinalContainerFound: true,
 		OwnedVolumes: []string{state.Identity.ConfigVolume, state.Identity.DataVolume},
 	}
-	if !gatewayV2ObservedResourcesMatchJournal(journal, observation) ||
-		!validGatewayV2Volumes(state, journal, observation) ||
+	if !gatewayV2ObservedResourcesMatchJournal(journal, dockerObservation) ||
+		!validGatewayV2Volumes(state, journal, dockerObservation) ||
 		!validGatewayV2Container(state, journal, container, runtime, true, gatewayV2FinalContainerRole, image.ID) ||
 		!validGatewayV2IngressNetwork(state, journal, network, true, container.ID, state.Identity.FinalContainer) {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V2 static identity is invalid")
@@ -1469,13 +1552,13 @@ func (r *generatedDomainStartupReader) attestNativeV2(ctx context.Context, deadl
 		return generatedDomainGatewayAttestation{}, err
 	}
 	defer clear(wanted)
-	restart, err := r.readRestartConfig(ctx, deadline, container.ID, state.Identity.ActiveConfigFilename)
+	restart, err := r.readGatewayRestartConfigObserved(ctx, deadline, container.ID, state.Identity.ActiveConfigFilename, observation)
 	if err != nil || !sameCaddyConfig(wanted, restart) {
 		clear(restart)
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V2 restart config is invalid")
 	}
 	defer clear(restart)
-	live, err := r.readLiveConfig(ctx, deadline, container.ID)
+	live, err := r.readGatewayLiveConfigObserved(ctx, deadline, container.ID, state.Identity.ActiveConfigFilename, observation)
 	if err != nil || !sameCaddyConfig(wanted, live) {
 		clear(live)
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain native V2 live config is invalid")
@@ -1495,8 +1578,15 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
 	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
+	return r.attestCurrentObserved(ctx, deadline, snapshot, expected, allowApplicationRoutes, nil)
+}
+
+func (r *generatedDomainStartupReader) attestCurrentObserved(ctx context.Context, deadline time.Time,
+	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool, observation *generatedDomainGatewayConfigObservation,
+) (generatedDomainGatewayAttestation, error) {
 	if expected.currentV2 != nil && expected.currentV2.Lineage.Kind == appaccess.GatewayRebindSourceGatewayUpgrade {
-		return r.attestCurrentV2Upgrade(ctx, deadline, snapshot, expected, allowApplicationRoutes)
+		return r.attestCurrentV2UpgradeObserved(ctx, deadline, snapshot, expected, allowApplicationRoutes, observation)
 	}
 	if expected.terminal == nil {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway terminal is unavailable")
@@ -1580,13 +1670,13 @@ func (r *generatedDomainStartupReader) attestCurrent(ctx context.Context, deadli
 		!generatedDomainCurrentStartupNetworksMatch(*final, networkPlan, container, runtime, ingressID, applications) {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway static identity is invalid")
 	}
-	restart, err := r.readRestartConfig(ctx, deadline, container.ID, final.ActiveConfigFilename)
+	restart, err := r.readGatewayRestartConfigObserved(ctx, deadline, container.ID, final.ActiveConfigFilename, observation)
 	if err != nil || !sameCaddyConfig(wanted, restart) {
 		clear(restart)
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway restart config is invalid")
 	}
 	defer clear(restart)
-	live, err := r.readLiveConfig(ctx, deadline, container.ID)
+	live, err := r.readGatewayLiveConfigObserved(ctx, deadline, container.ID, final.ActiveConfigFilename, observation)
 	if err != nil || !sameCaddyConfig(wanted, live) {
 		clear(live)
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current gateway live config is invalid")
@@ -1683,6 +1773,13 @@ func (r *generatedDomainStartupReader) attestCurrentV2Upgrade(ctx context.Contex
 	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
 	allowApplicationRoutes bool,
 ) (generatedDomainGatewayAttestation, error) {
+	return r.attestCurrentV2UpgradeObserved(ctx, deadline, snapshot, expected, allowApplicationRoutes, nil)
+}
+
+func (r *generatedDomainStartupReader) attestCurrentV2UpgradeObserved(ctx context.Context, deadline time.Time,
+	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	allowApplicationRoutes bool, observation *generatedDomainGatewayConfigObservation,
+) (generatedDomainGatewayAttestation, error) {
 	if !generatedDomainCurrentV2UpgradeExpectationValid(expected) || expected.currentV2 == nil ||
 		expected.nativeV2 == nil || expected.journal == nil ||
 		!allowApplicationRoutes && (len(expected.currentV2.Apps) != 0 || len(expected.nativeV2.Apps) != 0) ||
@@ -1717,7 +1814,7 @@ func (r *generatedDomainStartupReader) attestCurrentV2Upgrade(ctx context.Contex
 	if err != nil {
 		return generatedDomainGatewayAttestation{}, err
 	}
-	observation := gatewayV2DockerObservation{
+	dockerObservation := gatewayV2DockerObservation{
 		Image: image, ImageFound: true,
 		ConfigVolume: config, ConfigVolumeIdentity: configID, ConfigVolumeFound: true,
 		DataVolume: data, DataVolumeIdentity: dataID, DataVolumeFound: true,
@@ -1725,8 +1822,8 @@ func (r *generatedDomainStartupReader) attestCurrentV2Upgrade(ctx context.Contex
 		FinalContainer: container, FinalRuntime: runtime, FinalContainerFound: true,
 		OwnedVolumes: []string{source.Identity.ConfigVolume, source.Identity.DataVolume},
 	}
-	if !validGatewayPinnedImage(image, true) || !gatewayV2ObservedResourcesMatchJournal(journal, observation) ||
-		!validGatewayV2Volumes(source, journal, observation) ||
+	if !validGatewayPinnedImage(image, true) || !gatewayV2ObservedResourcesMatchJournal(journal, dockerObservation) ||
+		!validGatewayV2Volumes(source, journal, dockerObservation) ||
 		!validGatewayV2Container(source, journal, container, runtime, true, gatewayV2FinalContainerRole, image.ID) ||
 		!validGatewayV2IngressNetwork(source, journal, ingress, true, container.ID, source.Identity.FinalContainer) {
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current V2 upgrade static identity is invalid")
@@ -1736,13 +1833,13 @@ func (r *generatedDomainStartupReader) attestCurrentV2Upgrade(ctx context.Contex
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current V2 upgrade config is invalid")
 	}
 	defer clear(wanted)
-	restart, err := r.readRestartConfig(ctx, deadline, container.ID, source.Identity.ActiveConfigFilename)
+	restart, err := r.readGatewayRestartConfigObserved(ctx, deadline, container.ID, source.Identity.ActiveConfigFilename, observation)
 	if err != nil || !sameCaddyConfig(wanted, restart) {
 		clear(restart)
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current V2 upgrade restart config is invalid")
 	}
 	defer clear(restart)
-	live, err := r.readLiveConfig(ctx, deadline, container.ID)
+	live, err := r.readGatewayLiveConfigObserved(ctx, deadline, container.ID, source.Identity.ActiveConfigFilename, observation)
 	if err != nil || !sameCaddyConfig(wanted, live) {
 		clear(live)
 		return generatedDomainGatewayAttestation{}, errors.New("generated domain current V2 upgrade live config is invalid")

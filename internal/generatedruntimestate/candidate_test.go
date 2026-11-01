@@ -395,8 +395,16 @@ func newCandidateFixture(t *testing.T, components []string) *candidateFixture {
 		f.releaseID, f.appID, stamp, strings.Repeat("b", 64), strings.Repeat("e", 64), f.releaseConfigurationID, f.planID)
 	f.exec(t, `INSERT INTO jobs(
 		id,type,resource_type,resource_id,status,phase,attempt,requested_by,input_json,created_at,started_at,updated_at
-	) VALUES(?,'deploy','application',?,'running','running',?,?,'{}',?,?,?)`,
-		f.jobID, f.appID, f.jobAttempt, f.actorID, stamp, stamp, stamp)
+	) VALUES(?,'deploy','application',?,'queued','queued',0,?,'{}',?,NULL,?)`,
+		f.jobID, f.appID, f.actorID, stamp, stamp)
+	// Route-activation history requires the immutable deployment binding that is
+	// only legal while this fresh deployment job is still queued at attempt zero.
+	f.exec(t, `INSERT INTO application_deployment_lifecycle_bindings(
+		job_id,app_id,desired_revision,mode,authorizing_lifecycle_job_id,created_at
+	) VALUES(?,?,0,'legacy_uninitialized',NULL,?)`, f.jobID, f.appID, stamp)
+	f.exec(t, `UPDATE jobs SET status='running',phase='running',attempt=?,started_at=?,updated_at=?
+		WHERE id=? AND status='queued' AND phase='queued' AND attempt=0`,
+		f.jobAttempt, stamp, stamp, f.jobID)
 	f.exec(t, `INSERT INTO deployments(
 		id,app_id,release_id,job_id,status,started_at,configuration_mode,actual_configuration_revision_id,
 		actual_configuration_revision_number,provenance_initialized,runtime_strategy,

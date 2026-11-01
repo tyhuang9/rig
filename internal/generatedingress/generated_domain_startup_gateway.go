@@ -813,6 +813,11 @@ func generatedDomainNativeV2LANRecoveries(state gatewayV2RouteState,
 		return nil, !generatedDomainLANClaimsRequireRecovery(claims)
 	}
 	switch state.Pending.Kind {
+	case gatewayV2PendingRouteSwitch:
+		// A route publication marker belongs to cold route activation, not
+		// LAN recovery. Unresolved LAN claims remain fail-closed because this
+		// marker cannot authenticate or reconcile them.
+		return nil, !generatedDomainLANClaimsRequireRecovery(claims)
 	case gatewayV2PendingLANGrant, gatewayV2PendingLANWithdrawal:
 		request, err := gatewayV2LANPendingRequest(*state.Pending)
 		claim, exists := claims.grants.byAttempt[request.AttemptID]
@@ -965,17 +970,15 @@ func generatedDomainUpgradeDatabaseCurrent(database deployments.GeneratedDomainS
 	return false
 }
 
-// generatedDomainCommittedUpgradeGatewayCandidate binds the SQL-selected
-// committed upgrade to its exact active protected generation and retained V1
-// source. The source is carried with the candidate so a current V2 projection
-// can prove its upgrade origin without inventing a rebind terminal.
-func generatedDomainCommittedUpgradeGatewayCandidate(database deployments.GeneratedDomainStartupSnapshot,
-	protected generatedDomainProtectedStartupSnapshot, stableOnly bool,
-) (generatedDomainGatewayExpectation, bool) {
+// generatedDomainCommittedUpgradeGatewaySelection binds the SQL-selected
+// committed upgrade to its one exact active protected generation. Callers
+// remain responsible for admitting only the protected state shape they own.
+func generatedDomainCommittedUpgradeGatewaySelection(database deployments.GeneratedDomainStartupSnapshot,
+	protected generatedDomainProtectedStartupSnapshot,
+) (gatewayUpgradeGenerationSelection, bool) {
 	if protected.nativeV1 == nil || !protected.upgrade.committed ||
-		stableOnly && (protected.upgrade.state.Pending != nil || protected.upgrade.state.LANRecovery != nil) ||
 		!generatedDomainUpgradeDatabaseCurrent(database, protected.upgrade) {
-		return generatedDomainGatewayExpectation{}, false
+		return gatewayUpgradeGenerationSelection{}, false
 	}
 	var selected *gatewayUpgradeGenerationSelection
 	for index := range protected.upgrade.generations {
@@ -987,21 +990,74 @@ func generatedDomainCommittedUpgradeGatewayCandidate(database deployments.Genera
 			continue
 		}
 		if selected != nil {
-			return generatedDomainGatewayExpectation{}, false
+			return gatewayUpgradeGenerationSelection{}, false
 		}
 		copy := candidate
 		selected = &copy
 	}
-	if selected == nil || !validGatewayTopologyInputs(*protected.nativeV1, selected.State, selected.Journal) {
+	if selected == nil {
+		return gatewayUpgradeGenerationSelection{}, false
+	}
+	return *selected, true
+}
+
+// generatedDomainCommittedUpgradeGatewayCandidate binds the SQL-selected
+// committed upgrade to its exact active protected generation and retained V1
+// source. The source is carried with the candidate so a current V2 projection
+// can prove its upgrade origin without inventing a rebind terminal.
+func generatedDomainCommittedUpgradeGatewayCandidate(database deployments.GeneratedDomainStartupSnapshot,
+	protected generatedDomainProtectedStartupSnapshot, stableOnly bool,
+) (generatedDomainGatewayExpectation, bool) {
+	if stableOnly && (protected.upgrade.state.Pending != nil || protected.upgrade.state.LANRecovery != nil) {
 		return generatedDomainGatewayExpectation{}, false
 	}
-	if _, err := gatewayUpgradeCurrentLineage(*selected); err != nil {
+	selected, ok := generatedDomainCommittedUpgradeGatewaySelection(database, protected)
+	if !ok || !validGatewayTopologyInputs(*protected.nativeV1, selected.State, selected.Journal) {
+		return generatedDomainGatewayExpectation{}, false
+	}
+	if _, err := gatewayUpgradeCurrentLineage(selected); err != nil {
 		return generatedDomainGatewayExpectation{}, false
 	}
 	state := cloneGatewayV2RouteState(selected.State)
 	journal := selected.Journal
 	source := cloneRouteState(*protected.nativeV1)
-	selection := *selected
+	selection := selected
+	digest, err := canonicalDigest(state)
+	if err != nil {
+		return generatedDomainGatewayExpectation{}, false
+	}
+	return generatedDomainGatewayExpectation{kind: generatedDomainGatewayNativeV2,
+		stateDigest: digest, nativeV1: &source, nativeV2: &state, journal: &journal, upgrade: &selection}, true
+}
+
+// generatedDomainCommittedUpgradeRoutePendingGatewayCandidate is the narrow
+// cold-activation counterpart to the stable committed candidate above. It
+// admits only an exact route-switch Pending whose Pending-cleared state is the
+// same valid committed topology. LAN recovery and all other pending kinds stay
+// owned by their dedicated startup recovery paths.
+func generatedDomainCommittedUpgradeRoutePendingGatewayCandidate(database deployments.GeneratedDomainStartupSnapshot,
+	protected generatedDomainProtectedStartupSnapshot,
+) (generatedDomainGatewayExpectation, bool) {
+	selected, ok := generatedDomainCommittedUpgradeGatewaySelection(database, protected)
+	if !ok {
+		return generatedDomainGatewayExpectation{}, false
+	}
+	state := cloneGatewayV2RouteState(selected.State)
+	if state.Pending == nil || state.Pending.Kind != gatewayV2PendingRouteSwitch || state.LANRecovery != nil ||
+		!validGatewayV2RouteState(state) {
+		return generatedDomainGatewayExpectation{}, false
+	}
+	cleared := cloneGatewayV2RouteState(state)
+	cleared.Pending = nil
+	if !validGatewayTopologyInputs(*protected.nativeV1, cleared, selected.Journal) {
+		return generatedDomainGatewayExpectation{}, false
+	}
+	if _, err := gatewayUpgradeCurrentLineage(selected); err != nil {
+		return generatedDomainGatewayExpectation{}, false
+	}
+	journal := selected.Journal
+	source := cloneRouteState(*protected.nativeV1)
+	selection := selected
 	digest, err := canonicalDigest(state)
 	if err != nil {
 		return generatedDomainGatewayExpectation{}, false

@@ -190,6 +190,11 @@ func validateRouteCompletionInputTx(ctx context.Context, tx *sql.Tx,
 		  ON job.id=deployment.job_id AND job.type='deploy'
 		 AND job.resource_type='application' AND job.resource_id=a.app_id
 		WHERE a.id=? AND a.creator_job_id=? AND a.creator_worker_attempt<=?
+		 AND ((a.writer_job_id IS NULL AND a.writer_worker_attempt IS NULL)
+		      OR (a.writer_job_id IS NOT NULL AND a.writer_worker_attempt IS NOT NULL))
+		 AND ?=CASE WHEN a.writer_job_id IS NULL THEN a.creator_job_id ELSE a.writer_job_id END
+		 AND CASE WHEN a.writer_worker_attempt IS NULL THEN a.creator_worker_attempt
+		          ELSE a.writer_worker_attempt END<=?
 		 AND job.id=? AND job.attempt=? AND job.status IN ('running','succeeded')
 		  AND handoff.successor_component_count=(
 		      SELECT COUNT(*) FROM generated_runtime_components c
@@ -201,7 +206,8 @@ func validateRouteCompletionInputTx(ctx context.Context, tx *sql.Tx,
 		            SELECT 1 FROM generated_candidate_intents i
 		            WHERE i.deployment_id=c.deployment_id AND i.component_name=c.component_name)))`,
 		input.Activation.ReceiptID, input.Activation.CreatorJobID, input.CurrentWorkerAttempt,
-		input.CurrentJobID, input.CurrentWorkerAttempt).Scan(&phase, &status, &jobStatus, &jobPhase)
+		input.CurrentJobID, input.CurrentWorkerAttempt, input.CurrentJobID,
+		input.CurrentWorkerAttempt).Scan(&phase, &status, &jobStatus, &jobPhase)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", "", "", ErrConflict
 	}
@@ -212,8 +218,9 @@ func validRouteCompletionInput(input RouteCompletionInput) bool {
 	activation := input.Activation
 	handoff := input.AccountingHandoff
 	return validRouteActivationReceipt(activation) && validRouteAccountingHandoffReceipt(handoff) &&
-		canonicalUUID(input.CurrentJobID) && input.CurrentJobID == activation.CreatorJobID &&
-		input.CurrentWorkerAttempt >= activation.CreatorWorkerAttempt && !input.CompletedAt.IsZero() &&
+		canonicalUUID(input.CurrentJobID) && input.CurrentJobID == activation.WriterJobID &&
+		activation.CreatorWorkerAttempt <= activation.WriterWorkerAttempt &&
+		input.CurrentWorkerAttempt >= activation.WriterWorkerAttempt && !input.CompletedAt.IsZero() &&
 		handoff.ActivationReceiptID == activation.ReceiptID && handoff.AppID == activation.AppID &&
 		handoff.SuccessorDeploymentID == activation.SuccessorDeploymentID &&
 		handoff.PredecessorDeploymentID == activation.PredecessorDeploymentID &&

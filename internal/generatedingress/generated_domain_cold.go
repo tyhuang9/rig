@@ -4,10 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net"
 	"reflect"
 	"sort"
+	"strconv"
 	"time"
 
+	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
 	"github.com/hostd/hostd/internal/deployments"
@@ -41,9 +44,12 @@ type generatedDomainColdGroup struct {
 }
 
 type generatedDomainColdManifest struct {
-	groups          []generatedDomainColdManifestGroup
-	retainedGateway generatedDomainColdRetainedGatewayProof
-	retainedV2      generatedDomainColdRetainedV2Proof
+	groups                        []generatedDomainColdManifestGroup
+	retainedGateway               generatedDomainColdRetainedGatewayProof
+	retainedV2                    generatedDomainColdRetainedV2Proof
+	pendingActivation             *generatedRouteActivationGatewayTransition
+	pendingActivationDeploymentID string
+	pendingGatewayDisposition     generatedDomainColdPendingGatewayDisposition
 }
 
 type generatedDomainColdManifestGroup struct {
@@ -60,14 +66,39 @@ type generatedDomainColdManifestComponent struct {
 	retained        bool
 }
 
+type generatedDomainColdPendingActivationEvidence struct {
+	transition          *generatedRouteActivationGatewayTransition
+	successorDeployment string
+	beforeActivation    bool
+	protectedGateway    generatedDomainGatewayExpectation
+	routeGateway        generatedDomainGatewayExpectation
+	servingGateway      generatedDomainGatewayExpectation
+	disposition         generatedDomainColdPendingGatewayDisposition
+}
+
+// generatedDomainColdPendingGatewayDisposition records the one physical
+// projection that cold construction observed for a typed Pending activation.
+// It is descriptive evidence only: construction does not clear Pending or
+// publish either projection.
+type generatedDomainColdPendingGatewayDisposition uint8
+
+const (
+	generatedDomainColdPendingGatewayUnknown generatedDomainColdPendingGatewayDisposition = iota
+	generatedDomainColdPendingGatewayProposedExact
+	generatedDomainColdPendingGatewayPreviousExact
+)
+
 func sameGeneratedDomainColdManifest(left, right *generatedDomainColdManifest) bool {
 	return reflect.DeepEqual(left, right)
 }
 
 func cloneGeneratedDomainColdManifest(value generatedDomainColdManifest) *generatedDomainColdManifest {
 	result := &generatedDomainColdManifest{groups: make([]generatedDomainColdManifestGroup, len(value.groups)),
-		retainedGateway: cloneGeneratedDomainColdRetainedGatewayProof(value.retainedGateway),
-		retainedV2:      cloneGeneratedDomainColdRetainedV2Proof(value.retainedV2)}
+		retainedGateway:               cloneGeneratedDomainColdRetainedGatewayProof(value.retainedGateway),
+		retainedV2:                    cloneGeneratedDomainColdRetainedV2Proof(value.retainedV2),
+		pendingActivation:             cloneGeneratedRouteActivationGatewayTransition(value.pendingActivation),
+		pendingActivationDeploymentID: value.pendingActivationDeploymentID,
+		pendingGatewayDisposition:     value.pendingGatewayDisposition}
 	for index, group := range value.groups {
 		result.groups[index] = group
 		result.groups[index].components = append([]generatedDomainColdManifestComponent(nil), group.components...)
@@ -94,10 +125,21 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdGroupReconstruction, err)
 	}
+	pendingActivation, pendingActivationFound, err := generatedDomainColdPendingActivation(
+		observed.database, observed.protected, groups)
+	if err != nil {
+		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdOwnership, err)
+	}
+	var pendingEvidence *generatedDomainColdPendingActivationEvidence
+	if pendingActivationFound {
+		pendingEvidence = &pendingActivation
+	}
 	var retainedGateway generatedDomainColdRetainedGatewayProof
 	var retainedV2 generatedDomainColdRetainedV2Proof
-	if err := attestGeneratedDomainColdGroupsWithRetainedProofs(ctx, result.manager, result.candidates, observed, groups,
-		&retainedGateway, &retainedV2); err != nil {
+	if err := attestGeneratedDomainColdGroupsWithPendingProofs(ctx, result.manager, result.candidates, observed, groups,
+		pendingEvidence, &retainedGateway, &retainedV2); err != nil {
 		return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdGroupAttestation, err)
@@ -108,6 +150,38 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 	// debt as one closed bootstrap batch. No Budget snapshot is available until
 	// the whole batch and its ledger tokens exist.
 	restoredDeployments := make(map[string]struct{})
+	// FinishHealth marks a complete candidate roster handed to the route before
+	// it durably enters SwitchingRoute. The retained pre-042 Pending proof is
+	// the only cold shape that can reconstruct that in-memory marker: generic
+	// healthy candidates remain merely Present. Validate the complete clone
+	// before installing any bootstrap capacity so a partial or crossed Pending
+	// cannot retain a share or manufacture route ownership.
+	preActivationSeeds := map[string]map[string]candidateColdReceiptSeed{}
+	if pendingActivationFound && pendingActivation.beforeActivation {
+		matched := 0
+		for index := range groups {
+			group := groups[index]
+			if group.pins.deploymentID != pendingActivation.successorDeployment {
+				continue
+			}
+			matched++
+			seeds, valid := generatedDomainColdPreActivationHandoffSeeds(group, pendingActivation)
+			if !valid {
+				return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+					generatedDomainConstructionStageColdConstruction,
+					generatedDomainConstructionReasonColdOwnership, errGeneratedDomainConstructionRefused)
+			}
+			preActivationSeeds[group.pins.deploymentID] = seeds
+		}
+		if matched != 1 || len(preActivationSeeds) != 1 {
+			return generatedDomainColdManifest{}, generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdOwnership, errGeneratedDomainConstructionRefused)
+		}
+	}
+	if pendingActivationFound && pendingActivation.beforeActivation {
+		restoredDeployments[pendingActivation.successorDeployment] = struct{}{}
+	}
 	for index := range groups {
 		switch groups[index].kind {
 		case generatedDomainColdCurrent:
@@ -162,8 +236,21 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 			if debtOffset+count > len(debtTokens) {
 				seedErr = errGeneratedDomainCapacityDebtState
 			} else {
-				seedErr = result.candidates.ledger.seedColdOwnershipWithDebt(
-					spec, group.receipts, debtTokens[debtOffset:debtOffset+count])
+				owner := candidateAccountingRouteActive
+				seeds := group.receipts
+				if pendingActivationFound && pendingActivation.beforeActivation &&
+					group.pins.deploymentID == pendingActivation.successorDeployment {
+					owner = candidateAccountingCandidate
+					var found bool
+					seeds, found = preActivationSeeds[group.pins.deploymentID]
+					if !found {
+						seedErr = errGeneratedDomainConstructionRefused
+					}
+				}
+				if seedErr == nil {
+					seedErr = result.candidates.ledger.seedColdOwnershipWithDebtFor(
+						spec, seeds, debtTokens[debtOffset:debtOffset+count], owner)
+				}
 				debtOffset += count
 			}
 		} else if group.kind != generatedDomainColdRisky {
@@ -241,7 +328,45 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 	}
 	manifest.retainedGateway = cloneGeneratedDomainColdRetainedGatewayProof(retainedGateway)
 	manifest.retainedV2 = cloneGeneratedDomainColdRetainedV2Proof(retainedV2)
+	if pendingActivationFound {
+		manifest.pendingActivation = cloneGeneratedRouteActivationGatewayTransition(pendingActivation.transition)
+		manifest.pendingActivationDeploymentID = pendingActivation.successorDeployment
+		manifest.pendingGatewayDisposition = pendingActivation.disposition
+	}
 	return manifest, nil
+}
+
+// generatedDomainColdPreActivationHandoffSeeds clones the one exact
+// pre-activation successor roster whose Pending proof also authenticates a
+// completed FinishHealth boundary. It returns no partial result: every
+// healthy component must have the exact present receipt reconstructed from
+// the same group before the clone is marked handed to the route.
+func generatedDomainColdPreActivationHandoffSeeds(group generatedDomainColdGroup,
+	pending generatedDomainColdPendingActivationEvidence,
+) (map[string]candidateColdReceiptSeed, bool) {
+	if !pending.beforeActivation || pending.successorDeployment == "" ||
+		group.pins.deploymentID != pending.successorDeployment || group.kind != generatedDomainColdRisky ||
+		!group.bindHead || group.selfHead || group.snapshot.runtime.phase != generatedruntimestate.PhaseSwitchingRoute ||
+		group.snapshot.observedHead.deploymentID != group.snapshot.headPins.previousDeploymentID ||
+		len(group.snapshot.components) == 0 || len(group.receipts) != len(group.snapshot.components) {
+		return nil, false
+	}
+	result := make(map[string]candidateColdReceiptSeed, len(group.receipts))
+	for _, component := range group.snapshot.components {
+		name := component.plan.Name
+		seed, found := group.receipts[name]
+		if component.state != generatedruntimestate.ComponentHealthy || component.receipt == nil || name == "" ||
+			!found || seed.id == "" || seed.id != component.receipt.id || seed.unknown ||
+			seed.physical != candidatePhysicalPresent {
+			return nil, false
+		}
+		if _, duplicate := result[name]; duplicate {
+			return nil, false
+		}
+		seed.physical = candidatePhysicalHandedToRoute
+		result[name] = seed
+	}
+	return result, len(result) == len(group.receipts)
 }
 
 func verifyGeneratedDomainColdConstruction(ctx context.Context, reservation *generatedDomainReservation,
@@ -286,23 +411,182 @@ func verifyGeneratedDomainColdConstruction(ctx context.Context, reservation *gen
 func reattestGeneratedDomainCold(ctx context.Context, manager *Manager, authority *GeneratedCandidateAuthority,
 	observed generatedDomainStartupObservation, expected generatedDomainColdManifest,
 ) error {
-	groups, err := readGeneratedDomainColdGroups(ctx, authority, observed)
+	groups, pendingEvidence, err := readGeneratedDomainColdGroupsForReattestation(
+		ctx, authority, observed, &expected)
 	if err != nil {
 		return err
 	}
 	var retainedGateway generatedDomainColdRetainedGatewayProof
 	var retainedV2 generatedDomainColdRetainedV2Proof
-	if err := attestGeneratedDomainColdGroupsWithRetainedProofs(ctx, manager, authority, observed, groups,
-		&retainedGateway, &retainedV2); err != nil {
+	if err := attestGeneratedDomainColdGroupsWithPendingProofs(ctx, manager, authority, observed, groups,
+		pendingEvidence, &retainedGateway, &retainedV2); err != nil {
 		return err
 	}
 	current, err := snapshotGeneratedDomainColdManifest(authority)
 	current.retainedGateway = cloneGeneratedDomainColdRetainedGatewayProof(retainedGateway)
 	current.retainedV2 = cloneGeneratedDomainColdRetainedV2Proof(retainedV2)
+	if pendingEvidence != nil {
+		current.pendingActivation = cloneGeneratedRouteActivationGatewayTransition(pendingEvidence.transition)
+		current.pendingActivationDeploymentID = pendingEvidence.successorDeployment
+		current.pendingGatewayDisposition = pendingEvidence.disposition
+	} else if expected.pendingActivation != nil {
+		if !generatedDomainColdFinalizedActivationMatches(observed, groups, expected) {
+			return errGeneratedDomainConstructionRefused
+		}
+		current.pendingActivation = cloneGeneratedRouteActivationGatewayTransition(expected.pendingActivation)
+		current.pendingActivationDeploymentID = expected.pendingActivationDeploymentID
+		current.pendingGatewayDisposition = expected.pendingGatewayDisposition
+	}
 	if err != nil || !reflect.DeepEqual(expected, current) {
 		return errors.Join(errGeneratedDomainConstructionRefused, err)
 	}
 	return nil
+}
+
+func generatedDomainColdFinalizedActivationMatches(observed generatedDomainStartupObservation,
+	groups []generatedDomainColdGroup, expected generatedDomainColdManifest,
+) bool {
+	transition := expected.pendingActivation
+	if !validGeneratedRouteActivationGatewayTransition(transition) ||
+		expected.pendingActivationDeploymentID == "" ||
+		expected.pendingGatewayDisposition == generatedDomainColdPendingGatewayUnknown {
+		return false
+	}
+	gateway, err := resolveGeneratedDomainColdGatewayExpectation(observed.database, observed.protected)
+	if err != nil {
+		return false
+	}
+	switch transition.kind {
+	case generatedDomainGatewayNativeV1:
+		if gateway.kind != generatedDomainGatewayNativeV1 || gateway.nativeV1 == nil ||
+			!reflect.DeepEqual(*gateway.nativeV1, transition.legacy.effective) {
+			return false
+		}
+	case generatedDomainGatewayNativeV2:
+		if gateway.kind != generatedDomainGatewayNativeV2 || gateway.nativeV2 == nil || gateway.journal == nil ||
+			!reflect.DeepEqual(*gateway.nativeV2, transition.nativeV2.effective) ||
+			!reflect.DeepEqual(*gateway.journal, transition.nativeV2.journal) {
+			return false
+		}
+	case generatedDomainGatewayCurrentV1:
+		if gateway.kind != generatedDomainGatewayCurrentV1 || gateway.currentV1 == nil ||
+			!reflect.DeepEqual(*gateway.currentV1, transition.currentV1.Effective) {
+			return false
+		}
+	default:
+		return false
+	}
+	group, found := generatedDomainColdGroupByDeployment(groups, expected.pendingActivationDeploymentID)
+	if !found || !group.selfHead || group.snapshot.observedHead.activationReceiptID == "" {
+		return false
+	}
+	return generatedDomainColdActivationMatches(group.pins, group.snapshot, groups,
+		observed.database.Runtime.RouteActivations)
+}
+
+// generatedDomainColdClearedPreviousActivationEvidence is used only by
+// reattestation of an already sealed PreviousExact manifest. A markerless new
+// construction has no expected manifest and cannot enter this path.
+func generatedDomainColdClearedPreviousActivationEvidence(observed generatedDomainStartupObservation,
+	groups []generatedDomainColdGroup, expected generatedDomainColdManifest,
+) (generatedDomainColdPendingActivationEvidence, bool) {
+	transition := expected.pendingActivation
+	if expected.pendingGatewayDisposition != generatedDomainColdPendingGatewayPreviousExact ||
+		expected.pendingActivationDeploymentID == "" ||
+		!validGeneratedRouteActivationGatewayTransition(transition) {
+		return generatedDomainColdPendingActivationEvidence{}, false
+	}
+	gateway, err := resolveGeneratedDomainColdGatewayExpectation(observed.database, observed.protected)
+	if err != nil {
+		return generatedDomainColdPendingActivationEvidence{}, false
+	}
+	switch transition.kind {
+	case generatedDomainGatewayNativeV1:
+		if gateway.kind != generatedDomainGatewayNativeV1 || gateway.nativeV1 == nil ||
+			!reflect.DeepEqual(*gateway.nativeV1, transition.legacy.before) {
+			return generatedDomainColdPendingActivationEvidence{}, false
+		}
+	case generatedDomainGatewayNativeV2:
+		if gateway.kind != generatedDomainGatewayNativeV2 || gateway.nativeV2 == nil ||
+			gateway.journal == nil || gateway.upgrade == nil ||
+			!reflect.DeepEqual(*gateway.nativeV2, transition.nativeV2.before) ||
+			!reflect.DeepEqual(*gateway.journal, transition.nativeV2.journal) ||
+			!reflect.DeepEqual(gateway.upgrade.State, transition.nativeV2.before) {
+			return generatedDomainColdPendingActivationEvidence{}, false
+		}
+	case generatedDomainGatewayCurrentV1:
+		cleared, clearErr := gatewayCurrentNextState(transition.currentV1.Pending,
+			func(next *gatewayCurrentRouteState) { next.Pending = nil })
+		if clearErr != nil || !reflect.DeepEqual(cleared.Apps, transition.currentV1.Before.Apps) ||
+			!sameGatewayCurrentRouteOrigin(cleared, transition.currentV1.Before) ||
+			gateway.kind != generatedDomainGatewayCurrentV1 || gateway.currentV1 == nil ||
+			!reflect.DeepEqual(*gateway.currentV1, cleared) {
+			return generatedDomainColdPendingActivationEvidence{}, false
+		}
+	default:
+		return generatedDomainColdPendingActivationEvidence{}, false
+	}
+	before, hadBefore, proposed, valid := generatedRouteActivationGatewayRoutes(transition)
+	if !valid || transition.request.AppID == "" || transition.request.FromSlot != before.Slot ||
+		transition.request.ToSlot != proposed.Slot ||
+		!sameRoute(proposed, routeRecord{Slot: transition.request.ToSlot,
+			Endpoints: transition.request.Endpoints}) ||
+		(!hadBefore && (!sameRoute(before, routeRecord{}) || transition.request.FromSlot != "")) {
+		return generatedDomainColdPendingActivationEvidence{}, false
+	}
+	matched := 0
+	for _, group := range groups {
+		if group.pins.deploymentID != expected.pendingActivationDeploymentID {
+			continue
+		}
+		matched++
+		actual, actualValid := generatedDomainColdGroupRoute(group)
+		if !actualValid || !sameRoute(actual, proposed) || group.pins.applicationID() != transition.request.AppID ||
+			group.kind != generatedDomainColdRisky || !group.bindHead || group.selfHead ||
+			group.snapshot.runtime.phase != generatedruntimestate.PhaseSwitchingRoute ||
+			group.snapshot.observedHead.deploymentID != group.snapshot.headPins.previousDeploymentID ||
+			group.snapshot.observedHead.releaseID != group.snapshot.headPins.previousReleaseID ||
+			group.snapshot.observedHead.slot != group.snapshot.headPins.previousSlot ||
+			group.snapshot.observedHead.slot != string(before.Slot) {
+			return generatedDomainColdPendingActivationEvidence{}, false
+		}
+		if !hadBefore && (group.snapshot.observedHead.deploymentID != "" ||
+			group.snapshot.observedHead.releaseID != "" || group.snapshot.observedHead.slot != "" ||
+			group.snapshot.observedHead.generation != 0 ||
+			group.snapshot.observedHead.activationReceiptID != "") {
+			return generatedDomainColdPendingActivationEvidence{}, false
+		}
+	}
+	if matched != 1 {
+		return generatedDomainColdPendingActivationEvidence{}, false
+	}
+	for _, activation := range observed.database.Runtime.RouteActivations {
+		if activation.AppID == transition.request.AppID &&
+			activation.SuccessorDeploymentID == expected.pendingActivationDeploymentID {
+			return generatedDomainColdPendingActivationEvidence{}, false
+		}
+	}
+	for _, values := range [][]string{generatedDomainColdSuccessorIDs043(observed.database),
+		generatedDomainColdSuccessorIDs044(observed.database), generatedDomainColdSuccessorIDs045(observed.database)} {
+		for _, deploymentID := range values {
+			if deploymentID == expected.pendingActivationDeploymentID {
+				return generatedDomainColdPendingActivationEvidence{}, false
+			}
+		}
+	}
+	serving, err := generatedDomainColdPendingGatewayProjection(gateway, *transition, false)
+	if err != nil {
+		return generatedDomainColdPendingActivationEvidence{}, false
+	}
+	return generatedDomainColdPendingActivationEvidence{
+		transition:          cloneGeneratedRouteActivationGatewayTransition(transition),
+		successorDeployment: expected.pendingActivationDeploymentID,
+		beforeActivation:    true,
+		protectedGateway:    gateway,
+		routeGateway:        gateway,
+		servingGateway:      serving,
+		disposition:         generatedDomainColdPendingGatewayPreviousExact,
+	}, true
 }
 
 func generatedDomainColdOwnerManifest(value generatedDomainColdManifest) generatedDomainOwnerManifest {
@@ -328,7 +612,7 @@ func generatedDomainColdGroupSpec(authority *GeneratedCandidateAuthority,
 			DiskBytes: authority.options.ReplacementDiskBytes}}
 }
 
-func readGeneratedDomainColdGroups(ctx context.Context, authority *GeneratedCandidateAuthority,
+func readGeneratedDomainColdGroupSet(ctx context.Context, authority *GeneratedCandidateAuthority,
 	observed generatedDomainStartupObservation,
 ) ([]generatedDomainColdGroup, error) {
 	if authority == nil || authority.stores == nil || authority.stores.Database() == nil {
@@ -382,13 +666,47 @@ func readGeneratedDomainColdGroups(ctx context.Context, authority *GeneratedCand
 		groups[index].kind, groups[index].bindHead = kind, bindHead
 		groups[index].selfHead, groups[index].legacyHead = selfHead, legacyHead
 	}
-	if err := validateGeneratedDomainColdLifecycleRetention(observed.database, groups); err != nil {
-		return nil, err
-	}
-	if err := validateGeneratedDomainColdGatewayRoutes(observed, groups); err != nil {
-		return nil, err
-	}
 	return groups, nil
+}
+
+func readGeneratedDomainColdGroups(ctx context.Context, authority *GeneratedCandidateAuthority,
+	observed generatedDomainStartupObservation,
+) ([]generatedDomainColdGroup, error) {
+	groups, pending, err := readGeneratedDomainColdGroupsForReattestation(ctx, authority, observed, nil)
+	_ = pending
+	return groups, err
+}
+
+func readGeneratedDomainColdGroupsForReattestation(ctx context.Context,
+	authority *GeneratedCandidateAuthority, observed generatedDomainStartupObservation,
+	expected *generatedDomainColdManifest,
+) ([]generatedDomainColdGroup, *generatedDomainColdPendingActivationEvidence, error) {
+	groups, err := readGeneratedDomainColdGroupSet(ctx, authority, observed)
+	if err != nil {
+		return nil, nil, err
+	}
+	pendingActivation, pendingFound, err := generatedDomainColdPendingActivation(
+		observed.database, observed.protected, groups)
+	if err != nil {
+		return nil, nil, err
+	}
+	var pending *generatedDomainColdPendingActivationEvidence
+	if pendingFound {
+		pending = &pendingActivation
+	} else if expected != nil &&
+		expected.pendingGatewayDisposition == generatedDomainColdPendingGatewayPreviousExact {
+		cleared, found := generatedDomainColdClearedPreviousActivationEvidence(observed, groups, *expected)
+		if found {
+			pending = &cleared
+		}
+	}
+	if err := validateGeneratedDomainColdLifecycleRetentionWithPending(observed.database, groups, pending); err != nil {
+		return nil, nil, err
+	}
+	if err := validateGeneratedDomainColdGatewayRoutesWithPending(observed, groups, pending); err != nil {
+		return nil, nil, err
+	}
+	return groups, pending, nil
 }
 
 // validateGeneratedDomainColdGatewayRoutes closes the durable head to
@@ -402,7 +720,24 @@ func readGeneratedDomainColdGroups(ctx context.Context, authority *GeneratedCand
 func validateGeneratedDomainColdGatewayRoutes(observed generatedDomainStartupObservation,
 	groups []generatedDomainColdGroup,
 ) error {
+	return validateGeneratedDomainColdGatewayRoutesWithPending(observed, groups, nil)
+}
+
+func validateGeneratedDomainColdGatewayRoutesWithPending(observed generatedDomainStartupObservation,
+	groups []generatedDomainColdGroup, pending *generatedDomainColdPendingActivationEvidence,
+) error {
 	gateway, err := resolveGeneratedDomainColdGatewayExpectation(observed.database, observed.protected)
+	if pending != nil {
+		gateway, err = pending.routeGateway, nil
+	} else {
+		pending, found, pendingErr := generatedDomainColdPendingActivation(observed.database, observed.protected, groups)
+		if pendingErr != nil {
+			return pendingErr
+		}
+		if found {
+			gateway, err = pending.routeGateway, nil
+		}
+	}
 	if err != nil {
 		return err
 	}
@@ -478,27 +813,8 @@ func validateGeneratedDomainColdGatewayRoutes(observed generatedDomainStartupObs
 		if _, duplicate := seen[appID]; duplicate {
 			return errGeneratedDomainConstructionRefused
 		}
-		if len(group.snapshot.components) == 0 {
-			return errGeneratedDomainConstructionRefused
-		}
-		actual := routeRecord{Slot: generatedidentity.Slot(group.snapshot.pins.candidateSlot),
-			Endpoints: make([]generatedroute.RouteEndpoint, 0, len(group.snapshot.components))}
-		for _, component := range group.snapshot.components {
-			policy, ok := group.policies[component.plan.Name]
-			if !ok {
-				return errGeneratedDomainConstructionRefused
-			}
-			actual.Endpoints = append(actual.Endpoints, generatedroute.RouteEndpoint{
-				Component: component.plan.Name, Role: component.plan.Role,
-				ContainerID: component.containerID, NetworkName: policy.identity.NetworkName,
-				NetworkAlias: policy.identity.NetworkAlias,
-				InternalPort: component.plan.InternalPort,
-			})
-		}
-		sort.Slice(actual.Endpoints, func(i, j int) bool {
-			return actual.Endpoints[i].Component < actual.Endpoints[j].Component
-		})
-		if validateRoute(actual) != nil || !sameRoute(actual, want.route) {
+		actual, valid := generatedDomainColdGroupRoute(group)
+		if !valid || !sameRoute(actual, want.route) {
 			return errGeneratedDomainConstructionRefused
 		}
 		if want.runtime != nil && (want.runtime.DeploymentID != group.pins.deploymentID ||
@@ -513,6 +829,30 @@ func validateGeneratedDomainColdGatewayRoutes(observed generatedDomainStartupObs
 		return errGeneratedDomainConstructionRefused
 	}
 	return nil
+}
+
+func generatedDomainColdGroupRoute(group generatedDomainColdGroup) (routeRecord, bool) {
+	if len(group.snapshot.components) == 0 {
+		return routeRecord{}, false
+	}
+	route := routeRecord{Slot: generatedidentity.Slot(group.snapshot.pins.candidateSlot),
+		Endpoints: make([]generatedroute.RouteEndpoint, 0, len(group.snapshot.components))}
+	for _, component := range group.snapshot.components {
+		policy, ok := group.policies[component.plan.Name]
+		if !ok {
+			return routeRecord{}, false
+		}
+		route.Endpoints = append(route.Endpoints, generatedroute.RouteEndpoint{
+			Component: component.plan.Name, Role: component.plan.Role,
+			ContainerID: component.containerID, NetworkName: policy.identity.NetworkName,
+			NetworkAlias: policy.identity.NetworkAlias,
+			InternalPort: component.plan.InternalPort,
+		})
+	}
+	sort.Slice(route.Endpoints, func(i, j int) bool {
+		return route.Endpoints[i].Component < route.Endpoints[j].Component
+	})
+	return route, validateRoute(route) == nil
 }
 
 // resolveGeneratedDomainColdGatewayExpectation extends the descriptive stable
@@ -549,6 +889,583 @@ func resolveGeneratedDomainColdGatewayExpectation(database deployments.Generated
 		return generatedDomainGatewayExpectation{}, errGeneratedDomainStartupGatewayInvalid
 	}
 	return value, nil
+}
+
+func generatedDomainColdPendingActivation(database deployments.GeneratedDomainStartupSnapshot,
+	protected generatedDomainProtectedStartupSnapshot, groups []generatedDomainColdGroup,
+) (generatedDomainColdPendingActivationEvidence, bool, error) {
+	var result generatedDomainColdPendingActivationEvidence
+	var candidates []generatedDomainGatewayExpectation
+	var allCandidates []generatedDomainGatewayExpectation
+	selectedIndex := -1
+	if protected.nativeV1 != nil && protected.nativeV1.Pending != nil {
+		if !validRouteState(*protected.nativeV1) || protected.upgrade.store != nil ||
+			len(protected.upgrade.generations) != 0 || len(protected.currentV1) != 0 ||
+			len(protected.currentV2.files) != 0 || protected.hasRebind || len(protected.rebindArtifacts) != 0 {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		state := cloneRouteState(*protected.nativeV1)
+		digest, err := canonicalDigest(state)
+		if err != nil {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		candidates = append(candidates, generatedDomainGatewayExpectation{kind: generatedDomainGatewayNativeV1,
+			stateDigest: digest, nativeV1: &state})
+	} else {
+		if candidate, ok := generatedDomainCommittedUpgradeRoutePendingGatewayCandidate(database, protected); ok {
+			allCandidates = append(allCandidates, candidate)
+		}
+		allCandidates = append(allCandidates, generatedDomainCurrentGatewayCandidates(database, protected, false)...)
+		for index, candidate := range allCandidates {
+			pending := candidate.kind == generatedDomainGatewayNativeV2 && candidate.nativeV2 != nil &&
+				candidate.nativeV2.Pending != nil && candidate.nativeV2.Pending.Kind == gatewayV2PendingRouteSwitch ||
+				candidate.kind == generatedDomainGatewayCurrentV1 && candidate.currentV1 != nil &&
+					candidate.currentV1.Pending != nil && candidate.currentV1.Pending.Kind == gatewayV2PendingRouteSwitch
+			if pending {
+				candidates = append(candidates, candidate)
+				selectedIndex = index
+			}
+		}
+	}
+	if len(candidates) == 0 {
+		return result, false, nil
+	}
+	if len(candidates) != 1 {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	protectedGateway := candidates[0]
+	var transition generatedRouteActivationGatewayTransition
+	switch protectedGateway.kind {
+	case generatedDomainGatewayNativeV1:
+		state := cloneRouteState(*protectedGateway.nativeV1)
+		pending := state.Pending
+		if pending == nil {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		before, effective := cloneRouteState(state), cloneRouteState(state)
+		before.Pending, effective.Pending = nil, nil
+		if pending.Previous == nil {
+			delete(before.Active, pending.AppID)
+		} else {
+			before.Active[pending.AppID] = *pending.Previous
+		}
+		effective.Active[pending.AppID] = pending.Proposed
+		transition = generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayNativeV1,
+			legacy: &generatedRouteActivationLegacyTransition{before: before, pending: state, effective: effective}}
+		protectedGateway.names = generatedDomainGatewayExpectedNames(protectedGateway)
+		ids, err := generatedDomainGatewayExpectedIDs(protectedGateway)
+		if err != nil {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		protectedGateway.ids = ids
+	case generatedDomainGatewayNativeV2:
+		state := cloneGatewayV2RouteState(*protectedGateway.nativeV2)
+		pending := state.Pending
+		if pending == nil || protectedGateway.journal == nil {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		before, effective := cloneGatewayV2RouteState(state), cloneGatewayV2RouteState(state)
+		before.Pending, effective.Pending = nil, nil
+		if pending.Previous == nil {
+			delete(before.Apps, pending.AppID)
+		} else {
+			before.Apps[pending.AppID] = cloneGatewayV2AppRoute(*pending.Previous)
+		}
+		effective.Apps[pending.AppID] = cloneGatewayV2AppRoute(pending.Proposed)
+		transition = generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayNativeV2,
+			nativeV2: &generatedRouteActivationNativeV2Transition{before: before, pending: state,
+				effective: effective, journal: *protectedGateway.journal, operationID: state.OperationID}}
+	case generatedDomainGatewayCurrentV1:
+		value, err := gatewayCurrentTransitionFromPending(*protectedGateway.currentV1)
+		if err != nil || value.Pending.Pending == nil || value.Pending.Pending.Kind != gatewayV2PendingRouteSwitch {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		transition = generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayCurrentV1,
+			currentV1: &value}
+	default:
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	// A pending V1/upgrade record may coexist with only its one exact stable
+	// Current V2 projection from immediately before the transition.  Prove the
+	// projection against the reconstructed before-state; every other protected
+	// candidate remains ambiguous and refuses construction.
+	if selectedIndex >= 0 && len(allCandidates) > 1 {
+		if len(allCandidates) != 2 {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		historical := candidates[0]
+		switch transition.kind {
+		case generatedDomainGatewayNativeV2:
+			state := cloneGatewayV2RouteState(transition.nativeV2.before)
+			selection := *historical.upgrade
+			selection.State = state
+			historical.nativeV2, historical.upgrade = &state, &selection
+		case generatedDomainGatewayCurrentV1:
+			state := cloneGatewayCurrentRouteState(transition.currentV1.Before)
+			historical.currentV1 = &state
+		default:
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		otherIndex := 1 - selectedIndex
+		if otherIndex < 0 || otherIndex >= len(allCandidates) ||
+			allCandidates[otherIndex].kind != generatedDomainGatewayCurrentV2 {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		collapsed, ok := generatedDomainCollapseCurrentV2Sources(
+			[]generatedDomainGatewayExpectation{historical, allCandidates[otherIndex]})
+		if !ok || len(collapsed) != 1 || collapsed[0].kind != generatedDomainGatewayCurrentV2 {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+	}
+	appID := ""
+	requestBefore := routeRecord{}
+	requestProposed := routeRecord{}
+	switch transition.kind {
+	case generatedDomainGatewayNativeV1:
+		pending := transition.legacy.pending.Pending
+		appID, requestProposed = pending.AppID, pending.Proposed
+		if pending.Previous != nil {
+			requestBefore = *pending.Previous
+		}
+	case generatedDomainGatewayNativeV2:
+		pending := transition.nativeV2.pending.Pending
+		appID, requestProposed = pending.AppID, pending.Proposed.Route
+		if pending.Previous != nil {
+			requestBefore = pending.Previous.Route
+		}
+	case generatedDomainGatewayCurrentV1:
+		pending := transition.currentV1.Pending.Pending
+		appID, requestProposed = pending.AppID, pending.Proposed.Route
+		if pending.Previous != nil {
+			requestBefore = pending.Previous.Route
+		}
+	}
+	// Reconstruct the canonical request from the durable Pending record before
+	// asking the gateway helper to validate the complete transition.  The
+	// helper deliberately validates request as part of the transition, so using
+	// it first would reject every restart reconstruction for a zero request.
+	transition.request = generatedroute.RouteSwitchRequest{AppID: appID, FromSlot: requestBefore.Slot,
+		ToSlot: requestProposed.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), requestProposed.Endpoints...)}
+	before, hadBefore, proposed, valid := generatedRouteActivationGatewayRoutes(&transition)
+	if !valid || (!hadBefore && (transition.request.FromSlot != "" || !sameRoute(before, routeRecord{}))) {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	var successor *generatedDomainColdGroup
+	beforeActivation := false
+	for index := range groups {
+		group := &groups[index]
+		if group.pins.applicationID() != appID || group.kind != generatedDomainColdRisky || !group.bindHead {
+			continue
+		}
+		for _, component := range group.snapshot.components {
+			if component.state != generatedruntimestate.ComponentHealthy &&
+				component.state != generatedruntimestate.ComponentActive {
+				return result, false, errGeneratedDomainConstructionRefused
+			}
+		}
+		actual, actualValid := generatedDomainColdGroupRoute(*group)
+		if !actualValid {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+		pre := group.snapshot.runtime.phase == generatedruntimestate.PhaseSwitchingRoute && !group.selfHead &&
+			group.snapshot.observedHead.deploymentID == group.snapshot.headPins.previousDeploymentID
+		post := group.snapshot.runtime.phase == generatedruntimestate.PhaseDraining && group.selfHead &&
+			generatedDomainColdActivationMatches(group.pins, group.snapshot, groups,
+				database.Runtime.RouteActivations)
+		if sameRoute(actual, proposed) && (pre || post) {
+			if successor != nil {
+				return result, false, errGeneratedDomainConstructionRefused
+			}
+			successor = group
+			beforeActivation = pre
+		}
+	}
+	if successor == nil {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	if beforeActivation && !hadBefore && (successor.snapshot.observedHead.deploymentID != "" ||
+		successor.snapshot.observedHead.releaseID != "" || successor.snapshot.observedHead.slot != "" ||
+		successor.snapshot.observedHead.generation != 0 || successor.snapshot.observedHead.activationReceiptID != "") {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	if beforeActivation && successor.snapshot.observedHead.slot != string(before.Slot) {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	if !beforeActivation && successor.snapshot.observedHead.slot != string(proposed.Slot) {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	if beforeActivation {
+		for _, value := range database.Runtime.RouteActivations {
+			if value.AppID == appID && value.SuccessorDeploymentID == successor.pins.deploymentID {
+				return result, false, errGeneratedDomainConstructionRefused
+			}
+		}
+		for _, values := range [][]string{
+			generatedDomainColdSuccessorIDs043(database), generatedDomainColdSuccessorIDs044(database),
+			generatedDomainColdSuccessorIDs045(database),
+		} {
+			for _, deploymentID := range values {
+				if deploymentID == successor.pins.deploymentID {
+					return result, false, errGeneratedDomainConstructionRefused
+				}
+			}
+		}
+	} else {
+		for _, deploymentID := range generatedDomainColdSuccessorIDs045(database) {
+			if deploymentID == successor.pins.deploymentID {
+				return result, false, errGeneratedDomainConstructionRefused
+			}
+		}
+	}
+	serving, err := generatedDomainColdPendingGatewayProjection(protectedGateway, transition, false)
+	if err != nil {
+		return result, false, errGeneratedDomainConstructionRefused
+	}
+	routeGateway := serving
+	if beforeActivation {
+		routeGateway, err = generatedDomainColdPendingGatewayProjection(protectedGateway, transition, true)
+		if err != nil {
+			return result, false, errGeneratedDomainConstructionRefused
+		}
+	}
+	result = generatedDomainColdPendingActivationEvidence{transition: &transition,
+		successorDeployment: successor.pins.deploymentID, beforeActivation: beforeActivation,
+		protectedGateway: protectedGateway, routeGateway: routeGateway, servingGateway: serving}
+	return result, true, nil
+}
+
+// generatedDomainColdPendingGatewayProjection creates a canonical, standalone
+// physical expectation for one protected Pending projection. The raw
+// protectedGateway remains unmodified: it is durable marker evidence, not a
+// serving-state expectation. Keeping all companion projections in step with
+// the primary state prevents a native V2/current retained proof from observing
+// the previous Pending-bearing state through a shallow pointer alias.
+func generatedDomainColdPendingGatewayProjection(protected generatedDomainGatewayExpectation,
+	transition generatedRouteActivationGatewayTransition, before bool,
+) (generatedDomainGatewayExpectation, error) {
+	if protected.kind != transition.kind {
+		return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+	}
+	result := protected
+	switch transition.kind {
+	case generatedDomainGatewayNativeV1:
+		if transition.legacy == nil || protected.nativeV1 == nil {
+			return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+		}
+		state := cloneRouteState(transition.legacy.effective)
+		if before {
+			state = cloneRouteState(transition.legacy.before)
+		}
+		if !validRouteState(state) || state.Pending != nil {
+			return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+		}
+		result.nativeV1, result.nativeV2, result.journal, result.upgrade = &state, nil, nil, nil
+		result.currentV1, result.currentV2, result.terminal = nil, nil, nil
+		result.retainedV1, result.retainedV2 = nil, nil
+		digest, err := canonicalDigest(state)
+		if err != nil {
+			return generatedDomainGatewayExpectation{}, err
+		}
+		result.stateDigest = digest
+	case generatedDomainGatewayNativeV2:
+		if transition.nativeV2 == nil || protected.nativeV1 == nil || protected.nativeV2 == nil ||
+			protected.journal == nil || protected.upgrade == nil {
+			return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+		}
+		state := cloneGatewayV2RouteState(transition.nativeV2.effective)
+		if before {
+			state = cloneGatewayV2RouteState(transition.nativeV2.before)
+		}
+		if !validGatewayTopologyInputs(*protected.nativeV1, state, *protected.journal) || state.Pending != nil {
+			return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+		}
+		upgrade := *protected.upgrade
+		upgrade.State = cloneGatewayV2RouteState(state)
+		result.nativeV2, result.upgrade = &state, &upgrade
+		result.currentV1, result.currentV2, result.terminal = nil, nil, nil
+		result.retainedV1, result.retainedV2 = nil, nil
+		digest, err := canonicalDigest(state)
+		if err != nil {
+			return generatedDomainGatewayExpectation{}, err
+		}
+		result.stateDigest = digest
+	case generatedDomainGatewayCurrentV1:
+		if transition.currentV1 == nil || protected.currentV1 == nil || protected.terminal == nil {
+			return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+		}
+		state := cloneGatewayCurrentRouteState(transition.currentV1.Effective)
+		if before {
+			state = cloneGatewayCurrentRouteState(transition.currentV1.Before)
+		}
+		if !validGatewayCurrentRouteState(state) || state.Pending != nil {
+			return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+		}
+		result.currentV1, result.currentV2 = &state, nil
+		if protected.retainedV1 != nil {
+			retained := cloneGeneratedDomainRetainedV1Projection(*protected.retainedV1)
+			result.retainedV1 = &retained
+		}
+		if protected.retainedV2 != nil {
+			retained := cloneGeneratedDomainRetainedV2Projection(*protected.retainedV2)
+			retained.current = cloneGatewayCurrentRouteState(state)
+			result.retainedV2 = &retained
+		}
+		result.stateDigest = state.Digest
+	default:
+		return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+	}
+	if result.stateDigest == "" {
+		return generatedDomainGatewayExpectation{}, errGeneratedDomainConstructionRefused
+	}
+	result.names = generatedDomainGatewayExpectedNames(result)
+	ids, err := generatedDomainGatewayExpectedIDs(result)
+	if err != nil {
+		return generatedDomainGatewayExpectation{}, err
+	}
+	result.ids = ids
+	return result, nil
+}
+
+// generatedDomainColdPendingGatewayIdentity identifies the one immutable
+// gateway container and restart file that both canonical Pending projections
+// must share before cold construction reads configuration bytes. Application
+// networks deliberately are not compared here: the Before and Effective route
+// states can legitimately have different app-network memberships.
+func generatedDomainColdPendingGatewayIdentity(snapshot generatedDomainDockerStartupSnapshot,
+	expected generatedDomainGatewayExpectation,
+) (string, string, bool) {
+	containers := expected.names["container"]
+	if len(containers) != 1 {
+		return "", "", false
+	}
+	containerName := ""
+	for name := range containers {
+		containerName = name
+	}
+	container, found := generatedDomainObjectByName(snapshot, "container", containerName)
+	if !found || !generatedDomainCanonicalDockerID(container.id, false) || normalizeID(container.id) != container.id {
+		return "", "", false
+	}
+	if ids := expected.ids["container"]; len(ids) != 0 {
+		if len(ids) != 1 {
+			return "", "", false
+		}
+		if _, matches := ids[container.id]; !matches {
+			return "", "", false
+		}
+	}
+	filename := ""
+	switch expected.kind {
+	case generatedDomainGatewayNativeV1:
+		filename = gatewayV2ActiveConfigFile
+	case generatedDomainGatewayNativeV2:
+		if expected.nativeV2 == nil {
+			return "", "", false
+		}
+		filename = expected.nativeV2.Identity.ActiveConfigFilename
+	case generatedDomainGatewayCurrentV1:
+		if expected.currentV1 == nil || expected.currentV1.Identity.Rebind == nil {
+			return "", "", false
+		}
+		filename = expected.currentV1.Identity.Rebind.ActiveConfigFilename
+	case generatedDomainGatewayCurrentV2:
+		if expected.currentV2 == nil {
+			return "", "", false
+		}
+		if expected.currentV2.Lineage.Kind == appaccess.GatewayRebindSourceGatewayUpgrade {
+			if expected.nativeV2 == nil {
+				return "", "", false
+			}
+			filename = expected.nativeV2.Identity.ActiveConfigFilename
+		} else if expected.currentV2.Identity.Rebind != nil {
+			filename = expected.currentV2.Identity.Rebind.ActiveConfigFilename
+		}
+	}
+	if !validName(filename, 255) {
+		return "", "", false
+	}
+	return container.id, filename, true
+}
+
+func sameGeneratedDomainColdPendingGatewayIdentity(left, right generatedDomainGatewayExpectation) bool {
+	if left.kind != right.kind {
+		return false
+	}
+	switch left.kind {
+	case generatedDomainGatewayNativeV1:
+		return left.nativeV1 != nil && right.nativeV1 != nil
+	case generatedDomainGatewayNativeV2:
+		return left.nativeV1 != nil && right.nativeV1 != nil && left.nativeV2 != nil && right.nativeV2 != nil &&
+			left.journal != nil && right.journal != nil && left.upgrade != nil && right.upgrade != nil &&
+			reflect.DeepEqual(left.nativeV1, right.nativeV1) &&
+			reflect.DeepEqual(left.nativeV2.Identity, right.nativeV2.Identity) &&
+			reflect.DeepEqual(left.journal.Resources, right.journal.Resources) &&
+			left.upgrade.Generation == right.upgrade.Generation && left.upgrade.operationID == right.upgrade.operationID &&
+			reflect.DeepEqual(left.upgrade.Journal, right.upgrade.Journal)
+	case generatedDomainGatewayCurrentV1:
+		return left.currentV1 != nil && right.currentV1 != nil && left.terminal != nil && right.terminal != nil &&
+			reflect.DeepEqual(left.currentV1.Lineage, right.currentV1.Lineage) &&
+			reflect.DeepEqual(left.currentV1.Identity, right.currentV1.Identity) &&
+			reflect.DeepEqual(left.currentV1.Profile, right.currentV1.Profile) &&
+			reflect.DeepEqual(left.currentV1.Network, right.currentV1.Network) &&
+			reflect.DeepEqual(left.terminal.Resources, right.terminal.Resources)
+	default:
+		return false
+	}
+}
+
+func generatedDomainColdPendingGatewayConfig(ctx context.Context, reader *generatedDomainStartupReader,
+	deadline time.Time, snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	containerID string,
+) ([]byte, error) {
+	if reader == nil || !generatedDomainCanonicalDockerID(containerID, false) {
+		return nil, errGeneratedDomainConstructionRefused
+	}
+	switch expected.kind {
+	case generatedDomainGatewayNativeV1:
+		if expected.nativeV1 == nil {
+			return nil, errGeneratedDomainConstructionRefused
+		}
+		containerObject, found := generatedDomainObjectByName(snapshot, "container", caddyContainerName)
+		if !found || containerObject.id != containerID {
+			return nil, errGeneratedDomainConstructionRefused
+		}
+		networkObject, found := generatedDomainObjectByName(snapshot, "network", caddyNetworkName)
+		if !found {
+			return nil, errGeneratedDomainConstructionRefused
+		}
+		container, _, err := reader.readDetailedContainer(ctx, deadline, containerID)
+		if err != nil || container.ID != containerID {
+			return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+		}
+		network, _, err := reader.readDetailedNetwork(ctx, deadline, networkObject.id)
+		listenIP, valid := caddyIngressAddress(network, container.ID)
+		if err != nil || !valid {
+			return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+		}
+		config, err := buildCaddyConfig(expected.nativeV1.Active,
+			net.JoinHostPort(listenIP, strconv.FormatUint(uint64(gatewayV2ContainerPort), 10)))
+		if err != nil {
+			return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+		}
+		return config, nil
+	case generatedDomainGatewayNativeV2:
+		if expected.nativeV2 == nil {
+			return nil, errGeneratedDomainConstructionRefused
+		}
+		config, err := expectedGatewayV2FinalConfig(*expected.nativeV2)
+		if err != nil {
+			return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+		}
+		return config, nil
+	case generatedDomainGatewayCurrentV1:
+		if expected.currentV1 == nil {
+			return nil, errGeneratedDomainConstructionRefused
+		}
+		config, err := gatewayCurrentPhysicalConfigBytes(*expected.currentV1)
+		if err != nil {
+			return nil, errors.Join(errGeneratedDomainConstructionRefused, err)
+		}
+		return config, nil
+	default:
+		return nil, errGeneratedDomainConstructionRefused
+	}
+}
+
+func classifyGeneratedDomainColdPendingGateway(ctx context.Context, reader *generatedDomainStartupReader,
+	deadline time.Time, snapshot generatedDomainDockerStartupSnapshot,
+	pending *generatedDomainColdPendingActivationEvidence,
+) (generatedDomainGatewayExpectation, *generatedDomainGatewayConfigObservation,
+	generatedDomainColdPendingGatewayDisposition, error) {
+	if pending == nil || pending.transition == nil || !pending.beforeActivation ||
+		!sameGeneratedDomainColdPendingGatewayIdentity(pending.routeGateway, pending.servingGateway) {
+		return generatedDomainGatewayExpectation{}, nil, generatedDomainColdPendingGatewayUnknown,
+			errGeneratedDomainConstructionRefused
+	}
+	containerID, filename, valid := generatedDomainColdPendingGatewayIdentity(snapshot, pending.routeGateway)
+	if !valid {
+		return generatedDomainGatewayExpectation{}, nil, generatedDomainColdPendingGatewayUnknown,
+			errGeneratedDomainConstructionRefused
+	}
+	otherID, otherFilename, valid := generatedDomainColdPendingGatewayIdentity(snapshot, pending.servingGateway)
+	if !valid || otherID != containerID || otherFilename != filename {
+		return generatedDomainGatewayExpectation{}, nil, generatedDomainColdPendingGatewayUnknown,
+			errGeneratedDomainConstructionRefused
+	}
+	observation, err := reader.readGatewayConfigObservation(ctx, deadline, containerID, filename)
+	if err != nil {
+		return generatedDomainGatewayExpectation{}, nil, generatedDomainColdPendingGatewayUnknown, err
+	}
+	before, err := generatedDomainColdPendingGatewayConfig(ctx, reader, deadline, snapshot, pending.routeGateway, containerID)
+	if err != nil {
+		observation.clear()
+		return generatedDomainGatewayExpectation{}, nil, generatedDomainColdPendingGatewayUnknown, err
+	}
+	defer clear(before)
+	serving, err := generatedDomainColdPendingGatewayConfig(ctx, reader, deadline, snapshot, pending.servingGateway, containerID)
+	if err != nil {
+		observation.clear()
+		return generatedDomainGatewayExpectation{}, nil, generatedDomainColdPendingGatewayUnknown, err
+	}
+	defer clear(serving)
+	disposition, matches := classifyGeneratedDomainColdPendingGatewayConfigs(before, serving,
+		observation.restart, observation.live)
+	if !matches {
+		observation.clear()
+		return generatedDomainGatewayExpectation{}, nil, generatedDomainColdPendingGatewayUnknown,
+			errGeneratedDomainConstructionRefused
+	}
+	if disposition == generatedDomainColdPendingGatewayPreviousExact {
+		return pending.routeGateway, observation, generatedDomainColdPendingGatewayPreviousExact, nil
+	}
+	return pending.servingGateway, observation, generatedDomainColdPendingGatewayProposedExact, nil
+}
+
+// classifyGeneratedDomainColdPendingGatewayConfigs is deliberately pure so the
+// physical pairing rule stays closed: both restart and live bytes must match
+// exactly one canonical projection. A mixed, absent, or indistinguishable pair
+// has no typed physical disposition.
+func classifyGeneratedDomainColdPendingGatewayConfigs(before, serving, restart, live []byte) (
+	generatedDomainColdPendingGatewayDisposition, bool,
+) {
+	beforeMatches := sameCaddyConfig(before, restart) && sameCaddyConfig(before, live)
+	servingMatches := sameCaddyConfig(serving, restart) && sameCaddyConfig(serving, live)
+	switch {
+	case beforeMatches && !servingMatches:
+		return generatedDomainColdPendingGatewayPreviousExact, true
+	case servingMatches && !beforeMatches:
+		return generatedDomainColdPendingGatewayProposedExact, true
+	default:
+		return generatedDomainColdPendingGatewayUnknown, false
+	}
+}
+
+func generatedDomainColdSuccessorIDs043(database deployments.GeneratedDomainStartupSnapshot) []string {
+	result := make([]string, 0, len(database.Runtime.PredecessorRetirementComponents)+len(database.Runtime.PredecessorRetirementReceipts))
+	for _, value := range database.Runtime.PredecessorRetirementComponents {
+		result = append(result, value.SuccessorDeploymentID)
+	}
+	for _, value := range database.Runtime.PredecessorRetirementReceipts {
+		result = append(result, value.SuccessorDeploymentID)
+	}
+	return result
+}
+func generatedDomainColdSuccessorIDs044(database deployments.GeneratedDomainStartupSnapshot) []string {
+	result := make([]string, 0, len(database.Runtime.AccountingHandoffAuthorizations)+len(database.Runtime.AccountingHandoffReceipts))
+	for _, value := range database.Runtime.AccountingHandoffAuthorizations {
+		result = append(result, value.SuccessorDeploymentID)
+	}
+	for _, value := range database.Runtime.AccountingHandoffReceipts {
+		result = append(result, value.SuccessorDeploymentID)
+	}
+	return result
+}
+func generatedDomainColdSuccessorIDs045(database deployments.GeneratedDomainStartupSnapshot) []string {
+	result := make([]string, 0, len(database.Runtime.RouteCompletionReceipts))
+	for _, value := range database.Runtime.RouteCompletionReceipts {
+		result = append(result, value.SuccessorDeploymentID)
+	}
+	return result
 }
 
 func readGeneratedDomainColdGroup(ctx context.Context, authority *GeneratedCandidateAuthority,
@@ -869,6 +1786,17 @@ func generatedDomainColdRunningBindingRetainsRetirementPrefix(
 func validateGeneratedDomainColdLifecycleRetention(database deployments.GeneratedDomainStartupSnapshot,
 	groups []generatedDomainColdGroup,
 ) error {
+	return validateGeneratedDomainColdLifecycleRetentionWithPending(database, groups, nil)
+}
+
+// validateGeneratedDomainColdLifecycleRetentionWithPending consumes, but never
+// contributes to, the independently reconstructed pre-042 Pending evidence.
+// The sole extra shape is the still-current predecessor selected by that
+// evidence. It remains subject to all operation, binding, route and head
+// correlation checks below.
+func validateGeneratedDomainColdLifecycleRetentionWithPending(database deployments.GeneratedDomainStartupSnapshot,
+	groups []generatedDomainColdGroup, pending *generatedDomainColdPendingActivationEvidence,
+) error {
 	type operationIdentity struct {
 		appID, jobID string
 		revision     int64
@@ -885,7 +1813,8 @@ func validateGeneratedDomainColdLifecycleRetention(database deployments.Generate
 		group, ok := generatedDomainColdGroupByDeployment(groups, operation.DeploymentID)
 		if !ok || group.pins.applicationID() != operation.AppID ||
 			group.kind != generatedDomainColdHistorical &&
-				!generatedDomainColdRunningBindingRetainsRetirementPrefix(database, groups, operation, group) {
+				!generatedDomainColdRunningBindingRetainsRetirementPrefix(database, groups, operation, group) &&
+				!generatedDomainColdPendingActivationRetainsCurrent(database, groups, pending, operation, group) {
 			return errGeneratedDomainConstructionRefused
 		}
 		retained[operation.DeploymentID]++
@@ -928,12 +1857,78 @@ func validateGeneratedDomainColdLifecycleRetention(database deployments.Generate
 				authorizer, authorizerCount = operation, authorizerCount+1
 			}
 		}
-		if authorizerCount != 1 || !authorizer.Complete || authorizer.DeploymentID == current.pins.deploymentID ||
+		if authorizerCount != 1 || !authorizer.Complete {
+			return errGeneratedDomainConstructionRefused
+		}
+		if authorizer.DeploymentID == current.pins.deploymentID ||
 			!generatedDomainColdAuthorizerLineage(groups, current, authorizer.DeploymentID) {
 			return errGeneratedDomainConstructionRefused
 		}
 	}
 	return nil
+}
+
+// generatedDomainColdPendingActivationRetainsCurrent admits no general
+// Current/self-authorized lifecycle shape. It recognizes only the exact
+// predecessor that an independently reconstructed pre-042 Pending activation
+// selected. The subsequent gateway correlation consumes the same Pending
+// evidence before any reservation or effect is allowed.
+func generatedDomainColdPendingActivationRetainsCurrent(database deployments.GeneratedDomainStartupSnapshot,
+	groups []generatedDomainColdGroup,
+	pending *generatedDomainColdPendingActivationEvidence,
+	operation deployments.GeneratedDomainStartupLifecycleOperation, current generatedDomainColdGroup,
+) bool {
+	if pending == nil || !pending.beforeActivation || pending.transition == nil ||
+		!validGeneratedRouteActivationGatewayTransition(pending.transition) ||
+		current.kind != generatedDomainColdCurrent || !current.snapshot.lifecycleRetained ||
+		operation.DeploymentID != current.pins.deploymentID || operation.AppID != current.pins.applicationID() ||
+		current.snapshot.observedHead.deploymentID != current.pins.deploymentID ||
+		current.snapshot.observedHead.releaseID != current.pins.releaseID ||
+		current.snapshot.observedHead.slot != current.pins.candidateSlot {
+		return false
+	}
+	before, hadBefore, proposed, valid := generatedRouteActivationGatewayRoutes(pending.transition)
+	if !valid || !hadBefore || pending.transition.request.AppID != operation.AppID ||
+		pending.transition.request.FromSlot != before.Slot || pending.transition.request.ToSlot != proposed.Slot ||
+		!sameRoute(proposed, routeRecord{Slot: pending.transition.request.ToSlot,
+			Endpoints: pending.transition.request.Endpoints}) {
+		return false
+	}
+	currentRoute, currentRouteValid := generatedDomainColdGroupRoute(current)
+	if !currentRouteValid || !sameRoute(currentRoute, before) {
+		return false
+	}
+	successor, found := generatedDomainColdGroupByDeployment(groups, pending.successorDeployment)
+	if !found || successor.kind != generatedDomainColdRisky || !successor.bindHead || successor.selfHead ||
+		successor.pins.applicationID() != operation.AppID ||
+		successor.snapshot.runtime.phase != generatedruntimestate.PhaseSwitchingRoute ||
+		successor.snapshot.headPins.previousDeploymentID != current.pins.deploymentID ||
+		successor.snapshot.headPins.previousReleaseID != current.pins.releaseID ||
+		successor.snapshot.headPins.previousSlot != current.pins.candidateSlot ||
+		successor.snapshot.observedHead.deploymentID != current.snapshot.observedHead.deploymentID ||
+		successor.snapshot.observedHead.releaseID != current.snapshot.observedHead.releaseID ||
+		successor.snapshot.observedHead.slot != current.snapshot.observedHead.slot ||
+		successor.snapshot.observedHead.generation != current.snapshot.observedHead.generation ||
+		successor.snapshot.observedHead.activationReceiptID != current.snapshot.observedHead.activationReceiptID {
+		return false
+	}
+	successorRoute, successorRouteValid := generatedDomainColdGroupRoute(successor)
+	if !successorRouteValid || !sameRoute(successorRoute, proposed) {
+		return false
+	}
+	bindingCount := 0
+	for _, binding := range database.LifecycleBindings {
+		if binding.DeploymentJobID != successor.pins.jobID() {
+			continue
+		}
+		bindingCount++
+		if binding.AppID != operation.AppID || binding.Mode != deploymentbinding.ModeRunning ||
+			binding.DesiredRevision != operation.DesiredRevision ||
+			binding.AuthorizingOperationID != operation.JobID {
+			return false
+		}
+	}
+	return bindingCount == 1
 }
 
 func generatedDomainColdStagePair(status Status, phase generatedruntimestate.Phase,
@@ -1216,7 +2211,9 @@ func generatedDomainColdActivationMatches(pins candidateValidationPins, snapshot
 			value.PredecessorReleaseID != snapshot.headPins.previousReleaseID ||
 			value.PredecessorSlot != snapshot.headPins.previousSlot ||
 			value.CreatorJobID != snapshot.pins.jobID || value.CreatorWorkerAttempt < 1 ||
-			value.CreatorWorkerAttempt > pins.attempt() ||
+			value.WriterJobID != snapshot.pins.jobID ||
+			value.CreatorWorkerAttempt > value.WriterWorkerAttempt ||
+			value.WriterWorkerAttempt < 1 || value.WriterWorkerAttempt > pins.attempt() ||
 			value.CandidateRosterDigest != generatedRouteActivationRosterDigest(candidateRoster) ||
 			!lowerHex(value.RouteIntentDigest, 64) || !lowerHex(value.CommittedRouteProofDigest, 64) {
 			return false
@@ -1326,7 +2323,9 @@ func generatedDomainColdCompletedRouteEvidenceForGroup(database deployments.Gene
 	if !ok || activation.SuccessorReleaseID != group.pins.releaseID ||
 		activation.SuccessorSlot != group.pins.candidateSlot ||
 		activation.CreatorJobID != group.pins.jobID() || activation.CreatorWorkerAttempt < 1 ||
-		activation.CreatorWorkerAttempt > group.pins.attempt() ||
+		activation.WriterJobID != group.pins.jobID() ||
+		activation.CreatorWorkerAttempt > activation.WriterWorkerAttempt ||
+		activation.WriterWorkerAttempt < 1 || activation.WriterWorkerAttempt > group.pins.attempt() ||
 		activation.CandidateRosterDigest != generatedRouteActivationRosterDigest(candidateRoster) ||
 		activation.PredecessorDeploymentID != group.snapshot.headPins.previousDeploymentID ||
 		activation.PredecessorReleaseID != group.snapshot.headPins.previousReleaseID ||
@@ -1412,6 +2411,9 @@ func generatedDomainColdCompletedRouteEvidenceForGroup(database deployments.Gene
 		completion.AppID != activation.AppID || completion.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
 		completion.CreatorJobID != activation.CreatorJobID ||
 		completion.CreatorWorkerAttempt != activation.CreatorWorkerAttempt ||
+		activation.WriterJobID != group.pins.jobID() ||
+		activation.WriterWorkerAttempt < activation.CreatorWorkerAttempt ||
+		activation.WriterWorkerAttempt > completion.CurrentWorkerAttempt ||
 		completion.CurrentJobID != group.pins.jobID() || completion.CurrentWorkerAttempt != group.pins.attempt() ||
 		completion.CompletionCode != "deployment_completed" || completion.CompletedAt.IsZero() ||
 		handoff.HandedOffAt.After(completion.CompletedAt) {
@@ -1838,6 +2840,9 @@ func generatedDomainColdCurrentDebtEvidence(database deployments.GeneratedDomain
 		completion.SuccessorDeploymentID != activation.SuccessorDeploymentID ||
 		completion.CreatorJobID != activation.CreatorJobID ||
 		completion.CreatorWorkerAttempt != activation.CreatorWorkerAttempt ||
+		activation.WriterJobID != group.pins.jobID() ||
+		activation.WriterWorkerAttempt < activation.CreatorWorkerAttempt ||
+		activation.WriterWorkerAttempt > completion.CurrentWorkerAttempt ||
 		completion.CurrentJobID != group.pins.jobID() || completion.CurrentWorkerAttempt != group.pins.attempt() ||
 		completion.CompletionCode != "deployment_completed" || completion.CompletedAt.IsZero() ||
 		handoff.HandedOffAt.After(completion.CompletedAt) {
@@ -1920,6 +2925,25 @@ func attestGeneratedDomainColdGroupsWithRetained(ctx context.Context, manager *M
 func attestGeneratedDomainColdGroupsWithRetainedProofs(ctx context.Context, manager *Manager,
 	authority *GeneratedCandidateAuthority,
 	observed generatedDomainStartupObservation, groups []generatedDomainColdGroup,
+	retainedGateway *generatedDomainColdRetainedGatewayProof,
+	retainedV2Proof *generatedDomainColdRetainedV2Proof,
+) error {
+	pending, found, err := generatedDomainColdPendingActivation(observed.database, observed.protected, groups)
+	if err != nil {
+		return err
+	}
+	var evidence *generatedDomainColdPendingActivationEvidence
+	if found {
+		evidence = &pending
+	}
+	return attestGeneratedDomainColdGroupsWithPendingProofs(ctx, manager, authority, observed, groups, evidence,
+		retainedGateway, retainedV2Proof)
+}
+
+func attestGeneratedDomainColdGroupsWithPendingProofs(ctx context.Context, manager *Manager,
+	authority *GeneratedCandidateAuthority,
+	observed generatedDomainStartupObservation, groups []generatedDomainColdGroup,
+	pending *generatedDomainColdPendingActivationEvidence,
 	retainedGateway *generatedDomainColdRetainedGatewayProof,
 	retainedV2Proof *generatedDomainColdRetainedV2Proof,
 ) error {
@@ -2059,6 +3083,27 @@ func attestGeneratedDomainColdGroupsWithRetainedProofs(ctx context.Context, mana
 		}
 	}
 	gateway, err := resolveGeneratedDomainColdGatewayExpectation(observed.database, observed.protected)
+	var reader *generatedDomainStartupReader
+	var configObservation *generatedDomainGatewayConfigObservation
+	if pending != nil {
+		gateway = pending.servingGateway
+		if pending.beforeActivation {
+			reader, err = newGeneratedDomainColdStartupReader(manager, authority, observed.docker, gateway)
+			if err == nil {
+				deadline, deadlineSet := ctx.Deadline()
+				if !deadlineSet {
+					deadline = time.Now().Add(generatedDomainStartupObservationTimeout)
+				}
+				gateway, configObservation, pending.disposition, err = classifyGeneratedDomainColdPendingGateway(
+					ctx, reader, deadline, observed.docker, pending)
+			}
+			if configObservation != nil {
+				defer configObservation.clear()
+			}
+		} else {
+			pending.disposition = generatedDomainColdPendingGatewayProposedExact
+		}
+	}
 	if err != nil {
 		return generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
@@ -2185,10 +3230,20 @@ func attestGeneratedDomainColdGroupsWithRetainedProofs(ctx context.Context, mana
 			generatedDomainConstructionReasonColdGroupMissingNetwork,
 			errGeneratedDomainConstructionRefused)
 	}
-	if err := attestGeneratedDomainColdGateway(ctx, manager, authority, observed.docker, gateway); err != nil {
+	if configObservation != nil {
+		err = attestGeneratedDomainColdGatewayWithReader(ctx, reader, observed.docker, gateway, configObservation)
+	} else {
+		err = attestGeneratedDomainColdGateway(ctx, manager, authority, observed.docker, gateway)
+	}
+	if err != nil {
 		return generatedDomainConstructionBoundaryDiagnostic(
 			generatedDomainConstructionStageColdConstruction,
 			generatedDomainConstructionReasonColdGroupGatewayAttestation, err)
+	}
+	if pending != nil && pending.disposition == generatedDomainColdPendingGatewayUnknown {
+		return generatedDomainConstructionBoundaryDiagnostic(
+			generatedDomainConstructionStageColdConstruction,
+			generatedDomainConstructionReasonColdGroupGatewayAttestation, errGeneratedDomainConstructionRefused)
 	}
 	return nil
 }
@@ -2204,6 +3259,16 @@ func attestGeneratedDomainColdGateway(ctx context.Context, manager *Manager,
 	if err != nil {
 		return err
 	}
+	return attestGeneratedDomainColdGatewayWithReader(ctx, reader, snapshot, expected, nil)
+}
+
+func attestGeneratedDomainColdGatewayWithReader(ctx context.Context, reader *generatedDomainStartupReader,
+	snapshot generatedDomainDockerStartupSnapshot, expected generatedDomainGatewayExpectation,
+	observation *generatedDomainGatewayConfigObservation,
+) error {
+	if ctx == nil || reader == nil {
+		return errGeneratedDomainConstructionRefused
+	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
 		deadline = time.Now().Add(generatedDomainStartupObservationTimeout)
@@ -2212,11 +3277,11 @@ func attestGeneratedDomainColdGateway(ctx context.Context, manager *Manager,
 	var attestErr error
 	switch expected.kind {
 	case generatedDomainGatewayNativeV1:
-		attestation, attestErr = reader.attestNativeV1(ctx, deadline, snapshot, expected, true)
+		attestation, attestErr = reader.attestNativeV1Observed(ctx, deadline, snapshot, expected, true, observation)
 	case generatedDomainGatewayNativeV2:
-		attestation, attestErr = reader.attestNativeV2(ctx, deadline, snapshot, expected, true)
+		attestation, attestErr = reader.attestNativeV2Observed(ctx, deadline, snapshot, expected, true, observation)
 	case generatedDomainGatewayCurrentV1, generatedDomainGatewayCurrentV2:
-		attestation, attestErr = reader.attestCurrent(ctx, deadline, snapshot, expected, true)
+		attestation, attestErr = reader.attestCurrentObserved(ctx, deadline, snapshot, expected, true, observation)
 	default:
 		return errGeneratedDomainConstructionRefused
 	}

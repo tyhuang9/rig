@@ -3,7 +3,6 @@ package deploymentexecution
 import (
 	"database/sql"
 	"errors"
-	"time"
 
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
@@ -49,27 +48,14 @@ func (p *Pinned) CheckGeneratedRouteCompletionReplayTx(tx *sql.Tx, claim Claim,
 	if err != nil || !found || persisted != completion {
 		return errors.Join(ErrIdentityLost, err)
 	}
-	var receipt generatedruntimestate.RouteActivationReceipt
-	var activatedAt string
-	err = tx.QueryRowContext(ctx, `SELECT id,app_id,successor_deployment_id,successor_release_id,
-		successor_slot,successor_generation,predecessor_deployment_id,predecessor_release_id,
-		predecessor_slot,predecessor_generation,predecessor_activation_receipt_id,creator_job_id,
-		creator_worker_attempt,candidate_roster_digest,predecessor_roster_digest,route_intent_digest,
-		committed_route_proof_digest,activated_at FROM generated_route_activations WHERE id=?`,
-		activation.ReceiptID).Scan(&receipt.ReceiptID, &receipt.AppID, &receipt.SuccessorDeploymentID,
-		&receipt.SuccessorReleaseID, &receipt.SuccessorSlot, &receipt.SuccessorGeneration,
-		&receipt.PredecessorDeploymentID, &receipt.PredecessorReleaseID, &receipt.PredecessorSlot,
-		&receipt.PredecessorGeneration, &receipt.PredecessorActivationReceiptID, &receipt.CreatorJobID,
-		&receipt.CreatorWorkerAttempt, &receipt.CandidateRosterDigest, &receipt.PredecessorRosterDigest,
-		&receipt.RouteIntentDigest, &receipt.CommittedRouteProofDigest, &activatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
+	receipt, err := generatedruntimestate.New(guard.db).ReadRouteActivationReceiptTx(ctx, tx, activation.ReceiptID)
+	if errors.Is(err, generatedruntimestate.ErrNotFound) || errors.Is(err, generatedruntimestate.ErrInvalidState) {
 		return ErrIdentityLost
 	}
 	if err != nil {
 		return storageError(ctx, err)
 	}
-	receipt.ActivatedAt, err = time.Parse(time.RFC3339Nano, activatedAt)
-	if err != nil || receipt != activation {
+	if receipt != activation {
 		return errors.Join(ErrIdentityLost, err)
 	}
 

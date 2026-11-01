@@ -327,6 +327,7 @@ func TestGeneratedDomainStartupSnapshotTxReadsSortedPredecessorRetirementRowsInd
 			SuccessorDeploymentID: candidate.deploymentID, SuccessorReleaseID: candidate.releaseID,
 			SuccessorSlot: "blue", SuccessorGeneration: generation,
 			CreatorJobID: candidate.jobID, CreatorWorkerAttempt: candidate.jobAttempt,
+			WriterJobID: candidate.jobID, WriterWorkerAttempt: candidate.jobAttempt,
 			CandidateRosterDigest:     predecessorRetirementRosterDigest(candidateRoster),
 			PredecessorRosterDigest:   predecessorRetirementRosterDigest(predecessorRoster),
 			RouteIntentDigest:         strings.Repeat("4", 64),

@@ -1,0 +1,159 @@
+{
+  "purpose": "Reproduce the bounded local activation-recovery acceptance suite; this is not whole-repository or Docker acceptance.",
+  "goVersion": "1.26.7",
+  "environment": {
+    "GOTOOLCHAIN": "local",
+    "GOFLAGS": "-mod=readonly -p=1 -buildvcs=false",
+    "CGO_ENABLED": "0"
+  },
+  "localParentCount": 89,
+  "hostdLiveDiscoveryOnly": "TestLiveControllerGeneratedProcessKillRecovery",
+  "frozenRosterSHA256": "8c596727dd615dcaa65bc7253c57bc1d6c3b355d3f7598d61666e7d385dc84b8",
+  "groups": {
+    "generatedingress": {
+      "package": "./internal/generatedingress",
+      "parents": [
+        "TestGeneratedDomainRestartAccountingSwitchingRouteRecoversActivationWithoutSecondShare",
+        "TestGeneratedDomainColdPreActivationHandoffSeeds",
+        "TestGeneratedDomainColdRuntimeBoundary",
+        "TestGeneratedDomainColdGroupGatewaySelectionAttribution",
+        "TestGeneratedDomainRestartAccountingInterruptedDrainingClaimsFreshWorkerWithoutSecondShare",
+        "TestGeneratedDomainRestartAccountingInterruptedDrainingRestoresConfiguredDebt",
+        "TestGeneratedDomainRestartAccountingActivePredecessorRecoversRetirementWithoutSecondShare",
+        "TestGeneratedDomainRecoveredRetirementFailureBoundariesPreserveDebt",
+        "TestGeneratedDomainColdInitialDrainingDebtEvidenceFallsThroughExactZeroPredecessorChain",
+        "TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster",
+        "TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRosterPart2",
+        "TestGeneratedDomainColdHistoricalLifecycleRetentionRequiresExactRunningSuccessor",
+        "TestGeneratedDomainColdCurrentDebtEvidenceRequiresTotalAbsenceOrExactChain",
+        "TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedRetirementPrefix",
+        "TestCandidateCapacityRestoredDebtRequiresExactPublishedTokenGraph",
+        "TestCandidateCapacityRestoredPredecessorReleasesExactDebtAndKeepsSuccessorCharge",
+        "TestCandidateCapacityRecoveredHandoffTransfersExactDualDebt",
+        "TestCandidateCapacityRecoveredRetirementHoldsWholeExactDualRoster",
+        "TestCandidateSharedTokenAndEntryMarkersPreventDuplicateCommands",
+        "TestCandidateAccountingHandoffTransfersWholeRoster",
+        "TestCandidateAccountingHandoffRejectsInvalidBatchWithoutMutation",
+        "TestGeneratedRouteAccountingHandoffSuccess",
+        "TestGeneratedRouteAccountingHandoffRefusesBeforeUnlock",
+        "TestGeneratedRouteAccountingHandoffFinalUnlockFailureIsTerminal",
+        "TestGeneratedRouteAccountingHandoffFinalProofDriftKeepsTerminalCharges",
+        "TestGeneratedRouteAccountingHandoffResolvesDurableLostAcknowledgement",
+        "TestGeneratedRouteRecoveredAccountingHandoffResolvesDurableReceiptLostAcknowledgement",
+        "TestGeneratedRouteRecoveredAccountingHandoffFinalProofFailureIsTerminal",
+        "TestGeneratedRouteAuthorityCommitsReceiptHeadAndRosterWithOriginalClaim",
+        "TestGeneratedRouteAuthorityRejectsChangedOriginalClaimWithoutPartialSQLCommit",
+        "TestGeneratedRouteAuthorityAttestPublishedAcceptsCurrentRouteAndRejectsPhysicalDrift",
+        "TestGeneratedRouteAuthorityAttestPublishedRejectsCurrentClaimAttemptDrift",
+        "TestGeneratedRouteAuthorityAttestPublishedRejectsReceiptCreatorLineage",
+        "TestGeneratedRouteActivationTransactionFailuresRollBackAllSQL",
+        "TestGeneratedRouteActivationExactPersistedReplayAndCrossedFields",
+        "TestGeneratedRouteExecutionIsOneShotAcrossConcurrentAndFailedOriginalUse",
+        "TestSwitchPersistsAcceptedRouteAfterValidatedReload",
+        "TestSwitchIdempotentlyRepairsCommittedRoute",
+        "TestSwitchReloadFailureRollsBackFirstDeploymentAndClearsPendingState",
+        "TestSwitchRestartInstallFailureCompensatesBeforeCleanupSafeError",
+        "TestSwitchFailedCompensationMarksCandidateLiveAndRemainsRecoverable",
+        "TestCommittedV2PrivateSwitchObserveRecoveryCoreAndSnapshot",
+        "TestCommittedV2UnknownTopologyStopsBeforeDockerMutation",
+        "TestCommittedV2RecoveryRollsBackDurableProposedRoute",
+        "TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow",
+        "TestGatewayCurrentStateMachineSwitchAndRecoveryUseDurablePending",
+        "TestGatewayCurrentObservationUsesExactStableRebindState",
+        "TestGatewayCurrentStateMachineFencesNativeFallbackDuringActiveRebind",
+        "TestPersistGatewayCurrentExactRejectsRevisionOnlyNoop",
+        "TestGeneratedDomainGatewayConfigObservationBindsExactReader",
+        "TestGeneratedDomainColdPendingGatewayConfigDisposition",
+        "TestGeneratedDomainRestartAccountingPostActivationPendingCompletesWithoutSecondShare",
+        "TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending",
+        "TestGeneratedRouteActivationFinishClaimGateHelperDoesNotFinalizePending",
+        "TestGeneratedRouteActivationFreshFinishClaimGateDoesNotFinalizePending",
+        "TestGeneratedRouteActivationResolvesLostDurableCommitAcknowledgement",
+        "TestGeneratedDomainRestartAccountingInitialSwitchingRouteRecoversActivationWithoutSecondShare",
+        "TestGeneratedDomainRestartAccountingPreviousExactClearsPendingAndActivatesWithoutSecondShare",
+        "TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls",
+        "TestGeneratedRouteActivationPreviousExactLegacyClearMatrix",
+        "TestGeneratedRouteActivationPreviousExactCommittedV2ClearMatrix",
+        "TestGeneratedRouteActivationPreviousExactGatewayCurrentClearMatrix",
+        "TestGeneratedDomainColdPreviousExactProtectedModeProjection",
+        "TestGatewayRebindEffectBoundaryAttestsExactTwoAppRoster",
+        "TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy",
+        "TestGatewayRebindLegacyCompositionSeedRetainsCanonicalAuthority",
+        "TestGeneratedDomainStartupReadOnlyTraceAndNoAuthority"
+      ],
+      "selector": "^(TestGeneratedDomainRestartAccountingSwitchingRouteRecoversActivationWithoutSecondShare|TestGeneratedDomainColdPreActivationHandoffSeeds|TestGeneratedDomainColdRuntimeBoundary|TestGeneratedDomainColdGroupGatewaySelectionAttribution|TestGeneratedDomainRestartAccountingInterruptedDrainingClaimsFreshWorkerWithoutSecondShare|TestGeneratedDomainRestartAccountingInterruptedDrainingRestoresConfiguredDebt|TestGeneratedDomainRestartAccountingActivePredecessorRecoversRetirementWithoutSecondShare|TestGeneratedDomainRecoveredRetirementFailureBoundariesPreserveDebt|TestGeneratedDomainColdInitialDrainingDebtEvidenceFallsThroughExactZeroPredecessorChain|TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRoster|TestGeneratedDomainColdReconstructsExactTwoComponentCurrentRosterPart2|TestGeneratedDomainColdHistoricalLifecycleRetentionRequiresExactRunningSuccessor|TestGeneratedDomainColdCurrentDebtEvidenceRequiresTotalAbsenceOrExactChain|TestGeneratedDomainColdDrainingDebtEvidenceRequiresExactCompletedRetirementPrefix|TestCandidateCapacityRestoredDebtRequiresExactPublishedTokenGraph|TestCandidateCapacityRestoredPredecessorReleasesExactDebtAndKeepsSuccessorCharge|TestCandidateCapacityRecoveredHandoffTransfersExactDualDebt|TestCandidateCapacityRecoveredRetirementHoldsWholeExactDualRoster|TestCandidateSharedTokenAndEntryMarkersPreventDuplicateCommands|TestCandidateAccountingHandoffTransfersWholeRoster|TestCandidateAccountingHandoffRejectsInvalidBatchWithoutMutation|TestGeneratedRouteAccountingHandoffSuccess|TestGeneratedRouteAccountingHandoffRefusesBeforeUnlock|TestGeneratedRouteAccountingHandoffFinalUnlockFailureIsTerminal|TestGeneratedRouteAccountingHandoffFinalProofDriftKeepsTerminalCharges|TestGeneratedRouteAccountingHandoffResolvesDurableLostAcknowledgement|TestGeneratedRouteRecoveredAccountingHandoffResolvesDurableReceiptLostAcknowledgement|TestGeneratedRouteRecoveredAccountingHandoffFinalProofFailureIsTerminal|TestGeneratedRouteAuthorityCommitsReceiptHeadAndRosterWithOriginalClaim|TestGeneratedRouteAuthorityRejectsChangedOriginalClaimWithoutPartialSQLCommit|TestGeneratedRouteAuthorityAttestPublishedAcceptsCurrentRouteAndRejectsPhysicalDrift|TestGeneratedRouteAuthorityAttestPublishedRejectsCurrentClaimAttemptDrift|TestGeneratedRouteAuthorityAttestPublishedRejectsReceiptCreatorLineage|TestGeneratedRouteActivationTransactionFailuresRollBackAllSQL|TestGeneratedRouteActivationExactPersistedReplayAndCrossedFields|TestGeneratedRouteExecutionIsOneShotAcrossConcurrentAndFailedOriginalUse|TestSwitchPersistsAcceptedRouteAfterValidatedReload|TestSwitchIdempotentlyRepairsCommittedRoute|TestSwitchReloadFailureRollsBackFirstDeploymentAndClearsPendingState|TestSwitchRestartInstallFailureCompensatesBeforeCleanupSafeError|TestSwitchFailedCompensationMarksCandidateLiveAndRemainsRecoverable|TestCommittedV2PrivateSwitchObserveRecoveryCoreAndSnapshot|TestCommittedV2UnknownTopologyStopsBeforeDockerMutation|TestCommittedV2RecoveryRollsBackDurableProposedRoute|TestCommittedV2RecoveryRepairsReloadOnlyCrashWindow|TestGatewayCurrentStateMachineSwitchAndRecoveryUseDurablePending|TestGatewayCurrentObservationUsesExactStableRebindState|TestGatewayCurrentStateMachineFencesNativeFallbackDuringActiveRebind|TestPersistGatewayCurrentExactRejectsRevisionOnlyNoop|TestGeneratedDomainGatewayConfigObservationBindsExactReader|TestGeneratedDomainColdPendingGatewayConfigDisposition|TestGeneratedDomainRestartAccountingPostActivationPendingCompletesWithoutSecondShare|TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending|TestGeneratedRouteActivationFinishClaimGateHelperDoesNotFinalizePending|TestGeneratedRouteActivationFreshFinishClaimGateDoesNotFinalizePending|TestGeneratedRouteActivationResolvesLostDurableCommitAcknowledgement|TestGeneratedDomainRestartAccountingInitialSwitchingRouteRecoversActivationWithoutSecondShare|TestGeneratedDomainRestartAccountingPreviousExactClearsPendingAndActivatesWithoutSecondShare|TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls|TestGeneratedRouteActivationPreviousExactLegacyClearMatrix|TestGeneratedRouteActivationPreviousExactCommittedV2ClearMatrix|TestGeneratedRouteActivationPreviousExactGatewayCurrentClearMatrix|TestGeneratedDomainColdPreviousExactProtectedModeProjection|TestGatewayRebindEffectBoundaryAttestsExactTwoAppRoster|TestGatewayRebindCoordinatorPreservesTransferAcrossOrdinaryRedeploy|TestGatewayRebindLegacyCompositionSeedRetainsCanonicalAuthority|TestGeneratedDomainStartupReadOnlyTraceAndNoAuthority)$",
+      "timeout": "50m"
+    },
+    "database": {
+      "package": "./internal/database",
+      "parents": [
+        "TestGeneratedRouteActivationWritersMigrationFreshAndMirror",
+        "TestGeneratedRouteActivationWritersMigrationUpgradePreservesHistoricalChain",
+        "TestGeneratedRouteActivationWritersMigrationActivationAndCompletionGuards",
+        "TestGeneratedRouteActivationWritersMigrationFailureRestoresSchema"
+      ],
+      "selector": "^(TestGeneratedRouteActivationWritersMigrationFreshAndMirror|TestGeneratedRouteActivationWritersMigrationUpgradePreservesHistoricalChain|TestGeneratedRouteActivationWritersMigrationActivationAndCompletionGuards|TestGeneratedRouteActivationWritersMigrationFailureRestoresSchema)$",
+      "timeout": "10m"
+    },
+    "generatedruntimestate": {
+      "package": "./internal/generatedruntimestate",
+      "parents": [
+        "TestReadRouteActivationReceiptTxNormalizesLegacyWriterAndRejectsHalfPair",
+        "TestGeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAndCandidateFacts",
+        "TestGeneratedDomainStartupSnapshotTxReadsCompleteAccountingChainIndependently",
+        "TestGeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPartialResult",
+        "TestGeneratedRouteCompletionMigrationAndReceipt",
+        "TestRecordGeneratedRouteRuntimeSucceededTx",
+        "TestRouteAccountingHandoffTxSuccessAndReplay",
+        "TestRouteAccountingHandoffTxRejectsMissingAndCrossedEvidence",
+        "TestRouteAccountingHandoffMigrationMirrorAndImmutability"
+      ],
+      "selector": "^(TestReadRouteActivationReceiptTxNormalizesLegacyWriterAndRejectsHalfPair|TestGeneratedDomainStartupSnapshotTxReturnsSortedServingPendingMigrationAndCandidateFacts|TestGeneratedDomainStartupSnapshotTxReadsCompleteAccountingChainIndependently|TestGeneratedDomainStartupSnapshotTxRejectsMalformedOrCrossedStateWithoutPartialResult|TestGeneratedRouteCompletionMigrationAndReceipt|TestRecordGeneratedRouteRuntimeSucceededTx|TestRouteAccountingHandoffTxSuccessAndReplay|TestRouteAccountingHandoffTxRejectsMissingAndCrossedEvidence|TestRouteAccountingHandoffMigrationMirrorAndImmutability)$",
+      "timeout": "10m"
+    },
+    "deploymentexecution": {
+      "package": "./internal/deploymentexecution",
+      "parents": [
+        "TestGuardRouteActivationUsesExactWaitingHealthStage",
+        "TestCheckGeneratedRouteCompletionReplayTxRefusesUnsealedAndCrossed"
+      ],
+      "selector": "^(TestGuardRouteActivationUsesExactWaitingHealthStage|TestCheckGeneratedRouteCompletionReplayTxRefusesUnsealedAndCrossed)$",
+      "timeout": "5m"
+    },
+    "deployments": {
+      "package": "./internal/deployments",
+      "parents": [
+        "TestRecordGeneratedRouteDeploymentSucceededTx",
+        "TestRecordGeneratedRouteDeploymentSucceededTxRejectsInvalidCurrentState",
+        "TestRecordGeneratedRouteDeploymentSucceededTxRejectsCrossedReceipts",
+        "TestGeneratedRouteCompletionAtomicRollbackAndReadback"
+      ],
+      "selector": "^(TestRecordGeneratedRouteDeploymentSucceededTx|TestRecordGeneratedRouteDeploymentSucceededTxRejectsInvalidCurrentState|TestRecordGeneratedRouteDeploymentSucceededTxRejectsCrossedReceipts|TestGeneratedRouteCompletionAtomicRollbackAndReadback)$",
+      "timeout": "5m"
+    },
+    "jobs": {
+      "package": "./internal/jobs",
+      "parents": [
+        "TestCompleteGeneratedRouteTx",
+        "TestCompleteGeneratedRouteTxRejectsInvalidCurrentState"
+      ],
+      "selector": "^(TestCompleteGeneratedRouteTx|TestCompleteGeneratedRouteTxRejectsInvalidCurrentState)$",
+      "timeout": "5m"
+    },
+    "hostd": {
+      "package": "./cmd/hostd",
+      "parents": [
+        "TestControllerProcessKillBoundaryControls"
+      ],
+      "selector": "^(TestControllerProcessKillBoundaryControls|TestLiveControllerGeneratedProcessKillRecovery)$",
+      "timeout": "8m",
+      "discoveryParents": [
+        "TestControllerProcessKillBoundaryControls",
+        "TestLiveControllerGeneratedProcessKillRecovery"
+      ],
+      "targetSelector": "^TestControllerProcessKillBoundaryControls$",
+      "tags": "live_docker",
+      "liveParentRunLocally": false
+    }
+  }
+}

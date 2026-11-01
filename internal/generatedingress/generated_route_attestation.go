@@ -90,11 +90,12 @@ func (a *GeneratedRouteAuthority) readGeneratedRouteAttestation(ctx context.Cont
 	if err != nil || head.DeploymentID != deploymentID || head.ActivationReceiptID == "" {
 		return routeRecord{}, publishedRouteAttestationError(err)
 	}
-	receipt, err := readGeneratedRouteActivationReceiptTx(ctx, tx, head.ActivationReceiptID)
+	receipt, err := a.runtime.ReadRouteActivationReceiptTx(ctx, tx, head.ActivationReceiptID)
 	if err != nil || receipt.AppID != appID || receipt.SuccessorDeploymentID != deploymentID ||
 		receipt.SuccessorReleaseID != head.ReleaseID || receipt.SuccessorSlot != head.Slot ||
-		receipt.SuccessorGeneration != head.Generation || receipt.CreatorJobID != claim.JobID() ||
-		receipt.CreatorWorkerAttempt < 1 || receipt.CreatorWorkerAttempt > claim.Attempt() ||
+		receipt.SuccessorGeneration != head.Generation || receipt.WriterJobID != claim.JobID() ||
+		receipt.CreatorWorkerAttempt < 1 || receipt.CreatorWorkerAttempt > receipt.WriterWorkerAttempt ||
+		receipt.WriterWorkerAttempt > claim.Attempt() ||
 		expectedActivation != nil && receipt != *expectedActivation {
 		return routeRecord{}, publishedRouteAttestationError(err)
 	}

@@ -118,37 +118,57 @@ func secureDirectory(path string) error {
 }
 
 func (s *stateStore) load() (routeState, error) {
+	state, _, err := s.loadWithPresence()
+	return state, err
+}
+
+// loadRequired is reserved for replay/recovery paths that already carry an
+// exact protected transition. Ordinary bootstrap deliberately projects an
+// absent bundle as the canonical empty state through load(); exact replay must
+// instead distinguish that absence from a durably installed empty bundle.
+func (s *stateStore) loadRequired() (routeState, error) {
+	state, present, err := s.loadWithPresence()
+	if err != nil {
+		return routeState{}, err
+	}
+	if !present {
+		return routeState{}, errors.New("generated ingress state is absent")
+	}
+	return state, nil
+}
+
+func (s *stateStore) loadWithPresence() (routeState, bool, error) {
 	state := routeState{Version: stateVersion, Active: map[string]routeRecord{}}
 	before, err := s.directoryIdentity()
 	if err != nil {
-		return routeState{}, err
+		return routeState{}, false, err
 	}
 	body, err := secretfile.Read(s.path, statePurpose)
 	if errors.Is(err, os.ErrNotExist) {
 		if s.sameDirectory(before) != nil {
-			return routeState{}, errors.New("generated ingress state directory changed")
+			return routeState{}, false, errors.New("generated ingress state directory changed")
 		}
-		return state, nil
+		return state, false, nil
 	}
 	if err != nil {
-		return routeState{}, err
+		return routeState{}, false, err
 	}
 	defer clear(body)
 	if s.sameDirectory(before) != nil {
-		return routeState{}, errors.New("generated ingress state directory changed")
+		return routeState{}, false, errors.New("generated ingress state directory changed")
 	}
 	if len(body) > maxStateBytes {
-		return routeState{}, errors.New("generated ingress state is too large")
+		return routeState{}, false, errors.New("generated ingress state is too large")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&state); err != nil || decoder.Decode(&struct{}{}) != io.EOF || state.Version != stateVersion || state.Active == nil || len(state.Active) > maxStateApps {
-		return routeState{}, errors.New("generated ingress state is invalid")
+		return routeState{}, false, errors.New("generated ingress state is invalid")
 	}
 	if !validRouteState(state) {
-		return routeState{}, errors.New("generated ingress state is invalid")
+		return routeState{}, false, errors.New("generated ingress state is invalid")
 	}
-	return state, nil
+	return state, true, nil
 }
 
 func (s *stateStore) save(state routeState) error {

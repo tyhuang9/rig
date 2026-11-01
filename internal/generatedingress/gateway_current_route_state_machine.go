@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"context"
+	"errors"
 	"math"
 	"reflect"
 	"strconv"
@@ -348,6 +349,226 @@ func (m *Manager) switchGatewayCurrentStateMachineLocked(ctx context.Context,
 		return true, markCandidateMayBeLive(gatewayCurrentRouteOperationError(ctx))
 	}
 	return true, nil
+}
+
+func (m *Manager) beginGatewayCurrentRouteActivationLocked(ctx context.Context,
+	request generatedroute.RouteSwitchRequest, expected *generatedRouteActivationGatewayTransition,
+) (bool, *generatedRouteActivationGatewayTransition, error) {
+	selection, _, handled, err := m.gatewayCurrentSelectedStateLocked(ctx)
+	if expected != nil {
+		selection, _, handled, err = m.gatewayCurrentSelectedStateForRecoveryLocked(ctx)
+	}
+	if err != nil || !handled {
+		return handled, nil, err
+	}
+	if selection.Kind != gatewayCurrentSelectionRebind || selection.State == nil {
+		return true, nil, gatewayCurrentRouteOperationError(ctx)
+	}
+	if expected != nil {
+		transition := expected.currentV1
+		if expected.kind != generatedDomainGatewayCurrentV1 || transition == nil ||
+			!reflect.DeepEqual(*selection.State, transition.Pending) ||
+			transition.Pending.Pending == nil || transition.Pending.Pending.Kind != gatewayV2PendingRouteSwitch {
+			return true, nil, gatewayCurrentRouteOperationError(ctx)
+		}
+		projection, projectionErr := gatewayCurrentPhysicalOutcomeProjectionForSelection(transition.Pending)
+		if projectionErr != nil || projection.Effective == nil {
+			return true, nil, markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), projectionErr))
+		}
+		attestation, attestErr := m.attestGatewayCurrentPhysicalLocked(ctx, selection)
+		if attestErr != nil {
+			return true, nil, markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), attestErr))
+		}
+		if attestation.Outcome != gatewayCurrentPhysicalRecoveryEffective ||
+			!reflect.DeepEqual(attestation.State, *projection.Effective) {
+			return true, nil, markCandidateMayBeLive(gatewayCurrentRouteOperationError(ctx))
+		}
+		copy := *expected
+		return true, &copy, nil
+	}
+	before := cloneGatewayCurrentOperationState(*selection.State)
+	if before.Pending != nil || before.LANRecovery != nil {
+		return true, nil, gatewayCurrentRouteOperationError(ctx)
+	}
+	transition, err := gatewayCurrentSwitchTransition(before, request)
+	if err != nil {
+		return true, nil, err
+	}
+	if err := m.persistGatewayCurrentExactLocked(ctx, before, transition.Pending); err != nil {
+		return true, nil, err
+	}
+	if _, err := m.confirmGatewayCurrentStateLocked(ctx, transition.Pending); err != nil {
+		return true, nil, err
+	}
+	attestation, err := m.applyGatewayCurrentPhysicalLocked(ctx, transition)
+	if err != nil || attestation.Outcome != gatewayCurrentPhysicalRecoveryEffective ||
+		!reflect.DeepEqual(attestation.State, transition.Effective) {
+		return true, nil, markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), err))
+	}
+	value := transition
+	return true, &generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayCurrentV1,
+		request: canonicalGeneratedRouteRequest(request), currentV1: &value}, nil
+}
+
+func (m *Manager) finishGatewayCurrentRouteActivationLocked(ctx context.Context,
+	transition *gatewayCurrentPhysicalTransition,
+) error {
+	if transition == nil || transition.Pending.Pending == nil ||
+		transition.Pending.Pending.Kind != gatewayV2PendingRouteSwitch {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	selection, _, handled, err := m.gatewayCurrentSelectedStateForRecoveryLocked(ctx)
+	if err != nil || !handled || selection.State == nil {
+		return errors.Join(gatewayCurrentRouteOperationError(ctx), err)
+	}
+	if reflect.DeepEqual(*selection.State, transition.Effective) {
+		attestation, attestErr := m.attestGatewayCurrentStateLocked(ctx, transition.Effective)
+		if attestErr != nil || attestation.Outcome != gatewayCurrentPhysicalStableServing ||
+			!reflect.DeepEqual(attestation.State, transition.Effective) {
+			return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), attestErr))
+		}
+		return nil
+	}
+	if !reflect.DeepEqual(*selection.State, transition.Pending) {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	projection, projectionErr := gatewayCurrentPhysicalOutcomeProjectionForSelection(transition.Pending)
+	if projectionErr != nil || projection.Effective == nil {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), projectionErr))
+	}
+	attestation, err := m.attestGatewayCurrentPhysicalLocked(ctx, selection)
+	if err != nil || attestation.Outcome != gatewayCurrentPhysicalRecoveryEffective ||
+		!reflect.DeepEqual(attestation.State, *projection.Effective) {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), err))
+	}
+	if err := m.persistGatewayCurrentExactLocked(ctx, transition.Pending, transition.Effective); err != nil {
+		return markCandidateMayBeLive(err)
+	}
+	attestation, err = m.attestGatewayCurrentStateLocked(ctx, transition.Effective)
+	if err != nil || attestation.Outcome != gatewayCurrentPhysicalStableServing ||
+		!reflect.DeepEqual(attestation.State, transition.Effective) {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), err))
+	}
+	return nil
+}
+
+func (m *Manager) rollbackGatewayCurrentRouteActivationLocked(ctx context.Context,
+	transition *gatewayCurrentPhysicalTransition,
+) error {
+	if transition == nil || transition.Pending.Pending == nil ||
+		transition.Pending.Pending.Kind != gatewayV2PendingRouteSwitch {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	cleared, err := gatewayCurrentNextState(transition.Pending, func(next *gatewayCurrentRouteState) {
+		next.Pending = nil
+	})
+	if err != nil || !reflect.DeepEqual(cleared.Apps, transition.Before.Apps) {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	selection, _, handled, err := m.gatewayCurrentSelectedStateForRecoveryLocked(ctx)
+	if err != nil || !handled || selection.State == nil {
+		return errors.Join(gatewayCurrentRouteOperationError(ctx), err)
+	}
+	if reflect.DeepEqual(*selection.State, cleared) {
+		attestation, attestErr := m.attestGatewayCurrentStateLocked(ctx, cleared)
+		if attestErr != nil || attestation.Outcome != gatewayCurrentPhysicalStableServing ||
+			!reflect.DeepEqual(attestation.State, cleared) {
+			return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), attestErr))
+		}
+		return nil
+	}
+	if !reflect.DeepEqual(*selection.State, transition.Pending) {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	projection, projectionErr := gatewayCurrentPhysicalOutcomeProjectionForSelection(transition.Pending)
+	if projectionErr != nil || projection.Effective == nil {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), projectionErr))
+	}
+	attestation, err := m.attestGatewayCurrentPhysicalLocked(ctx, selection)
+	if err != nil {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), err))
+	}
+	if attestation.Outcome == gatewayCurrentPhysicalRecoveryBefore {
+		if !reflect.DeepEqual(attestation.State, projection.Before) {
+			return markCandidateMayBeLive(gatewayCurrentRouteOperationError(ctx))
+		}
+		if err := m.persistGatewayCurrentExactLocked(ctx, transition.Pending, cleared); err != nil {
+			return markCandidateMayBeLive(err)
+		}
+		attestation, err = m.attestGatewayCurrentStateLocked(ctx, cleared)
+		if err != nil || attestation.Outcome != gatewayCurrentPhysicalStableServing ||
+			!reflect.DeepEqual(attestation.State, cleared) {
+			return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), err))
+		}
+		return nil
+	}
+	if attestation.Outcome != gatewayCurrentPhysicalRecoveryEffective ||
+		!reflect.DeepEqual(attestation.State, *projection.Effective) {
+		return markCandidateMayBeLive(gatewayCurrentRouteOperationError(ctx))
+	}
+	if _, err := m.restoreGatewayCurrentPhysicalLocked(ctx, *transition); err != nil {
+		return markCandidateMayBeLive(err)
+	}
+	if err := m.persistGatewayCurrentExactLocked(ctx, transition.Pending, cleared); err != nil {
+		return markCandidateMayBeLive(err)
+	}
+	attestation, err = m.attestGatewayCurrentStateLocked(ctx, cleared)
+	if err != nil || attestation.Outcome != gatewayCurrentPhysicalStableServing ||
+		!reflect.DeepEqual(attestation.State, cleared) {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), err))
+	}
+	return nil
+}
+
+func (m *Manager) clearPreviousGatewayCurrentRouteActivationLocked(ctx context.Context,
+	transition *gatewayCurrentPhysicalTransition,
+) error {
+	if transition == nil || transition.Pending.Pending == nil ||
+		transition.Pending.Pending.Kind != gatewayV2PendingRouteSwitch {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	cleared, err := gatewayCurrentNextState(transition.Pending, func(next *gatewayCurrentRouteState) {
+		next.Pending = nil
+	})
+	if err != nil || !reflect.DeepEqual(cleared.Apps, transition.Before.Apps) ||
+		!sameGatewayCurrentRouteOrigin(cleared, transition.Before) {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	selection, _, handled, err := m.gatewayCurrentSelectedStateForRecoveryLocked(ctx)
+	if err != nil || !handled || selection.State == nil {
+		return errors.Join(gatewayCurrentRouteOperationError(ctx), err)
+	}
+	if reflect.DeepEqual(*selection.State, cleared) {
+		attestation, attestErr := m.attestGatewayCurrentStateLocked(ctx, cleared)
+		if attestErr != nil || attestation.Outcome != gatewayCurrentPhysicalStableServing ||
+			!reflect.DeepEqual(attestation.State, cleared) {
+			return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), attestErr))
+		}
+		return nil
+	}
+	if !reflect.DeepEqual(*selection.State, transition.Pending) {
+		return gatewayCurrentRouteOperationError(ctx)
+	}
+	attestation, err := m.attestGatewayCurrentPhysicalLocked(ctx, selection)
+	if err != nil || attestation.Outcome != gatewayCurrentPhysicalRecoveryBefore {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), err))
+	}
+	projection, projectionErr := gatewayCurrentPhysicalOutcomeProjectionForSelection(transition.Pending)
+	if projectionErr != nil || !reflect.DeepEqual(attestation.State, projection.Before) {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), projectionErr))
+	}
+	if err := m.persistGatewayCurrentExactLocked(ctx, transition.Pending, cleared); err != nil {
+		return markCandidateMayBeLive(err)
+	}
+	if _, err := m.confirmGatewayCurrentStateLocked(ctx, cleared); err != nil {
+		return markCandidateMayBeLive(err)
+	}
+	attestation, err = m.attestGatewayCurrentStateLocked(ctx, cleared)
+	if err != nil || attestation.Outcome != gatewayCurrentPhysicalStableServing ||
+		!reflect.DeepEqual(attestation.State, cleared) {
+		return markCandidateMayBeLive(errors.Join(gatewayCurrentRouteOperationError(ctx), err))
+	}
+	return nil
 }
 
 // recoverGatewayCurrentStateMachineLocked performs only recovery decisions

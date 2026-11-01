@@ -503,6 +503,7 @@ func generatedRouteRecoveredStartupActivation(
 		PredecessorGeneration:          value.PredecessorGeneration,
 		PredecessorActivationReceiptID: value.PredecessorActivationReceiptID,
 		CreatorJobID:                   value.CreatorJobID, CreatorWorkerAttempt: value.CreatorWorkerAttempt,
+		WriterJobID: value.WriterJobID, WriterWorkerAttempt: value.WriterWorkerAttempt,
 		CandidateRosterDigest:     value.CandidateRosterDigest,
 		PredecessorRosterDigest:   value.PredecessorRosterDigest,
 		RouteIntentDigest:         value.RouteIntentDigest,

@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -79,18 +80,20 @@ func waitGeneratedRouteRecoveredRetirement(ctx context.Context, delay time.Durat
 // operation. It retains the original candidate execution and Claim; callers
 // cannot supply an activation receipt, digest, or writer success assertion.
 type GeneratedRouteExecution struct {
-	self              *GeneratedRouteExecution
-	liveness          *generatedRouteExecutionLiveness
-	authority         *GeneratedRouteAuthority
-	candidate         *GeneratedCandidateExecution
-	request           generatedroute.RouteSwitchRequest
-	expectedHead      generatedruntimestate.ActiveHead
-	candidateRoster   []generatedruntimestate.RouteActivationComponent
-	predecessorRoster []generatedruntimestate.RouteActivationComponent
-	previous          routeRecord
-	hadPrevious       bool
-	receiptID         string
-	intent            []byte
+	self               *GeneratedRouteExecution
+	liveness           *generatedRouteExecutionLiveness
+	authority          *GeneratedRouteAuthority
+	candidate          *GeneratedCandidateExecution
+	request            generatedroute.RouteSwitchRequest
+	expectedHead       generatedruntimestate.ActiveHead
+	candidateRoster    []generatedruntimestate.RouteActivationComponent
+	predecessorRoster  []generatedruntimestate.RouteActivationComponent
+	previous           routeRecord
+	hadPrevious        bool
+	receiptID          string
+	intent             []byte
+	gatewayTransition  *generatedRouteActivationGatewayTransition
+	gatewayDisposition generatedDomainColdPendingGatewayDisposition
 }
 
 type generatedRouteExecutionLiveness struct {
@@ -179,18 +182,39 @@ func (a *GeneratedRouteAuthority) Pin(ctx context.Context, candidate *GeneratedC
 	}
 	predecessorRoster := []generatedruntimestate.RouteActivationComponent{}
 	var previous routeRecord
+	var gatewayTransition *generatedRouteActivationGatewayTransition
+	gatewayDisposition := generatedDomainColdPendingGatewayUnknown
 	hadPrevious := expectedHead.DeploymentID != ""
+	if a.construction != nil && a.construction.cold != nil &&
+		a.construction.cold.pendingActivationDeploymentID == s.pins.deploymentID {
+		candidateTransition := a.construction.cold.pendingActivation
+		candidateDisposition := a.construction.cold.pendingGatewayDisposition
+		before, coldHadPrevious, proposed, valid := generatedRouteActivationGatewayRoutes(candidateTransition)
+		if valid && (candidateDisposition == generatedDomainColdPendingGatewayProposedExact ||
+			candidateDisposition == generatedDomainColdPendingGatewayPreviousExact) &&
+			coldHadPrevious == hadPrevious &&
+			sameGeneratedRouteActivationGatewayRequest(candidateTransition.request, request) &&
+			sameRoute(proposed, routeRecord{Slot: request.ToSlot, Endpoints: request.Endpoints}) {
+			previous = before
+			gatewayTransition = cloneGeneratedRouteActivationGatewayTransition(candidateTransition)
+			gatewayTransition.request = canonicalGeneratedRouteRequest(request)
+			gatewayDisposition = candidateDisposition
+		}
+	}
 	if hadPrevious {
 		predecessorRoster, err = a.runtime.RouteActivationRoster(ctx, request.AppID,
 			expectedHead.DeploymentID, generatedruntimestate.ComponentActive)
 		if err != nil {
 			return nil, err
 		}
-		observation, err := a.manager.Observe(ctx, request.AppID)
-		if err != nil || string(observation.Slot) != expectedHead.Slot {
-			return nil, errors.Join(deploymentexecution.ErrAuthorityStale, err)
+		if gatewayTransition == nil {
+			observation, err := a.manager.Observe(ctx, request.AppID)
+			if err != nil || string(observation.Slot) != expectedHead.Slot {
+				return nil, errors.Join(deploymentexecution.ErrAuthorityStale, err)
+			}
+			previous = routeRecord{Slot: observation.Slot,
+				Endpoints: append([]generatedroute.RouteEndpoint(nil), observation.Endpoints...)}
 		}
-		previous = routeRecord{Slot: observation.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), observation.Endpoints...)}
 		if request.FromSlot != previous.Slot {
 			return nil, deploymentexecution.ErrAuthorityStale
 		}
@@ -208,6 +232,7 @@ func (a *GeneratedRouteAuthority) Pin(ctx context.Context, candidate *GeneratedC
 		request: canonicalGeneratedRouteRequest(request), expectedHead: expectedHead,
 		candidateRoster: candidateRoster, predecessorRoster: predecessorRoster,
 		previous: previous, hadPrevious: hadPrevious, receiptID: receiptID, intent: intent,
+		gatewayTransition: gatewayTransition, gatewayDisposition: gatewayDisposition,
 		liveness: &generatedRouteExecutionLiveness{}}
 	result.self = result
 	return result, nil
@@ -305,20 +330,49 @@ func (e *GeneratedRouteExecution) activateCore(ctx context.Context) (
 		current.observedHead != expectedCandidateHead {
 		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, errors.Join(deploymentexecution.ErrAuthorityStale, err)
 	}
-	if e.hadPrevious {
+	if e.hadPrevious && e.gatewayTransition == nil {
 		observation, observeErr := a.manager.Observe(ctx, e.request.AppID)
 		if observeErr != nil || !sameRoute(e.previous, routeRecord{Slot: observation.Slot, Endpoints: observation.Endpoints}) {
 			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, errors.Join(deploymentexecution.ErrAuthorityStale, observeErr)
 		}
 	}
-	if err := a.manager.switchGeneratedDomainRoute(ctx, e.request); err != nil {
+	if err := e.checkRouteActivationAuthority(ctx, s); err != nil {
 		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, err
 	}
-	afterObservation, err := a.manager.Observe(ctx, e.request.AppID)
-	after := routeRecord{Slot: afterObservation.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), afterObservation.Endpoints...)}
+	transition := e.gatewayTransition
+	if transition != nil {
+		switch e.gatewayDisposition {
+		case generatedDomainColdPendingGatewayProposedExact:
+		case generatedDomainColdPendingGatewayPreviousExact:
+			clearErr := a.manager.clearPreviousGeneratedDomainRouteActivation(ctx, transition)
+			if clearErr != nil {
+				retryCtx := context.WithoutCancel(ctx)
+				if gateErr := e.checkRouteActivationAuthority(retryCtx, s); gateErr != nil {
+					return generatedruntimestate.Deployment{}, generatedRouteActivationResult{},
+						errors.Join(clearErr, gateErr)
+				}
+				if retryErr := a.manager.clearPreviousGeneratedDomainRouteActivation(retryCtx, transition); retryErr != nil {
+					return generatedruntimestate.Deployment{}, generatedRouteActivationResult{},
+						errors.Join(clearErr, retryErr)
+				}
+			}
+			if err := e.checkRouteActivationAuthority(ctx, s); err != nil {
+				return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, err
+			}
+			transition = nil
+		default:
+			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{},
+				deploymentexecution.ErrIdentityLost
+		}
+	}
+	transition, err = a.manager.beginGeneratedDomainRouteActivation(ctx, e.request, transition)
+	if err != nil {
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, err
+	}
+	before, hadBefore, after, valid := generatedRouteActivationGatewayRoutes(transition)
 	proposed := routeRecord{Slot: e.request.ToSlot, Endpoints: append([]generatedroute.RouteEndpoint(nil), e.request.Endpoints...)}
-	if err != nil || !sameRoute(after, proposed) {
-		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, errors.Join(deploymentexecution.ErrIdentityLost, err)
+	if !valid || hadBefore != e.hadPrevious || hadBefore && !sameRoute(before, e.previous) || !sameRoute(after, proposed) {
+		return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, deploymentexecution.ErrIdentityLost
 	}
 	proofDocument := generatedRouteProofDocument{Version: 1, ReceiptID: e.receiptID, After: after}
 	if e.hadPrevious {
@@ -342,8 +396,15 @@ func (e *GeneratedRouteExecution) activateCore(ctx context.Context) (
 		// exact state. No new receipt or generic self-head success is accepted.
 		result, err = a.activateRoute(ctx, s.pinned, s.pins.claim, input)
 		if err != nil {
-			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, e.resolveActivationFailure(ctx,
+			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, e.resolveActivationFailure(ctx, transition,
 				errors.Join(activateErr, err))
+		}
+	}
+	if err := a.finishPendingRouteActivation(ctx, s.pins.claim, s.pins.deploymentID, transition,
+		result.receipt); err != nil {
+		if replayErr := a.finishPendingRouteActivation(context.WithoutCancel(ctx), s.pins.claim,
+			s.pins.deploymentID, transition, result.receipt); replayErr != nil {
+			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, errors.Join(err, replayErr)
 		}
 	}
 	self := candidateHeadSnapshot{appID: result.head.AppID, deploymentID: result.head.DeploymentID,
@@ -359,23 +420,54 @@ func (e *GeneratedRouteExecution) activateCore(ctx context.Context) (
 	return deployment, result, nil
 }
 
+// checkRouteActivationAuthority revalidates the original Claim and exact
+// predecessor head in one read-only transaction. Callers close this SQL
+// transaction before acquiring the gateway lock for a protected-state clear
+// or publication.
+func (e *GeneratedRouteExecution) checkRouteActivationAuthority(ctx context.Context,
+	state *generatedCandidateExecutionState,
+) error {
+	if e == nil || e.authority == nil || state == nil || ctx == nil {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
+	tx, err := e.authority.stores.Database().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	if err := state.pinned.CheckRouteActivationTx(tx, state.pins.claim, state.pins.deploymentID); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	var head generatedruntimestate.ActiveHead
+	err = tx.QueryRowContext(ctx, `SELECT app_id,COALESCE(deployment_id,''),COALESCE(release_id,''),
+		COALESCE(slot,''),generation,COALESCE(activation_receipt_id,'')
+		FROM generated_runtime_active_heads WHERE app_id=?`, e.request.AppID).Scan(&head.AppID,
+		&head.DeploymentID, &head.ReleaseID, &head.Slot, &head.Generation, &head.ActivationReceiptID)
+	if err != nil || !sameActivationHeadForRouteAuthority(head, e.expectedHead) {
+		_ = tx.Rollback()
+		return errors.Join(deploymentexecution.ErrIdentityLost, err)
+	}
+	return tx.Commit()
+}
+
 // resolveActivationFailure restores a predecessor route only after a fresh
 // database observation proves that the fixed activation transaction did not
 // commit. A self, crossed, or unreadable head is left untouched because the
 // physical route may already be backed by a durable activation receipt.
-func (e *GeneratedRouteExecution) resolveActivationFailure(ctx context.Context, activationErr error) error {
+func (e *GeneratedRouteExecution) resolveActivationFailure(ctx context.Context,
+	transition *generatedRouteActivationGatewayTransition, activationErr error,
+) error {
 	a := e.authority
 	observeCtx := context.WithoutCancel(ctx)
 	head, err := a.runtime.Active(observeCtx, e.request.AppID)
-	if err != nil || !sameActivationHeadForRouteAuthority(head, e.expectedHead) || !e.hadPrevious {
+	if err != nil || !sameActivationHeadForRouteAuthority(head, e.expectedHead) {
 		return errors.Join(activationErr, err)
 	}
-	restore := generatedroute.RouteSwitchRequest{AppID: e.request.AppID,
-		FromSlot: e.request.ToSlot, ToSlot: e.previous.Slot,
-		Endpoints:   append([]generatedroute.RouteEndpoint(nil), e.previous.Endpoints...),
-		DrainPeriod: e.request.DrainPeriod}
-	if err := a.manager.switchGeneratedDomainRoute(observeCtx, restore); err != nil {
-		return errors.Join(activationErr, err)
+	if rollbackErr := a.manager.rollbackGeneratedDomainRouteActivation(observeCtx, transition); rollbackErr != nil {
+		return errors.Join(activationErr, rollbackErr)
+	}
+	if !e.hadPrevious {
+		return activationErr
 	}
 	observed, err := a.manager.Observe(observeCtx, e.request.AppID)
 	if err != nil || !sameRoute(e.previous, routeRecord{Slot: observed.Slot, Endpoints: observed.Endpoints}) {

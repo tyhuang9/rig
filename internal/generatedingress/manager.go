@@ -157,6 +157,28 @@ type Manager struct {
 	gatewayRebindTerminalReleaseEvent GatewayRebindDurableBoundaryEvent
 }
 
+// generatedRouteActivationGatewayTransition is package-private durable route
+// evidence retained across the SQL activation boundary.  Each variant carries
+// the exact protected Pending record written before physical publication and
+// the exact effective record that may be installed only after 042 commits.
+type generatedRouteActivationGatewayTransition struct {
+	kind      generatedDomainGatewayKind
+	request   generatedroute.RouteSwitchRequest
+	legacy    *generatedRouteActivationLegacyTransition
+	nativeV2  *generatedRouteActivationNativeV2Transition
+	currentV1 *gatewayCurrentPhysicalTransition
+}
+
+type generatedRouteActivationLegacyTransition struct {
+	before, pending, effective routeState
+}
+
+type generatedRouteActivationNativeV2Transition struct {
+	before, pending, effective gatewayV2RouteState
+	journal                    gatewayMigrationJournal
+	operationID                string
+}
+
 // contextMutex lets a route observation abandon lock contention when its
 // request deadline expires, while preserving Switch and Provision ordering.
 type contextMutex struct{ token chan struct{} }
@@ -327,6 +349,422 @@ func assembleManagerInto(manager *Manager, runner runtimeprocess.CommandRunner, 
 // are available only through the domain-owned sealed route execution.
 func (m *Manager) Switch(context.Context, generatedroute.RouteSwitchRequest) error {
 	return &Error{Code: DiagnosticValidationFailed}
+}
+
+func validGeneratedRouteActivationGatewayTransition(value *generatedRouteActivationGatewayTransition) bool {
+	if value == nil || !validSwitchRequest(value.request) {
+		return false
+	}
+	count := 0
+	if value.legacy != nil {
+		count++
+	}
+	if value.nativeV2 != nil {
+		count++
+	}
+	if value.currentV1 != nil {
+		count++
+	}
+	if count != 1 {
+		return false
+	}
+	switch value.kind {
+	case generatedDomainGatewayNativeV1:
+		return value.legacy != nil
+	case generatedDomainGatewayNativeV2:
+		return value.nativeV2 != nil
+	case generatedDomainGatewayCurrentV1:
+		return value.currentV1 != nil
+	default:
+		return false
+	}
+}
+
+func cloneGeneratedRouteActivationGatewayTransition(
+	value *generatedRouteActivationGatewayTransition,
+) *generatedRouteActivationGatewayTransition {
+	if value == nil {
+		return nil
+	}
+	result := &generatedRouteActivationGatewayTransition{kind: value.kind,
+		request: canonicalGeneratedRouteRequest(value.request)}
+	if value.legacy != nil {
+		result.legacy = &generatedRouteActivationLegacyTransition{
+			before: cloneRouteState(value.legacy.before), pending: cloneRouteState(value.legacy.pending),
+			effective: cloneRouteState(value.legacy.effective)}
+	}
+	if value.nativeV2 != nil {
+		result.nativeV2 = &generatedRouteActivationNativeV2Transition{
+			before:    cloneGatewayV2RouteState(value.nativeV2.before),
+			pending:   cloneGatewayV2RouteState(value.nativeV2.pending),
+			effective: cloneGatewayV2RouteState(value.nativeV2.effective),
+			journal:   value.nativeV2.journal, operationID: value.nativeV2.operationID}
+	}
+	if value.currentV1 != nil {
+		transition := *value.currentV1
+		transition.Before = cloneGatewayCurrentOperationState(value.currentV1.Before)
+		transition.Pending = cloneGatewayCurrentOperationState(value.currentV1.Pending)
+		transition.Effective = cloneGatewayCurrentOperationState(value.currentV1.Effective)
+		result.currentV1 = &transition
+	}
+	return result
+}
+
+func generatedRouteActivationGatewayRoutes(
+	value *generatedRouteActivationGatewayTransition,
+) (before routeRecord, hadBefore bool, proposed routeRecord, ok bool) {
+	if !validGeneratedRouteActivationGatewayTransition(value) {
+		return routeRecord{}, false, routeRecord{}, false
+	}
+	switch value.kind {
+	case generatedDomainGatewayNativeV1:
+		pending := value.legacy.pending.Pending
+		if pending == nil {
+			return routeRecord{}, false, routeRecord{}, false
+		}
+		if pending.Previous != nil {
+			before, hadBefore = *pending.Previous, true
+			before.Endpoints = append([]generatedroute.RouteEndpoint(nil), pending.Previous.Endpoints...)
+		}
+		proposed = pending.Proposed
+	case generatedDomainGatewayNativeV2:
+		pending := value.nativeV2.pending.Pending
+		if pending == nil {
+			return routeRecord{}, false, routeRecord{}, false
+		}
+		if pending.Previous != nil {
+			before, hadBefore = pending.Previous.Route, true
+			before.Endpoints = append([]generatedroute.RouteEndpoint(nil), pending.Previous.Route.Endpoints...)
+		}
+		proposed = pending.Proposed.Route
+	case generatedDomainGatewayCurrentV1:
+		pending := value.currentV1.Pending.Pending
+		if pending == nil {
+			return routeRecord{}, false, routeRecord{}, false
+		}
+		if pending.Previous != nil {
+			before, hadBefore = pending.Previous.Route, true
+			before.Endpoints = append([]generatedroute.RouteEndpoint(nil), pending.Previous.Route.Endpoints...)
+		}
+		proposed = pending.Proposed.Route
+	default:
+		return routeRecord{}, false, routeRecord{}, false
+	}
+	proposed.Endpoints = append([]generatedroute.RouteEndpoint(nil), proposed.Endpoints...)
+	return before, hadBefore, proposed, validateRoute(proposed) == nil
+}
+
+func sameGeneratedRouteActivationGatewayRequest(left, right generatedroute.RouteSwitchRequest) bool {
+	return left.AppID == right.AppID && left.FromSlot == right.FromSlot && left.ToSlot == right.ToSlot &&
+		sameRoute(routeRecord{Slot: left.ToSlot, Endpoints: left.Endpoints},
+			routeRecord{Slot: right.ToSlot, Endpoints: right.Endpoints})
+}
+
+// beginGeneratedDomainRouteActivation publishes the exact proposed route but
+// deliberately retains the protected Pending record. The caller must release
+// this gateway exclusion before opening the 042 SQL transaction.
+func (m *Manager) beginGeneratedDomainRouteActivation(ctx context.Context,
+	request generatedroute.RouteSwitchRequest,
+	expected *generatedRouteActivationGatewayTransition,
+) (result *generatedRouteActivationGatewayTransition, resultErr error) {
+	if m == nil || ctx == nil || !validSwitchRequest(request) ||
+		(expected != nil && (!validGeneratedRouteActivationGatewayTransition(expected) ||
+			!reflect.DeepEqual(expected.request, canonicalGeneratedRouteRequest(request)))) {
+		return nil, &Error{Code: DiagnosticValidationFailed}
+	}
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseGatewaySwitchLock(release, &resultErr)
+	if handled, transition, err := m.beginGatewayCurrentRouteActivationLocked(ctx, request, expected); err != nil || handled {
+		return transition, err
+	}
+	if store, state, journal, committed, err := m.committedV2Locked(ctx); err != nil {
+		return nil, markCandidateMayBeLive(err)
+	} else if committed {
+		return m.beginCommittedV2RouteActivationLocked(ctx, store, state, journal, request, expected)
+	}
+	if err := m.fenceLegacyV1Locked(); err != nil {
+		return nil, markCandidateMayBeLive(err)
+	}
+	return m.beginLegacyRouteActivationLocked(ctx, request, expected)
+}
+
+func (m *Manager) beginLegacyRouteActivationLocked(ctx context.Context,
+	request generatedroute.RouteSwitchRequest, expected *generatedRouteActivationGatewayTransition,
+) (*generatedRouteActivationGatewayTransition, error) {
+	var state routeState
+	var err error
+	if expected == nil {
+		state, err = m.store.load()
+	} else {
+		state, err = m.store.loadRequired()
+	}
+	if err != nil {
+		return nil, &Error{Code: DiagnosticRouteStateFailed}
+	}
+	if expected != nil {
+		if expected.kind != generatedDomainGatewayNativeV1 || expected.legacy == nil ||
+			!reflect.DeepEqual(state, expected.legacy.pending) || expected.legacy.pending.Pending == nil ||
+			expected.legacy.effective.Pending != nil || expected.legacy.before.Pending != nil ||
+			!reflect.DeepEqual(expected.legacy.before.Active, expected.legacy.pending.Active) ||
+			expected.legacy.pending.Pending.AppID != request.AppID ||
+			!sameRoute(expected.legacy.pending.Pending.Proposed,
+				routeRecord{Slot: request.ToSlot, Endpoints: request.Endpoints}) ||
+			!sameRoute(expected.legacy.effective.Active[request.AppID],
+				expected.legacy.pending.Pending.Proposed) {
+			return nil, &Error{Code: DiagnosticRouteUnresolved}
+		}
+		if err := m.attestLegacyRouteActivationPendingLocked(ctx, expected.legacy); err != nil {
+			return nil, err
+		}
+		copy := *expected
+		return &copy, nil
+	}
+	if state.Pending != nil {
+		return nil, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	previous, hadPrevious := state.Active[request.AppID]
+	proposed := routeRecord{Slot: request.ToSlot,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), request.Endpoints...)}
+	if request.FromSlot == "" {
+		if hadPrevious {
+			return nil, &Error{Code: DiagnosticRouteInvalid}
+		}
+	} else if !hadPrevious || previous.Slot != request.FromSlot || sameRoute(previous, proposed) {
+		return nil, &Error{Code: DiagnosticRouteInvalid}
+	}
+	if err := m.ensureCaddy(ctx, state.Active); err != nil {
+		return nil, err
+	}
+	if err := m.verifyEndpoints(ctx, request.AppID, proposed); err != nil {
+		return nil, err
+	}
+	pending := cloneRouteState(state)
+	pending.Pending = &pendingRoute{AppID: request.AppID, Proposed: proposed}
+	if hadPrevious {
+		copy := previous
+		copy.Endpoints = append([]generatedroute.RouteEndpoint(nil), previous.Endpoints...)
+		pending.Pending.Previous = &copy
+	}
+	if err := m.store.save(pending); err != nil {
+		return nil, &Error{Code: DiagnosticRouteStateFailed}
+	}
+	effective := cloneRouteState(pending)
+	effective.Active[request.AppID] = proposed
+	effective.Pending = nil
+	if err := m.reconcileCaddyNetworks(ctx, effective.Active); err != nil {
+		return nil, m.rollbackAfterFailure(err, &pending)
+	}
+	if err := m.verifyGatewayReadiness(ctx, proposed); err != nil {
+		return nil, m.rollbackAfterFailure(err, &pending)
+	}
+	if err := m.applyRoutes(ctx, effective.Active, "proposed.json"); err != nil {
+		return nil, m.rollbackAfterFailure(err, &pending)
+	}
+	if err := m.installRestartConfig(context.WithoutCancel(ctx)); err != nil {
+		return nil, candidateMayBeLiveError()
+	}
+	transition := &generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayNativeV1,
+		request: canonicalGeneratedRouteRequest(request),
+		legacy: &generatedRouteActivationLegacyTransition{before: cloneRouteState(state),
+			pending: cloneRouteState(pending), effective: cloneRouteState(effective)}}
+	if err := m.attestLegacyRouteActivationPendingLocked(ctx, transition.legacy); err != nil {
+		return nil, markCandidateMayBeLive(err)
+	}
+	return transition, nil
+}
+
+func (m *Manager) attestLegacyRouteActivationPendingLocked(ctx context.Context,
+	transition *generatedRouteActivationLegacyTransition,
+) error {
+	if transition == nil || transition.pending.Pending == nil || transition.effective.Pending != nil ||
+		!validRouteState(transition.before) || !validRouteState(transition.pending) ||
+		!validRouteState(transition.effective) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	state, err := m.store.loadRequired()
+	if err != nil || !reflect.DeepEqual(state, transition.pending) {
+		return &Error{Code: DiagnosticRouteStateFailed}
+	}
+	appID := transition.pending.Pending.AppID
+	_, found := transition.effective.Active[appID]
+	if !found {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if err := m.attestLegacyRouteStateLocked(ctx, transition.pending, transition.effective, appID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) finishGeneratedDomainRouteActivation(ctx context.Context,
+	transition *generatedRouteActivationGatewayTransition,
+) (resultErr error) {
+	if m == nil || ctx == nil || !validGeneratedRouteActivationGatewayTransition(transition) {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseGatewaySwitchLock(release, &resultErr)
+	switch transition.kind {
+	case generatedDomainGatewayNativeV1:
+		state, err := m.store.loadRequired()
+		if err != nil {
+			return &Error{Code: DiagnosticRouteStateFailed}
+		}
+		if reflect.DeepEqual(state, transition.legacy.effective) {
+			return m.attestLegacyRouteStateLocked(ctx, transition.legacy.effective,
+				transition.legacy.effective, transition.request.AppID)
+		}
+		if err := m.attestLegacyRouteActivationPendingLocked(ctx, transition.legacy); err != nil {
+			return err
+		}
+		if err := m.store.save(transition.legacy.effective); err != nil {
+			return markCandidateMayBeLive(&Error{Code: DiagnosticRouteStateFailed})
+		}
+		confirmed, err := m.store.loadRequired()
+		if err != nil || !reflect.DeepEqual(confirmed, transition.legacy.effective) {
+			return markCandidateMayBeLive(errors.Join(&Error{Code: DiagnosticRouteStateFailed}, err))
+		}
+		return m.attestLegacyRouteStateLocked(ctx, transition.legacy.effective,
+			transition.legacy.effective, transition.request.AppID)
+	case generatedDomainGatewayNativeV2:
+		return m.finishCommittedV2RouteActivationLocked(ctx, transition.nativeV2)
+	case generatedDomainGatewayCurrentV1:
+		return m.finishGatewayCurrentRouteActivationLocked(ctx, transition.currentV1)
+	default:
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+}
+
+// clearPreviousGeneratedDomainRouteActivation clears only an exact retained
+// Pending marker whose protected and physical projections are still the
+// pre-activation route. It never restores a route that is already Proposed:
+// that broader rollback decision remains reserved for a failed fresh
+// activation whose durable SQL transaction is known not to have committed.
+func (m *Manager) clearPreviousGeneratedDomainRouteActivation(ctx context.Context,
+	transition *generatedRouteActivationGatewayTransition,
+) (resultErr error) {
+	if m == nil || ctx == nil || !validGeneratedRouteActivationGatewayTransition(transition) {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseGatewaySwitchLock(release, &resultErr)
+	switch transition.kind {
+	case generatedDomainGatewayNativeV1:
+		state, err := m.store.loadRequired()
+		if err != nil {
+			return &Error{Code: DiagnosticRouteStateFailed}
+		}
+		if reflect.DeepEqual(state, transition.legacy.before) {
+			return m.attestLegacyRouteActivationRollbackStateLocked(ctx, transition.legacy.before,
+				transition.legacy.before, transition.request.AppID)
+		}
+		if !reflect.DeepEqual(state, transition.legacy.pending) {
+			return &Error{Code: DiagnosticRouteUnresolved}
+		}
+		return m.clearLegacyRouteActivationRollbackPendingLocked(ctx, transition.legacy,
+			transition.request.AppID)
+	case generatedDomainGatewayNativeV2:
+		return m.clearPreviousCommittedV2RouteActivationLocked(ctx, transition.nativeV2)
+	case generatedDomainGatewayCurrentV1:
+		return m.clearPreviousGatewayCurrentRouteActivationLocked(ctx, transition.currentV1)
+	default:
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+}
+
+func (m *Manager) rollbackGeneratedDomainRouteActivation(ctx context.Context,
+	transition *generatedRouteActivationGatewayTransition,
+) (resultErr error) {
+	if m == nil || ctx == nil || !validGeneratedRouteActivationGatewayTransition(transition) {
+		return &Error{Code: DiagnosticValidationFailed}
+	}
+	release, err := m.lockGateway(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseGatewaySwitchLock(release, &resultErr)
+	switch transition.kind {
+	case generatedDomainGatewayNativeV1:
+		state, err := m.store.loadRequired()
+		if err != nil {
+			return &Error{Code: DiagnosticRouteStateFailed}
+		}
+		if reflect.DeepEqual(state, transition.legacy.before) {
+			return m.attestLegacyRouteActivationRollbackStateLocked(ctx, transition.legacy.before,
+				transition.legacy.before, transition.request.AppID)
+		}
+		if err := m.attestLegacyRouteActivationRollbackPendingLocked(ctx, transition.legacy,
+			transition.request.AppID); err != nil {
+			return err
+		}
+		state = cloneRouteState(transition.legacy.before)
+		if err := m.store.save(state); err != nil {
+			return candidateMayBeLiveError()
+		}
+		confirmed, err := m.store.loadRequired()
+		if err != nil || !reflect.DeepEqual(confirmed, state) {
+			return candidateMayBeLiveError()
+		}
+		return m.attestLegacyRouteActivationRollbackStateLocked(ctx, state, state, transition.request.AppID)
+	case generatedDomainGatewayNativeV2:
+		return m.rollbackCommittedV2RouteActivationLocked(ctx, transition.nativeV2)
+	case generatedDomainGatewayCurrentV1:
+		return m.rollbackGatewayCurrentRouteActivationLocked(ctx, transition.currentV1)
+	default:
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+}
+
+// attestLegacyRouteActivationRollbackPendingLocked proves that the protected
+// Pending record is still exact while the physical route is already the exact
+// pre-activation route. It performs no publication, so a fresh caller may
+// clear only the retained Pending record after a prior clear/save lost reply.
+func (m *Manager) attestLegacyRouteActivationRollbackPendingLocked(ctx context.Context,
+	transition *generatedRouteActivationLegacyTransition, appID string,
+) error {
+	if transition == nil || transition.pending.Pending == nil || transition.before.Pending != nil ||
+		!validRouteState(transition.pending) || !validRouteState(transition.before) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	state, err := m.store.loadRequired()
+	if err != nil || !reflect.DeepEqual(state, transition.pending) {
+		return &Error{Code: DiagnosticRouteStateFailed}
+	}
+	return m.attestLegacyRouteActivationRollbackStateLocked(ctx, transition.pending, transition.before, appID)
+}
+
+func (m *Manager) clearLegacyRouteActivationRollbackPendingLocked(ctx context.Context,
+	transition *generatedRouteActivationLegacyTransition, appID string,
+) error {
+	if err := m.attestLegacyRouteActivationRollbackPendingLocked(ctx, transition, appID); err != nil {
+		return err
+	}
+	if err := m.store.save(transition.before); err != nil {
+		return candidateMayBeLiveError()
+	}
+	confirmed, err := m.store.loadRequired()
+	if err != nil || !reflect.DeepEqual(confirmed, transition.before) {
+		return candidateMayBeLiveError()
+	}
+	return m.attestLegacyRouteActivationRollbackStateLocked(ctx, transition.before, transition.before, appID)
+}
+
+func (m *Manager) attestLegacyRouteActivationRollbackStateLocked(ctx context.Context,
+	protected, served routeState, appID string,
+) error {
+	if _, exists := served.Active[appID]; exists {
+		return m.attestLegacyRouteStateLocked(ctx, protected, served, appID)
+	}
+	return m.attestLegacyRouteAbsenceLocked(ctx, protected, served, appID)
 }
 
 // switchGeneratedDomainRoute is the private physical route primitive. Its
@@ -1709,4 +2147,114 @@ func (m *Manager) observeLocked(ctx context.Context, appID string) (Observation,
 		return Observation{}, err
 	}
 	return Observation{URL: url, Slot: route.Slot, Endpoints: append([]generatedroute.RouteEndpoint(nil), route.Endpoints...), ObservedAt: time.Now().UTC()}, nil
+}
+
+// attestLegacyRouteStateLocked verifies an exact served projection while a
+// distinct protected Pending record remains installed. It performs no route
+// or protected-state mutation and is used only by the sealed activation
+// boundary.
+func (m *Manager) attestLegacyRouteStateLocked(ctx context.Context, protected, served routeState,
+	appID string,
+) error {
+	if ctx == nil || !validAppID(appID) || served.Pending != nil ||
+		!validRouteState(protected) || !validRouteState(served) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if protected.Pending == nil && !reflect.DeepEqual(protected, served) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	route, exists := served.Active[appID]
+	if !exists {
+		return &Error{Code: DiagnosticRouteInvalid}
+	}
+	return m.attestLegacyRouteProjectionLocked(ctx, protected, served, appID, &route)
+}
+
+// attestLegacyRouteAbsenceLocked proves the exact active and restart
+// configuration excludes appID while preserving the supplied protected state.
+// It is used only for the canonical initial activation rollback, where there
+// is no predecessor endpoint to probe.
+func (m *Manager) attestLegacyRouteAbsenceLocked(ctx context.Context, protected, served routeState,
+	appID string,
+) error {
+	if ctx == nil || !validAppID(appID) || served.Pending != nil ||
+		!validRouteState(protected) || !validRouteState(served) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if protected.Pending == nil && !reflect.DeepEqual(protected, served) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if _, exists := served.Active[appID]; exists {
+		return &Error{Code: DiagnosticRouteInvalid}
+	}
+	return m.attestLegacyRouteProjectionLocked(ctx, protected, served, appID, nil)
+}
+
+func (m *Manager) attestLegacyRouteProjectionLocked(ctx context.Context, protected, served routeState,
+	appID string, route *routeRecord,
+) error {
+	image, found, err := m.inspectImage(ctx)
+	if err != nil || !found || image.OS != "linux" || !validContainerID(image.ID) ||
+		!containsDigest(image.RepoDigests, caddyImageDigest) {
+		return errors.Join(&Error{Code: DiagnosticIngressDrift}, err)
+	}
+	caddy, found, err := m.inspectCaddy(ctx)
+	if err != nil || !found || !caddy.Running || caddy.Restarting ||
+		!validContainerID(caddy.ID) || !validCaddyInspection(caddy, image.ID, m.options.HostPort) {
+		return errors.Join(&Error{Code: DiagnosticIngressDrift}, err)
+	}
+	desired, err := m.desiredNetworks(ctx, served.Active)
+	if err != nil || len(caddy.Networks) != len(desired) {
+		return errors.Join(&Error{Code: DiagnosticIngressDrift}, err)
+	}
+	for network := range desired {
+		if caddy.Networks[network] == nil {
+			return &Error{Code: DiagnosticIngressDrift}
+		}
+	}
+	ingress, found, err := m.inspectCaddyNetwork(ctx)
+	defer clearCaddyNetworkInspection(&ingress)
+	listenIP, valid := caddyIngressAddress(ingress, caddy.ID)
+	if err != nil || !found || !valid || caddy.Networks[caddyNetworkName].IPAddress != listenIP {
+		return errors.Join(&Error{Code: DiagnosticIngressDrift}, err)
+	}
+	expected, err := buildCaddyConfig(served.Active, net.JoinHostPort(listenIP, "8080"))
+	if err != nil {
+		return &Error{Code: DiagnosticRouteInvalid}
+	}
+	result, err := m.run(ctx, m.options.CommandTimeout, "container", "exec", caddy.ID,
+		"curl", "--silent", "--show-error", "--fail", "--max-time", "10", "http://127.0.0.1:2019/config/")
+	if err != nil {
+		clear(expected)
+		return err
+	}
+	restart, restartErr := m.inspectStoppedCaddyRestartConfig(ctx, caddy.ID, "active.json")
+	var expectedJSON, liveJSON, restartJSON any
+	expectedErr := json.Unmarshal(expected, &expectedJSON)
+	liveErr := json.Unmarshal(result.Stdout, &liveJSON)
+	restartJSONErr := json.Unmarshal(restart, &restartJSON)
+	clear(expected)
+	clear(restart)
+	clearResult(&result)
+	if expectedErr != nil || liveErr != nil || restartErr != nil || restartJSONErr != nil ||
+		!reflect.DeepEqual(expectedJSON, liveJSON) || !reflect.DeepEqual(expectedJSON, restartJSON) {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
+	if route != nil {
+		if err := m.verifyEndpoints(ctx, appID, *route); err != nil {
+			return err
+		}
+		if err := m.verifyGatewayReadiness(ctx, *route); err != nil {
+			return err
+		}
+	}
+	confirmed, found, err := m.inspectCaddy(ctx)
+	if err != nil || !found || !reflect.DeepEqual(caddy, confirmed) {
+		return &Error{Code: DiagnosticIngressDrift}
+	}
+	confirmedState, err := m.store.loadRequired()
+	if err != nil || !reflect.DeepEqual(protected, confirmedState) {
+		return &Error{Code: DiagnosticRouteStateFailed}
+	}
+	return contextError(ctx)
 }

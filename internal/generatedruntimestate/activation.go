@@ -35,6 +35,8 @@ type RouteActivationReceipt struct {
 	PredecessorActivationReceiptID string
 	CreatorJobID                   string
 	CreatorWorkerAttempt           int
+	WriterJobID                    string
+	WriterWorkerAttempt            int
 	CandidateRosterDigest          string
 	PredecessorRosterDigest        string
 	RouteIntentDigest              string
@@ -58,6 +60,8 @@ type GeneratedDomainStartupRouteActivation struct {
 	PredecessorActivationReceiptID string
 	CreatorJobID                   string
 	CreatorWorkerAttempt           int
+	WriterJobID                    string
+	WriterWorkerAttempt            int
 	CandidateRosterDigest          string
 	PredecessorRosterDigest        string
 	RouteIntentDigest              string
@@ -131,14 +135,40 @@ func validRouteActivationComponent(value RouteActivationComponent) bool {
 			(canonicalUUID(value.CandidateReceiptID) && lowerHex(value.CandidatePolicyDigest, 64)))
 }
 
+// ReadRouteActivationReceiptTx reads one immutable activation receipt in the
+// caller-owned transaction. It grants no writer, route, or execution
+// authority; callers must separately validate their current scoped claim.
+func (r *Repository) ReadRouteActivationReceiptTx(ctx context.Context, tx *sql.Tx,
+	receiptID string,
+) (RouteActivationReceipt, error) {
+	if r == nil || r.db == nil || ctx == nil || tx == nil || !canonicalUUID(receiptID) {
+		return RouteActivationReceipt{}, ErrInvalidState
+	}
+	return readRouteActivationReceiptTx(ctx, tx, receiptID)
+}
+
+type routeActivationRowScanner interface {
+	Scan(dest ...any) error
+}
+
 func readRouteActivationReceiptTx(ctx context.Context, tx *sql.Tx, receiptID string) (RouteActivationReceipt, error) {
+	if ctx == nil || tx == nil || !canonicalUUID(receiptID) {
+		return RouteActivationReceipt{}, ErrInvalidState
+	}
+	return scanRouteActivationReceipt(tx.QueryRowContext(ctx, routeActivationSelect+` WHERE id=?`, receiptID))
+}
+
+func scanRouteActivationReceipt(row routeActivationRowScanner) (RouteActivationReceipt, error) {
 	var value RouteActivationReceipt
 	var activatedAt string
-	err := tx.QueryRowContext(ctx, routeActivationSelect+` WHERE id=?`, receiptID).Scan(
+	var writerJobID sql.NullString
+	var writerWorkerAttempt sql.NullInt64
+	err := row.Scan(
 		&value.ReceiptID, &value.AppID, &value.SuccessorDeploymentID, &value.SuccessorReleaseID,
 		&value.SuccessorSlot, &value.SuccessorGeneration, &value.PredecessorDeploymentID,
 		&value.PredecessorReleaseID, &value.PredecessorSlot, &value.PredecessorGeneration,
 		&value.PredecessorActivationReceiptID, &value.CreatorJobID, &value.CreatorWorkerAttempt,
+		&writerJobID, &writerWorkerAttempt,
 		&value.CandidateRosterDigest, &value.PredecessorRosterDigest, &value.RouteIntentDigest,
 		&value.CommittedRouteProofDigest, &activatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -146,6 +176,17 @@ func readRouteActivationReceiptTx(ctx context.Context, tx *sql.Tx, receiptID str
 	}
 	if err != nil {
 		return RouteActivationReceipt{}, err
+	}
+	if writerJobID.Valid != writerWorkerAttempt.Valid {
+		return RouteActivationReceipt{}, ErrInvalidState
+	}
+	if writerJobID.Valid {
+		if writerWorkerAttempt.Int64 < 1 || writerWorkerAttempt.Int64 > int64(^uint(0)>>1) {
+			return RouteActivationReceipt{}, ErrInvalidState
+		}
+		value.WriterJobID, value.WriterWorkerAttempt = writerJobID.String, int(writerWorkerAttempt.Int64)
+	} else {
+		value.WriterJobID, value.WriterWorkerAttempt = value.CreatorJobID, value.CreatorWorkerAttempt
 	}
 	value.ActivatedAt, err = parseTime(activatedAt)
 	if err != nil || !validRouteActivationReceipt(value) {
@@ -165,6 +206,8 @@ func validRouteActivationReceipt(value RouteActivationReceipt) bool {
 				validReleaseID(value.PredecessorReleaseID) && (value.PredecessorSlot == "blue" || value.PredecessorSlot == "green") &&
 				(value.PredecessorActivationReceiptID == "" || canonicalUUID(value.PredecessorActivationReceiptID)))) &&
 		canonicalUUID(value.CreatorJobID) && value.CreatorWorkerAttempt > 0 &&
+		canonicalUUID(value.WriterJobID) && value.WriterJobID == value.CreatorJobID &&
+		value.WriterWorkerAttempt >= value.CreatorWorkerAttempt &&
 		lowerHex(value.CandidateRosterDigest, 64) && lowerHex(value.PredecessorRosterDigest, 64) &&
 		lowerHex(value.RouteIntentDigest, 64) && lowerHex(value.CommittedRouteProofDigest, 64) &&
 		!value.ActivatedAt.IsZero()
@@ -173,6 +216,7 @@ func validRouteActivationReceipt(value RouteActivationReceipt) bool {
 const routeActivationSelect = `SELECT id,app_id,successor_deployment_id,successor_release_id,successor_slot,
 	successor_generation,predecessor_deployment_id,predecessor_release_id,predecessor_slot,
 	predecessor_generation,predecessor_activation_receipt_id,creator_job_id,creator_worker_attempt,
+	writer_job_id,writer_worker_attempt,
 	candidate_roster_digest,predecessor_roster_digest,route_intent_digest,committed_route_proof_digest,
 	activated_at FROM generated_route_activations`
 
@@ -184,19 +228,9 @@ func readGeneratedDomainStartupRouteActivations(ctx context.Context, tx *sql.Tx)
 	defer rows.Close()
 	result := []GeneratedDomainStartupRouteActivation{}
 	for rows.Next() {
-		var receipt RouteActivationReceipt
-		var activatedAt string
-		if err := rows.Scan(&receipt.ReceiptID, &receipt.AppID, &receipt.SuccessorDeploymentID,
-			&receipt.SuccessorReleaseID, &receipt.SuccessorSlot, &receipt.SuccessorGeneration,
-			&receipt.PredecessorDeploymentID, &receipt.PredecessorReleaseID, &receipt.PredecessorSlot,
-			&receipt.PredecessorGeneration, &receipt.PredecessorActivationReceiptID, &receipt.CreatorJobID,
-			&receipt.CreatorWorkerAttempt, &receipt.CandidateRosterDigest, &receipt.PredecessorRosterDigest,
-			&receipt.RouteIntentDigest, &receipt.CommittedRouteProofDigest, &activatedAt); err != nil {
+		receipt, err := scanRouteActivationReceipt(rows)
+		if err != nil {
 			return nil, err
-		}
-		receipt.ActivatedAt, err = parseTime(activatedAt)
-		if err != nil || !validRouteActivationReceipt(receipt) {
-			return nil, ErrInvalidState
 		}
 		result = append(result, GeneratedDomainStartupRouteActivation{
 			ReceiptID: receipt.ReceiptID, AppID: receipt.AppID,
@@ -206,6 +240,7 @@ func readGeneratedDomainStartupRouteActivations(ctx context.Context, tx *sql.Tx)
 			PredecessorSlot: receipt.PredecessorSlot, PredecessorGeneration: receipt.PredecessorGeneration,
 			PredecessorActivationReceiptID: receipt.PredecessorActivationReceiptID,
 			CreatorJobID:                   receipt.CreatorJobID, CreatorWorkerAttempt: receipt.CreatorWorkerAttempt,
+			WriterJobID: receipt.WriterJobID, WriterWorkerAttempt: receipt.WriterWorkerAttempt,
 			CandidateRosterDigest: receipt.CandidateRosterDigest, PredecessorRosterDigest: receipt.PredecessorRosterDigest,
 			RouteIntentDigest: receipt.RouteIntentDigest, CommittedRouteProofDigest: receipt.CommittedRouteProofDigest,
 		})

@@ -114,7 +114,8 @@ func gatewayCurrentServingRestoreRedeployFixture(t *testing.T, f gatewayRebindPr
 	selection gatewayCurrentSelection, entry appaccess.GatewayRebindRosterEntryV2,
 ) gatewayCurrentSelection {
 	t.Helper()
-	f.manager.gatewayCurrentPhysicalDriver = &gatewayCurrentStateMachineDriver{t: t, terminal: *selection.Terminal}
+	f.manager.gatewayCurrentPhysicalDriver = &gatewayCurrentStateMachineDriver{t: t, terminal: *selection.Terminal,
+		pendingAttestOutcome: gatewayCurrentPhysicalRecoveryEffective}
 	gatewayRebindSequenceRedeploy(t, f, *selection.State, entry)
 	snapshot, err := f.repository.GatewayRebindRecoverySnapshot(context.Background())
 	if err != nil {

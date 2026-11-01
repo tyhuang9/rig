@@ -418,14 +418,16 @@ func newGeneratedDomainA0NamespaceFixture(t *testing.T) generatedDomainA0Namespa
 		endpoints[candidate.ContainerID] = generatedRouteEndpointSnapshot{appID: second.migration.guarded.appID,
 			endpoint: endpoint, slot: generatedidentity.Slot(candidate.Slot)}
 	}
+	physicalRoutes := &generatedRoutePredecessorRunner{ingressRunner: ingress, endpoints: endpoints}
 	routeRunner := &generatedDomainTwoComponentRouteRunner{daemonID: "generated-domain-a0-namespace",
-		delegate: &generatedRoutePredecessorRunner{ingressRunner: ingress, endpoints: endpoints}}
+		delegate: physicalRoutes}
+	reader := &generatedRouteColdAccountingRouteReadRunner{routes: physicalRoutes, delegate: routeRunner}
 	manager, err := assembleGeneratedDomainManager(generatedDomainReservationInput{database: identity.database,
-		stores: identity.stores, runner: routeRunner, options: identity.options}, store)
+		stores: identity.stores, runner: reader, options: identity.options}, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	physical, _, err := inspectGeneratedDomainPhysicalIdentity(context.Background(), identity.stores, routeRunner, identity.options)
+	physical, _, err := inspectGeneratedDomainPhysicalIdentity(context.Background(), identity.stores, reader, identity.options)
 	if err != nil {
 		t.Fatal(err)
 	}

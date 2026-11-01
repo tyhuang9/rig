@@ -68,6 +68,19 @@ func (a *GeneratedRouteAuthority) CompleteRecovered(ctx context.Context,
 	if err != nil {
 		return err
 	}
+	if construction.cold.pendingActivation != nil &&
+		construction.cold.pendingActivationDeploymentID == deploymentID {
+		transition := cloneGeneratedRouteActivationGatewayTransition(construction.cold.pendingActivation)
+		if err := a.finishRecoveredPendingRouteActivation(ctx, claim, deploymentID, transition,
+			evidence.activation); err != nil {
+			// Retrying any first finish error is safe only after a second
+			// read-only attestation proves that the durable Claim remains current.
+			if replayErr := a.finishRecoveredPendingRouteActivation(context.WithoutCancel(ctx), claim,
+				deploymentID, transition, evidence.activation); replayErr != nil {
+				return errors.Join(err, replayErr)
+			}
+		}
+	}
 	var hold candidateRecoveredCompletionGuard
 	if evidence.replay {
 		activation, err := a.readRecoveredRouteActivation(ctx, evidence.activation)
@@ -123,7 +136,7 @@ func (a *GeneratedRouteAuthority) readRecoveredRouteActivation(ctx context.Conte
 		return generatedruntimestate.RouteActivationReceipt{}, err
 	}
 	defer tx.Rollback()
-	activation, err := readGeneratedRouteActivationReceiptTx(ctx, tx, observed.ReceiptID)
+	activation, err := a.runtime.ReadRouteActivationReceiptTx(ctx, tx, observed.ReceiptID)
 	if err != nil || !sameRecoveredRouteActivation(activation, observed) {
 		return generatedruntimestate.RouteActivationReceipt{}, errors.Join(deploymentexecution.ErrIdentityLost, err)
 	}
@@ -131,6 +144,52 @@ func (a *GeneratedRouteAuthority) readRecoveredRouteActivation(ctx context.Conte
 		return generatedruntimestate.RouteActivationReceipt{}, err
 	}
 	return activation, nil
+}
+
+// finishRecoveredPendingRouteActivation validates the live authority that
+// permits exactly one protected Pending-to-Effective transition. It is called
+// before every finish attempt, including a caller-cancellation retry, so the
+// Pinned effects lifetime can never substitute for a current durable Claim.
+func (a *GeneratedRouteAuthority) finishRecoveredPendingRouteActivation(ctx context.Context,
+	claim deploymentexecution.Claim, deploymentID string, transition *generatedRouteActivationGatewayTransition,
+	observed generatedruntimestate.GeneratedDomainStartupRouteActivation,
+) error {
+	if a == nil || a.construction == nil || a.construction.manager == nil || ctx == nil ||
+		transition == nil || !validAppID(deploymentID) {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
+	activation, err := a.readRecoveredRouteActivation(ctx, observed)
+	if err != nil {
+		return err
+	}
+	return a.finishPendingRouteActivation(ctx, claim, deploymentID, transition, activation)
+}
+
+// finishPendingRouteActivation revalidates the durable worker authority and
+// exact committed 042 immediately before one protected Pending-to-Effective
+// attempt. The read-only SQL transaction closes before the Manager acquires
+// its gateway lock.
+func (a *GeneratedRouteAuthority) finishPendingRouteActivation(ctx context.Context,
+	claim deploymentexecution.Claim, deploymentID string, transition *generatedRouteActivationGatewayTransition,
+	activation generatedruntimestate.RouteActivationReceipt,
+) error {
+	if a == nil || a.manager == nil || ctx == nil ||
+		transition == nil || !validAppID(deploymentID) || activation.ReceiptID == "" {
+		return deploymentexecution.ErrInvalidConfiguration
+	}
+	_, _, proposed, valid := generatedRouteActivationGatewayRoutes(transition)
+	if !valid {
+		return deploymentexecution.ErrAuthorityStale
+	}
+	attested, err := a.readGeneratedRouteAttestation(ctx, claim, deploymentID,
+		generatedruntimestate.PhaseDraining, &activation,
+		func(ctx context.Context, tx *sql.Tx) error {
+			return a.stores.ExecutionGuard().CheckPublishedRouteAttestationTx(ctx, tx, claim, deploymentID)
+		})
+	if err != nil || !sameRoute(attested, proposed) {
+		return errors.Join(deploymentexecution.ErrAuthorityStale, err)
+	}
+	return a.manager.finishGeneratedDomainRouteActivation(ctx, transition)
 }
 
 func recoveredRouteCompletionEvidence(observed generatedDomainStartupObservation,
@@ -277,7 +336,7 @@ func (a *GeneratedRouteAuthority) completeRecovered(ctx context.Context, pinned 
 		return gateDatabaseError(ctx, err)
 	}
 	defer tx.Rollback()
-	activation, err := readGeneratedRouteActivationReceiptTx(ctx, tx, evidence.activation.ReceiptID)
+	activation, err := a.runtime.ReadRouteActivationReceiptTx(ctx, tx, evidence.activation.ReceiptID)
 	if err != nil || !sameRecoveredRouteActivation(activation, evidence.activation) {
 		return errors.Join(deploymentexecution.ErrIdentityLost, err)
 	}
@@ -399,6 +458,8 @@ func sameRecoveredRouteActivation(value generatedruntimestate.RouteActivationRec
 		value.PredecessorActivationReceiptID == observed.PredecessorActivationReceiptID &&
 		value.CreatorJobID == observed.CreatorJobID &&
 		value.CreatorWorkerAttempt == observed.CreatorWorkerAttempt &&
+		value.WriterJobID == observed.WriterJobID &&
+		value.WriterWorkerAttempt == observed.WriterWorkerAttempt &&
 		value.CandidateRosterDigest == observed.CandidateRosterDigest &&
 		value.PredecessorRosterDigest == observed.PredecessorRosterDigest &&
 		value.RouteIntentDigest == observed.RouteIntentDigest &&

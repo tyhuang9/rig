@@ -511,7 +511,8 @@ func newGeneratedRoutePredecessorManagerFixture(t *testing.T) (*Manager, *ingres
 		files: map[string][]byte{}}
 	routeRunner := &generatedRoutePredecessorRunner{ingressRunner: runner, slot: generatedidentity.SlotBlue,
 		endpoints: make(map[string]generatedRouteEndpointSnapshot)}
-	manager, err := New(routeRunner, Options{
+	reader := &generatedRouteColdAccountingRouteReadRunner{routes: routeRunner, delegate: routeRunner}
+	manager, err := New(reader, Options{
 		DockerExecutable: filepath.Join(root, "docker.exe"), DockerConfigDirectory: directories.DockerConfigDirectory,
 		WorkingDirectory: directories.WorkingDirectory, DataRoot: root,
 		RebindFenceCheck:             func(context.Context) error { return nil },

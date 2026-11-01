@@ -49,6 +49,7 @@ import (
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -74,12 +75,191 @@ type controllerProcessKillBarrier struct {
 	marker                 string
 	state                  *generatedruntimestate.Repository
 	db                     *sql.DB
+	dataRoot               string
 	appID                  string
 	jobID                  string
 	mu                     sync.Mutex
 	deploymentID           string
 	candidateRouteReloaded bool
 	once                   sync.Once
+}
+
+const (
+	controllerProcessKillRouteStatePurpose  = "hostd/generated-ingress/routes/v1"
+	controllerProcessKillRouteStateMaxBytes = 48 << 10
+)
+
+type controllerProcessKillRouteRecord struct {
+	Slot      generatedruntime.Slot            `json:"slot"`
+	Endpoints []generatedruntime.RouteEndpoint `json:"endpoints"`
+}
+
+type controllerProcessKillPendingRoute struct {
+	AppID    string                            `json:"appId"`
+	Previous *controllerProcessKillRouteRecord `json:"previous,omitempty"`
+	Proposed controllerProcessKillRouteRecord  `json:"proposed"`
+}
+
+type controllerProcessKillRouteState struct {
+	Version int                                         `json:"version"`
+	Active  map[string]controllerProcessKillRouteRecord `json:"active"`
+	Pending *controllerProcessKillPendingRoute          `json:"pending,omitempty"`
+}
+
+type controllerProcessKillRouteHistoryCounts struct {
+	predecessorHeadReceipts                      int
+	activations, retirements, retirementReceipts int
+	authorizations, handoffs, completions        int
+}
+
+func (b *controllerProcessKillBarrier) routeCommitPrefix(ctx context.Context) bool {
+	if b == nil || b.state == nil || b.db == nil || ctx == nil || b.appID == "" || b.jobID == "" ||
+		b.dataRoot == "" || !filepath.IsAbs(b.dataRoot) || filepath.Clean(b.dataRoot) != b.dataRoot {
+		return false
+	}
+	protected, ok := b.readProtectedRouteState()
+	if !ok {
+		return false
+	}
+	deploymentID := b.resolveDeploymentID(ctx)
+	if deploymentID == "" {
+		return false
+	}
+	candidate, err := b.state.Get(ctx, b.appID, deploymentID)
+	if err != nil || candidate.Phase != generatedruntimestate.PhaseSwitchingRoute ||
+		candidate.PreviousActiveDeploymentID == "" || candidate.PreviousActiveSlot == "" {
+		return false
+	}
+	previous, err := b.state.Get(ctx, b.appID, candidate.PreviousActiveDeploymentID)
+	if err != nil {
+		return false
+	}
+	head, err := b.state.Active(ctx, b.appID)
+	if err != nil {
+		return false
+	}
+	var history controllerProcessKillRouteHistoryCounts
+	err = b.db.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM generated_route_activations WHERE id=? AND app_id=?
+		 AND successor_deployment_id=? AND successor_release_id=? AND successor_slot=? AND successor_generation=?),
+		(SELECT COUNT(*) FROM generated_route_activations WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_predecessor_retirements WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_completion_receipts WHERE successor_deployment_id=?)`,
+		head.ActivationReceiptID, b.appID, head.DeploymentID, head.ReleaseID, head.Slot, head.Generation,
+		deploymentID, deploymentID, deploymentID, deploymentID, deploymentID, deploymentID).Scan(
+		&history.predecessorHeadReceipts,
+		&history.activations, &history.retirements, &history.retirementReceipts,
+		&history.authorizations, &history.handoffs, &history.completions)
+	return err == nil && controllerProcessKillRouteCommitPrefixMatches(protected, b.appID, previous, candidate, head, history)
+}
+
+func (b *controllerProcessKillBarrier) readProtectedRouteState() (controllerProcessKillRouteState, bool) {
+	if b == nil || b.appID == "" || b.dataRoot == "" || !filepath.IsAbs(b.dataRoot) ||
+		filepath.Clean(b.dataRoot) != b.dataRoot {
+		return controllerProcessKillRouteState{}, false
+	}
+	body, err := secretfile.ReadBounded(filepath.Join(b.dataRoot, "runtime", "generated-ingress", "routes.bundle"),
+		controllerProcessKillRouteStatePurpose, controllerProcessKillRouteStateMaxBytes)
+	if err != nil {
+		return controllerProcessKillRouteState{}, false
+	}
+	defer clear(body)
+	var protected controllerProcessKillRouteState
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&protected) != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+		!controllerProcessKillProtectedPendingMatches(protected, b.appID) {
+		return controllerProcessKillRouteState{}, false
+	}
+	return protected, true
+}
+
+func controllerProcessKillProtectedPendingMatches(protected controllerProcessKillRouteState, appID string) bool {
+	if protected.Version != 1 || protected.Active == nil || protected.Pending == nil ||
+		protected.Pending.AppID != appID || protected.Pending.Previous == nil ||
+		!controllerProcessKillRouteRecordWellFormed(*protected.Pending.Previous) ||
+		!controllerProcessKillRouteRecordWellFormed(protected.Pending.Proposed) ||
+		protected.Pending.Previous.Slot == protected.Pending.Proposed.Slot {
+		return false
+	}
+	active, ok := protected.Active[appID]
+	return ok && reflect.DeepEqual(active, *protected.Pending.Previous)
+}
+
+func controllerProcessKillRouteRecordWellFormed(route controllerProcessKillRouteRecord) bool {
+	if (route.Slot != generatedruntime.SlotBlue && route.Slot != generatedruntime.SlotGreen) || len(route.Endpoints) == 0 {
+		return false
+	}
+	components := make(map[string]struct{}, len(route.Endpoints))
+	containers := make(map[string]struct{}, len(route.Endpoints))
+	for _, endpoint := range route.Endpoints {
+		if endpoint.Component == "" || endpoint.Role == "" || endpoint.ContainerID == "" ||
+			endpoint.NetworkName == "" || endpoint.NetworkAlias == "" || endpoint.InternalPort == 0 {
+			return false
+		}
+		if _, duplicate := components[endpoint.Component]; duplicate {
+			return false
+		}
+		if _, duplicate := containers[endpoint.ContainerID]; duplicate {
+			return false
+		}
+		components[endpoint.Component] = struct{}{}
+		containers[endpoint.ContainerID] = struct{}{}
+	}
+	return true
+}
+
+func controllerProcessKillRouteCommitPrefixMatches(protected controllerProcessKillRouteState, appID string,
+	previous, candidate generatedruntimestate.Deployment, head generatedruntimestate.ActiveHead,
+	history controllerProcessKillRouteHistoryCounts,
+) bool {
+	if protected.Version != 1 || protected.Active == nil || protected.Pending == nil ||
+		protected.Pending.AppID != appID || protected.Pending.Previous == nil ||
+		previous.AppID != appID || candidate.AppID != appID ||
+		candidate.PreviousActiveDeploymentID != previous.DeploymentID ||
+		candidate.PreviousActiveSlot != previous.CandidateSlot || candidate.Phase != generatedruntimestate.PhaseSwitchingRoute ||
+		head.AppID != appID || head.DeploymentID != previous.DeploymentID || head.ReleaseID != previous.ReleaseID ||
+		head.Slot != previous.CandidateSlot || head.Generation <= 0 || head.ActivationReceiptID == "" ||
+		history.predecessorHeadReceipts != 1 ||
+		history.activations != 0 || history.retirements != 0 || history.retirementReceipts != 0 ||
+		history.authorizations != 0 || history.handoffs != 0 || history.completions != 0 {
+		return false
+	}
+	active, ok := protected.Active[appID]
+	return ok && reflect.DeepEqual(active, *protected.Pending.Previous) &&
+		controllerProcessKillRouteRecordMatchesDeployment(*protected.Pending.Previous, previous) &&
+		controllerProcessKillRouteRecordMatchesDeployment(protected.Pending.Proposed, candidate)
+}
+
+func controllerProcessKillRouteRecordMatchesDeployment(route controllerProcessKillRouteRecord,
+	deployment generatedruntimestate.Deployment,
+) bool {
+	if string(route.Slot) != deployment.CandidateSlot || len(route.Endpoints) == 0 ||
+		len(route.Endpoints) != len(deployment.Components) {
+		return false
+	}
+	components := make(map[string]string, len(deployment.Components))
+	for _, component := range deployment.Components {
+		if component.DeploymentID != deployment.DeploymentID || component.Name == "" || component.ContainerID == "" {
+			return false
+		}
+		if _, duplicate := components[component.Name]; duplicate {
+			return false
+		}
+		components[component.Name] = component.ContainerID
+	}
+	for _, endpoint := range route.Endpoints {
+		if endpoint.Component == "" || endpoint.Role == "" || endpoint.ContainerID == "" ||
+			endpoint.NetworkName == "" || endpoint.NetworkAlias == "" || endpoint.InternalPort == 0 ||
+			components[endpoint.Component] != endpoint.ContainerID {
+			return false
+		}
+		delete(components, endpoint.Component)
+	}
+	return len(components) == 0
 }
 
 func (b *controllerProcessKillBarrier) wait(ctx context.Context, want generatedruntimestate.Phase, predicate func(generatedruntimestate.Deployment) bool) error {
@@ -90,6 +270,13 @@ func (b *controllerProcessKillBarrier) wait(ctx context.Context, want generatedr
 	runtime, err := b.state.Get(ctx, b.appID, deploymentID)
 	if err != nil || runtime.Phase != want || !predicate(runtime) {
 		return fmt.Errorf("process-kill boundary %s has no durable %s state", b.boundary, want)
+	}
+	return b.markAndWait(ctx)
+}
+
+func (b *controllerProcessKillBarrier) markAndWait(ctx context.Context) error {
+	if b == nil || ctx == nil || b.marker == "" {
+		return errors.New("process-kill marker wait is incomplete")
 	}
 	var writeErr error
 	b.once.Do(func() { writeErr = controllerProcessKillMarker(b.marker, b.boundary) })
@@ -169,8 +356,11 @@ func (r controllerProcessKillRunner) Run(ctx context.Context, request runtimepro
 	}
 	result, err := r.delegate.Run(ctx, request)
 	if err == nil && r.barrier != nil && r.barrier.boundary == controllerKillAfterRoute {
-		if r.barrier.candidateRouteCommitted(request) && r.barrier.ready(ctx, generatedruntimestate.PhaseSwitchingRoute) {
-			if waitErr := r.barrier.wait(ctx, generatedruntimestate.PhaseSwitchingRoute, func(d generatedruntimestate.Deployment) bool { return d.PreviousActiveDeploymentID != "" }); waitErr != nil {
+		if r.barrier.candidateRouteCommitted(request) {
+			if _, ok := r.barrier.readProtectedRouteState(); !ok {
+				return result, errors.New("process-kill route boundary missed its exact protected Pending prefix")
+			}
+			if waitErr := r.barrier.markAndWait(ctx); waitErr != nil {
 				return result, waitErr
 			}
 		}
@@ -282,6 +472,120 @@ func TestControllerProcessKillBoundaryControls(t *testing.T) {
 			controllerChildConstructionDiagnosticKnownPair("empty_construction", reason) {
 			t.Fatalf("retained final construction pair %q crossed its closed stage", reason)
 		}
+	}
+	newRoutePrefix := func() (controllerProcessKillRouteState, generatedruntimestate.Deployment,
+		generatedruntimestate.Deployment, generatedruntimestate.ActiveHead,
+		controllerProcessKillRouteHistoryCounts,
+	) {
+		appID := "11111111-1111-4111-8111-111111111111"
+		previousID, candidateID := "22222222-2222-4222-8222-222222222222", "33333333-3333-4333-8333-333333333333"
+		previousEndpoint := generatedruntime.RouteEndpoint{Component: "web", Role: "server",
+			ContainerID: strings.Repeat("a", 64), NetworkName: "app-blue", NetworkAlias: "web-blue", InternalPort: 3000}
+		candidateEndpoint := generatedruntime.RouteEndpoint{Component: "web", Role: "server",
+			ContainerID: strings.Repeat("b", 64), NetworkName: "app-green", NetworkAlias: "web-green", InternalPort: 3000}
+		previousRoute := controllerProcessKillRouteRecord{Slot: generatedruntime.SlotBlue,
+			Endpoints: []generatedruntime.RouteEndpoint{previousEndpoint}}
+		activeRoute := previousRoute
+		activeRoute.Endpoints = append([]generatedruntime.RouteEndpoint(nil), previousRoute.Endpoints...)
+		candidateRoute := controllerProcessKillRouteRecord{Slot: generatedruntime.SlotGreen,
+			Endpoints: []generatedruntime.RouteEndpoint{candidateEndpoint}}
+		previous := generatedruntimestate.Deployment{DeploymentID: previousID, AppID: appID,
+			ReleaseID: "44444444-4444-4444-8444-444444444444", CandidateSlot: string(generatedruntime.SlotBlue),
+			Phase: generatedruntimestate.PhaseSucceeded, Components: []generatedruntimestate.Component{{
+				DeploymentID: previousID, Name: "web", ContainerID: previousEndpoint.ContainerID,
+			}}}
+		candidate := generatedruntimestate.Deployment{DeploymentID: candidateID, AppID: appID,
+			ReleaseID: "55555555-5555-4555-8555-555555555555", CandidateSlot: string(generatedruntime.SlotGreen),
+			PreviousActiveDeploymentID: previousID, PreviousActiveSlot: string(generatedruntime.SlotBlue),
+			Phase: generatedruntimestate.PhaseSwitchingRoute, Components: []generatedruntimestate.Component{{
+				DeploymentID: candidateID, Name: "web", ContainerID: candidateEndpoint.ContainerID,
+			}}}
+		protected := controllerProcessKillRouteState{Version: 1,
+			Active:  map[string]controllerProcessKillRouteRecord{appID: activeRoute},
+			Pending: &controllerProcessKillPendingRoute{AppID: appID, Previous: &previousRoute, Proposed: candidateRoute}}
+		head := generatedruntimestate.ActiveHead{AppID: appID, DeploymentID: previousID,
+			ReleaseID: previous.ReleaseID, Slot: previous.CandidateSlot, Generation: 1,
+			ActivationReceiptID: "66666666-6666-4666-8666-666666666666"}
+		return protected, previous, candidate, head,
+			controllerProcessKillRouteHistoryCounts{predecessorHeadReceipts: 1}
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*controllerProcessKillRouteState, *generatedruntimestate.Deployment,
+			*generatedruntimestate.Deployment, *generatedruntimestate.ActiveHead,
+			*controllerProcessKillRouteHistoryCounts)
+	}{
+		{name: "exact protected Pending prefix"},
+		{name: "missing Pending", mutate: func(value *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, _ *controllerProcessKillRouteHistoryCounts) {
+			value.Pending = nil
+		}},
+		{name: "crossed Pending app", mutate: func(value *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, _ *controllerProcessKillRouteHistoryCounts) {
+			value.Pending.AppID = "77777777-7777-4777-8777-777777777777"
+		}},
+		{name: "active route differs from Previous", mutate: func(value *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, _ *controllerProcessKillRouteHistoryCounts) {
+			route := value.Active[value.Pending.AppID]
+			route.Endpoints[0].ContainerID = strings.Repeat("c", 64)
+			value.Active[value.Pending.AppID] = route
+		}},
+		{name: "crossed Previous deployment", mutate: func(_ *controllerProcessKillRouteState, previous *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, _ *controllerProcessKillRouteHistoryCounts) {
+			previous.Components[0].ContainerID = strings.Repeat("c", 64)
+		}},
+		{name: "crossed Proposed deployment", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			candidate *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, _ *controllerProcessKillRouteHistoryCounts) {
+			candidate.Components[0].ContainerID = strings.Repeat("c", 64)
+		}},
+		{name: "crossed active head", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, head *generatedruntimestate.ActiveHead, _ *controllerProcessKillRouteHistoryCounts) {
+			head.DeploymentID = "77777777-7777-4777-8777-777777777777"
+		}},
+		{name: "predecessor head receipt missing", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, history *controllerProcessKillRouteHistoryCounts) {
+			history.predecessorHeadReceipts = 0
+		}},
+		{name: "activation already committed", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, history *controllerProcessKillRouteHistoryCounts) {
+			history.activations = 1
+		}},
+		{name: "retirement intent already committed", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, history *controllerProcessKillRouteHistoryCounts) {
+			history.retirements = 1
+		}},
+		{name: "retirement receipt already committed", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, history *controllerProcessKillRouteHistoryCounts) {
+			history.retirementReceipts = 1
+		}},
+		{name: "handoff authorization already committed", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, history *controllerProcessKillRouteHistoryCounts) {
+			history.authorizations = 1
+		}},
+		{name: "handoff receipt already committed", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, history *controllerProcessKillRouteHistoryCounts) {
+			history.handoffs = 1
+		}},
+		{name: "completion already committed", mutate: func(_ *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, history *controllerProcessKillRouteHistoryCounts) {
+			history.completions = 1
+		}},
+		{name: "incomplete endpoint identity", mutate: func(value *controllerProcessKillRouteState, _ *generatedruntimestate.Deployment,
+			_ *generatedruntimestate.Deployment, _ *generatedruntimestate.ActiveHead, _ *controllerProcessKillRouteHistoryCounts) {
+			value.Pending.Proposed.Endpoints[0].NetworkAlias = ""
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			protected, previous, candidate, head, history := newRoutePrefix()
+			if test.mutate != nil {
+				test.mutate(&protected, &previous, &candidate, &head, &history)
+			}
+			got := controllerProcessKillRouteCommitPrefixMatches(protected, previous.AppID,
+				previous, candidate, head, history)
+			if got != (test.mutate == nil) {
+				t.Fatalf("protected Pending prefix match=%t want=%t", got, test.mutate == nil)
+			}
+		})
 	}
 }
 
@@ -415,7 +719,9 @@ func (b *controllerProcessKillBarrier) accountingHandoffPrefix(ctx context.Conte
 		}
 	}
 	if activations != 1 || result.activation.ReceiptID == "" ||
-		result.activation.PredecessorDeploymentID == "" {
+		result.activation.PredecessorDeploymentID == "" ||
+		result.activation.WriterJobID != b.jobID ||
+		result.activation.WriterWorkerAttempt < result.activation.CreatorWorkerAttempt {
 		return controllerProcessKillAccountingPrefix{}, false
 	}
 	successorComponents := 0
@@ -508,7 +814,8 @@ func (b *controllerProcessKillBarrier) accountingHandoffPrefix(ctx context.Conte
 		result.completion[0].SuccessorDeploymentID != result.activation.SuccessorDeploymentID ||
 		result.completion[0].CreatorJobID != result.activation.CreatorJobID ||
 		result.completion[0].CreatorWorkerAttempt != result.activation.CreatorWorkerAttempt ||
-		result.completion[0].CurrentJobID != b.jobID || result.completion[0].CurrentWorkerAttempt < 1 ||
+		result.completion[0].CurrentJobID != result.activation.WriterJobID ||
+		result.completion[0].CurrentWorkerAttempt < result.activation.WriterWorkerAttempt ||
 		result.completion[0].CompletedAt.IsZero() ||
 		result.completion[0].CompletedAt.Before(result.handoff[0].HandedOffAt)) {
 		return controllerProcessKillAccountingPrefix{}, false
@@ -878,7 +1185,7 @@ func controllerProcessKillRunChild(t *testing.T) {
 	if manifest.Boundary != "" {
 		barrier = &controllerProcessKillBarrier{
 			boundary: manifest.Boundary, marker: marker, state: generatedruntimestate.New(db),
-			db: db, appID: manifest.AppID, jobID: manifest.JobID,
+			db: db, dataRoot: manifest.DataRoot, appID: manifest.AppID, jobID: manifest.JobID,
 		}
 	}
 	composition, err := prepareRuntimeCompositionForTest(t, childContext, settings, runtimeCompositionDependencies{
@@ -1027,7 +1334,7 @@ func controllerProcessKillMatrix(
 				t.Fatal("process-kill child signaled the wrong durable boundary")
 			}
 			prefixBarrier := &controllerProcessKillBarrier{
-				state: state, db: db, appID: appID, jobID: mutation.Job.ID,
+				state: state, db: db, dataRoot: dataRoot, appID: appID, jobID: mutation.Job.ID,
 			}
 			var firstPrefix controllerProcessKillAccountingPrefix
 			var authorizedPrefix controllerProcessKillAccountingPrefix
@@ -1066,6 +1373,9 @@ func controllerProcessKillMatrix(
 			if err != nil {
 				t.Fatal("read previous serving runtime before controller kill")
 			}
+			if boundary == controllerKillAfterRoute && !prefixBarrier.routeCommitPrefix(ctx) {
+				t.Fatal("route-commit process-kill boundary omitted its exact protected Pending and pre-042 SQL prefix")
+			}
 			componentIDs := make(map[string]string, len(phase.Components))
 			for _, component := range phase.Components {
 				if component.ContainerID != "" {
@@ -1074,11 +1384,18 @@ func controllerProcessKillMatrix(
 			}
 			controllerProcessKillTerminate(t, child)
 			childStopped = true
+			if boundary == controllerKillAfterRoute && !prefixBarrier.routeCommitPrefix(ctx) {
+				t.Fatal("route-commit process-kill boundary changed its protected Pending or pre-042 SQL prefix after SIGKILL")
+			}
 			expectedRoute := oldRuntime
 			if boundary != controllerKillBeforeBuild && boundary != controllerKillBeforeStart {
 				expectedRoute = phase
 			}
-			controllerProcessKillAssertRoute(t, ctx, ingress, appID, expectedRoute)
+			if boundary == controllerKillAfterRoute {
+				controllerProcessKillAssertPendingRoute(t, ctx, ingress, appID)
+			} else {
+				controllerProcessKillAssertRoute(t, ctx, ingress, appID, expectedRoute)
+			}
 			expectedMarker := candidateMarker
 			if boundary == controllerKillBeforeBuild || boundary == controllerKillBeforeStart {
 				expectedMarker = previousMarker
@@ -1230,6 +1547,19 @@ func controllerProcessKillMatrix(
 					t.Fatal("final recovery changed the immutable retirement or authorization lineage")
 				}
 			}
+			if boundary == controllerKillAfterRoute {
+				finalPrefix, ok := prefixBarrier.accountingHandoffPrefix(ctx, 1, 1, 1)
+				wantWriterAttempt := before.Attempt + 1
+				if !ok || finalPrefix.activation.CreatorJobID != before.ID ||
+					finalPrefix.activation.CreatorWorkerAttempt != before.Attempt ||
+					finalPrefix.activation.WriterJobID != before.ID ||
+					finalPrefix.activation.WriterWorkerAttempt != wantWriterAttempt ||
+					len(finalPrefix.completion) != 1 ||
+					finalPrefix.completion[0].CurrentJobID != before.ID ||
+					finalPrefix.completion[0].CurrentWorkerAttempt != wantWriterAttempt {
+					t.Fatal("route-commit recovery changed the immutable creator or final writer lineage")
+				}
+			}
 			for _, component := range finalRuntime.Components {
 				if component.State != generatedruntimestate.ComponentActive || component.ContainerID == "" ||
 					(componentIDs[component.Name] != "" && componentIDs[component.Name] != component.ContainerID) ||
@@ -1306,6 +1636,21 @@ func controllerProcessKillAssertRunningContainer(t *testing.T, ctx context.Conte
 	output, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", "{{.Id}} {{.State.Running}}", component.ContainerName)
 	if err != nil || strings.TrimSpace(string(output)) != component.ContainerID+" true" {
 		t.Fatal("process-kill serving container is missing, stopped or has a different identity")
+	}
+}
+
+func controllerProcessKillAssertPendingRoute(t *testing.T, ctx context.Context,
+	ingress *generatedingress.Manager, appID string,
+) {
+	t.Helper()
+	observed, err := ingress.Observe(ctx, appID)
+	if !reflect.DeepEqual(observed, generatedingress.Observation{}) ||
+		!generatedingress.IsCode(err, generatedingress.DiagnosticRouteUnresolved) {
+		var diagnostic *generatedingress.Error
+		if errors.As(err, &diagnostic) {
+			t.Fatalf("retained protected Pending route returned observation=%#v diagnostic code=%s", observed, diagnostic.Code)
+		}
+		t.Fatalf("retained protected Pending route returned observation=%#v without route_unresolved", observed)
 	}
 }
 

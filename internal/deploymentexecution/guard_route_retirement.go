@@ -3,7 +3,6 @@ package deploymentexecution
 import (
 	"database/sql"
 	"errors"
-	"time"
 
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 )
@@ -34,27 +33,14 @@ func (p *Pinned) CheckGeneratedRouteRetirementTx(tx *sql.Tx, claim Claim,
 	if err := p.checkCurrent(ctx); err != nil {
 		return err
 	}
-	var persisted generatedruntimestate.RouteActivationReceipt
-	var activatedAt string
-	err = tx.QueryRowContext(ctx, `SELECT id,app_id,successor_deployment_id,successor_release_id,
-		successor_slot,successor_generation,predecessor_deployment_id,predecessor_release_id,
-		predecessor_slot,predecessor_generation,predecessor_activation_receipt_id,creator_job_id,
-		creator_worker_attempt,candidate_roster_digest,predecessor_roster_digest,route_intent_digest,
-		committed_route_proof_digest,activated_at FROM generated_route_activations WHERE id=?`,
-		receipt.ReceiptID).Scan(&persisted.ReceiptID, &persisted.AppID, &persisted.SuccessorDeploymentID,
-		&persisted.SuccessorReleaseID, &persisted.SuccessorSlot, &persisted.SuccessorGeneration,
-		&persisted.PredecessorDeploymentID, &persisted.PredecessorReleaseID, &persisted.PredecessorSlot,
-		&persisted.PredecessorGeneration, &persisted.PredecessorActivationReceiptID, &persisted.CreatorJobID,
-		&persisted.CreatorWorkerAttempt, &persisted.CandidateRosterDigest, &persisted.PredecessorRosterDigest,
-		&persisted.RouteIntentDigest, &persisted.CommittedRouteProofDigest, &activatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
+	persisted, err := generatedruntimestate.New(guard.db).ReadRouteActivationReceiptTx(ctx, tx, receipt.ReceiptID)
+	if errors.Is(err, generatedruntimestate.ErrNotFound) || errors.Is(err, generatedruntimestate.ErrInvalidState) {
 		return ErrIdentityLost
 	}
 	if err != nil {
 		return storageError(ctx, err)
 	}
-	persisted.ActivatedAt, err = time.Parse(time.RFC3339Nano, activatedAt)
-	if err != nil || persisted != receipt {
+	if persisted != receipt {
 		return ErrIdentityLost
 	}
 	var phase generatedruntimestate.Phase
@@ -92,7 +78,9 @@ func (p *Pinned) CheckGeneratedRouteRetirementTx(tx *sql.Tx, claim Claim,
 func validRetirementReceiptIdentity(receipt generatedruntimestate.RouteActivationReceipt, claim Claim) bool {
 	return claim.valid() && receipt.ReceiptID != "" && receipt.AppID == claim.ApplicationID() &&
 		receipt.SuccessorDeploymentID != "" && receipt.CreatorJobID == claim.JobID() &&
-		receipt.CreatorWorkerAttempt > 0 && receipt.CreatorWorkerAttempt <= claim.Attempt() &&
+		receipt.CreatorWorkerAttempt > 0 && receipt.WriterJobID == claim.JobID() &&
+		receipt.CreatorWorkerAttempt <= receipt.WriterWorkerAttempt &&
+		receipt.WriterWorkerAttempt > 0 && receipt.WriterWorkerAttempt <= claim.Attempt() &&
 		receipt.SuccessorGeneration > 0 && receipt.PredecessorGeneration == receipt.SuccessorGeneration-1 &&
 		receipt.CandidateRosterDigest != "" && receipt.PredecessorRosterDigest != "" &&
 		receipt.RouteIntentDigest != "" && receipt.CommittedRouteProofDigest != "" && !receipt.ActivatedAt.IsZero()

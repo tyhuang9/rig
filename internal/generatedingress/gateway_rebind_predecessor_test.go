@@ -18,12 +18,14 @@ import (
 	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedroute"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
+	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
 )
 
 const gatewayRebindTestAdministrator = "91919191-9191-4191-8191-919191919191"
 
 type gatewayRebindPredecessorFixture struct {
 	manager    *Manager
+	routes     *generatedRoutePredecessorRunner
 	store      *gatewayUpgradeStateStore
 	repository *appaccess.Repository
 	db         *sql.DB
@@ -317,7 +319,11 @@ func newGatewayRebindPredecessorFixtureWithEndpointLANApproverAndCompletion(t *t
 	if includeLoopback && !completeRuntime {
 		t.Fatal("loopback predecessor fixture requires completed serving runtimes")
 	}
-	manager, runner := newManagerFixture(t, false)
+	manager, runner := newGeneratedRouteLostAckManagerFixture(t)
+	routes := generatedRoutePredecessorRoutes(manager.runner)
+	if routes == nil {
+		t.Fatal("gateway rebind predecessor Manager lacks its stable exact route reader")
+	}
 	db, err := openGatewayRebindFixtureDatabase(manager.options.DataRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -637,7 +643,7 @@ func newGatewayRebindPredecessorFixtureWithEndpointLANApproverAndCompletion(t *t
 		t.Fatal(err)
 	}
 	return gatewayRebindPredecessorFixture{
-		manager: manager, store: store, repository: repository, db: db, migration: migration, runner: runner,
+		manager: manager, routes: routes, store: store, repository: repository, db: db, migration: migration, runner: runner,
 		state: loadedState, journal: loadedJournal, seeded: seeded, loopback: loopback,
 		proposal: appaccess.GatewayRebindPreclaimProposal{
 			Spec: rebindSpec, RebindApproval: rebindApproval,
@@ -684,8 +690,12 @@ func seedGatewayRebindPredecessorRuntimeWithContainerIDUnfinished(t *testing.T, 
 	t.Cleanup(execution.Leave)
 	endpoint := generatedRouteEndpoint(identity)
 	endpoints := make(map[string]generatedRouteEndpointSnapshot)
-	if installed, ok := manager.runner.(*generatedRoutePredecessorRunner); ok {
-		for id, snapshot := range installed.endpoints {
+	installedRoutes := generatedRoutePredecessorRoutes(manager.runner)
+	if installedRoutes == nil {
+		t.Fatal("gateway rebind predecessor seed requires a stable route observation runner")
+	}
+	if len(installedRoutes.endpoints) != 0 {
+		for id, snapshot := range installedRoutes.endpoints {
 			endpoints[id] = snapshot
 		}
 	} else {
@@ -695,8 +705,8 @@ func seedGatewayRebindPredecessorRuntimeWithContainerIDUnfinished(t *testing.T, 
 	}
 	endpoints[identity.ContainerID] = generatedRouteEndpointSnapshot{appID: migration.guarded.appID,
 		endpoint: endpoint, slot: generatedidentity.Slot(identity.Slot)}
-	manager.runner = &generatedRoutePredecessorRunner{ingressRunner: runner,
-		slot: generatedidentity.Slot(identity.Slot), endpoints: endpoints}
+	installedRoutes.slot = generatedidentity.Slot(identity.Slot)
+	installedRoutes.endpoints = endpoints
 	authority, err := newGeneratedRouteAuthority(manager, owner.authority, owner.authority.stores)
 	if err != nil {
 		t.Fatalf("construct predecessor route authority: %v", err)
@@ -716,6 +726,14 @@ func seedGatewayRebindPredecessorRuntimeWithContainerIDUnfinished(t *testing.T, 
 	}
 	return &gatewayRebindSeededRuntime{head: head, endpoint: endpoint, owner: owner,
 		execution: execution, migration: migration}
+}
+
+func generatedRoutePredecessorRoutes(runner runtimeprocess.CommandRunner) *generatedRoutePredecessorRunner {
+	value, ok := runner.(*generatedRouteColdAccountingRouteReadRunner)
+	if ok && value.routes != nil && value.delegate == value.routes {
+		return value.routes
+	}
+	return nil
 }
 
 func insertGatewayRebindPredecessorClaim(t *testing.T, db *sql.DB, claim appaccess.GatewayRebindClaim) {

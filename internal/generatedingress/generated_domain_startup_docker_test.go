@@ -1138,10 +1138,15 @@ func newGeneratedDomainUpgradeFixtureAtPhase(t *testing.T, target gatewayMigrati
 			Name: caddyContainerName, IPv4Address: ingressIP + "/28"}}
 	}
 	constructManager := newManager
+	var managerRunner runtimeprocess.CommandRunner = runner
 	if retainedApp {
 		constructManager = New
+		physicalRoutes := &generatedRoutePredecessorRunner{ingressRunner: runner,
+			endpoints: make(map[string]generatedRouteEndpointSnapshot)}
+		managerRunner = &generatedRouteColdAccountingRouteReadRunner{routes: physicalRoutes,
+			delegate: physicalRoutes}
 	}
-	manager, err := constructManager(runner, Options{
+	manager, err := constructManager(managerRunner, Options{
 		DockerExecutable:             identity.options.DockerExecutable,
 		DockerEndpoint:               identity.options.DockerEndpoint,
 		DockerConfigDirectory:        identity.options.DockerConfigDirectory,

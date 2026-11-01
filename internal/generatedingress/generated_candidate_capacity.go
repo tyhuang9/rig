@@ -115,10 +115,11 @@ type candidateCapacityCharge struct {
 	token candidateCapacityChargeToken
 	// lease remains the exact raw-token projection used by existing internal
 	// accounting proofs. Restored debt never populates it.
-	lease *generatedcapacity.Lease
-	refs  int
-	state candidateChargeState
-	owner candidateAccountingOwner
+	lease            *generatedcapacity.Lease
+	refs             int
+	state            candidateChargeState
+	owner            candidateAccountingOwner
+	publicationOwner candidateAccountingOwner
 
 	receiptRetained  bool
 	explicitRetained bool
@@ -1590,7 +1591,17 @@ func (l *candidateCapacityLedger) seedColdOwnership(spec candidateGroupSpec,
 func (l *candidateCapacityLedger) seedColdOwnershipWithDebt(spec candidateGroupSpec,
 	receipts map[string]candidateColdReceiptSeed, tokens []*generatedDomainCapacityDebtToken,
 ) error {
+	return l.seedColdOwnershipWithDebtFor(spec, receipts, tokens, candidateAccountingRouteActive)
+}
+
+func (l *candidateCapacityLedger) seedColdOwnershipWithDebtFor(spec candidateGroupSpec,
+	receipts map[string]candidateColdReceiptSeed, tokens []*generatedDomainCapacityDebtToken,
+	publicationOwner candidateAccountingOwner,
+) error {
 	if l == nil || l.budget == nil || l.coordinator == nil {
+		return errCandidateCapacityInvalid
+	}
+	if publicationOwner != candidateAccountingCandidate && publicationOwner != candidateAccountingRouteActive {
 		return errCandidateCapacityInvalid
 	}
 	normalized, err := normalizeCandidateGroupSpec(spec)
@@ -1631,7 +1642,8 @@ func (l *candidateCapacityLedger) seedColdOwnershipWithDebt(spec candidateGroupS
 		component.receipt = &candidateReceiptTombstone{id: seed.id}
 		component.receipt.state.Store(words[index])
 		component.charge = &candidateCapacityCharge{epoch: group.nextEpoch, token: tokens[index],
-			state: candidateChargeActive, owner: candidateAccountingPendingPublication, receiptRetained: true}
+			state: candidateChargeActive, owner: candidateAccountingPendingPublication,
+			publicationOwner: publicationOwner, receiptRetained: true}
 	}
 	l.groups[key] = group
 	return nil
@@ -1703,6 +1715,8 @@ func (l *candidateCapacityLedger) publishRestoredOwnership() error {
 			charge := component.charge
 			token, restored := charge.token.(*generatedDomainCapacityDebtToken)
 			if charge.state != candidateChargeActive || charge.logicallyRetired || !restored ||
+				(charge.publicationOwner != candidateAccountingCandidate &&
+					charge.publicationOwner != candidateAccountingRouteActive) ||
 				token.owner != l.coordinator ||
 				!candidateCapacityChargeTokenConfigured(charge.token) ||
 				candidateCapacityChargeTokenPublished(charge.token) {
@@ -1740,7 +1754,8 @@ func (l *candidateCapacityLedger) publishRestoredOwnership() error {
 			entry.group.mu.Unlock()
 			return errCandidateCapacityInvalid
 		}
-		entry.charge.owner = candidateAccountingRouteActive
+		entry.charge.owner = entry.charge.publicationOwner
+		entry.charge.publicationOwner = 0
 		entry.group.mu.Unlock()
 	}
 	return nil

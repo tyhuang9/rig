@@ -2,6 +2,7 @@ package generatedingress
 
 import (
 	"context"
+	"errors"
 	"net"
 	"os"
 	"reflect"
@@ -119,6 +120,198 @@ func (m *Manager) switchCommittedV2Locked(ctx context.Context, store *gatewayUpg
 		return candidateMayBeLiveError()
 	}
 	return nil
+}
+
+func (m *Manager) beginCommittedV2RouteActivationLocked(ctx context.Context,
+	store *gatewayUpgradeStateStore, state gatewayV2RouteState, journal gatewayMigrationJournal,
+	request generatedroute.RouteSwitchRequest, expected *generatedRouteActivationGatewayTransition,
+) (*generatedRouteActivationGatewayTransition, error) {
+	if store == nil {
+		return nil, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if expected != nil {
+		value := expected.nativeV2
+		if expected.kind != generatedDomainGatewayNativeV2 || value == nil ||
+			value.operationID != state.OperationID || !reflect.DeepEqual(state, value.pending) ||
+			!reflect.DeepEqual(journal, value.journal) || state.Pending == nil ||
+			state.Pending.Kind != gatewayV2PendingRouteSwitch {
+			return nil, &Error{Code: DiagnosticRouteUnresolved}
+		}
+		source, err := m.store.load()
+		if err != nil {
+			return nil, markCandidateMayBeLive(errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err))
+		}
+		if m.observeCommittedV2PendingTopology(ctx, source, value.before, value.effective,
+			value.journal) != gatewayV2PendingProposedExact {
+			return nil, markCandidateMayBeLive(&Error{Code: DiagnosticRouteUnresolved})
+		}
+		copy := *expected
+		return &copy, nil
+	}
+	if state.Pending != nil || state.LANRecovery != nil {
+		return nil, &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if err := m.attestCommittedV2Locked(ctx, state, journal); err != nil {
+		return nil, markCandidateMayBeLive(err)
+	}
+	previous, hadPrevious := state.Apps[request.AppID]
+	proposed := gatewayV2AppRoute{Route: routeRecord{Slot: request.ToSlot,
+		Endpoints: append([]generatedroute.RouteEndpoint(nil), request.Endpoints...)}}
+	if hadPrevious {
+		proposed.LAN = cloneGatewayV2AppRoute(previous).LAN
+	}
+	if request.FromSlot == "" {
+		if hadPrevious {
+			return nil, &Error{Code: DiagnosticRouteInvalid}
+		}
+	} else if !hadPrevious || previous.Route.Slot != request.FromSlot || reflect.DeepEqual(previous, proposed) {
+		return nil, &Error{Code: DiagnosticRouteInvalid}
+	}
+	if err := m.preflightCommittedV2Candidate(ctx, state, journal, request.AppID, proposed); err != nil {
+		return nil, err
+	}
+	pending := cloneGatewayV2RouteState(state)
+	pending.Pending = &gatewayV2PendingRoute{Kind: gatewayV2PendingRouteSwitch,
+		AppID: request.AppID, Proposed: cloneGatewayV2AppRoute(proposed)}
+	if hadPrevious {
+		copy := cloneGatewayV2AppRoute(previous)
+		pending.Pending.Previous = &copy
+	}
+	if err := store.saveCommittedV2State(pending, journal); err != nil {
+		return nil, markCandidateMayBeLive(&Error{Code: DiagnosticRouteStateFailed})
+	}
+	if err := m.preflightCommittedV2Candidate(ctx, state, journal, request.AppID, proposed); err != nil {
+		if clearErr := store.saveCommittedV2State(state, journal); clearErr != nil {
+			return nil, candidateMayBeLiveError()
+		}
+		return nil, err
+	}
+	effective := cloneGatewayV2RouteState(state)
+	effective.Apps[request.AppID] = cloneGatewayV2AppRoute(proposed)
+	if err := m.applyCommittedV2Routes(ctx, effective, journal.Resources.FinalContainerID, "proposed.json"); err != nil {
+		return nil, m.rollbackCommittedV2AfterFailure(store, state, journal, err)
+	}
+	source, err := m.store.load()
+	if err != nil || m.observeCommittedV2PendingTopology(ctx, source, state, effective,
+		journal) != gatewayV2PendingProposedExact {
+		return nil, markCandidateMayBeLive(errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err))
+	}
+	return &generatedRouteActivationGatewayTransition{kind: generatedDomainGatewayNativeV2,
+		request: canonicalGeneratedRouteRequest(request),
+		nativeV2: &generatedRouteActivationNativeV2Transition{before: cloneGatewayV2RouteState(state),
+			pending: cloneGatewayV2RouteState(pending), effective: cloneGatewayV2RouteState(effective),
+			journal: journal, operationID: state.OperationID}}, nil
+}
+
+func (m *Manager) finishCommittedV2RouteActivationLocked(ctx context.Context,
+	transition *generatedRouteActivationNativeV2Transition,
+) error {
+	if transition == nil || transition.operationID == "" || transition.pending.Pending == nil {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	store, state, journal, err := m.committedV2StoreLocked(ctx, transition.operationID)
+	if err != nil || store == nil || !reflect.DeepEqual(journal, transition.journal) {
+		return errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err)
+	}
+	if reflect.DeepEqual(state, transition.effective) {
+		return m.attestCommittedV2Locked(ctx, transition.effective, transition.journal)
+	}
+	if !reflect.DeepEqual(state, transition.pending) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	source, err := m.store.load()
+	if err != nil || m.observeCommittedV2PendingTopology(ctx, source, transition.before,
+		transition.effective, transition.journal) != gatewayV2PendingProposedExact {
+		return markCandidateMayBeLive(errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err))
+	}
+	if err := store.saveCommittedV2State(transition.effective, transition.journal); err != nil {
+		return candidateMayBeLiveError()
+	}
+	return m.attestCommittedV2Locked(ctx, transition.effective, transition.journal)
+}
+
+func (m *Manager) rollbackCommittedV2RouteActivationLocked(ctx context.Context,
+	transition *generatedRouteActivationNativeV2Transition,
+) error {
+	if transition == nil || transition.operationID == "" || transition.pending.Pending == nil {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	store, state, journal, err := m.committedV2StoreLocked(ctx, transition.operationID)
+	if err != nil || store == nil || !reflect.DeepEqual(journal, transition.journal) {
+		return errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err)
+	}
+	if reflect.DeepEqual(state, transition.before) {
+		return m.attestCommittedV2Locked(ctx, transition.before, transition.journal)
+	}
+	if !reflect.DeepEqual(state, transition.pending) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	source, err := m.store.load()
+	if err != nil {
+		return markCandidateMayBeLive(errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err))
+	}
+	switch m.observeCommittedV2PendingTopology(ctx, source, transition.before, transition.effective, transition.journal) {
+	case gatewayV2PendingCommittedExact:
+		if err := store.saveCommittedV2State(transition.before, transition.journal); err != nil {
+			return candidateMayBeLiveError()
+		}
+		return m.attestCommittedV2Locked(ctx, transition.before, transition.journal)
+	case gatewayV2PendingProposedExact:
+	default:
+		return markCandidateMayBeLive(errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err))
+	}
+	if err := m.applyCommittedV2Routes(ctx, transition.before,
+		transition.journal.Resources.FinalContainerID, "rollback.json"); err != nil {
+		return candidateMayBeLiveError()
+	}
+	if err := store.saveCommittedV2State(transition.before, transition.journal); err != nil {
+		return candidateMayBeLiveError()
+	}
+	return m.attestCommittedV2Locked(ctx, transition.before, transition.journal)
+}
+
+func (m *Manager) clearPreviousCommittedV2RouteActivationLocked(ctx context.Context,
+	transition *generatedRouteActivationNativeV2Transition,
+) error {
+	if transition == nil || transition.operationID == "" || transition.pending.Pending == nil {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	store, state, journal, err := m.committedV2StoreLocked(ctx, transition.operationID)
+	if err != nil || store == nil || !reflect.DeepEqual(journal, transition.journal) {
+		return errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err)
+	}
+	if reflect.DeepEqual(state, transition.before) {
+		return m.attestCommittedV2Locked(ctx, transition.before, transition.journal)
+	}
+	if !reflect.DeepEqual(state, transition.pending) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	source, err := m.store.load()
+	if err != nil || m.observeCommittedV2PendingTopology(ctx, source, transition.before,
+		transition.effective, transition.journal) != gatewayV2PendingCommittedExact {
+		return markCandidateMayBeLive(errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err))
+	}
+	if err := store.saveCommittedV2State(transition.before, transition.journal); err != nil {
+		return candidateMayBeLiveError()
+	}
+	_, confirmed, confirmedJournal, err := m.committedV2StoreLocked(ctx, transition.operationID)
+	if err != nil || !reflect.DeepEqual(confirmed, transition.before) ||
+		!reflect.DeepEqual(confirmedJournal, transition.journal) {
+		return markCandidateMayBeLive(errors.Join(&Error{Code: DiagnosticRouteStateFailed}, err))
+	}
+	return m.attestCommittedV2Locked(ctx, transition.before, transition.journal)
+}
+
+func (m *Manager) committedV2StoreLocked(ctx context.Context,
+	operationID string,
+) (*gatewayUpgradeStateStore, gatewayV2RouteState, gatewayMigrationJournal, error) {
+	store, state, journal, committed, err := m.committedV2Locked(ctx)
+	if err != nil || !committed || store == nil || state.OperationID != operationID ||
+		journal.OperationID != operationID {
+		return nil, gatewayV2RouteState{}, gatewayMigrationJournal{},
+			errors.Join(&Error{Code: DiagnosticRouteUnresolved}, err)
+	}
+	return store, state, journal, nil
 }
 
 func (m *Manager) preflightCommittedV2Candidate(ctx context.Context, state gatewayV2RouteState, journal gatewayMigrationJournal, appID string, proposed gatewayV2AppRoute) error {
