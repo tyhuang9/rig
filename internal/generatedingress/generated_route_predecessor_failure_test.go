@@ -1,10 +1,12 @@
 package generatedingress
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -72,8 +74,10 @@ func TestGeneratedRoutePredecessorUpdateFailureRollsBackAndRestores(t *testing.T
 	}
 }
 
-func TestGeneratedRoutePredecessorUnreadableHeadRetainsProvedPhysicalSuccessor(t *testing.T) {
+func TestGeneratedRoutePredecessorUnreadableHeadRefusesBeforePhysicalSwitch(t *testing.T) {
 	fixture := newGeneratedRoutePredecessorFixture(t)
+	capacityBefore := generatedRoutePredecessorCapacitySnapshot(t, fixture)
+	effectsBefore := [2]int{fixture.owner.runner.count(candidateOwnerStop), fixture.owner.runner.count(candidateOwnerRemove)}
 	mutated := false
 	var mutationErr error
 	fixture.runner.gatewayProbeMutate = func(*ingressRunner) {
@@ -94,23 +98,36 @@ func TestGeneratedRoutePredecessorUnreadableHeadRetainsProvedPhysicalSuccessor(t
 	}
 	commandsBefore := len(fixture.runner.commands)
 	if result, err := fixture.successor.Activate(fixture.owner.validation.migration.guarded.context); err == nil ||
-		result.DeploymentID != "" || !errors.Is(err, generatedruntimestate.ErrNotFound) {
+		result.DeploymentID != "" || !errors.Is(err, deploymentexecution.ErrIdentityLost) ||
+		!errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("unreadable-head activation result=%#v error=%v", result, err)
 	}
 	if !mutated || mutationErr != nil {
 		t.Fatalf("unreadable-head mutation reached=%t error=%v", mutated, mutationErr)
 	}
 	observation, err := fixture.manager.Observe(context.Background(), fixture.appID)
-	if err != nil {
-		t.Fatal(err)
+	if err != nil || !sameRoute(fixture.predecessorRoute,
+		routeRecord{Slot: observation.Slot, Endpoints: observation.Endpoints}) {
+		t.Fatalf("unreadable-head public observation=%#v error=%v", observation, err)
 	}
-	if !sameRoute(fixture.successorRoute, routeRecord{Slot: observation.Slot, Endpoints: observation.Endpoints}) {
-		t.Fatalf("ambiguous activation restored unsafe predecessor: observation=%#v", observation)
+	state, err := fixture.manager.store.loadRequired()
+	if err != nil || state.Pending != nil || len(state.Active) != 1 ||
+		!sameRoute(state.Active[fixture.appID], fixture.predecessorRoute) {
+		t.Fatalf("unreadable-head protected state=%#v error=%v", state, err)
 	}
-	// The first fixed reload establishes the canonical owned gateway before the
-	// proposed successor reload. A restoration would add a third reload.
-	if generatedRoutePredecessorCommandCount(fixture.runner.commands[commandsBefore:], "reload") != 2 {
-		t.Fatalf("ambiguous activation did not switch physical route: commands=%v", fixture.runner.commands[commandsBefore:])
+	expected := expectedConfig(t, fixture.runner, map[string]routeRecord{fixture.appID: fixture.predecessorRoute})
+	if !bytes.Equal(fixture.runner.liveConfig, expected) ||
+		!bytes.Equal(fixture.runner.files[caddyContainerName+":/config/active.json"], expected) {
+		t.Fatal("unreadable-head changed the physical predecessor before Begin")
+	}
+	if reloads := generatedRoutePredecessorCommandCount(fixture.runner.commands[commandsBefore:], "reload"); reloads != 0 {
+		t.Fatalf("unreadable-head pre-Begin refusal reloads=%d commands=%v",
+			reloads, fixture.runner.commands[commandsBefore:])
+	}
+	var headCount int
+	if err := fixture.database().QueryRow(`SELECT COUNT(*) FROM generated_runtime_active_heads WHERE app_id=?`,
+		fixture.appID).Scan(&headCount); err != nil || headCount != 0 {
+		t.Fatalf("unreadable-head durable head count=%d error=%v", headCount, err)
 	}
 	var receiptCount int
 	if err := fixture.database().QueryRow(`SELECT COUNT(*) FROM generated_route_activations`).Scan(&receiptCount); err != nil {
@@ -119,6 +136,159 @@ func TestGeneratedRoutePredecessorUnreadableHeadRetainsProvedPhysicalSuccessor(t
 	if receiptCount != 1 {
 		t.Fatalf("ambiguous activation receipt count=%d", receiptCount)
 	}
+	if after := generatedRoutePredecessorCapacitySnapshot(t, fixture); !reflect.DeepEqual(after, capacityBefore) ||
+		[2]int{fixture.owner.runner.count(candidateOwnerStop), fixture.owner.runner.count(candidateOwnerRemove)} != effectsBefore {
+		t.Fatalf("ambiguous activation changed capacity/effects: before=%#v after=%#v", capacityBefore, after)
+	}
+}
+
+func TestGeneratedRoutePredecessorRollbackAuthorityHelperRefusesDurableDrift(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		mutate      func(*testing.T, *generatedRoutePredecessorFixture) (int64, error)
+		verify      func(*testing.T, *generatedRoutePredecessorFixture)
+		wantReadErr error
+	}{
+		{name: "crossed_attempt_after_pending_helper_input", mutate: func(t *testing.T, fixture *generatedRoutePredecessorFixture) (int64, error) {
+			result, err := fixture.database().Exec(`UPDATE jobs SET attempt=attempt+1,updated_at=? WHERE id=?`,
+				time.Now().UTC().Format(time.RFC3339Nano), fixture.owner.validation.migration.claim.JobID())
+			if err != nil {
+				return 0, err
+			}
+			return result.RowsAffected()
+		}, verify: func(t *testing.T, fixture *generatedRoutePredecessorFixture) {
+			var attempt int
+			if err := fixture.database().QueryRow(`SELECT attempt FROM jobs WHERE id=?`,
+				fixture.owner.validation.migration.claim.JobID()).Scan(&attempt); err != nil ||
+				attempt != fixture.owner.validation.migration.claim.Attempt()+1 {
+				t.Fatalf("crossed rollback helper attempt=%d error=%v", attempt, err)
+			}
+		}},
+		{name: "durable_cancelling_after_pending_helper_input", mutate: func(t *testing.T, fixture *generatedRoutePredecessorFixture) (int64, error) {
+			result, err := fixture.database().Exec(`UPDATE jobs SET phase='cancelling',updated_at=? WHERE id=?`,
+				time.Now().UTC().Format(time.RFC3339Nano), fixture.owner.validation.migration.claim.JobID())
+			if err != nil {
+				return 0, err
+			}
+			return result.RowsAffected()
+		}, verify: func(t *testing.T, fixture *generatedRoutePredecessorFixture) {
+			var phase string
+			if err := fixture.database().QueryRow(`SELECT phase FROM jobs WHERE id=?`,
+				fixture.owner.validation.migration.claim.JobID()).Scan(&phase); err != nil || phase != "cancelling" {
+				t.Fatalf("durable rollback helper phase=%q error=%v", phase, err)
+			}
+		}},
+		{name: "missing_head_after_pending_helper_input", mutate: func(t *testing.T, fixture *generatedRoutePredecessorFixture) (int64, error) {
+			result, err := fixture.database().Exec(`DELETE FROM generated_runtime_active_heads WHERE app_id=?`,
+				fixture.appID)
+			if err != nil {
+				return 0, err
+			}
+			return result.RowsAffected()
+		}, verify: func(t *testing.T, fixture *generatedRoutePredecessorFixture) {
+			var count int
+			if err := fixture.database().QueryRow(`SELECT COUNT(*) FROM generated_runtime_active_heads WHERE app_id=?`,
+				fixture.appID).Scan(&count); err != nil || count != 0 {
+				t.Fatalf("missing-head rollback helper count=%d error=%v", count, err)
+			}
+		}, wantReadErr: sql.ErrNoRows},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newGeneratedRoutePredecessorFixture(t)
+			capacityBefore := generatedRoutePredecessorCapacitySnapshot(t, fixture)
+			effectsBefore := [2]int{fixture.owner.runner.count(candidateOwnerStop), fixture.owner.runner.count(candidateOwnerRemove)}
+			commandsBefore := len(fixture.runner.commands)
+			state, done, transition := generatedRoutePredecessorBeginPending(t, fixture)
+			defer done()
+			mutationRows, mutationErr := test.mutate(t, fixture)
+			if mutationErr != nil || mutationRows != 1 {
+				t.Fatalf("%s mutation rows=%d error=%v", test.name, mutationRows, mutationErr)
+			}
+			test.verify(t, fixture)
+			fixed := errors.New("fixed route activation SQL failure")
+			err := fixture.successor.resolveActivationFailure(
+				fixture.owner.validation.migration.guarded.context, state, transition, fixed)
+			if !errors.Is(err, fixed) || !errors.Is(err, deploymentexecution.ErrIdentityLost) ||
+				test.wantReadErr != nil && !errors.Is(err, test.wantReadErr) {
+				t.Fatalf("%s rollback helper error=%v", test.name, err)
+			}
+			test.verify(t, fixture)
+			if test.wantReadErr == nil {
+				assertGeneratedRoutePredecessorRollbackRefused(t, fixture, commandsBefore,
+					capacityBefore, effectsBefore)
+			} else {
+				assertGeneratedRoutePredecessorRollbackRefusedWithoutHead(t, fixture, commandsBefore,
+					capacityBefore, effectsBefore)
+			}
+		})
+	}
+}
+
+func TestGeneratedRoutePredecessorRollbackAuthorityHandlesCallerCancelAndCrossedBinding(t *testing.T) {
+	t.Run("caller_only_cancellation_restores", func(t *testing.T) {
+		fixture := newGeneratedRoutePredecessorFixture(t)
+		capacityBefore := generatedRoutePredecessorCapacitySnapshot(t, fixture)
+		effectsBefore := [2]int{fixture.owner.runner.count(candidateOwnerStop), fixture.owner.runner.count(candidateOwnerRemove)}
+		commandsBefore := len(fixture.runner.commands)
+		state, done, transition := generatedRoutePredecessorBeginPending(t, fixture)
+		defer done()
+		ctx, cancel := context.WithCancel(fixture.owner.validation.migration.guarded.context)
+		cancel()
+		fixed := errors.New("fixed activation SQL failure")
+		if err := fixture.successor.resolveActivationFailure(ctx, state, transition, fixed); !errors.Is(err, fixed) ||
+			errors.Is(err, context.Canceled) {
+			t.Fatalf("caller-only cancellation rollback error=%v", err)
+		}
+		assertGeneratedRoutePredecessorRolledBack(t, fixture)
+		observation, err := fixture.manager.Observe(context.Background(), fixture.appID)
+		if err != nil || !sameRoute(fixture.predecessorRoute,
+			routeRecord{Slot: observation.Slot, Endpoints: observation.Endpoints}) {
+			t.Fatalf("caller-only cancellation restored route=%#v error=%v", observation, err)
+		}
+		if reloads := generatedRoutePredecessorCommandCount(fixture.runner.commands[commandsBefore:], "reload"); reloads != 4 {
+			t.Fatalf("caller-only cancellation reloads=%d commands=%v", reloads, fixture.runner.commands[commandsBefore:])
+		}
+		if after := generatedRoutePredecessorCapacitySnapshot(t, fixture); !reflect.DeepEqual(after, capacityBefore) ||
+			[2]int{fixture.owner.runner.count(candidateOwnerStop), fixture.owner.runner.count(candidateOwnerRemove)} != effectsBefore {
+			t.Fatalf("caller-only cancellation changed capacity/effects: before=%#v after=%#v", capacityBefore, after)
+		}
+	})
+
+	t.Run("crossed_binding_input_refuses_before_restore", func(t *testing.T) {
+		fixture := newGeneratedRoutePredecessorFixture(t)
+		capacityBefore := generatedRoutePredecessorCapacitySnapshot(t, fixture)
+		effectsBefore := [2]int{fixture.owner.runner.count(candidateOwnerStop), fixture.owner.runner.count(candidateOwnerRemove)}
+		commandsBefore := len(fixture.runner.commands)
+		state, done, transition := generatedRoutePredecessorBeginPending(t, fixture)
+		defer done()
+		var crossedJobID string
+		var crossedAttempt int
+		if err := fixture.database().QueryRow(`SELECT deployment.job_id,job.attempt
+			FROM deployments deployment JOIN jobs job ON job.id=deployment.job_id
+			WHERE deployment.id=?`, fixture.predecessorDeploymentID).Scan(&crossedJobID, &crossedAttempt); err != nil {
+			t.Fatal(err)
+		}
+		binding, err := fixture.owner.validation.migration.bindings.Read(context.Background(), crossedJobID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		classification, err := fixture.owner.validation.migration.bindings.Check(context.Background(), binding)
+		if err != nil || classification != deploymentbinding.ClassificationStale {
+			t.Fatalf("crossed rollback binding classification=%d error=%v", classification, err)
+		}
+		crossedClaim, err := deploymentexecution.NewClaim(binding, crossedJobID, fixture.appID, crossedAttempt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		crossedState := &generatedCandidateExecutionState{pinned: state.pinned, pins: state.pins}
+		crossedState.pins.claim = crossedClaim
+		fixed := errors.New("fixed activation SQL failure")
+		if err := fixture.successor.resolveActivationFailure(context.Background(), crossedState, transition, fixed); !errors.Is(err, fixed) || !errors.Is(err, deploymentexecution.ErrAuthorityStale) {
+			t.Fatalf("crossed rollback binding error=%v", err)
+		}
+		assertGeneratedRoutePredecessorRollbackRefused(t, fixture, commandsBefore,
+			capacityBefore, effectsBefore)
+	})
 }
 
 type generatedRoutePredecessorFixture struct {
@@ -134,6 +304,131 @@ type generatedRoutePredecessorFixture struct {
 	predecessorActivationReceipt string
 	predecessorRoute             routeRecord
 	successorRoute               routeRecord
+}
+
+type generatedRoutePredecessorCapacityState struct {
+	group              *candidateCapacityGroup
+	charge             *candidateCapacityCharge
+	receipt            *candidateReceiptTombstone
+	token              candidateCapacityChargeToken
+	lease              *generatedcapacity.Lease
+	epoch              uint64
+	physical           candidatePhysicalState
+	chargeState        candidateChargeState
+	owner              candidateAccountingOwner
+	refs               int
+	receiptRetained    bool
+	explicitRetained   bool
+	logicallyRetired   bool
+	tokenHeld          bool
+	tokenConfigured    bool
+	tokenPublished     bool
+	capacityProbeCalls int
+}
+
+func generatedRoutePredecessorCapacitySnapshot(t *testing.T,
+	fixture *generatedRoutePredecessorFixture,
+) generatedRoutePredecessorCapacityState {
+	t.Helper()
+	ledger := fixture.owner.authority.ledger
+	key := candidateCapacityGroupKey{appID: fixture.appID, deploymentID: fixture.successorDeploymentID}
+	ledger.mu.Lock()
+	group := ledger.groups[key]
+	ledger.mu.Unlock()
+	if group == nil {
+		t.Fatal("successor capacity group is missing")
+	}
+	group.mu.Lock()
+	component := group.byName["api"]
+	if component == nil || component.charge == nil || component.receipt == nil {
+		group.mu.Unlock()
+		t.Fatalf("successor capacity component=%#v", component)
+	}
+	charge := component.charge
+	result := generatedRoutePredecessorCapacityState{group: group, charge: charge,
+		receipt: component.receipt, token: charge.token, lease: charge.lease, epoch: charge.epoch,
+		physical: candidatePhysicalFromWord(component.receipt.state.Load()), chargeState: charge.state,
+		owner: charge.owner, refs: charge.refs, receiptRetained: charge.receiptRetained,
+		explicitRetained: charge.explicitRetained, logicallyRetired: charge.logicallyRetired,
+		tokenHeld: component.tokenHeld, tokenConfigured: candidateCapacityChargeTokenConfigured(charge.token),
+		tokenPublished: candidateCapacityChargeTokenPublished(charge.token)}
+	group.mu.Unlock()
+	_, result.capacityProbeCalls = fixture.owner.source.observed()
+	return result
+}
+
+func generatedRoutePredecessorBeginPending(t *testing.T, fixture *generatedRoutePredecessorFixture) (
+	*generatedCandidateExecutionState, func(), *generatedRouteActivationGatewayTransition,
+) {
+	t.Helper()
+	state, done, err := fixture.successor.candidate.begin(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.successor.checkRouteActivationAuthority(
+		fixture.owner.validation.migration.guarded.context, state); err != nil {
+		done()
+		t.Fatal(err)
+	}
+	transition, err := fixture.manager.beginGeneratedDomainRouteActivation(
+		fixture.owner.validation.migration.guarded.context, fixture.successor.request, nil)
+	if err != nil {
+		done()
+		t.Fatal(err)
+	}
+	return state, done, transition
+}
+
+func assertGeneratedRoutePredecessorPendingPhysical(t *testing.T,
+	fixture *generatedRoutePredecessorFixture, commandsBefore int,
+) {
+	t.Helper()
+	state, err := fixture.manager.store.loadRequired()
+	if err != nil || state.Pending == nil || state.Pending.AppID != fixture.appID ||
+		state.Pending.Previous == nil || !sameRoute(*state.Pending.Previous, fixture.predecessorRoute) ||
+		!sameRoute(state.Pending.Proposed, fixture.successorRoute) ||
+		!sameRoute(state.Active[fixture.appID], fixture.predecessorRoute) {
+		t.Fatalf("rollback refusal protected state=%#v error=%v", state, err)
+	}
+	expected := expectedConfig(t, fixture.runner, map[string]routeRecord{fixture.appID: fixture.successorRoute})
+	if !bytes.Equal(fixture.runner.liveConfig, expected) ||
+		!bytes.Equal(fixture.runner.files[caddyContainerName+":/config/active.json"], expected) {
+		t.Fatal("rollback refusal did not retain the exact physical successor")
+	}
+	if reloads := generatedRoutePredecessorCommandCount(fixture.runner.commands[commandsBefore:], "reload"); reloads != 2 {
+		t.Fatalf("rollback refusal reloads=%d commands=%v", reloads, fixture.runner.commands[commandsBefore:])
+	}
+}
+
+func assertGeneratedRoutePredecessorRollbackRefused(t *testing.T, fixture *generatedRoutePredecessorFixture,
+	commandsBefore int, capacityBefore generatedRoutePredecessorCapacityState, effectsBefore [2]int,
+) {
+	t.Helper()
+	assertGeneratedRoutePredecessorRollbackRefusedWithoutHead(t, fixture, commandsBefore,
+		capacityBefore, effectsBefore)
+	head, err := generatedruntimestate.New(fixture.database()).Active(context.Background(), fixture.appID)
+	if err != nil || head.DeploymentID != fixture.predecessorDeploymentID ||
+		head.ActivationReceiptID != fixture.predecessorActivationReceipt {
+		t.Fatalf("rollback refusal head=%#v error=%v", head, err)
+	}
+}
+
+func assertGeneratedRoutePredecessorRollbackRefusedWithoutHead(t *testing.T,
+	fixture *generatedRoutePredecessorFixture, commandsBefore int,
+	capacityBefore generatedRoutePredecessorCapacityState, effectsBefore [2]int,
+) {
+	t.Helper()
+	assertGeneratedRoutePredecessorPendingPhysical(t, fixture, commandsBefore)
+	var receipts int
+	if err := fixture.database().QueryRow(`SELECT COUNT(*) FROM generated_route_activations`).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	after := generatedRoutePredecessorCapacitySnapshot(t, fixture)
+	effectsAfter := [2]int{fixture.owner.runner.count(candidateOwnerStop), fixture.owner.runner.count(candidateOwnerRemove)}
+	if receipts != 1 || !reflect.DeepEqual(after, capacityBefore) || effectsAfter != effectsBefore {
+		t.Fatalf("rollback refusal receipts=%d capacity before=%#v after=%#v effects=%v/%v",
+			receipts, capacityBefore, after, effectsBefore, effectsAfter)
+	}
 }
 
 func (f *generatedRoutePredecessorFixture) database() *sql.DB {

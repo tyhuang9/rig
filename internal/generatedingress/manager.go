@@ -694,27 +694,7 @@ func (m *Manager) rollbackGeneratedDomainRouteActivation(ctx context.Context,
 	defer releaseGatewaySwitchLock(release, &resultErr)
 	switch transition.kind {
 	case generatedDomainGatewayNativeV1:
-		state, err := m.store.loadRequired()
-		if err != nil {
-			return &Error{Code: DiagnosticRouteStateFailed}
-		}
-		if reflect.DeepEqual(state, transition.legacy.before) {
-			return m.attestLegacyRouteActivationRollbackStateLocked(ctx, transition.legacy.before,
-				transition.legacy.before, transition.request.AppID)
-		}
-		if err := m.attestLegacyRouteActivationRollbackPendingLocked(ctx, transition.legacy,
-			transition.request.AppID); err != nil {
-			return err
-		}
-		state = cloneRouteState(transition.legacy.before)
-		if err := m.store.save(state); err != nil {
-			return candidateMayBeLiveError()
-		}
-		confirmed, err := m.store.loadRequired()
-		if err != nil || !reflect.DeepEqual(confirmed, state) {
-			return candidateMayBeLiveError()
-		}
-		return m.attestLegacyRouteActivationRollbackStateLocked(ctx, state, state, transition.request.AppID)
+		return m.rollbackLegacyRouteActivationLocked(ctx, transition.legacy, transition.request.AppID)
 	case generatedDomainGatewayNativeV2:
 		return m.rollbackCommittedV2RouteActivationLocked(ctx, transition.nativeV2)
 	case generatedDomainGatewayCurrentV1:
@@ -722,6 +702,53 @@ func (m *Manager) rollbackGeneratedDomainRouteActivation(ctx context.Context,
 	default:
 		return &Error{Code: DiagnosticRouteUnresolved}
 	}
+}
+
+// rollbackLegacyRouteActivationLocked consumes only the exact sealed Legacy
+// transition. A retained Pending marker may describe either a predecessor that
+// is already serving (a lost clear reply) or the exact proposed successor left
+// live by a failed SQL activation. The latter is restored before the marker is
+// cleared. Any mixed or unknown physical projection remains unresolved.
+func (m *Manager) rollbackLegacyRouteActivationLocked(ctx context.Context,
+	transition *generatedRouteActivationLegacyTransition, appID string,
+) error {
+	if transition == nil || transition.pending.Pending == nil || transition.before.Pending != nil ||
+		transition.effective.Pending != nil || !validRouteState(transition.before) ||
+		!validRouteState(transition.pending) || !validRouteState(transition.effective) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	state, err := m.store.loadRequired()
+	if err != nil {
+		return &Error{Code: DiagnosticRouteStateFailed}
+	}
+	if reflect.DeepEqual(state, transition.before) {
+		return m.attestLegacyRouteActivationRollbackStateLocked(ctx, transition.before,
+			transition.before, appID)
+	}
+	if !reflect.DeepEqual(state, transition.pending) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	cleared := cloneRouteState(state)
+	cleared.Pending = nil
+	if !reflect.DeepEqual(cleared, transition.before) {
+		return &Error{Code: DiagnosticRouteUnresolved}
+	}
+	if err := m.attestLegacyRouteActivationRollbackPendingLocked(ctx, transition, appID); err == nil {
+		return m.clearLegacyRouteActivationRollbackPendingLocked(ctx, transition, appID)
+	}
+	if err := m.attestLegacyRouteStateLocked(ctx, transition.pending, transition.effective, appID); err != nil {
+		return err
+	}
+	rollback := cloneRouteState(state)
+	if err := m.rollbackPending(ctx, &rollback); err != nil {
+		return err
+	}
+	confirmed, err := m.store.loadRequired()
+	if err != nil || !reflect.DeepEqual(confirmed, transition.before) {
+		return candidateMayBeLiveError()
+	}
+	return m.attestLegacyRouteActivationRollbackStateLocked(ctx, transition.before,
+		transition.before, appID)
 }
 
 // attestLegacyRouteActivationRollbackPendingLocked proves that the protected
