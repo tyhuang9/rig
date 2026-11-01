@@ -189,8 +189,14 @@ func seedGeneratedRoutePredecessorRetirementFixture(t *testing.T, db *sql.DB) (
 	}
 	mustExec(`INSERT INTO jobs(
 		id,type,resource_type,resource_id,status,phase,attempt,requested_by,input_json,created_at,started_at,updated_at
-		) VALUES(?,'deploy','application',?,'running','running',1,?,'{}',?,?,?)`, successor.jobID,
-		successor.appID, "route-activation-primary-owner", successor.stamp, successor.stamp, successor.stamp)
+		) VALUES(?,'deploy','application',?,'queued','queued',0,?,'{}',?,NULL,?)`, successor.jobID,
+		successor.appID, "route-activation-primary-owner", successor.stamp, successor.stamp)
+	mustExec(`INSERT INTO application_deployment_lifecycle_bindings(
+		job_id,app_id,desired_revision,mode,authorizing_lifecycle_job_id,created_at
+		) VALUES(?,?,0,'legacy_uninitialized',NULL,?)`, successor.jobID, successor.appID, successor.stamp)
+	mustExec(`UPDATE jobs SET status='running',phase='running',attempt=1,started_at=?,updated_at=?
+		WHERE id=? AND status='queued' AND phase='queued' AND attempt=0`, successor.stamp, successor.stamp,
+		successor.jobID)
 	mustExec(`INSERT INTO deployments(
 		id,app_id,release_id,job_id,status,started_at,configuration_mode,actual_configuration_revision_id,
 		actual_configuration_revision_number,provenance_initialized,runtime_strategy,
