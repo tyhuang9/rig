@@ -1,14 +1,19 @@
 package generatedexecutor
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +35,9 @@ import (
 	"github.com/hostd/hostd/internal/projectanalysis"
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/hostd/hostd/internal/testsupport/databasefixture"
+	"github.com/hostd/hostd/internal/testsupport/generateddomain"
 )
 
 const (
@@ -1957,7 +1964,8 @@ func TestGeneratedExecutorCleansCandidateWhenActiveCASRollbackSucceeds(t *testin
 		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 	}
 	if reloads := fixture.capacity.ReloadCalls() - reloadsBefore; fixture.routes.delegateCalls != 1 || reloads != 4 {
-		t.Fatalf("real activation/restore calls=%d reload delta=%d", fixture.routes.delegateCalls, reloads)
+		t.Fatalf("real activation/restore calls=%d reload delta=%d route error=%v",
+			fixture.routes.delegateCalls, reloads, fixture.routes.lastErr)
 	}
 	observation, observationErr := fixture.domain.Gateway().Observe(context.Background(), fixture.app.ID)
 	if observationErr != nil || len(observation.Endpoints) != 1 || observation.Endpoints[0].ContainerID != oldComponent.ContainerID {
@@ -1994,16 +2002,130 @@ func TestGeneratedExecutorPreservesFirstSlotWhenActiveCASFails(t *testing.T) {
 	}
 }
 
+type generatedExecutorLegacyRouteRecordSnapshot struct {
+	Slot      generatedruntime.Slot            `json:"slot"`
+	Endpoints []generatedruntime.RouteEndpoint `json:"endpoints"`
+}
+
+type generatedExecutorLegacyPendingSnapshot struct {
+	AppID    string                                      `json:"appId"`
+	Previous *generatedExecutorLegacyRouteRecordSnapshot `json:"previous,omitempty"`
+	Proposed generatedExecutorLegacyRouteRecordSnapshot  `json:"proposed"`
+}
+
+type generatedExecutorLegacyRouteStateSnapshot struct {
+	Version int                                                   `json:"version"`
+	Active  map[string]generatedExecutorLegacyRouteRecordSnapshot `json:"active"`
+	Pending *generatedExecutorLegacyPendingSnapshot               `json:"pending,omitempty"`
+}
+
+func generatedExecutorReadLegacyRouteState(t *testing.T,
+	fixture *sealedExecutorFixture,
+) generatedExecutorLegacyRouteStateSnapshot {
+	t.Helper()
+	if fixture == nil || fixture.environment == nil || fixture.environment.root == "" {
+		t.Fatal("sealed executor route state requires one exact data root")
+	}
+	path := filepath.Join(filepath.Dir(fixture.environment.root),
+		"runtime", "generated-ingress", "routes.bundle")
+	body, err := secretfile.ReadBounded(path, "hostd/generated-ingress/routes/v1", 48<<10)
+	if err != nil {
+		t.Fatalf("read protected generated route state: %v", err)
+	}
+	defer clear(body)
+	var state generatedExecutorLegacyRouteStateSnapshot
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&state); err != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+		state.Version != 1 || state.Active == nil {
+		t.Fatalf("decode protected generated route state: state=%#v error=%v", state, err)
+	}
+	return state
+}
+
+func generatedExecutorPhysicalRouteConfigs(t *testing.T,
+	fixture *sealedExecutorFixture,
+) ([]byte, []byte) {
+	t.Helper()
+	live, err := fixture.capacity.Run(context.Background(), runtimeprocess.CommandRequest{Args: []string{
+		"container", "exec", generateddomain.ContainerID,
+		"curl", "--silent", "--show-error", "--fail", "--max-time", "10", "http://127.0.0.1:2019/config/",
+	}})
+	if err != nil || live.StdoutTruncated || live.StderrTruncated || len(live.Stdout) == 0 {
+		t.Fatalf("read live generated route configuration: error=%v result=%#v", err, live)
+	}
+	restartArchive, err := fixture.capacity.Run(context.Background(), runtimeprocess.CommandRequest{Args: []string{
+		"container", "cp", generateddomain.ContainerID + ":/config/active.json", "-",
+	}})
+	if err != nil || restartArchive.StdoutTruncated || restartArchive.StderrTruncated {
+		t.Fatalf("read restart generated route configuration: error=%v result=%#v", err, restartArchive)
+	}
+	reader := tar.NewReader(bytes.NewReader(restartArchive.Stdout))
+	header, err := reader.Next()
+	if err != nil || header == nil || header.Name != "active.json" ||
+		(header.Typeflag != tar.TypeReg && header.Typeflag != tar.TypeRegA) || header.Size < 1 || header.Size > 48<<10 {
+		t.Fatalf("restart generated route archive header=%#v error=%v", header, err)
+	}
+	restart, err := io.ReadAll(io.LimitReader(reader, header.Size+1))
+	if err != nil || int64(len(restart)) != header.Size {
+		t.Fatalf("read restart generated route body size=%d want=%d error=%v", len(restart), header.Size, err)
+	}
+	if extra, nextErr := reader.Next(); nextErr != io.EOF || extra != nil {
+		t.Fatalf("restart generated route archive has an extra member: header=%#v error=%v", extra, nextErr)
+	}
+	return append([]byte(nil), live.Stdout...), restart
+}
+
+func generatedExecutorRouteConfigDials(t *testing.T, body []byte) []string {
+	t.Helper()
+	var document any
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	if err := decoder.Decode(&document); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		t.Fatalf("decode generated route configuration: %v", err)
+	}
+	dials := make([]string, 0)
+	var visit func(any)
+	visit = func(value any) {
+		switch typed := value.(type) {
+		case map[string]any:
+			for key, nested := range typed {
+				if key == "dial" {
+					if dial, ok := nested.(string); ok {
+						dials = append(dials, dial)
+					}
+					continue
+				}
+				visit(nested)
+			}
+		case []any:
+			for _, nested := range typed {
+				visit(nested)
+			}
+		}
+	}
+	visit(document)
+	return dials
+}
+
 func TestGeneratedExecutorPreservesBothSlotsWhenActiveCASRollbackFails(t *testing.T) {
 	fixture := newSealedExecutorFixture(t)
 	if _, err := fixture.execute(); err != nil {
 		t.Fatal(err)
 	}
+	if len(fixture.routes.requests) != 1 {
+		t.Fatalf("predecessor route requests=%+v", fixture.routes.requests)
+	}
+	predecessorRequest := fixture.routes.requests[0]
 	oldDeploymentID := fixture.deployment(t).ID
 	oldContainerID := fixture.runtimeDeployment(t).Components[0].ContainerID
+	oldHead, err := fixture.stateStore.Active(context.Background(), fixture.app.ID)
+	if err != nil || oldHead.DeploymentID != oldDeploymentID {
+		t.Fatalf("predecessor active head=%+v error=%v", oldHead, err)
+	}
 	fixture.nextDeployment(t)
 	fixture.routes.requests = nil
 	fixture.routes.delegateCalls = 0
+	capacityCallsBefore := fixture.capacity.CapacityCalls()
 	installGeneratedExecutorActivationHeadFault(t, fixture, "executor rollback unavailable")
 	fixture.capacity.SetReloadErrors(nil, nil, errors.New("rollback route unavailable"))
 
@@ -2011,27 +2133,76 @@ func TestGeneratedExecutorPreservesBothSlotsWhenActiveCASRollbackFails(t *testin
 	if err != nil || result.Disposition != jobs.ExecutionWaitingUser || result.PauseDisposition != jobs.PauseRouteReconciliationRequired {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 {
-		t.Fatalf("candidate cleanup calls=%d docker stops=%d", fixture.runtime.stopCalls, fixture.runner.stopCalls)
+	if fixture.runtime.stopCalls != 0 || fixture.runner.stopCalls != 0 || fixture.runner.removeCalls != 0 {
+		t.Fatalf("candidate cleanup calls=%d docker stops=%d removals=%d",
+			fixture.runtime.stopCalls, fixture.runner.stopCalls, fixture.runner.removeCalls)
 	}
-	active, _ := fixture.stateStore.Active(context.Background(), fixture.app.ID)
-	if active.DeploymentID != oldDeploymentID {
-		t.Fatalf("active head changed: %+v", active)
+	active, activeErr := fixture.stateStore.Active(context.Background(), fixture.app.ID)
+	if activeErr != nil || !reflect.DeepEqual(active, oldHead) {
+		t.Fatalf("active head changed: before=%+v after=%+v error=%v", oldHead, active, activeErr)
 	}
-	if runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t); runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute || deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
+	runtimeDeployment, deployment := fixture.runtimeDeployment(t), fixture.deployment(t)
+	if runtimeDeployment.Phase != generatedruntimestate.PhaseSwitchingRoute ||
+		len(runtimeDeployment.Components) != 1 ||
+		runtimeDeployment.Components[0].State != generatedruntimestate.ComponentHealthy ||
+		deployment.Status == deployments.Failed || deployment.Status == deployments.Cancelled {
 		t.Fatalf("runtime=%+v deployment=%+v", runtimeDeployment, deployment)
 	}
 	previous, previousErr := fixture.stateStore.Get(context.Background(), fixture.app.ID, oldDeploymentID)
 	if previousErr != nil || len(previous.Components) != 1 || previous.Components[0].State != generatedruntimestate.ComponentActive || previous.Components[0].ContainerID != oldContainerID {
 		t.Fatalf("previous slot was not preserved: %+v", previous)
 	}
-	if fixture.routes.delegateCalls != 1 || fixture.capacity.ReloadCalls() != 3 {
-		t.Fatalf("real activation/failed restore calls=%d reloads=%d", fixture.routes.delegateCalls, fixture.capacity.ReloadCalls())
+	if fixture.routes.delegateCalls != 1 || fixture.capacity.ReloadCalls() != 3 ||
+		fixture.authorization.calls != 1 || fixture.capacity.CapacityCalls() != capacityCallsBefore+1 {
+		t.Fatalf("real activation/failed restore calls=%d reloads=%d authorization=%d capacity=%d/%d route error=%v",
+			fixture.routes.delegateCalls, fixture.capacity.ReloadCalls(), fixture.authorization.calls,
+			capacityCallsBefore, fixture.capacity.CapacityCalls(), fixture.routes.lastErr)
 	}
-	successor := fixture.runtimeDeployment(t).Components[0]
+	if len(fixture.routes.requests) != 1 {
+		t.Fatalf("successor route requests=%+v", fixture.routes.requests)
+	}
+	successorRequest := fixture.routes.requests[0]
+	successor := runtimeDeployment.Components[0]
 	observation, observationErr := fixture.domain.Gateway().Observe(context.Background(), fixture.app.ID)
-	if observationErr != nil || observation.Slot != generatedruntime.SlotGreen || len(observation.Endpoints) != 1 || observation.Endpoints[0].ContainerID != successor.ContainerID {
-		t.Fatalf("failed restore observation=%+v error=%v", observation, observationErr)
+	if !reflect.DeepEqual(observation, generatedingress.Observation{}) ||
+		!generatedingress.IsCode(observationErr, generatedingress.DiagnosticRouteUnresolved) {
+		t.Fatalf("failed restore public observation=%+v error=%v", observation, observationErr)
+	}
+	protected := generatedExecutorReadLegacyRouteState(t, fixture)
+	wantPrevious := generatedExecutorLegacyRouteRecordSnapshot{
+		Slot: predecessorRequest.ToSlot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), predecessorRequest.Endpoints...),
+	}
+	wantProposed := generatedExecutorLegacyRouteRecordSnapshot{
+		Slot: successorRequest.ToSlot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), successorRequest.Endpoints...),
+	}
+	if len(protected.Active) != 1 || !reflect.DeepEqual(protected.Active[fixture.app.ID], wantPrevious) ||
+		protected.Pending == nil || protected.Pending.AppID != fixture.app.ID ||
+		protected.Pending.Previous == nil || !reflect.DeepEqual(*protected.Pending.Previous, wantPrevious) ||
+		!reflect.DeepEqual(protected.Pending.Proposed, wantProposed) {
+		t.Fatalf("failed restore protected route state=%#v want previous=%#v proposed=%#v",
+			protected, wantPrevious, wantProposed)
+	}
+	live, restart := generatedExecutorPhysicalRouteConfigs(t, fixture)
+	if !bytes.Equal(live, restart) {
+		t.Fatal("failed restore live and restart successor configurations differ")
+	}
+	if len(successorRequest.Endpoints) != 1 || successorRequest.Endpoints[0].ContainerID != successor.ContainerID {
+		t.Fatalf("failed restore successor request=%+v runtime=%+v", successorRequest, successor)
+	}
+	endpoint := successorRequest.Endpoints[0]
+	wantDial := net.JoinHostPort(endpoint.NetworkAlias+"."+endpoint.NetworkName,
+		strconv.FormatUint(uint64(endpoint.InternalPort), 10))
+	if dials := generatedExecutorRouteConfigDials(t, live); !reflect.DeepEqual(dials, []string{wantDial}) {
+		t.Fatalf("failed restore successor dials=%v want=%q", dials, wantDial)
+	}
+	fixture.runner.mu.Lock()
+	predecessorContainer := fixture.runner.containers[oldContainerID]
+	successorContainer := fixture.runner.containers[successor.ContainerID]
+	predecessorRunning := predecessorContainer != nil && predecessorContainer.exists && predecessorContainer.running
+	successorRunning := successorContainer != nil && successorContainer.exists && successorContainer.running
+	fixture.runner.mu.Unlock()
+	if !predecessorRunning || !successorRunning {
+		t.Fatalf("failed restore running slots predecessor=%t successor=%t", predecessorRunning, successorRunning)
 	}
 	if count := generatedExecutorActivationReceiptCount(t, fixture); count != 1 {
 		t.Fatalf("ambiguous activation receipt count=%d", count)

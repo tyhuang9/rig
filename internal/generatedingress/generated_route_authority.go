@@ -396,7 +396,7 @@ func (e *GeneratedRouteExecution) activateCore(ctx context.Context) (
 		// exact state. No new receipt or generic self-head success is accepted.
 		result, err = a.activateRoute(ctx, s.pinned, s.pins.claim, input)
 		if err != nil {
-			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, e.resolveActivationFailure(ctx, transition,
+			return generatedruntimestate.Deployment{}, generatedRouteActivationResult{}, e.resolveActivationFailure(ctx, s, transition,
 				errors.Join(activateErr, err))
 		}
 	}
@@ -455,19 +455,18 @@ func (e *GeneratedRouteExecution) checkRouteActivationAuthority(ctx context.Cont
 // commit. A self, crossed, or unreadable head is left untouched because the
 // physical route may already be backed by a durable activation receipt.
 func (e *GeneratedRouteExecution) resolveActivationFailure(ctx context.Context,
-	transition *generatedRouteActivationGatewayTransition, activationErr error,
+	state *generatedCandidateExecutionState, transition *generatedRouteActivationGatewayTransition, activationErr error,
 ) error {
 	a := e.authority
+	if !e.hadPrevious {
+		return activationErr
+	}
 	observeCtx := context.WithoutCancel(ctx)
-	head, err := a.runtime.Active(observeCtx, e.request.AppID)
-	if err != nil || !sameActivationHeadForRouteAuthority(head, e.expectedHead) {
+	if err := e.checkRouteActivationAuthority(observeCtx, state); err != nil {
 		return errors.Join(activationErr, err)
 	}
 	if rollbackErr := a.manager.rollbackGeneratedDomainRouteActivation(observeCtx, transition); rollbackErr != nil {
 		return errors.Join(activationErr, rollbackErr)
-	}
-	if !e.hadPrevious {
-		return activationErr
 	}
 	observed, err := a.manager.Observe(observeCtx, e.request.AppID)
 	if err != nil || !sameRoute(e.previous, routeRecord{Slot: observed.Slot, Endpoints: observed.Endpoints}) {

@@ -1659,8 +1659,35 @@ func newGeneratedRoutePreviousLegacyClearFixture(t *testing.T) generatedRoutePre
 	if !validGeneratedRouteActivationGatewayTransition(transition) {
 		t.Fatal("legacy PreviousExact clear fixture produced an invalid transition")
 	}
+	generatedRoutePreviousLegacyInstallPhysicalRoutes(t, manager, runner, previous, proposed)
 	return generatedRoutePreviousLegacyClearFixture{manager: manager, runner: runner,
 		transition: transition, before: before, pending: pending, effective: effective}
+}
+
+func generatedRoutePreviousLegacyInstallPhysicalRoutes(t *testing.T, manager *Manager,
+	runner *ingressRunner, routes ...routeRecord,
+) {
+	t.Helper()
+	reader, ok := manager.runner.(*generatedRouteColdAccountingRouteReadRunner)
+	if !ok || reader.routes == nil || reader.routes.ingressRunner != runner || reader.delegate != reader.routes {
+		t.Fatal("legacy PreviousExact fixture lacks one construction-bound physical route reader")
+	}
+	if reader.routes.endpoints == nil {
+		reader.routes.endpoints = make(map[string]generatedRouteEndpointSnapshot)
+	}
+	for _, route := range routes {
+		for _, routeEndpoint := range route.Endpoints {
+			if routeEndpoint.ContainerID == "" || routeEndpoint.NetworkName == "" {
+				t.Fatalf("legacy PreviousExact fixture has incomplete route endpoint: %#v", routeEndpoint)
+			}
+			if _, exists := reader.routes.endpoints[routeEndpoint.ContainerID]; exists {
+				t.Fatalf("legacy PreviousExact fixture has duplicate route endpoint %q", routeEndpoint.ContainerID)
+			}
+			reader.routes.endpoints[routeEndpoint.ContainerID] = generatedRouteEndpointSnapshot{
+				appID: runner.appID, endpoint: routeEndpoint, slot: route.Slot,
+			}
+		}
+	}
 }
 
 func newGeneratedRoutePreviousInitialLegacyClearFixture(t *testing.T) generatedRoutePreviousLegacyClearFixture {
@@ -1963,6 +1990,122 @@ func TestGeneratedRouteActivationPreviousExactLegacyClearMatrix(t *testing.T) {
 		}
 		generatedRoutePreviousAssertLegacyClearResult(t, f, &f.pending, physical, commands, transition,
 			&protected, false)
+	})
+}
+
+func TestGeneratedRouteActivationLegacyRollbackRestoresExactPredecessor(t *testing.T) {
+	countReloads := func(commands [][]string) int {
+		count := 0
+		for _, command := range commands {
+			if len(command) >= 7 && command[0] == "container" && command[1] == "exec" &&
+				command[3] == "caddy" && command[4] == "reload" {
+				count++
+			}
+		}
+		return count
+	}
+	assertBefore := func(t *testing.T, f generatedRoutePreviousLegacyClearFixture) {
+		t.Helper()
+		state, err := f.manager.store.loadRequired()
+		if err != nil || !reflect.DeepEqual(state, f.before) {
+			t.Fatalf("legacy rollback state=%#v error=%v", state, err)
+		}
+		expected := expectedConfig(t, f.runner, f.before.Active)
+		if !bytes.Equal(f.runner.liveConfig, expected) ||
+			!bytes.Equal(f.runner.files[caddyContainerName+":/config/active.json"], expected) {
+			t.Fatal("legacy rollback did not retain the exact predecessor live and restart projection")
+		}
+	}
+
+	t.Run("proposed_exact_restores_then_clears", func(t *testing.T) {
+		f := newGeneratedRoutePreviousLegacyClearFixture(t)
+		f.installProtected(t, f.pending)
+		generatedRoutePreviousLegacySetPhysical(t, f, "proposed")
+		commandsBefore, installsBefore := len(f.runner.commands), f.runner.restartInstalls
+		transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+		if err := f.manager.rollbackGeneratedDomainRouteActivation(context.Background(), f.transition); err != nil {
+			t.Fatal(err)
+		}
+		assertBefore(t, f)
+		if reloads := countReloads(f.runner.commands[commandsBefore:]); reloads != 2 ||
+			f.runner.restartInstalls-installsBefore != 2 {
+			t.Fatalf("legacy rollback reloads=%d restart installs=%d commands=%v", reloads,
+				f.runner.restartInstalls-installsBefore, f.runner.commands[commandsBefore:])
+		}
+		if !reflect.DeepEqual(f.transition, transition) {
+			t.Fatal("legacy rollback mutated its sealed transition")
+		}
+	})
+
+	t.Run("previous_exact_clears_without_publication", func(t *testing.T) {
+		f := newGeneratedRoutePreviousLegacyClearFixture(t)
+		f.installProtected(t, f.pending)
+		generatedRoutePreviousLegacySetPhysical(t, f, "previous")
+		physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+		transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+		if err := f.manager.rollbackGeneratedDomainRouteActivation(context.Background(), f.transition); err != nil {
+			t.Fatal(err)
+		}
+		generatedRoutePreviousAssertLegacyClearResult(t, f, &f.before, physical, commands,
+			transition, nil, true)
+	})
+
+	t.Run("already_before_is_idempotent", func(t *testing.T) {
+		f := newGeneratedRoutePreviousLegacyClearFixture(t)
+		f.installProtected(t, f.before)
+		generatedRoutePreviousLegacySetPhysical(t, f, "previous")
+		physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+		transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+		protected := generatedRoutePreviousLegacyProtectedSnapshot(t, f)
+		if err := f.manager.rollbackGeneratedDomainRouteActivation(context.Background(), f.transition); err != nil {
+			t.Fatal(err)
+		}
+		generatedRoutePreviousAssertLegacyClearResult(t, f, &f.before, physical, commands,
+			transition, &protected, true)
+	})
+
+	for _, physicalKind := range []string{"mixed", "unknown"} {
+		t.Run(physicalKind+"_refuses_without_publication", func(t *testing.T) {
+			f := newGeneratedRoutePreviousLegacyClearFixture(t)
+			f.installProtected(t, f.pending)
+			generatedRoutePreviousLegacySetPhysical(t, f, physicalKind)
+			physical, commands := generatedRouteAttestationRunnerState(f.runner), len(f.runner.commands)
+			transition := cloneGeneratedRouteActivationGatewayTransition(f.transition)
+			protected := generatedRoutePreviousLegacyProtectedSnapshot(t, f)
+			if err := f.manager.rollbackGeneratedDomainRouteActivation(context.Background(), f.transition); !IsCode(err, DiagnosticIngressDrift) {
+				t.Fatalf("legacy rollback %s error=%v", physicalKind, err)
+			}
+			generatedRoutePreviousAssertLegacyClearResult(t, f, &f.pending, physical, commands,
+				transition, &protected, true)
+		})
+	}
+
+	t.Run("failed_restore_retains_pending_and_retries_clear_only", func(t *testing.T) {
+		f := newGeneratedRoutePreviousLegacyClearFixture(t)
+		f.installProtected(t, f.pending)
+		generatedRoutePreviousLegacySetPhysical(t, f, "proposed")
+		f.runner.failRollbackReload = true
+		commandsBefore := len(f.runner.commands)
+		if err := f.manager.rollbackGeneratedDomainRouteActivation(context.Background(), f.transition); !testRouteCandidateMayBeLive(err) {
+			t.Fatalf("legacy failed rollback error=%v candidateMayBeLive=%t", err, testRouteCandidateMayBeLive(err))
+		}
+		state, err := f.manager.store.loadRequired()
+		if err != nil || !reflect.DeepEqual(state, f.pending) {
+			t.Fatalf("legacy failed rollback state=%#v error=%v", state, err)
+		}
+		if reloads := countReloads(f.runner.commands[commandsBefore:]); reloads != 2 {
+			t.Fatalf("legacy failed rollback reloads=%d commands=%v", reloads, f.runner.commands[commandsBefore:])
+		}
+		commandsBefore = len(f.runner.commands)
+		if err := f.manager.rollbackGeneratedDomainRouteActivation(context.Background(), f.transition); err != nil {
+			t.Fatalf("legacy failed rollback clear-only retry: %v", err)
+		}
+		assertBefore(t, f)
+		for _, command := range f.runner.commands[commandsBefore:] {
+			if generatedRoutePreviousClearPublicationCommand(command) {
+				t.Fatalf("legacy rollback retry republished route: %v", command)
+			}
+		}
 	})
 }
 
