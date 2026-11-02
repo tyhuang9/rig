@@ -3,16 +3,114 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+)
+
+const (
+	liveColdStopControlDirectoryEnv  = "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL_DIRECTORY"
+	liveColdStopNonzeroRefusedMarker = `{"msg":"cold stop acknowledgment did not hide joined child failure","exit_code":"23"}`
 )
 
 func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 	const secret = "token=do-not-disclose"
+	if mode := os.Getenv("RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL"); mode == "cold_stop_ack_exit_nonzero" {
+		directory := os.Getenv(liveColdStopControlDirectoryEnv)
+		if !filepath.IsAbs(directory) {
+			os.Exit(24)
+		}
+		requestPath := filepath.Join(directory, "000001.request.json")
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			var request controllerJourneyRestartCommand
+			err := controllerJourneyReadRestartFile(requestPath, &request)
+			if err == nil {
+				if request.Sequence != 1 || request.Action != "stop" || request.Target != "" {
+					os.Exit(25)
+				}
+				break
+			}
+			if !errors.Is(err, os.ErrNotExist) {
+				os.Exit(26)
+			}
+			if time.Now().After(deadline) {
+				os.Exit(27)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		responsePath := filepath.Join(directory, "000001.response.json")
+		if err := controllerJourneyWriteRestartFile(responsePath, liveColdRuntimeRestartResponse{
+			Sequence: 1,
+			PID:      os.Getpid(),
+			URL:      "http://127.0.0.1:1",
+		}); err != nil {
+			os.Exit(28)
+		}
+		os.Exit(23)
+	}
+	if mode := os.Getenv("RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL"); mode == "cold_stop_nonzero_scenario" {
+		directory := os.Getenv(liveColdStopControlDirectoryEnv)
+		if !filepath.IsAbs(directory) {
+			t.Fatal("cold stop control directory is invalid")
+		}
+		command := exec.Command(os.Args[0], "-test.run=^TestLiveHostdRebindClosedDiagnosticControls$", "-test.timeout=30s")
+		for _, value := range os.Environ() {
+			if !strings.HasPrefix(value, "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL=") &&
+				!strings.HasPrefix(value, liveColdStopControlDirectoryEnv+"=") {
+				command.Env = append(command.Env, value)
+			}
+		}
+		command.Env = append(command.Env,
+			"RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL=cold_stop_ack_exit_nonzero",
+			liveColdStopControlDirectoryEnv+"="+directory,
+		)
+		child := controllerProcessKillCapture(command)
+		if command.Stdout != nil {
+			t.Fatal("cold stop child captured arbitrary stdout")
+		}
+		if err := command.Start(); err != nil {
+			t.Fatal("start cold stop child")
+		}
+		if child.command.Process.Pid == os.Getpid() {
+			t.Fatal("cold stop child reused the current process")
+		}
+		go func() {
+			child.err = command.Wait()
+			close(child.done)
+		}()
+		t.Cleanup(func() { controllerProcessKillCleanupChild(child) })
+		acknowledged := false
+		stopReturned := false
+		process := &liveColdRuntimeRestartProcess{
+			t: t, ctx: context.Background(), child: child, directory: directory,
+		}
+		process.readFile = func(path string, output any) error {
+			err := controllerJourneyReadRestartFile(path, output)
+			if err == nil {
+				if response, ok := output.(*liveColdRuntimeRestartResponse); ok &&
+					response.Sequence == 1 && response.PID == child.command.Process.Pid {
+					acknowledged = true
+				}
+			}
+			return err
+		}
+		t.Cleanup(func() {
+			if acknowledged && !stopReturned && child.command.ProcessState != nil &&
+				child.command.ProcessState.ExitCode() == 23 {
+				_, _ = os.Stderr.WriteString(liveColdStopNonzeroRefusedMarker + "\n")
+			}
+		})
+		process.stop()
+		stopReturned = true
+		t.Fatal("cold stop accepted a nonzero joined child")
+	}
 	if mode := os.Getenv("RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL"); mode != "" {
 		_, _ = os.Stdout.WriteString("/private/path " + secret + "\n")
 		construction := fmt.Errorf("controlled private cause /private/path %s: %w", secret,
@@ -44,6 +142,125 @@ func TestLiveHostdRebindClosedDiagnosticControls(t *testing.T) {
 		}
 		return
 	}
+	t.Run("cold stop response wins joined child race", func(t *testing.T) {
+		const (
+			sequence = uint64(1)
+			pid      = 4242
+		)
+		directory := t.TempDir()
+		path := filepath.Join(directory, "000001.response.json")
+		done := make(chan struct{})
+		close(done)
+		reads := 0
+		process := &liveColdRuntimeRestartProcess{
+			t: t, ctx: context.Background(), directory: directory,
+			child: &controllerProcessKillProcess{
+				command: &exec.Cmd{Process: &os.Process{Pid: pid}}, done: done,
+			},
+		}
+		process.readFile = func(gotPath string, output any) error {
+			reads++
+			if gotPath != path {
+				return errors.New("cold stop response path crossed")
+			}
+			if reads == 1 {
+				return os.ErrNotExist
+			}
+			response, ok := output.(*liveColdRuntimeRestartResponse)
+			if !ok {
+				return errors.New("cold stop response output crossed")
+			}
+			*response = liveColdRuntimeRestartResponse{Sequence: sequence, PID: pid, URL: "http://127.0.0.1:1"}
+			return nil
+		}
+		response := process.wait(sequence, time.Second)
+		if reads != 2 || response.Sequence != sequence || response.PID != pid || response.URL != "http://127.0.0.1:1" {
+			t.Fatalf("cold stop joined response reads=%d response=%#v", reads, response)
+		}
+	})
+	t.Run("cold restart response classification is exact", func(t *testing.T) {
+		const (
+			sequence = uint64(1)
+			pid      = 4242
+		)
+		for _, test := range []struct {
+			name     string
+			read     func(string, any) error
+			want     liveColdRuntimeRestartResponseState
+			response liveColdRuntimeRestartResponse
+		}{
+			{
+				name: "exact",
+				read: func(_ string, output any) error {
+					response := output.(*liveColdRuntimeRestartResponse)
+					*response = liveColdRuntimeRestartResponse{Sequence: sequence, PID: pid, URL: "http://127.0.0.1:1"}
+					return nil
+				},
+				want:     liveColdRuntimeRestartResponseExact,
+				response: liveColdRuntimeRestartResponse{Sequence: sequence, PID: pid, URL: "http://127.0.0.1:1"},
+			},
+			{name: "missing", read: func(string, any) error { return os.ErrNotExist }, want: liveColdRuntimeRestartResponseMissing},
+			{name: "malformed", read: func(string, any) error { return errors.New("malformed") }, want: liveColdRuntimeRestartResponseInvalid},
+			{
+				name: "wrong sequence",
+				read: func(_ string, output any) error {
+					*output.(*liveColdRuntimeRestartResponse) = liveColdRuntimeRestartResponse{Sequence: 2, PID: pid}
+					return nil
+				},
+				want: liveColdRuntimeRestartResponseInvalid,
+			},
+			{
+				name: "wrong pid",
+				read: func(_ string, output any) error {
+					*output.(*liveColdRuntimeRestartResponse) = liveColdRuntimeRestartResponse{Sequence: sequence, PID: pid + 1}
+					return nil
+				},
+				want: liveColdRuntimeRestartResponseInvalid,
+			},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				process := &liveColdRuntimeRestartProcess{
+					child:    &controllerProcessKillProcess{command: &exec.Cmd{Process: &os.Process{Pid: pid}}},
+					readFile: test.read,
+				}
+				response, state := process.readRestartResponse("response.json", sequence)
+				if state != test.want || response != test.response {
+					t.Fatalf("cold restart response state=%d response=%#v want %d/%#v", state, response, test.want, test.response)
+				}
+			})
+		}
+	})
+	t.Run("cold stop exact acknowledgment refuses nonzero joined child", func(t *testing.T) {
+		directory := t.TempDir()
+		command := exec.Command(os.Args[0], "-test.run=^TestLiveHostdRebindClosedDiagnosticControls$", "-test.timeout=30s")
+		for _, value := range os.Environ() {
+			if !strings.HasPrefix(value, "RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL=") &&
+				!strings.HasPrefix(value, liveColdStopControlDirectoryEnv+"=") {
+				command.Env = append(command.Env, value)
+			}
+		}
+		command.Env = append(command.Env,
+			"RIG_LIVE_CHILD_DIAGNOSTIC_CONTROL=cold_stop_nonzero_scenario",
+			liveColdStopControlDirectoryEnv+"="+directory,
+		)
+		child := controllerProcessKillCapture(command)
+		if command.Stdout != nil {
+			t.Fatal("cold stop scenario captured arbitrary stdout")
+		}
+		child.err = command.Run()
+		close(child.done)
+		var exitError *exec.ExitError
+		if !errors.As(child.err, &exitError) || exitError.ExitCode() != 1 ||
+			strings.TrimSpace(child.stderr.String()) != liveColdStopNonzeroRefusedMarker {
+			t.Fatalf("cold stop scenario refused=%t exit=%d marker=%t", errors.As(child.err, &exitError),
+				func() int {
+					if exitError == nil {
+						return -1
+					}
+					return exitError.ExitCode()
+				}(), strings.TrimSpace(child.stderr.String()) == liveColdStopNonzeroRefusedMarker)
+		}
+	})
 	knownRuntime := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"runtime composition failed","error":"` + secret + `"}`
 	constructionError := "generated domain construction was refused: stage=empty_final_locked reason=docker_static_response"
 	knownConstruction := `{"time":"2026-10-15T00:00:00Z","level":"ERROR","msg":"generated domain construction failed","error":"` + constructionError + `"}`

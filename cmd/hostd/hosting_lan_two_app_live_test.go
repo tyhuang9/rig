@@ -401,6 +401,36 @@ type liveColdRuntimeRestartProcess struct {
 	child     *controllerProcessKillProcess
 	directory string
 	url       string
+	readFile  func(string, any) error
+}
+
+type liveColdRuntimeRestartResponseState uint8
+
+const (
+	liveColdRuntimeRestartResponseMissing liveColdRuntimeRestartResponseState = iota
+	liveColdRuntimeRestartResponseExact
+	liveColdRuntimeRestartResponseInvalid
+)
+
+func (child *liveColdRuntimeRestartProcess) readRestartFile(path string, output any) error {
+	if child.readFile != nil {
+		return child.readFile(path, output)
+	}
+	return controllerJourneyReadRestartFile(path, output)
+}
+
+func (child *liveColdRuntimeRestartProcess) readRestartResponse(path string, sequence uint64) (
+	liveColdRuntimeRestartResponse, liveColdRuntimeRestartResponseState,
+) {
+	var response liveColdRuntimeRestartResponse
+	err := child.readRestartFile(path, &response)
+	if errors.Is(err, os.ErrNotExist) {
+		return liveColdRuntimeRestartResponse{}, liveColdRuntimeRestartResponseMissing
+	}
+	if err != nil || response.Sequence != sequence || response.PID != child.child.command.Process.Pid {
+		return liveColdRuntimeRestartResponse{}, liveColdRuntimeRestartResponseInvalid
+	}
+	return response, liveColdRuntimeRestartResponseExact
 }
 
 func newLiveColdRuntimeFixtureRoot(t *testing.T) string {
@@ -713,19 +743,25 @@ func (child *liveColdRuntimeRestartProcess) wait(sequence uint64, maximum time.D
 	defer tick.Stop()
 	path := filepath.Join(child.directory, fmt.Sprintf("%06d.response.json", sequence))
 	for {
-		var response liveColdRuntimeRestartResponse
-		if err := controllerJourneyReadRestartFile(path, &response); err == nil {
-			if response.Sequence != sequence || response.PID != child.child.command.Process.Pid {
-				child.t.Fatal("cold restart response identity mismatch")
-			}
+		response, state := child.readRestartResponse(path, sequence)
+		if state == liveColdRuntimeRestartResponseExact {
 			return response
-		} else if !errors.Is(err, os.ErrNotExist) {
+		} else if state == liveColdRuntimeRestartResponseInvalid {
 			child.t.Fatal("cold restart response is invalid")
 		}
 		select {
 		case <-child.child.done:
+			// A clean stop can publish its complete response and exit between
+			// the first read and this select. Accept only the exact response.
+			response, state = child.readRestartResponse(path, sequence)
+			if state == liveColdRuntimeRestartResponseExact {
+				return response
+			} else if state == liveColdRuntimeRestartResponseInvalid {
+				child.t.Fatal("cold restart response is invalid")
+			}
 			controllerProcessKillReportClosedDiagnostic(child.t, child.child)
-			child.t.Fatal("cold restarted controller exited before response")
+			child.t.Fatalf("cold restarted controller exited before response sequence %d, exit code %d",
+				sequence, child.child.command.ProcessState.ExitCode())
 		case <-ctx.Done():
 			child.t.Fatal("cold restart response exceeded bound")
 		case <-tick.C:
@@ -744,7 +780,8 @@ func (child *liveColdRuntimeRestartProcess) stop() {
 	case <-child.child.done:
 		if child.child.err != nil {
 			controllerProcessKillReportClosedDiagnostic(child.t, child.child)
-			child.t.Fatal("cold restart child did not stop cleanly")
+			child.t.Fatalf("cold restart child did not stop cleanly, exit code %d",
+				child.child.command.ProcessState.ExitCode())
 		}
 	case <-time.After(10 * time.Second):
 		child.t.Fatal("cold restart child did not exit after stopping")
