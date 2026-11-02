@@ -1649,6 +1649,75 @@ func (l *candidateCapacityLedger) seedColdOwnershipWithDebtFor(spec candidateGro
 	return nil
 }
 
+// seedColdStartingCandidateOwnershipWithDebt installs the exact capacity graph
+// for a cold StartingCandidate create/start prefix. Receipt-bearing prefix
+// components are retained by their immutable receipts. The not-yet-created
+// suffix has no receipt and is retained explicitly so a refused fresh worker
+// cannot release part of the already-authorized full-roster share.
+func (l *candidateCapacityLedger) seedColdStartingCandidateOwnershipWithDebt(spec candidateGroupSpec,
+	receipts map[string]candidateColdReceiptSeed, tokens []*generatedDomainCapacityDebtToken,
+) error {
+	if l == nil || l.budget == nil || l.coordinator == nil {
+		return errCandidateCapacityInvalid
+	}
+	normalized, err := normalizeCandidateGroupSpec(spec)
+	if err != nil || len(receipts) == 0 || len(receipts) > len(normalized.components) ||
+		len(tokens) != len(normalized.components) {
+		return errCandidateCapacityInvalid
+	}
+	words := make(map[string]uint64, len(receipts))
+	seenSuffix := false
+	consumedReceipts := 0
+	seenTokens := make(map[*generatedDomainCapacityDebtToken]struct{}, len(tokens))
+	for index, name := range normalized.components {
+		seed, found := receipts[name]
+		if found {
+			if seenSuffix || seed.id == "" || seed.unknown || seed.physical != candidatePhysicalPresent {
+				return errCandidateCapacityInvalid
+			}
+			words[name] = uint64(seed.physical) | candidateReceiptAcknowledged | candidateReceiptObserved
+			consumedReceipts++
+		} else {
+			seenSuffix = true
+		}
+		if tokens[index] == nil || tokens[index].owner != l.coordinator || !tokens[index].configured() {
+			return errCandidateCapacityInvalid
+		}
+		if _, duplicate := seenTokens[tokens[index]]; duplicate {
+			return errCandidateCapacityInvalid
+		}
+		seenTokens[tokens[index]] = struct{}{}
+	}
+	if consumedReceipts != len(receipts) {
+		return errCandidateCapacityInvalid
+	}
+	key := candidateCapacityGroupKey{appID: normalized.appID, deploymentID: normalized.deploymentID}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.groups[key] != nil {
+		return errCandidateCapacityPinsChanged
+	}
+	group := newCandidateCapacityGroup(l, key, normalized)
+	for index, name := range normalized.components {
+		component := group.byName[name]
+		group.nextEpoch++
+		seed, found := receipts[name]
+		charge := &candidateCapacityCharge{epoch: group.nextEpoch, token: tokens[index],
+			state: candidateChargeActive, owner: candidateAccountingPendingPublication,
+			publicationOwner: candidateAccountingCandidate}
+		if found {
+			component.receipt = &candidateReceiptTombstone{id: seed.id}
+			component.receipt.state.Store(words[name])
+			charge.receiptRetained = true
+		} else {
+			charge.explicitRetained = true
+		}
+		component.charge = charge
+	}
+	l.groups[key] = group
+	return nil
+}
+
 // abandonUnpublished detaches all raw tokens in a graph that registry state
 // still proves unreachable. It returns no authority and performs token release
 // only after dropping ledger and group locks.

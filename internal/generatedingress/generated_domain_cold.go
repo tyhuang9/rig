@@ -31,16 +31,20 @@ const (
 )
 
 type generatedDomainColdGroup struct {
-	pins         candidateValidationPins
-	protected    candidateProtectedSnapshot
-	snapshot     candidateAdmissionSnapshot
-	kind         generatedDomainColdGroupKind
-	policies     map[string]candidatePolicy
-	receipts     map[string]candidateColdReceiptSeed
-	bindHead     bool
-	selfHead     bool
-	legacyHead   bool
-	restoredDebt bool
+	pins      candidateValidationPins
+	protected candidateProtectedSnapshot
+	snapshot  candidateAdmissionSnapshot
+	kind      generatedDomainColdGroupKind
+	policies  map[string]candidatePolicy
+	receipts  map[string]candidateColdReceiptSeed
+	// startingCandidatePrefix is set only by the physical attestation pass for
+	// an exact sorted StartingCandidate create/start prefix. It is descriptive
+	// reconstruction evidence, not candidate mutation authority.
+	startingCandidatePrefix int
+	bindHead                bool
+	selfHead                bool
+	legacyHead              bool
+	restoredDebt            bool
 }
 
 type generatedDomainColdManifest struct {
@@ -195,6 +199,10 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 				restoredDeployments[groups[index].pins.deploymentID] = struct{}{}
 			}
 		case generatedDomainColdRisky:
+			if groups[index].startingCandidatePrefix != 0 {
+				restoredDeployments[groups[index].pins.deploymentID] = struct{}{}
+				continue
+			}
 			deployments, evidenceErr := generatedDomainColdDrainingDebtDeployments(
 				observed.database, groups[index], groups)
 			if evidenceErr != nil {
@@ -247,7 +255,10 @@ func reconstructGeneratedDomainCold(ctx context.Context, result *generatedDomain
 						seedErr = errGeneratedDomainConstructionRefused
 					}
 				}
-				if seedErr == nil {
+				if seedErr == nil && group.startingCandidatePrefix != 0 {
+					seedErr = result.candidates.ledger.seedColdStartingCandidateOwnershipWithDebt(
+						spec, group.receipts, debtTokens[debtOffset:debtOffset+count])
+				} else if seedErr == nil {
 					seedErr = result.candidates.ledger.seedColdOwnershipWithDebtFor(
 						spec, seeds, debtTokens[debtOffset:debtOffset+count], owner)
 				}
@@ -2187,6 +2198,49 @@ func generatedDomainColdHasReceipt(components []candidateAdmissionComponent) boo
 	return false
 }
 
+// generatedDomainColdStartingCandidatePrefixLength recognizes the durable
+// component ordering produced by the executor: a non-empty sorted Running
+// prefix with exact immutable receipts followed by an ImageReady suffix that
+// has no candidate identity yet. Physical attestation separately proves that
+// every prefix member is running, except that the final prefix member may be
+// the one exact configured container whose start had not yet been attempted.
+func generatedDomainColdStartingCandidatePrefixLength(group generatedDomainColdGroup) (int, bool) {
+	if group.kind != generatedDomainColdRisky ||
+		group.snapshot.runtime.phase != generatedruntimestate.PhaseStartingCandidate ||
+		len(group.snapshot.components) == 0 {
+		return 0, false
+	}
+	prefix := 0
+	suffix := false
+	for index, component := range group.snapshot.components {
+		name := component.plan.Name
+		if name == "" || index > 0 && group.snapshot.components[index-1].plan.Name >= name {
+			return 0, false
+		}
+		seed, hasReceipt := group.receipts[name]
+		_, hasPolicy := group.policies[name]
+		switch component.state {
+		case generatedruntimestate.ComponentRunning:
+			if suffix || component.receipt == nil || !hasReceipt || !hasPolicy ||
+				seed.id == "" || seed.id != component.receipt.id || seed.unknown ||
+				seed.physical != candidatePhysicalPresent || component.containerName == "" ||
+				!lowerHex(component.containerID, 64) {
+				return 0, false
+			}
+			prefix++
+		case generatedruntimestate.ComponentImageReady:
+			suffix = true
+			if component.receipt != nil || hasReceipt || hasPolicy ||
+				component.containerName != "" || component.containerID != "" {
+				return 0, false
+			}
+		default:
+			return 0, false
+		}
+	}
+	return prefix, prefix != 0 && len(group.receipts) == prefix && len(group.policies) == prefix
+}
+
 func generatedDomainColdActivationMatches(pins candidateValidationPins, snapshot candidateAdmissionSnapshot,
 	groups []generatedDomainColdGroup,
 	values []generatedruntimestate.GeneratedDomainStartupRouteActivation,
@@ -2977,8 +3031,18 @@ func attestGeneratedDomainColdGroupsWithPendingProofs(ctx context.Context, manag
 	if err != nil {
 		return err
 	}
-	for _, group := range groups {
-		for _, component := range group.snapshot.components {
+	for groupIndex := range groups {
+		group := &groups[groupIndex]
+		prefixLength, startingCandidatePrefix := generatedDomainColdStartingCandidatePrefixLength(*group)
+		group.startingCandidatePrefix = 0
+		if group.snapshot.runtime.phase == generatedruntimestate.PhaseStartingCandidate &&
+			generatedDomainColdHasReceipt(group.snapshot.components) && !startingCandidatePrefix {
+			return generatedDomainConstructionBoundaryDiagnostic(
+				generatedDomainConstructionStageColdConstruction,
+				generatedDomainConstructionReasonColdGroupStructure,
+				errGeneratedDomainConstructionRefused)
+		}
+		for componentIndex, component := range group.snapshot.components {
 			if component.artifact != nil && component.artifact.imageContentID != "" {
 				artifact := *component.artifact
 				policy := candidatePolicy{identity: generatedcontainer.Identity{
@@ -3029,6 +3093,13 @@ func attestGeneratedDomainColdGroupsWithPendingProofs(ctx context.Context, manag
 					deploymentID: group.pins.deploymentID, component: component.plan.Name}]
 				validPhysical := found && generatedcontainer.MatchesRunning(actual, expectedIdentity, policy.limits) &&
 					generatedcontainer.CurrentlyRunning(actual)
+				if startingCandidatePrefix && componentIndex < prefixLength {
+					validPhysical = found && (componentIndex+1 == prefixLength &&
+						generatedcontainer.MatchesConfigured(actual, expectedIdentity, policy.limits) &&
+						generatedcontainer.NeverStarted(actual) ||
+						generatedcontainer.MatchesRunning(actual, expectedIdentity, policy.limits) &&
+							generatedcontainer.CurrentlyRunning(actual))
+				}
 				if recoveredRetirement {
 					validPhysical = !found || generatedcontainer.MatchesConfigured(actual, expectedIdentity, policy.limits) &&
 						(generatedcontainer.CurrentlyRunning(actual) || candidateRemovableState(actual))
@@ -3080,6 +3151,9 @@ func attestGeneratedDomainColdGroupsWithPendingProofs(ctx context.Context, manag
 						errors.Join(errGeneratedDomainConstructionRefused, err))
 				}
 			}
+		}
+		if startingCandidatePrefix {
+			group.startingCandidatePrefix = prefixLength
 		}
 	}
 	gateway, err := resolveGeneratedDomainColdGatewayExpectation(observed.database, observed.protected)
