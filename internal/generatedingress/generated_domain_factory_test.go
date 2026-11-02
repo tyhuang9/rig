@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hostd/hostd/internal/generatedcontainer"
+	"github.com/hostd/hostd/internal/generatedidentity"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
 	"github.com/hostd/hostd/internal/runtime/deploymenteffects"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
@@ -618,20 +619,29 @@ func TestGeneratedDomainConstructionReconstructsColdAccounting(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, _, ingressIP := ingressNetworkCandidate(0)
-			routeRunner := &generatedDomainRouteSeedRunner{
-				daemonID: "generated-domain-cold-daemon",
-				delegate: &ingressRunner{
-					appID: migration.guarded.appID, network: candidateIdentity.NetworkName,
-					endpoint: generatedRouteEndpoint(candidateIdentity),
-					caddyNetworks: map[string]*networkAttachment{
-						caddyNetworkName: {GwPriority: caddyGatewayPriority, IPAddress: ingressIP},
-					},
-					ingressContainers: map[string]caddyNetworkContainerInspection{
-						strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: ingressIP + "/28"},
-					},
-					files: map[string][]byte{},
+			ingress := &ingressRunner{
+				appID: migration.guarded.appID, network: candidateIdentity.NetworkName,
+				endpoint: generatedRouteEndpoint(candidateIdentity),
+				caddyNetworks: map[string]*networkAttachment{
+					caddyNetworkName: {GwPriority: caddyGatewayPriority, IPAddress: ingressIP},
 				},
+				ingressContainers: map[string]caddyNetworkContainerInspection{
+					strings.Repeat("d", 64): {Name: caddyContainerName, IPv4Address: ingressIP + "/28"},
+				},
+				files: map[string][]byte{},
 			}
+			physicalRoutes := &generatedRoutePredecessorRunner{ingressRunner: ingress,
+				slot: generatedidentity.Slot(candidateIdentity.Slot),
+				endpoints: map[string]generatedRouteEndpointSnapshot{candidateIdentity.ContainerID: {
+					appID: migration.guarded.appID, endpoint: generatedRouteEndpoint(candidateIdentity),
+					slot: generatedidentity.Slot(candidateIdentity.Slot),
+				}}}
+			routeSeed := &generatedDomainRouteSeedRunner{
+				daemonID: "generated-domain-cold-daemon",
+				delegate: ingress,
+			}
+			routeRunner := &generatedRouteColdAccountingRouteReadRunner{routes: physicalRoutes,
+				delegate: routeSeed}
 			input := generatedDomainReservationInput{database: identity.database, runner: routeRunner,
 				options: identity.options}
 			manager, err := assembleGeneratedDomainManager(input, store)
@@ -658,25 +668,35 @@ func TestGeneratedDomainConstructionReconstructsColdAccounting(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			activated, err := sealed.Activate(migration.guarded.context)
-			if err != nil || activated.Phase != generatedruntimestate.PhaseDraining {
-				t.Fatalf("activate cold current route = %#v, %v", activated, err)
+			activated, retirement, err := sealed.ActivateWithPredecessorRetirement(migration.guarded.context)
+			if retirement != nil {
+				defer func() {
+					if retirement != nil {
+						retirement.Leave()
+					}
+				}()
 			}
-			runtime := generatedruntimestate.New(identity.database)
-			if _, err := runtime.Advance(context.Background(), migration.guarded.appID,
-				migration.request.DeploymentID, generatedruntimestate.PhaseDraining,
-				generatedruntimestate.PhaseSucceeded, ""); err != nil {
+			if err != nil || retirement == nil || activated.Phase != generatedruntimestate.PhaseDraining {
+				t.Fatalf("activate cold current route = %#v, retirement=%#v, %v", activated, retirement, err)
+			}
+			activationReceipt := retirement.state.receipt
+			if activationReceipt.ReceiptID == "" {
+				t.Fatal("cold current activation omitted its durable receipt")
+			}
+			if err := retirement.Complete(migration.guarded.context); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := migration.repository.Transition(context.Background(), migration.guarded.appID,
-				migration.request.DeploymentID, Succeeded, ""); err != nil {
-				t.Fatal(err)
-			}
+			retirement.Leave()
+			retirement = nil
 			execution.Leave()
 			reservation.Release()
 			if err := migration.releaseEffects(); err != nil {
 				t.Fatal(err)
 			}
+			accountingFixture := generatedRouteColdAccountingFixture{identity: identity, migration: migration,
+				firstReceipt: activationReceipt, componentName: candidateIdentity.ComponentName,
+				componentReceipt: candidateIdentity.ReceiptID}
+			assertGeneratedRouteColdAccountingInitialLegacyCurrentSnapshot(t, accountingFixture)
 
 			state, err := store.load()
 			if err != nil {
@@ -741,9 +761,11 @@ func TestGeneratedDomainConstructionReconstructsColdAccounting(t *testing.T) {
 			group := result.cold.groups[0]
 			if group.appID != migration.guarded.appID || group.deploymentID != migration.request.DeploymentID ||
 				group.head == nil || group.head.deploymentID != migration.request.DeploymentID ||
-				len(group.components) != 1 || group.components[0].charged || group.components[0].retained {
+				len(group.components) != 1 || !group.components[0].charged || !group.components[0].retained {
 				t.Fatalf("cold current manifest = %#v", group)
 			}
+			assertGeneratedRouteColdAccountingRestoredCurrent(t, result, accountingFixture)
+			assertGeneratedRouteColdAccountingInitialLegacyCurrentSnapshot(t, accountingFixture)
 			for _, command := range runner.snapshot() {
 				if generatedDomainConstructionJoinCommandMutatesOrProbesCapacity(command) {
 					t.Fatalf("quiescent current reconstruction dispatched an effect/capacity probe: %#v", command)
