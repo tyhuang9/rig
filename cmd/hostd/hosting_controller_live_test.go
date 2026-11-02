@@ -44,6 +44,7 @@ import (
 	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcapacity"
+	"github.com/hostd/hostd/internal/generatedcontainer"
 	"github.com/hostd/hostd/internal/generatedingress"
 	"github.com/hostd/hostd/internal/generatedruntime"
 	"github.com/hostd/hostd/internal/generatedruntimestate"
@@ -52,6 +53,7 @@ import (
 	"github.com/hostd/hostd/internal/releasesnapshot"
 	runtimedocker "github.com/hostd/hostd/internal/runtime/docker"
 	runtimeprocess "github.com/hostd/hostd/internal/runtime/process"
+	"github.com/hostd/hostd/internal/secretfile"
 	"github.com/hostd/hostd/internal/sourceconnections"
 )
 
@@ -1237,6 +1239,11 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 	if err != nil {
 		t.Fatal("derive expected gateway readiness target")
 	}
+	gatewayHeadBefore, err := capacityRestart.composition.state.Active(ctx, application.ID)
+	if err != nil || gatewayHeadBefore.DeploymentID != replacementDeployment.ID || gatewayHeadBefore.ReleaseID != replacementDeployment.ReleaseID {
+		t.Fatal("gateway readiness replacement has no exact predecessor head")
+	}
+	gatewayRouteBefore := controllerJourneyReadProtectedRouteState(t, dataRoot)
 	restartedObserver.beginGatewayReadinessCapture(gatewayProbeTarget)
 	var gatewayMutation apicontract.JobMutationResponse
 	request(http.MethodPost, deploymentPath, apicontract.DeployApplicationRequest{
@@ -1253,10 +1260,10 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if gatewayJob.Status == string(jobs.Failed) {
+		if gatewayJob.Status == string(jobs.WaitingUser) {
 			break
 		}
-		if gatewayJob.Status == string(jobs.Succeeded) || gatewayJob.Status == string(jobs.WaitingUser) || gatewayJob.Status == string(jobs.NeedsAttention) || time.Now().After(gatewayDeadline) || ctx.Err() != nil {
+		if gatewayJob.Status == string(jobs.Succeeded) || gatewayJob.Status == string(jobs.Failed) || gatewayJob.Status == string(jobs.NeedsAttention) || time.Now().After(gatewayDeadline) || ctx.Err() != nil {
 			t.Fatalf("gateway loopback replacement had unexpected result: status=%s phase=%s code=%s", gatewayJob.Status, gatewayJob.Phase, gatewayJob.ErrorCode)
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -1273,14 +1280,16 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 			gatewayDeployment = item
 		}
 	}
-	if gatewayDeployment.ID == "" || gatewayDeployment.Status != "failed" || gatewayDeployment.DiagnosticCode != "gateway_readiness_failed" ||
+	if gatewayDeployment.ID == "" || gatewayDeployment.Status != string(deployments.WaitingHealth) || gatewayDeployment.DiagnosticCode != "" ||
 		gatewayDeployment.ActualConfigurationRevisionID != gatewayConfiguration.RevisionID || gatewayDeployment.ActualConfigurationRevisionNumber != gatewayConfiguration.RevisionNumber ||
 		gatewayDeployment.DeploymentPlanRevisionID != plan.RevisionID || gatewayDeployment.DeploymentPlanRevisionNumber != plan.RevisionNumber || gatewayDeployment.ReleaseID == "" {
-		t.Fatal("gateway readiness deployment did not retain its immutable pins")
+		t.Fatal("gateway readiness pause did not retain its nonterminal immutable deployment pins")
 	}
-	if gatewayJob.ErrorCode != "gateway_readiness_failed" || apiCandidate.ID == "" ||
+	if gatewayJob.Status != string(jobs.WaitingUser) || gatewayJob.Phase != jobs.PauseRouteReconciliationRequired ||
+		gatewayJob.PauseDisposition != jobs.PauseRouteReconciliationRequired || gatewayJob.Checkpoint != `{"phase":"route_reconciliation_required"}` ||
+		gatewayJob.ErrorCode != "" || apiCandidate.ID == "" ||
 		apiCandidate.AppID != application.ID || apiCandidate.DeploymentID != gatewayDeployment.ID || apiCandidate.ReleaseID != gatewayDeployment.ReleaseID || !gatewayProbeFailed {
-		t.Fatal("gateway loopback candidate did not fail after Docker health and the fixed Caddy probe")
+		t.Fatal("gateway loopback candidate did not pause after Docker health and the fixed Caddy probe")
 	}
 	var gatewayReleases apicontract.ReleaseList
 	request(http.MethodGet, "/api/v1/apps/"+application.ID+"/releases", nil, http.StatusOK, &gatewayReleases)
@@ -1295,12 +1304,54 @@ func controllerJourneyRun(t *testing.T, processKill bool) {
 		gatewayRelease.DeploymentPlanRevisionID != plan.RevisionID || gatewayRelease.DeploymentPlanRevisionNumber != plan.RevisionNumber {
 		t.Fatal("gateway readiness release did not retain same-source immutable pins")
 	}
+	gatewayRuntime, err := capacityRestart.composition.state.Get(ctx, application.ID, gatewayDeployment.ID)
+	if err != nil {
+		t.Fatal("read paused gateway readiness runtime")
+	}
+	predecessorRuntime, err := capacityRestart.composition.state.Get(ctx, application.ID, replacementDeployment.ID)
+	if err != nil {
+		t.Fatal("read gateway readiness predecessor runtime")
+	}
+	gatewayHeadAfter, err := capacityRestart.composition.state.Active(ctx, application.ID)
+	if err != nil {
+		t.Fatal("read gateway readiness active head after pause")
+	}
+	var gatewayRouteHistoryCounts controllerProcessKillRouteHistoryCounts
+	err = capacityRestartDB.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM generated_route_activations WHERE id=? AND app_id=?
+		 AND successor_deployment_id=? AND successor_release_id=? AND successor_slot=? AND successor_generation=?),
+		(SELECT COUNT(*) FROM generated_route_activations WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_predecessor_retirements WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_accounting_handoff_authorizations WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_accounting_handoff_receipts WHERE successor_deployment_id=?),
+		(SELECT COUNT(*) FROM generated_route_completion_receipts WHERE successor_deployment_id=?)`,
+		gatewayHeadAfter.ActivationReceiptID, application.ID, gatewayHeadAfter.DeploymentID, gatewayHeadAfter.ReleaseID,
+		gatewayHeadAfter.Slot, gatewayHeadAfter.Generation, gatewayDeployment.ID, gatewayDeployment.ID, gatewayDeployment.ID,
+		gatewayDeployment.ID, gatewayDeployment.ID, gatewayDeployment.ID).Scan(
+		&gatewayRouteHistoryCounts.predecessorHeadReceipts, &gatewayRouteHistoryCounts.activations, &gatewayRouteHistoryCounts.retirements,
+		&gatewayRouteHistoryCounts.retirementReceipts, &gatewayRouteHistoryCounts.authorizations, &gatewayRouteHistoryCounts.handoffs, &gatewayRouteHistoryCounts.completions)
+	if err != nil {
+		t.Fatal("read paused gateway readiness route history")
+	}
+	gatewayIntents := controllerJourneyReadCandidateIntentIdentities(t, ctx, capacityRestartDB, replacementDeployment.ID, gatewayDeployment.ID)
+	protectedGatewayRoute := controllerJourneyReadProtectedRouteState(t, dataRoot)
+	boundary := controllerJourneyGatewayPauseBoundary{
+		AppID: application.ID, Job: gatewayJob, Deployment: gatewayDeployment,
+		Previous: predecessorRuntime, Candidate: gatewayRuntime, HeadBefore: gatewayHeadBefore, HeadAfter: gatewayHeadAfter,
+		ProtectedBefore: gatewayRouteBefore, Protected: protectedGatewayRoute, History: gatewayRouteHistoryCounts, Intents: gatewayIntents,
+	}
+	if !controllerJourneyGatewayPauseBoundaryMatches(boundary) {
+		t.Fatal("gateway readiness pause did not preserve the exact durable predecessor and candidate boundary")
+	}
+	expectedPausedRoster := controllerJourneyPausedComponentRoster(t, application.ID, plan, predecessorRuntime, gatewayRuntime, gatewayIntents)
 	retainedGatewayRouteURL := assertAttestedRoute(replacementDeployment)
-	controllerJourneyAssertScopedContainers(t, ctx, docker, application.ID, network.Name, gateway, dbURL, sentinel)
+	controllerJourneyAssertPausedRouteContainers(t, ctx, docker, application.ID, network.Name, gateway, dbURL, sentinel,
+		expectedPausedRoster, apiCandidate, gatewayDeployment.ID)
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/version", "", http.StatusOK, "controller-journey-v2")
 	controllerJourneyRoutedRequest(t, ctx, application.ID, http.MethodGet, "/api/notes", "", http.StatusOK, "controller TLS note")
 	controllerJourneyBrowser(t, ctx, node, application.ID, retainedGatewayRouteURL, "read", browserNote)
-	t.Logf("M2 gateway readiness identities: gateway-config=%s/%d gateway-job=%s gateway-deployment=%s gateway-release=%s serving-deployment=%s", gatewayConfiguration.RevisionID, gatewayConfiguration.RevisionNumber, gatewayJob.ID, gatewayDeployment.ID, gatewayRelease.ID, replacementDeployment.ID)
+	t.Logf("M2 gateway readiness pause identities: gateway-config=%s/%d gateway-job=%s gateway-deployment=%s gateway-release=%s serving-deployment=%s", gatewayConfiguration.RevisionID, gatewayConfiguration.RevisionNumber, gatewayJob.ID, gatewayDeployment.ID, gatewayRelease.ID, replacementDeployment.ID)
 	restartedObserver.stop()
 }
 
@@ -1928,6 +1979,164 @@ type controllerJourneyCandidate struct {
 	ReleaseID    string
 }
 
+type controllerJourneyCandidateIntentIdentity struct {
+	ReceiptID      string
+	DeploymentID   string
+	Component      string
+	CreatorJobID   string
+	CreatorAttempt int
+}
+
+type controllerJourneyPausedComponentIdentity struct {
+	ContainerID  string
+	Name         string
+	AppID        string
+	DeploymentID string
+	ReleaseID    string
+	PlanID       string
+	ArtifactID   string
+	Slot         string
+	Component    string
+	Role         string
+	ReceiptID    string
+}
+
+type controllerJourneyGatewayPauseBoundary struct {
+	AppID           string
+	Job             jobs.Job
+	Deployment      apicontract.Deployment
+	Previous        generatedruntimestate.Deployment
+	Candidate       generatedruntimestate.Deployment
+	HeadBefore      generatedruntimestate.ActiveHead
+	HeadAfter       generatedruntimestate.ActiveHead
+	ProtectedBefore controllerProcessKillRouteState
+	Protected       controllerProcessKillRouteState
+	History         controllerProcessKillRouteHistoryCounts
+	Intents         []controllerJourneyCandidateIntentIdentity
+}
+
+func controllerJourneyGatewayPauseBoundaryMatches(value controllerJourneyGatewayPauseBoundary) bool {
+	if value.AppID == "" || value.Job.ID == "" || value.Job.ResourceID != value.AppID ||
+		value.Job.Status != string(jobs.WaitingUser) || value.Job.Phase != jobs.PauseRouteReconciliationRequired ||
+		value.Job.PauseDisposition != jobs.PauseRouteReconciliationRequired || value.Job.ErrorCode != "" ||
+		value.Job.Checkpoint != `{"phase":"route_reconciliation_required"}` || value.Job.Attempt < 1 ||
+		value.Deployment.ID == "" || value.Deployment.AppID != value.AppID || value.Deployment.JobID != value.Job.ID ||
+		value.Deployment.Status != string(deployments.WaitingHealth) || value.Deployment.DiagnosticCode != "" ||
+		value.Deployment.ReleaseID == "" || value.Deployment.ActualConfigurationRevisionID == "" ||
+		value.Deployment.ActualConfigurationRevisionNumber < 1 || value.Deployment.DeploymentPlanRevisionID == "" ||
+		value.Deployment.DeploymentPlanRevisionNumber < 1 || value.Candidate.DeploymentID != value.Deployment.ID ||
+		value.Candidate.AppID != value.AppID || value.Candidate.ReleaseID != value.Deployment.ReleaseID ||
+		value.Candidate.DeploymentPlanRevisionID != value.Deployment.DeploymentPlanRevisionID ||
+		value.Candidate.DeploymentPlanRevisionNumber != value.Deployment.DeploymentPlanRevisionNumber ||
+		value.Candidate.Phase != generatedruntimestate.PhaseSwitchingRoute || value.Candidate.DiagnosticCode != "" ||
+		value.Previous.DeploymentID == "" || value.Previous.AppID != value.AppID ||
+		value.Previous.Phase != generatedruntimestate.PhaseSucceeded || value.Previous.DiagnosticCode != "" ||
+		value.Candidate.PreviousActiveDeploymentID != value.Previous.DeploymentID ||
+		value.Candidate.PreviousActiveSlot != value.Previous.CandidateSlot || value.Candidate.CandidateSlot == value.Previous.CandidateSlot ||
+		!reflect.DeepEqual(value.HeadBefore, value.HeadAfter) || value.HeadAfter.AppID != value.AppID ||
+		value.HeadAfter.DeploymentID != value.Previous.DeploymentID || value.HeadAfter.ReleaseID != value.Previous.ReleaseID ||
+		value.HeadAfter.Slot != value.Previous.CandidateSlot || value.HeadAfter.Generation < 1 || value.HeadAfter.ActivationReceiptID == "" ||
+		value.History.predecessorHeadReceipts != 1 || value.History.activations != 0 || value.History.retirements != 0 ||
+		value.History.retirementReceipts != 0 || value.History.authorizations != 0 || value.History.handoffs != 0 ||
+		value.History.completions != 0 || value.Protected.Version != 1 || len(value.Protected.Active) != 1 ||
+		value.Protected.Pending != nil || !reflect.DeepEqual(value.ProtectedBefore, value.Protected) ||
+		len(value.Candidate.Components) != 2 || len(value.Previous.Components) != 2 {
+		return false
+	}
+	active, ok := value.Protected.Active[value.AppID]
+	if !ok || !controllerProcessKillRouteRecordMatchesDeployment(active, value.Previous) {
+		return false
+	}
+	previousComponents := make(map[string]bool, len(value.Previous.Components))
+	candidateComponents := make(map[string]bool, len(value.Candidate.Components))
+	for _, component := range value.Previous.Components {
+		if component.DeploymentID != value.Previous.DeploymentID || component.ContainerID == "" || component.ContainerName == "" ||
+			component.Slot != value.Previous.CandidateSlot || component.State != generatedruntimestate.ComponentActive ||
+			(component.Name != "api" && component.Name != "frontend") || previousComponents[component.Name] {
+			return false
+		}
+		previousComponents[component.Name] = true
+	}
+	for _, component := range value.Candidate.Components {
+		if component.DeploymentID != value.Candidate.DeploymentID || component.ContainerID == "" || component.ContainerName == "" ||
+			component.Slot != value.Candidate.CandidateSlot || component.State != generatedruntimestate.ComponentHealthy ||
+			(component.Name != "api" && component.Name != "frontend") || candidateComponents[component.Name] {
+			return false
+		}
+		candidateComponents[component.Name] = true
+	}
+	if !previousComponents["api"] || !previousComponents["frontend"] || !candidateComponents["api"] || !candidateComponents["frontend"] ||
+		len(value.Intents) != 4 {
+		return false
+	}
+	seenReceipts := make(map[string]bool, len(value.Intents))
+	seenComponents := make(map[string]bool, len(value.Intents))
+	for _, intent := range value.Intents {
+		key := intent.DeploymentID + "\x00" + intent.Component
+		if intent.ReceiptID == "" || seenReceipts[intent.ReceiptID] || seenComponents[key] ||
+			(intent.Component != "api" && intent.Component != "frontend") {
+			return false
+		}
+		seenReceipts[intent.ReceiptID] = true
+		seenComponents[key] = true
+		switch intent.DeploymentID {
+		case value.Previous.DeploymentID:
+			if !previousComponents[intent.Component] || intent.CreatorJobID == "" || intent.CreatorAttempt < 1 {
+				return false
+			}
+		case value.Candidate.DeploymentID:
+			if !candidateComponents[intent.Component] || intent.CreatorJobID != value.Job.ID || intent.CreatorAttempt != value.Job.Attempt {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return len(seenComponents) == 4
+}
+
+func controllerJourneyPausedComponentRosterMatches(expected, observed []controllerJourneyPausedComponentIdentity,
+	probe controllerJourneyCandidate, candidateDeploymentID string,
+) bool {
+	if len(expected) != 4 || len(observed) != 4 || probe.ID == "" || probe.DeploymentID != candidateDeploymentID {
+		return false
+	}
+	want := make(map[string]controllerJourneyPausedComponentIdentity, len(expected))
+	candidateAPI := ""
+	deploymentsSeen := make(map[string]int, 2)
+	for _, component := range expected {
+		if component.ContainerID == "" || component.Name == "" || component.AppID == "" || component.DeploymentID == "" ||
+			component.ReleaseID == "" || component.PlanID == "" || component.ArtifactID == "" || component.Slot == "" ||
+			component.ReceiptID == "" || (component.Component != "api" && component.Component != "frontend") ||
+			(component.Role != "service" && component.Role != "static") {
+			return false
+		}
+		if _, duplicate := want[component.ContainerID]; duplicate {
+			return false
+		}
+		want[component.ContainerID] = component
+		deploymentsSeen[component.DeploymentID]++
+		if component.DeploymentID == candidateDeploymentID && component.Component == "api" {
+			candidateAPI = component.ContainerID
+			if probe.AppID != component.AppID || probe.ReleaseID != component.ReleaseID {
+				return false
+			}
+		}
+	}
+	if len(deploymentsSeen) != 2 || deploymentsSeen[candidateDeploymentID] != 2 || candidateAPI != probe.ID {
+		return false
+	}
+	seen := make(map[string]bool, len(observed))
+	for _, component := range observed {
+		wantComponent, ok := want[component.ContainerID]
+		if !ok || seen[component.ContainerID] || !reflect.DeepEqual(component, wantComponent) {
+			return false
+		}
+		seen[component.ContainerID] = true
+	}
+	return len(seen) == len(want)
+}
+
 func (observer *controllerJourneyHealthObserver) Run(ctx context.Context, request runtimeprocess.CommandRequest) (runtimeprocess.CommandResult, error) {
 	if len(request.Args) >= 2 && request.Args[0] == "buildx" && request.Args[1] == "build" {
 		observer.mu.Lock()
@@ -2377,6 +2586,8 @@ type controllerJourneyNetworkAttachment struct {
 
 const controllerJourneyAppProbeInspectFormat = `{"id":{{json .ID}},"labels":{{json .Config.Labels}},"running":{{json .State.Running}},"networkMode":{{json .HostConfig.NetworkMode}},"pidMode":{{json .HostConfig.PidMode}},"ipcMode":{{json .HostConfig.IpcMode}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"configuredMounts":{{json .HostConfig.Mounts}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
 
+const controllerJourneyPausedContainerInspectFormat = `{"id":{{json .ID}},"name":{{json .Name}},"labels":{{json .Config.Labels}},"env":{{json .Config.Env}},"running":{{json .State.Running}},"networkMode":{{json .HostConfig.NetworkMode}},"pidMode":{{json .HostConfig.PidMode}},"ipcMode":{{json .HostConfig.IpcMode}},"binds":{{json .HostConfig.Binds}},"mounts":{{json .Mounts}},"configuredMounts":{{json .HostConfig.Mounts}},"networks":{{if .NetworkSettings}}{{json .NetworkSettings.Networks}}{{else}}null{{end}}}`
+
 const controllerJourneyAppNetworkInspectFormat = `{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Labels}}}`
 
 func controllerJourneyAppProbeSources(t *testing.T, ctx context.Context, docker, appID, networkName, gateway string) []controllerJourneyAppProbeSource {
@@ -2426,6 +2637,165 @@ func controllerJourneyAppProbeSources(t *testing.T, ctx context.Context, docker,
 	}
 	sort.Slice(sources, func(left, right int) bool { return sources[left].Component < sources[right].Component })
 	return sources
+}
+
+func controllerJourneyReadCandidateIntentIdentities(t *testing.T, ctx context.Context, db *sql.DB,
+	previousDeploymentID, candidateDeploymentID string,
+) []controllerJourneyCandidateIntentIdentity {
+	t.Helper()
+	rows, err := db.QueryContext(ctx, `SELECT id,deployment_id,component_name,creator_job_id,creator_worker_attempt
+		FROM generated_candidate_intents WHERE deployment_id IN (?,?) ORDER BY deployment_id,component_name`,
+		previousDeploymentID, candidateDeploymentID)
+	if err != nil {
+		t.Fatal("read exact paused route candidate receipts")
+	}
+	defer rows.Close()
+	var result []controllerJourneyCandidateIntentIdentity
+	for rows.Next() {
+		var value controllerJourneyCandidateIntentIdentity
+		if rows.Scan(&value.ReceiptID, &value.DeploymentID, &value.Component, &value.CreatorJobID, &value.CreatorAttempt) != nil {
+			t.Fatal("scan exact paused route candidate receipt")
+		}
+		result = append(result, value)
+	}
+	if rows.Err() != nil || rows.Close() != nil {
+		t.Fatal("complete exact paused route candidate receipt read")
+	}
+	return result
+}
+
+func controllerJourneyPausedComponentRoster(t *testing.T, appID string, plan apicontract.DeploymentPlanRevision,
+	previous, candidate generatedruntimestate.Deployment, intents []controllerJourneyCandidateIntentIdentity,
+) []controllerJourneyPausedComponentIdentity {
+	t.Helper()
+	roles := make(map[string]string, len(plan.Components))
+	for _, component := range plan.Components {
+		if component.Name == "" || (component.Role != "service" && component.Role != "static") || roles[component.Name] != "" {
+			t.Fatal("accepted plan has no exact paused route component roles")
+		}
+		roles[component.Name] = component.Role
+	}
+	if len(roles) != 2 || roles["api"] != "service" || roles["frontend"] != "static" {
+		t.Fatal("accepted plan does not describe the exact paused route roster")
+	}
+	receipts := make(map[string]string, len(intents))
+	for _, intent := range intents {
+		key := intent.DeploymentID + "\x00" + intent.Component
+		if intent.ReceiptID == "" || receipts[key] != "" {
+			t.Fatal("paused route candidate receipts are not an exact roster")
+		}
+		receipts[key] = intent.ReceiptID
+	}
+	result := make([]controllerJourneyPausedComponentIdentity, 0, 4)
+	for _, deployment := range []generatedruntimestate.Deployment{previous, candidate} {
+		for _, component := range deployment.Components {
+			receiptID := receipts[deployment.DeploymentID+"\x00"+component.Name]
+			if receiptID == "" || component.ContainerID == "" || component.ContainerName == "" || component.ImageArtifactID == "" || roles[component.Name] == "" {
+				t.Fatal("durable paused route component has no exact physical identity")
+			}
+			result = append(result, controllerJourneyPausedComponentIdentity{
+				ContainerID: component.ContainerID, Name: component.ContainerName, AppID: appID,
+				DeploymentID: deployment.DeploymentID, ReleaseID: deployment.ReleaseID,
+				PlanID: deployment.DeploymentPlanRevisionID, ArtifactID: component.ImageArtifactID,
+				Slot: component.Slot, Component: component.Name, Role: roles[component.Name], ReceiptID: receiptID,
+			})
+		}
+	}
+	if len(receipts) != 4 || len(result) != 4 {
+		t.Fatal("durable paused route roster is incomplete")
+	}
+	sort.Slice(result, func(left, right int) bool { return result[left].ContainerID < result[right].ContainerID })
+	return result
+}
+
+func controllerJourneyAssertPausedRouteContainers(t *testing.T, ctx context.Context, docker, appID, networkName, gateway,
+	dbURL, sentinel string, expected []controllerJourneyPausedComponentIdentity, probe controllerJourneyCandidate, candidateDeploymentID string,
+) {
+	t.Helper()
+	networkBody, err := controllerJourneyDocker(ctx, docker, nil, "network", "inspect", "--format", controllerJourneyAppNetworkInspectFormat, networkName)
+	var network struct {
+		ID     string            `json:"id"`
+		Name   string            `json:"name"`
+		Labels map[string]string `json:"labels"`
+	}
+	networkDecodeErr := json.Unmarshal(bytes.TrimSpace(networkBody), &network)
+	clear(networkBody)
+	if err != nil || networkDecodeErr != nil || network.ID == "" || network.Name != networkName ||
+		network.Labels["io.rig.managed"] != generatedruntime.NetworkOwnershipLabelValue || network.Labels["io.rig.application"] != appID {
+		t.Fatal("paused route app-private network identity is not attested")
+	}
+	ids, err := controllerJourneyDocker(ctx, docker, nil, "ps", "-aq", "--no-trunc", "--filter", "label=io.rig.application="+appID)
+	containerIDs := strings.Fields(string(ids))
+	clear(ids)
+	if err != nil || len(containerIDs) != 4 {
+		t.Fatal("paused route did not retain exactly four app-owned components")
+	}
+	observed := make([]controllerJourneyPausedComponentIdentity, 0, len(containerIDs))
+	for _, id := range containerIDs {
+		body, err := controllerJourneyDocker(ctx, docker, nil, "container", "inspect", "--format", controllerJourneyPausedContainerInspectFormat, id)
+		var inspection struct {
+			ID               string                                        `json:"id"`
+			Name             string                                        `json:"name"`
+			Labels           map[string]string                             `json:"labels"`
+			Env              []string                                      `json:"env"`
+			Running          bool                                          `json:"running"`
+			NetworkMode      string                                        `json:"networkMode"`
+			PIDMode          string                                        `json:"pidMode"`
+			IPCMode          string                                        `json:"ipcMode"`
+			Binds            []string                                      `json:"binds"`
+			Mounts           []controllerJourneyMountInspection            `json:"mounts"`
+			ConfiguredMounts []controllerJourneyMountInspection            `json:"configuredMounts"`
+			Networks         map[string]controllerJourneyNetworkAttachment `json:"networks"`
+		}
+		decodeErr := json.Unmarshal(bytes.TrimSpace(body), &inspection)
+		clear(body)
+		attachment, attached := inspection.Networks[networkName]
+		address := net.ParseIP(attachment.IPAddress)
+		if err != nil || decodeErr != nil || !controllerJourneyCanonicalContainerID(id) || inspection.ID != id || !inspection.Running ||
+			inspection.NetworkMode != networkName || !controllerJourneyPrivateNamespaceMode(inspection.PIDMode) ||
+			!controllerJourneyPrivateNamespaceMode(inspection.IPCMode) || len(inspection.Binds) != 0 ||
+			!controllerJourneyMountsArePrivate(inspection.Mounts) || !controllerJourneyMountsArePrivate(inspection.ConfiguredMounts) ||
+			len(inspection.Networks) != 1 || !attached || attachment.NetworkID != network.ID || attachment.Gateway != gateway ||
+			address == nil || address.IsLoopback() || inspection.Labels["io.rig.managed"] != "generated-runtime" ||
+			inspection.Labels["io.rig.application"] != appID {
+			t.Fatal("paused route container is not an owned isolated running component")
+		}
+		entries := strings.Join(inspection.Env, "\n")
+		if inspection.Labels["io.rig.component"] == "api" {
+			if !strings.Contains(entries, "NOTES_FIXTURE_DB_URL="+dbURL) || !strings.Contains(entries, "TEST_SENTINEL_SECRET="+sentinel) {
+				t.Fatal("paused API container did not retain its exact scoped server secrets")
+			}
+		} else if strings.Contains(entries, dbURL) || strings.Contains(entries, sentinel) || strings.Contains(entries, "NOTES_FIXTURE_DB_URL=") {
+			t.Fatal("paused frontend container received a server runtime secret")
+		}
+		observed = append(observed, controllerJourneyPausedComponentIdentity{
+			ContainerID: inspection.ID, Name: strings.TrimPrefix(inspection.Name, "/"), AppID: inspection.Labels["io.rig.application"],
+			DeploymentID: inspection.Labels["io.rig.deployment"], ReleaseID: inspection.Labels["io.rig.release"],
+			PlanID: inspection.Labels["io.rig.plan"], ArtifactID: inspection.Labels["io.rig.artifact"],
+			Slot: inspection.Labels["io.rig.slot"], Component: inspection.Labels["io.rig.component"],
+			Role: inspection.Labels["io.rig.role"], ReceiptID: inspection.Labels[generatedcontainer.ReceiptLabel],
+		})
+	}
+	if !controllerJourneyPausedComponentRosterMatches(expected, observed, probe, candidateDeploymentID) {
+		t.Fatal("paused route physical roster does not equal both durable deployments")
+	}
+}
+
+func controllerJourneyReadProtectedRouteState(t *testing.T, dataRoot string) controllerProcessKillRouteState {
+	t.Helper()
+	body, err := secretfile.ReadBounded(filepath.Join(dataRoot, "runtime", "generated-ingress", "routes.bundle"),
+		controllerProcessKillRouteStatePurpose, controllerProcessKillRouteStateMaxBytes)
+	if err != nil {
+		t.Fatal("read purpose-bound paused route state")
+	}
+	defer clear(body)
+	var state controllerProcessKillRouteState
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&state) != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		t.Fatal("decode purpose-bound paused route state")
+	}
+	return state
 }
 
 func controllerJourneyMountsArePrivate(mounts []controllerJourneyMountInspection) bool {
@@ -2573,6 +2943,144 @@ func TestControllerJourneyAppProbeAttestationBoundaries(t *testing.T) {
 			t.Fatal("app probe mount validation accepted a non-private mount")
 		}
 	}
+}
+
+func TestControllerJourneyGatewayReadinessPauseBoundaryControls(t *testing.T) {
+	boundary, expected, probe := controllerJourneyGatewayReadinessPauseControlFixture()
+	if !controllerJourneyGatewayPauseBoundaryMatches(boundary) ||
+		!controllerJourneyPausedComponentRosterMatches(expected, append([]controllerJourneyPausedComponentIdentity(nil), expected...), probe, boundary.Candidate.DeploymentID) {
+		t.Fatal("exact helper-level gateway readiness pause boundary was refused")
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*controllerJourneyGatewayPauseBoundary)
+	}{
+		{name: "wrong active head", mutate: func(value *controllerJourneyGatewayPauseBoundary) { value.HeadAfter.Generation++ }},
+		{name: "crossed protected predecessor route", mutate: func(value *controllerJourneyGatewayPauseBoundary) {
+			route := value.Protected.Active[value.AppID]
+			route.Endpoints[0].NetworkAlias = "crossed-alias"
+			value.Protected.Active[value.AppID] = route
+		}},
+		{name: "incorrect pause", mutate: func(value *controllerJourneyGatewayPauseBoundary) {
+			value.Job.PauseDisposition = jobs.PauseApprovalRequired
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value, _, _ := controllerJourneyGatewayReadinessPauseControlFixture()
+			test.mutate(&value)
+			if controllerJourneyGatewayPauseBoundaryMatches(value) {
+				t.Fatal("helper-level gateway readiness pause boundary accepted crossed durable state")
+			}
+		})
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func([]controllerJourneyPausedComponentIdentity) []controllerJourneyPausedComponentIdentity
+	}{
+		{name: "missing retained candidate", mutate: func(value []controllerJourneyPausedComponentIdentity) []controllerJourneyPausedComponentIdentity {
+			return value[:len(value)-1]
+		}},
+		{name: "foreign retained candidate", mutate: func(value []controllerJourneyPausedComponentIdentity) []controllerJourneyPausedComponentIdentity {
+			value[0].ContainerID = "foreign-container"
+			return value
+		}},
+		{name: "extra retained candidate", mutate: func(value []controllerJourneyPausedComponentIdentity) []controllerJourneyPausedComponentIdentity {
+			return append(value, controllerJourneyPausedComponentIdentity{ContainerID: "extra-container"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, want, gotProbe := controllerJourneyGatewayReadinessPauseControlFixture()
+			observed := test.mutate(append([]controllerJourneyPausedComponentIdentity(nil), want...))
+			if controllerJourneyPausedComponentRosterMatches(want, observed, gotProbe, boundary.Candidate.DeploymentID) {
+				t.Fatal("helper-level gateway readiness pause roster accepted an inexact retained candidate set")
+			}
+		})
+	}
+}
+
+func controllerJourneyGatewayReadinessPauseControlFixture() (controllerJourneyGatewayPauseBoundary,
+	[]controllerJourneyPausedComponentIdentity, controllerJourneyCandidate,
+) {
+	const (
+		appID                 = "11111111-1111-4111-8111-111111111111"
+		previousDeploymentID  = "22222222-2222-4222-8222-222222222222"
+		candidateDeploymentID = "33333333-3333-4333-8333-333333333333"
+		previousReleaseID     = "44444444-4444-4444-8444-444444444444"
+		candidateReleaseID    = "55555555-5555-4555-8555-555555555555"
+		planID                = "66666666-6666-4666-8666-666666666666"
+		jobID                 = "77777777-7777-4777-8777-777777777777"
+		configurationID       = "88888888-8888-4888-8888-888888888888"
+		activationReceiptID   = "99999999-9999-4999-8999-999999999999"
+	)
+	previousComponents := []generatedruntimestate.Component{
+		{DeploymentID: previousDeploymentID, Name: "api", Slot: string(generatedruntime.SlotBlue), ImageArtifactID: "previous-api-artifact", ContainerName: "previous-api", ContainerID: "previous-api-container", State: generatedruntimestate.ComponentActive},
+		{DeploymentID: previousDeploymentID, Name: "frontend", Slot: string(generatedruntime.SlotBlue), ImageArtifactID: "previous-frontend-artifact", ContainerName: "previous-frontend", ContainerID: "previous-frontend-container", State: generatedruntimestate.ComponentActive},
+	}
+	candidateComponents := []generatedruntimestate.Component{
+		{DeploymentID: candidateDeploymentID, Name: "api", Slot: string(generatedruntime.SlotGreen), ImageArtifactID: "candidate-api-artifact", ContainerName: "candidate-api", ContainerID: "candidate-api-container", State: generatedruntimestate.ComponentHealthy},
+		{DeploymentID: candidateDeploymentID, Name: "frontend", Slot: string(generatedruntime.SlotGreen), ImageArtifactID: "candidate-frontend-artifact", ContainerName: "candidate-frontend", ContainerID: "candidate-frontend-container", State: generatedruntimestate.ComponentHealthy},
+	}
+	previous := generatedruntimestate.Deployment{
+		DeploymentID: previousDeploymentID, AppID: appID, ReleaseID: previousReleaseID,
+		DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, CandidateSlot: string(generatedruntime.SlotBlue),
+		Phase: generatedruntimestate.PhaseSucceeded, Components: previousComponents,
+	}
+	candidate := generatedruntimestate.Deployment{
+		DeploymentID: candidateDeploymentID, AppID: appID, ReleaseID: candidateReleaseID,
+		DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1, CandidateSlot: string(generatedruntime.SlotGreen),
+		PreviousActiveDeploymentID: previousDeploymentID, PreviousActiveSlot: string(generatedruntime.SlotBlue),
+		Phase: generatedruntimestate.PhaseSwitchingRoute, Components: candidateComponents,
+	}
+	head := generatedruntimestate.ActiveHead{
+		AppID: appID, DeploymentID: previousDeploymentID, ReleaseID: previousReleaseID,
+		Slot: string(generatedruntime.SlotBlue), Generation: 2, ActivationReceiptID: activationReceiptID,
+	}
+	endpoint := func(component, role, containerID string, port uint16) generatedruntime.RouteEndpoint {
+		return generatedruntime.RouteEndpoint{Component: component, Role: role, ContainerID: containerID,
+			NetworkName: "rig-app-network", NetworkAlias: component + "-blue", InternalPort: port}
+	}
+	intents := []controllerJourneyCandidateIntentIdentity{
+		{ReceiptID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", DeploymentID: previousDeploymentID, Component: "api", CreatorJobID: "previous-job", CreatorAttempt: 1},
+		{ReceiptID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", DeploymentID: previousDeploymentID, Component: "frontend", CreatorJobID: "previous-job", CreatorAttempt: 1},
+		{ReceiptID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", DeploymentID: candidateDeploymentID, Component: "api", CreatorJobID: jobID, CreatorAttempt: 2},
+		{ReceiptID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", DeploymentID: candidateDeploymentID, Component: "frontend", CreatorJobID: jobID, CreatorAttempt: 2},
+	}
+	boundary := controllerJourneyGatewayPauseBoundary{
+		AppID: appID,
+		Job: jobs.Job{ID: jobID, ResourceID: appID, Status: string(jobs.WaitingUser), Phase: jobs.PauseRouteReconciliationRequired,
+			PauseDisposition: jobs.PauseRouteReconciliationRequired, Checkpoint: `{"phase":"route_reconciliation_required"}`, Attempt: 2},
+		Deployment: apicontract.Deployment{ID: candidateDeploymentID, AppID: appID, JobID: jobID, Status: string(deployments.WaitingHealth),
+			ReleaseID: candidateReleaseID, ActualConfigurationRevisionID: configurationID, ActualConfigurationRevisionNumber: 4,
+			DeploymentPlanRevisionID: planID, DeploymentPlanRevisionNumber: 1},
+		Previous: previous, Candidate: candidate, HeadBefore: head, HeadAfter: head,
+		ProtectedBefore: controllerProcessKillRouteState{Version: 1, Active: map[string]controllerProcessKillRouteRecord{
+			appID: {Slot: generatedruntime.SlotBlue, Endpoints: []generatedruntime.RouteEndpoint{
+				endpoint("api", "service", "previous-api-container", 3000), endpoint("frontend", "static", "previous-frontend-container", 8080),
+			}},
+		}},
+		History: controllerProcessKillRouteHistoryCounts{predecessorHeadReceipts: 1}, Intents: intents,
+	}
+	boundary.Protected = controllerProcessKillRouteState{Version: boundary.ProtectedBefore.Version, Active: map[string]controllerProcessKillRouteRecord{
+		appID: {Slot: boundary.ProtectedBefore.Active[appID].Slot, Endpoints: append([]generatedruntime.RouteEndpoint(nil), boundary.ProtectedBefore.Active[appID].Endpoints...)},
+	}}
+	role := map[string]string{"api": "service", "frontend": "static"}
+	receipt := make(map[string]string, len(intents))
+	for _, intent := range intents {
+		receipt[intent.DeploymentID+"\x00"+intent.Component] = intent.ReceiptID
+	}
+	var roster []controllerJourneyPausedComponentIdentity
+	for _, deployment := range []generatedruntimestate.Deployment{previous, candidate} {
+		for _, component := range deployment.Components {
+			roster = append(roster, controllerJourneyPausedComponentIdentity{
+				ContainerID: component.ContainerID, Name: component.ContainerName, AppID: appID,
+				DeploymentID: deployment.DeploymentID, ReleaseID: deployment.ReleaseID, PlanID: planID,
+				ArtifactID: component.ImageArtifactID, Slot: component.Slot, Component: component.Name,
+				Role: role[component.Name], ReceiptID: receipt[deployment.DeploymentID+"\x00"+component.Name],
+			})
+		}
+	}
+	probe := controllerJourneyCandidate{ID: "candidate-api-container", AppID: appID, DeploymentID: candidateDeploymentID, ReleaseID: candidateReleaseID}
+	return boundary, roster, probe
 }
 
 func controllerJourneyAssertAppControllerDenied(t *testing.T, ctx context.Context, docker, directory string, sources []controllerJourneyAppProbeSource, target controllerJourneyHTTPProbeTarget) {
