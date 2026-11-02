@@ -13,6 +13,7 @@ import (
 	"github.com/hostd/hostd/internal/appaccess"
 	"github.com/hostd/hostd/internal/deploymentbinding"
 	"github.com/hostd/hostd/internal/deploymentexecution"
+	"github.com/hostd/hostd/internal/deploymentplans"
 	"github.com/hostd/hostd/internal/deployments"
 	"github.com/hostd/hostd/internal/generatedcapacity"
 	"github.com/hostd/hostd/internal/generatedcontainer"
@@ -1597,7 +1598,7 @@ func validateGeneratedDomainColdSnapshot(ctx context.Context, stores *deployment
 		snapshot.plan.sourceProvider != revision.Plan.Source.Provider ||
 		snapshot.plan.sourceRepositoryID != revision.Plan.Source.RepositoryID ||
 		snapshot.plan.sourceResolvedDigest != revision.Plan.Source.ResolvedDigest ||
-		snapshot.plan.acceptanceStatus != string(revision.State) ||
+		snapshot.plan.acceptanceStatus != string(deploymentplans.RevisionAccepted) ||
 		snapshot.plan.componentCount != int64(len(protected.components)) ||
 		snapshot.configuration.formatVersion != 2 ||
 		snapshot.configuration.deploymentPlanRevisionID != pins.deploymentPlanRevisionID ||
