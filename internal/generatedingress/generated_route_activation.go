@@ -182,9 +182,11 @@ func (a *GeneratedRouteAuthority) activateRoute(ctx context.Context, pinned *dep
 	return generatedRouteActivationResult{head: head, receipt: receipt, changed: true}, nil
 }
 
-// readGeneratedRouteActivationCreatorTx derives the uniform immutable 041
-// creator from the exact candidate roster. It is read-only: the current Claim
-// remains the 042 writer and is checked at both transaction boundaries.
+// readGeneratedRouteActivationCreatorTx derives the earliest immutable 041
+// creator attempt from the exact candidate roster. Every component must have
+// been created by the same durable job and no later than the current Claim.
+// The current Claim remains the 042 writer and is checked at both transaction
+// boundaries.
 func readGeneratedRouteActivationCreatorTx(ctx context.Context, tx *sql.Tx, deploymentID string,
 	candidate []generatedruntimestate.RouteActivationComponent, claim deploymentexecution.Claim,
 ) (string, int, error) {
@@ -217,8 +219,10 @@ func readGeneratedRouteActivationCreatorTx(ctx context.Context, tx *sql.Tx, depl
 		}
 		if index == 0 {
 			creatorJobID, creatorWorkerAttempt = observedJobID, observedAttempt
-		} else if creatorJobID != observedJobID || creatorWorkerAttempt != observedAttempt {
+		} else if creatorJobID != observedJobID {
 			return "", 0, generatedruntimestate.ErrConflict
+		} else if observedAttempt < creatorWorkerAttempt {
+			creatorWorkerAttempt = observedAttempt
 		}
 		index++
 	}

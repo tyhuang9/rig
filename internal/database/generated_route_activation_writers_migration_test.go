@@ -86,6 +86,20 @@ func TestGeneratedRouteActivationWritersMigrationUpgradePreservesHistoricalChain
 }
 
 func TestGeneratedRouteActivationWritersMigrationActivationAndCompletionGuards(t *testing.T) {
+	probe := openMemoryDatabase(t)
+	defer probe.Close()
+	if err := Migrate(probe); err != nil {
+		t.Fatal(err)
+	}
+	var mixedCreatorMigration int
+	if err := probe.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version=?`,
+		generatedRouteActivationMixedCreatorsMigration).Scan(&mixedCreatorMigration); err != nil {
+		t.Fatal(err)
+	}
+	if mixedCreatorMigration != 1 {
+		t.Fatalf("047 migration count=%d", mixedCreatorMigration)
+	}
+
 	t.Run("legacy null writer requires original attempt", func(t *testing.T) {
 		t.Run("original attempt", func(t *testing.T) {
 			db := openMemoryDatabase(t)

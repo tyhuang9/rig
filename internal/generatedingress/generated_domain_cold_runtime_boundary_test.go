@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -1028,6 +1029,7 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 			predecessorPhysical := generatedRouteColdAccountingPhysicalRoster(candidateMux, predecessorIdentities)
 			processRunner, construction := generatedRouteColdAccountingPartialRestartProcess(t, identity, store,
 				physicalRoutes, candidateMux, append(append([]CandidateIdentity(nil), predecessorIdentities...), apiIdentity))
+			processRunner.routeWriteDirectory = identity.options.WorkingDirectory
 			process := &generatedColdCreatedCandidateStartRunner{delegate: processRunner, candidate: candidateMux,
 				containerID: apiIdentity.ContainerID}
 			census := construction.delegate
@@ -1169,6 +1171,7 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 			ledger := domain.Candidates().ledger
 			var memory, disk uint64
 			debts := make([]*generatedDomainCapacityDebtToken, 0, len(expectedDebts))
+			charges := make([]*candidateCapacityCharge, 0, len(expectedDebts))
 			for _, expected := range expectedDebts {
 				ledger.mu.Lock()
 				group := ledger.groups[candidateCapacityGroupKey{appID: migration.guarded.appID,
@@ -1207,6 +1210,7 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 						expected.component, component)
 				}
 				debts = append(debts, debt)
+				charges = append(charges, component.charge)
 			}
 			coordinator := domain.construction.capacity
 			coordinator.mu.Lock()
@@ -1227,8 +1231,19 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 				t.Fatalf("resume sequential created-prefix job=%+v err=%v", resumed, err)
 			}
 			frontendContainerID := strings.Repeat("a", 64)
+			type creator041 struct {
+				component string
+				receipt   string
+				job       string
+				attempt   int
+			}
 			var freshAttempt int
 			var frontendIdentity CandidateIdentity
+			var successorActivationReceiptID string
+			var mixed041Before []creator041
+			var expectedPredecessorRosterDigest string
+			var mixed041Proved bool
+			activationStage := "continuation"
 			var workerErr error
 			runGeneratedColdBoundaryWorker(t, successorMigration.jobService,
 				generatedColdBoundaryExecutor(func(ctx context.Context, job jobs.Job, _ jobs.ProgressReporter) (jobs.ExecutionResult, error) {
@@ -1354,11 +1369,101 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 						workerErr = err
 						return jobs.ExecutionResult{}, err
 					}
+					rows, err := identity.database.QueryContext(ctx, `SELECT component_name,id,creator_job_id,
+						creator_worker_attempt FROM generated_candidate_intents
+						WHERE deployment_id=? ORDER BY component_name`, successorMigration.request.DeploymentID)
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					creators := make([]creator041, 0, 2)
+					for rows.Next() {
+						var value creator041
+						if err := rows.Scan(&value.component, &value.receipt, &value.job, &value.attempt); err != nil {
+							_ = rows.Close()
+							workerErr = err
+							return jobs.ExecutionResult{}, err
+						}
+						creators = append(creators, value)
+					}
+					rowsErr := rows.Err()
+					closeErr := rows.Close()
+					if rowsErr != nil || closeErr != nil {
+						workerErr = errors.Join(rowsErr, closeErr)
+						return jobs.ExecutionResult{}, workerErr
+					}
+					mixed041Proved = len(creators) == 2 && creators[0] == (creator041{
+						component: "api", receipt: apiIdentity.ReceiptID,
+						job: job.ID, attempt: apiCreatorAttempt,
+					}) && creators[1] == (creator041{
+						component: "frontend", receipt: frontendIdentity.ReceiptID,
+						job: job.ID, attempt: job.Attempt,
+					}) && job.Attempt > apiCreatorAttempt
+					if !mixed041Proved {
+						workerErr = fmt.Errorf("pre-activation mixed 041 roster=%#v current=%s/%d original=%d",
+							creators, job.ID, job.Attempt, apiCreatorAttempt)
+						return jobs.ExecutionResult{}, workerErr
+					}
+					mixed041Before = append([]creator041(nil), creators...)
+					activationStage = "observe"
+					predecessor, err := domain.Gateway().Observe(ctx, migration.guarded.appID)
+					if err != nil || predecessor.Slot != generatedidentity.Slot(predecessorByName["api"].Slot) {
+						workerErr = errors.Join(err, fmt.Errorf("observe sequential predecessor slot=%s", predecessor.Slot))
+						return jobs.ExecutionResult{}, workerErr
+					}
+					successorEndpoints := []generatedroute.RouteEndpoint{
+						generatedRouteEndpoint(apiIdentity), generatedRouteEndpoint(frontendIdentity),
+					}
+					for _, value := range []CandidateIdentity{apiIdentity, frontendIdentity} {
+						endpoint := generatedRouteEndpoint(value)
+						physicalRoutes.endpoints[value.ContainerID] = generatedRouteEndpointSnapshot{
+							appID: migration.guarded.appID, endpoint: endpoint,
+							slot: generatedidentity.Slot(value.Slot),
+						}
+					}
+					physicalRoutes.network = apiIdentity.NetworkName
+					physicalRoutes.endpoint = successorEndpoints[0]
+					physicalRoutes.slot = generatedidentity.Slot(apiIdentity.Slot)
+					activationStage = "pin"
+					sealed, err := domain.Routes().Pin(ctx, freshExecution, generatedroute.RouteSwitchRequest{
+						AppID: migration.guarded.appID, FromSlot: predecessor.Slot,
+						ToSlot: generatedidentity.Slot(apiIdentity.Slot), Endpoints: successorEndpoints,
+					})
+					if err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					if len(sealed.predecessorRoster) != 2 {
+						workerErr = fmt.Errorf("sealed sequential predecessor roster=%#v", sealed.predecessorRoster)
+						return jobs.ExecutionResult{}, workerErr
+					}
+					expectedPredecessorRosterDigest = generatedRouteActivationRosterDigest(sealed.predecessorRoster)
+					activationStage = "activate"
+					activated, retirement, err := sealed.ActivateWithPredecessorRetirement(ctx)
+					if err != nil || retirement == nil || activated.Phase != generatedruntimestate.PhaseDraining {
+						workerErr = fmt.Errorf("stage=%s mixed041=%t: %w", activationStage, mixed041Proved,
+							errors.Join(err, fmt.Errorf("activate sequential successor phase=%s retirement=%v",
+								activated.Phase, retirement != nil)))
+						return jobs.ExecutionResult{}, workerErr
+					}
+					defer retirement.Leave()
+					successorActivationReceiptID = retirement.state.receipt.ReceiptID
+					if successorActivationReceiptID == "" {
+						workerErr = errors.New("sequential successor activation omitted receipt")
+						return jobs.ExecutionResult{}, workerErr
+					}
+					activationStage = "complete"
+					if err := retirement.Complete(ctx); err != nil {
+						workerErr = err
+						return jobs.ExecutionResult{}, err
+					}
+					activationStage = "done"
 					return jobs.ExecutionResult{}, nil
 				}), successorMigration.claim.JobID(), jobs.Succeeded, identity.options.WorkingDirectory,
 				func() string { return boundedErrorText(workerErr) })
 			if workerErr != nil {
-				t.Fatalf("fresh sequential created-prefix worker: %v", workerErr)
+				t.Fatalf("fresh sequential created-prefix worker stage=%s mixed041=%t err=%s",
+					activationStage, mixed041Proved, boundedErrorText(workerErr))
 			}
 			if freshAttempt <= apiCreatorAttempt || freshAttempt <= pausedAttempt {
 				t.Fatalf("fresh sequential attempt=%d paused=%d original=%d",
@@ -1378,6 +1483,26 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 				successorMigration.request.DeploymentID).Scan(&intentCountAfter); err != nil {
 				t.Fatal(err)
 			}
+			rowsAfter, err := identity.database.Query(`SELECT component_name,id,creator_job_id,
+				creator_worker_attempt FROM generated_candidate_intents
+				WHERE deployment_id=? ORDER BY component_name`, successorMigration.request.DeploymentID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mixed041After := make([]creator041, 0, 2)
+			for rowsAfter.Next() {
+				var value creator041
+				if err := rowsAfter.Scan(&value.component, &value.receipt, &value.job, &value.attempt); err != nil {
+					rowsAfter.Close()
+					t.Fatal(err)
+				}
+				mixed041After = append(mixed041After, value)
+			}
+			rowsAfterErr := rowsAfter.Err()
+			rowsAfterCloseErr := rowsAfter.Close()
+			if rowsAfterErr != nil || rowsAfterCloseErr != nil {
+				t.Fatal(errors.Join(rowsAfterErr, rowsAfterCloseErr))
+			}
 			_, capacityCallsAfter := owner.source.observed()
 			apiRunning := candidateMux.physical[apiIdentity.ContainerID]
 			frontendRunning := candidateMux.physical[frontendIdentity.ContainerID]
@@ -1389,8 +1514,14 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			finalRoute, finalRouteFound := finalState.Active[migration.guarded.appID]
+			wantFinalRoute := routeRecord{Slot: generatedidentity.Slot(apiIdentity.Slot),
+				Endpoints: []generatedroute.RouteEndpoint{
+					generatedRouteEndpoint(apiIdentity), generatedRouteEndpoint(frontendIdentity),
+				}}
 			if apiCreatorAttemptAfter != apiCreatorAttempt || intentCountAfter != 2 ||
 				frontendCreatorAttempt != freshAttempt || frontendCreatorAttempt == apiCreatorAttempt ||
+				!reflect.DeepEqual(mixed041After, mixed041Before) ||
 				!generatedcontainer.MatchesRunning(candidateOwnerPhysicalInspection(apiRunning),
 					apiRunningExpected, apiRunning.policy.limits) ||
 				!generatedcontainer.CurrentlyRunning(candidateOwnerPhysicalInspection(apiRunning)) ||
@@ -1399,17 +1530,288 @@ func TestGeneratedDomainColdRuntimeBoundary(t *testing.T) {
 				!generatedcontainer.CurrentlyRunning(candidateOwnerPhysicalInspection(frontendRunning)) ||
 				owner.runner.count(candidateOwnerCreate) != createBefore+1 ||
 				owner.runner.count(candidateOwnerStart) != startBefore+2 ||
-				owner.runner.count(candidateOwnerStop) != stopBefore ||
-				owner.runner.count(candidateOwnerRemove) != removeBefore ||
+				owner.runner.count(candidateOwnerStop) != stopBefore+len(predecessorIdentities) ||
+				owner.runner.count(candidateOwnerRemove) != removeBefore+len(predecessorIdentities) ||
 				capacityCallsAfter != originalCapacityCalls ||
 				generatedColdBoundaryCapacityProbes(construction.snapshot()) != 0 ||
-				!reflect.DeepEqual(stateBefore, finalState) {
+				successorActivationReceiptID == "" || finalState.Pending != nil || !finalRouteFound ||
+				!sameRoute(finalRoute, wantFinalRoute) {
 				t.Fatalf("fresh sequential continuation effects/provenance: attempts=%d/%d apiAfter=%d intents=%d running=%t/%t commands=%d/%d/%d/%d capacity=%d/%d probes=%d",
 					apiCreatorAttempt, frontendCreatorAttempt, apiCreatorAttemptAfter, intentCountAfter,
 					apiRunning.running, frontendRunning.running,
 					owner.runner.count(candidateOwnerCreate), owner.runner.count(candidateOwnerStart),
 					owner.runner.count(candidateOwnerStop), owner.runner.count(candidateOwnerRemove),
 					originalCapacityCalls, capacityCallsAfter, generatedColdBoundaryCapacityProbes(construction.snapshot()))
+			}
+
+			finalSnapshot, err := identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidateRoster, err := runtimeState.RouteActivationRoster(context.Background(),
+				migration.guarded.appID, successorMigration.request.DeploymentID,
+				generatedruntimestate.ComponentActive)
+			if err != nil || len(candidateRoster) != 2 ||
+				candidateRoster[0].ComponentName != "api" ||
+				candidateRoster[0].CandidateReceiptID != apiIdentity.ReceiptID ||
+				candidateRoster[1].ComponentName != "frontend" ||
+				candidateRoster[1].CandidateReceiptID != frontendIdentity.ReceiptID {
+				t.Fatalf("final sequential candidate roster=%#v error=%v", candidateRoster, err)
+			}
+			var activation generatedruntimestate.GeneratedDomainStartupRouteActivation
+			activationCount := 0
+			for _, value := range finalSnapshot.Runtime.RouteActivations {
+				if value.SuccessorDeploymentID == successorMigration.request.DeploymentID {
+					activation, activationCount = value, activationCount+1
+				}
+			}
+			if activationCount != 1 || activation.ReceiptID != successorActivationReceiptID ||
+				activation.CreatorJobID != successorMigration.claim.JobID() ||
+				activation.CreatorWorkerAttempt != apiCreatorAttempt ||
+				activation.WriterJobID != successorMigration.claim.JobID() ||
+				activation.WriterWorkerAttempt != freshAttempt ||
+				activation.CandidateRosterDigest != generatedRouteActivationRosterDigest(candidateRoster) ||
+				activation.PredecessorRosterDigest != expectedPredecessorRosterDigest ||
+				activation.PredecessorDeploymentID != predecessorHead.DeploymentID ||
+				activation.PredecessorActivationReceiptID != predecessorHead.ActivationReceiptID {
+				t.Fatalf("final sequential activation=%#v count=%d", activation, activationCount)
+			}
+			retiredComponents := make(map[string]generatedruntimestate.PredecessorRetirementObservation, 2)
+			for _, value := range finalSnapshot.Runtime.PredecessorRetirementComponents {
+				if value.ActivationReceiptID == successorActivationReceiptID {
+					retiredComponents[value.ComponentName] = value
+				}
+			}
+			for _, component := range components {
+				observed, found := retiredComponents[component]
+				want := predecessorByName[component]
+				var policyDigest string
+				if err := identity.database.QueryRow(`SELECT candidate_policy_digest
+					FROM generated_candidate_intents WHERE id=?`, want.ReceiptID).Scan(&policyDigest); err != nil {
+					t.Fatal(err)
+				}
+				if !found || observed.CandidateReceiptID != want.ReceiptID ||
+					observed.ContainerID != want.ContainerID || observed.CandidatePolicyDigest != policyDigest {
+					t.Fatalf("final sequential 043 component %s=%#v found=%t", component, observed, found)
+				}
+			}
+			var retirementReceipt generatedruntimestate.PredecessorRetirementReceipt
+			var authorization generatedruntimestate.RouteAccountingHandoffAuthorization
+			var handoff generatedruntimestate.RouteAccountingHandoffReceipt
+			var completion generatedruntimestate.RouteCompletionReceipt
+			for _, value := range finalSnapshot.Runtime.PredecessorRetirementReceipts {
+				if value.ActivationReceiptID == successorActivationReceiptID {
+					retirementReceipt = value
+				}
+			}
+			for _, value := range finalSnapshot.Runtime.AccountingHandoffAuthorizations {
+				if value.ActivationReceiptID == successorActivationReceiptID {
+					authorization = value
+				}
+			}
+			for _, value := range finalSnapshot.Runtime.AccountingHandoffReceipts {
+				if value.ActivationReceiptID == successorActivationReceiptID {
+					handoff = value
+				}
+			}
+			for _, value := range finalSnapshot.Runtime.RouteCompletionReceipts {
+				if value.ActivationReceiptID == successorActivationReceiptID {
+					completion = value
+				}
+			}
+			if retirementReceipt.ActivationReceiptID == "" || retirementReceipt.ComponentCount != 2 ||
+				retirementReceipt.AppID != migration.guarded.appID ||
+				retirementReceipt.SuccessorDeploymentID != successorMigration.request.DeploymentID ||
+				retirementReceipt.PredecessorDeploymentID != predecessorHead.DeploymentID ||
+				retirementReceipt.PredecessorRosterDigest != activation.PredecessorRosterDigest ||
+				authorization.ActivationReceiptID == "" || authorization.SuccessorComponentCount != 2 ||
+				authorization.PredecessorComponentCount != 2 ||
+				authorization.AppID != migration.guarded.appID ||
+				authorization.SuccessorDeploymentID != successorMigration.request.DeploymentID ||
+				authorization.PredecessorDeploymentID != predecessorHead.DeploymentID ||
+				authorization.CandidateRosterDigest != activation.CandidateRosterDigest ||
+				authorization.PredecessorRosterDigest != activation.PredecessorRosterDigest ||
+				handoff.ActivationReceiptID == "" || handoff.AppID != migration.guarded.appID ||
+				handoff.SuccessorDeploymentID != successorMigration.request.DeploymentID ||
+				handoff.PredecessorDeploymentID != predecessorHead.DeploymentID ||
+				handoff.SuccessorComponentCount != 2 || handoff.PredecessorComponentCount != 2 ||
+				handoff.CandidateRosterDigest != activation.CandidateRosterDigest ||
+				handoff.PredecessorRosterDigest != activation.PredecessorRosterDigest ||
+				completion.ActivationReceiptID == "" || completion.CreatorJobID != successorMigration.claim.JobID() ||
+				completion.CreatorWorkerAttempt != apiCreatorAttempt ||
+				completion.CurrentJobID != successorMigration.claim.JobID() ||
+				completion.CurrentWorkerAttempt != freshAttempt || completion.AppID != migration.guarded.appID ||
+				completion.SuccessorDeploymentID != successorMigration.request.DeploymentID ||
+				completion.CompletionCode != "deployment_completed" {
+				t.Fatalf("final sequential 043-045 retirement=%#v authorization=%#v handoff=%#v completion=%#v",
+					retirementReceipt, authorization, handoff, completion)
+			}
+			finalHead, err := runtimeState.Active(context.Background(), migration.guarded.appID)
+			if err != nil || finalHead.DeploymentID != successorMigration.request.DeploymentID ||
+				finalHead.ActivationReceiptID != successorActivationReceiptID ||
+				finalHead.Generation != predecessorHead.Generation+1 {
+				t.Fatalf("final sequential active head=%#v error=%v", finalHead, err)
+			}
+			terminalAccounting := true
+			for index, expected := range expectedDebts {
+				ledger.mu.Lock()
+				group := ledger.groups[candidateCapacityGroupKey{appID: migration.guarded.appID,
+					deploymentID: expected.deploymentID}]
+				ledger.mu.Unlock()
+				if group == nil {
+					terminalAccounting = false
+					continue
+				}
+				group.mu.Lock()
+				component := group.byName[expected.component]
+				if index < 2 {
+					terminalAccounting = terminalAccounting && component != nil && component.charge == charges[index] &&
+						charges[index].state == candidateChargeReleased &&
+						charges[index].owner == candidateAccountingPredecessorRetired &&
+						charges[index].logicallyRetired
+				} else {
+					terminalAccounting = terminalAccounting && component != nil && component.charge == charges[index] &&
+						charges[index].state == candidateChargeActive &&
+						charges[index].owner == candidateAccountingRouteActive &&
+						!charges[index].logicallyRetired
+				}
+				group.mu.Unlock()
+			}
+			coordinator.mu.Lock()
+			terminalAccounting = terminalAccounting && coordinator.phase == generatedDomainCapacityPublished &&
+				coordinator.borrows == 0 && len(coordinator.tokens) == 2
+			for index, debt := range debts {
+				_, registered := coordinator.tokens[debt]
+				terminalAccounting = terminalAccounting && (index < 2 && !registered && !debt.active ||
+					index >= 2 && registered && debt.active)
+			}
+			coordinator.mu.Unlock()
+			if !terminalAccounting {
+				t.Fatal("final sequential accounting did not release predecessor and retain exact successor debt")
+			}
+
+			// This is deliberately a lower-layer post-completion replay of the
+			// production startup readers and cold attestations. A second public New
+			// in this process would only join the singleton and would not prove a
+			// fresh-process reconstruction.
+			attemptBeforeReplay := freshAttempt
+			createReplay, startReplay := owner.runner.count(candidateOwnerCreate), owner.runner.count(candidateOwnerStart)
+			stopReplay, removeReplay := owner.runner.count(candidateOwnerStop), owner.runner.count(candidateOwnerRemove)
+			presentContainers := make([]string, 0, 2)
+			for id, physical := range candidateMux.physical {
+				if physical.exists {
+					presentContainers = append(presentContainers, id)
+				}
+			}
+			sort.Strings(presentContainers)
+			expectedPresent := []string{apiIdentity.ContainerID, frontendIdentity.ContainerID}
+			sort.Strings(expectedPresent)
+			predecessorAbsent := true
+			for _, identity := range predecessorIdentities {
+				physical, found := candidateMux.physical[identity.ContainerID]
+				if !found || physical.exists {
+					predecessorAbsent = false
+				}
+			}
+			if !reflect.DeepEqual(presentContainers, expectedPresent) || !predecessorAbsent {
+				t.Fatalf("lower-layer completed replay physical census=%v want=%v predecessorAbsent=%t",
+					presentContainers, expectedPresent, predecessorAbsent)
+			}
+			successorIdentities := []CandidateIdentity{apiIdentity, frontendIdentity}
+			successorPhysical := generatedRouteColdAccountingPhysicalRoster(candidateMux, successorIdentities)
+			if len(successorPhysical) != 2 {
+				t.Fatalf("lower-layer completed replay successor physical=%#v", successorPhysical)
+			}
+			for index, physical := range successorPhysical {
+				want := successorIdentities[index]
+				expected := physical.policy.identity
+				expected.ContainerID = want.ContainerID
+				if !physical.exists || !physical.running || physical.containerID != want.ContainerID ||
+					physical.policy.identity.ReceiptID != want.ReceiptID || physical.policy.identity.Component != want.ComponentName ||
+					!generatedcontainer.MatchesRunning(candidateOwnerPhysicalInspection(physical), expected,
+						physical.policy.limits) || !generatedcontainer.CurrentlyRunning(candidateOwnerPhysicalInspection(physical)) {
+					t.Fatalf("lower-layer completed replay successor %s physical=%#v identity=%#v",
+						want.ComponentName, physical, want)
+				}
+			}
+			builderRunner, ok := processRunner.cold.(*generatedDomainTwoComponentRouteRunner)
+			if !ok || builderRunner == nil || builderRunner.builder == nil || construction.delegate == nil {
+				t.Fatalf("lower-layer completed replay immutable runner binding cold=%T builder=%v census=%v",
+					processRunner.cold, builderRunner != nil && builderRunner.builder != nil,
+					construction.delegate != nil)
+			}
+			replayObjects := make([]generatedDomainDockerObject, 0, len(construction.delegate.objects))
+			for _, object := range construction.delegate.objects {
+				if object.kind == "container" && object.labels["io.rig.application"] == migration.guarded.appID {
+					continue
+				}
+				replayObjects = append(replayObjects, cloneGeneratedDomainColdRetainedGatewayObject(object))
+			}
+			for _, object := range generatedDomainA0ApplicationObjects(t, successorPhysical) {
+				if object.kind == "container" {
+					replayObjects = append(replayObjects, object)
+					continue
+				}
+				matched := false
+				for _, retained := range replayObjects {
+					if retained.kind != object.kind || object.kind == "image" && retained.id != object.id ||
+						object.kind == "network" && retained.name != object.name {
+						continue
+					}
+					matched = true
+					if !reflect.DeepEqual(retained, object) {
+						t.Fatalf("lower-layer completed replay crossed retained %s object: retained=%#v current=%#v",
+							object.kind, retained, object)
+					}
+					break
+				}
+				if !matched {
+					replayObjects = append(replayObjects, object)
+				}
+			}
+			replayCensus := &generatedDomainRecoveryCensusRunner{daemonID: construction.delegate.daemonID,
+				objects: replayObjects, imageID: construction.delegate.imageID, gateway: construction.delegate.gateway}
+			replayConstruction := &generatedDomainConstructionRunner{roster: candidateMux, delegate: replayCensus,
+				capacity: append([]byte(nil), construction.capacity...)}
+			replayBuilder := &generatedDomainTwoComponentRouteRunner{delegate: replayConstruction,
+				builder: builderRunner.builder}
+			replayProcess := &generatedRouteColdAccountingRunner{cold: replayBuilder, routes: physicalRoutes,
+				routeWriteDirectory: identity.options.WorkingDirectory, predecessor: candidateMux,
+				predecessorPhysical: successorPhysical}
+			observedReplay, err := inspectGeneratedDomainStartupObservation(context.Background(), identity.stores,
+				replayProcess, identity.options)
+			if err != nil {
+				t.Fatalf("lower-layer completed replay observation: %v", err)
+			}
+			groupsReplay, err := readGeneratedDomainColdGroups(context.Background(), domain.Candidates(), observedReplay)
+			if err != nil {
+				t.Fatalf("lower-layer completed replay groups: %v", err)
+			}
+			var retainedGateway generatedDomainColdRetainedGatewayProof
+			var retainedV2 generatedDomainColdRetainedV2Proof
+			if err := attestGeneratedDomainColdGroupsWithPendingProofs(context.Background(), domain.Gateway(),
+				domain.Candidates(), observedReplay, groupsReplay, nil, &retainedGateway, &retainedV2); err != nil {
+				t.Fatalf("lower-layer completed replay attestation: %v", err)
+			}
+			replayedSnapshot, err := identity.stores.GeneratedDomainStartupSnapshot(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var attemptAfterReplay int
+			if err := identity.database.QueryRow(`SELECT attempt FROM jobs WHERE id=?`,
+				successorMigration.claim.JobID()).Scan(&attemptAfterReplay); err != nil {
+				t.Fatal(err)
+			}
+			if attemptAfterReplay != attemptBeforeReplay || !reflect.DeepEqual(replayedSnapshot, finalSnapshot) ||
+				owner.runner.count(candidateOwnerCreate) != createReplay ||
+				owner.runner.count(candidateOwnerStart) != startReplay ||
+				owner.runner.count(candidateOwnerStop) != stopReplay ||
+				owner.runner.count(candidateOwnerRemove) != removeReplay {
+				t.Fatalf("lower-layer completed replay mutated history/attempt/effects: attempt=%d/%d history=%t commands=%d/%d/%d/%d want=%d/%d/%d/%d",
+					attemptBeforeReplay, attemptAfterReplay, reflect.DeepEqual(replayedSnapshot, finalSnapshot),
+					owner.runner.count(candidateOwnerCreate), owner.runner.count(candidateOwnerStart),
+					owner.runner.count(candidateOwnerStop), owner.runner.count(candidateOwnerRemove),
+					createReplay, startReplay, stopReplay, removeReplay)
 			}
 		})
 	})
