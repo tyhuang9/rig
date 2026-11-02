@@ -58,6 +58,10 @@ current_serving_predecessor_pattern='^TestGatewayCurrentPredecessor'
 # complete construction, startup, capacity and gateway-operation parent trees
 # in complementary groups; new tests in each family inherit the same split.
 domain_pattern='^TestGeneratedDomain'
+# Split recovery/accounting after the cumulative construction package timeout.
+# Keep complete parent trees in a complementary group and retain the general
+# domain selector as the fallback for future construction tests.
+domain_recovery_pattern='^TestGeneratedDomain(RestartAccounting|Recovered)'
 # Cold retained proofs exhausted the construction package budget. Separate
 # their complete parent trees and other cold cases without changing deadlines.
 # The established domain-cold prefixes retain priority in both new groups.
@@ -212,7 +216,11 @@ case "$suite" in
     ;;
   domain-construction)
     packages=(./internal/generatedingress)
-    filter=(-run "$domain_pattern" -skip "$domain_startup_pattern|$domain_a0_pattern|$domain_all_cold_pattern")
+    filter=(-run "$domain_pattern" -skip "$domain_startup_pattern|$domain_a0_pattern|$domain_all_cold_pattern|$domain_recovery_pattern")
+    ;;
+  domain-recovery-accounting)
+    packages=(./internal/generatedingress)
+    filter=(-run "$domain_recovery_pattern")
     ;;
   domain-cold-retained)
     packages=(./internal/generatedingress)
@@ -258,11 +266,38 @@ go test -json "${race_flags[@]}" -count=1 -timeout=32m "${filter[@]}" "${package
 # An empty selection must not satisfy a required race check. pipefail above
 # preserves every test, race, compilation and output-capture failure.
 expected_outer_tests=0
+required_parents=()
 case "$suite" in
   domain-a0) expected_outer_tests=4 ;;
   domain-cold) expected_outer_tests=19 ;;
+  domain-construction)
+    required_parents=(
+      TestGeneratedDomainEmptyBootstrapEffectBoundaries
+      TestGeneratedDomainConstructionCanonicalInputsAndStickyClassification
+    )
+    ;;
+  domain-recovery-accounting)
+    required_parents=(
+      TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls
+      TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending
+      TestGeneratedDomainRecoveredRetirementFailureBoundariesPreserveDebt
+    )
+    ;;
 esac
-if [[ "$expected_outer_tests" -gt 0 ]]; then
+if [[ "${#required_parents[@]}" -gt 0 ]]; then
+  # Require portable anchors, not a fixed total that rejects new tests. A
+  # sibling, child-only pass, skipped anchor or another package cannot satisfy
+  # the gate; the selected package itself must also complete successfully.
+  required_json="$(printf '%s\n' "${required_parents[@]}" | jq -Rsc 'split("\n")[:-1]')"
+  jq -se --arg package 'github.com/hostd/hostd/internal/generatedingress' --argjson required "$required_json" '
+    [.[] | select(.Package == $package)] as $events |
+    ([$events[] | select(.Action == "pass" and .Test == null)] | length) == 1 and
+    all($events[]; .Action != "fail") and
+    all($required[]; . as $name |
+      ([$events[] | select(.Test == $name and .Action == "pass")] | length) == 1 and
+      all($events[]; .Test != $name or .Action != "skip"))
+  ' "$output" > /dev/null
+elif [[ "$expected_outer_tests" -gt 0 ]]; then
   jq -se --argjson expected "$expected_outer_tests" '
     ([.[] | select(.Action == "pass" and ((.Test // "") | test("^Test[^/]+$"))) ] | length) == $expected
   ' "$output" > /dev/null

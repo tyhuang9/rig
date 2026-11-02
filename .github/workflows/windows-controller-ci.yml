@@ -120,6 +120,7 @@ jobs:
           - current-serving-predecessor
           - current-serving
           - domain-construction
+          - domain-recovery-accounting
           - domain-cold-retained
           - domain-cold-remainder
           - domain-a0
