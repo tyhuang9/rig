@@ -4918,7 +4918,19 @@ func prepareGeneratedRouteSequentialCandidates(t *testing.T, owner *candidateOwn
 		t.Fatal("multi-component candidate requires exact component and container rosters")
 	}
 	reservation := owner.reserve(t)
+	reservationOwned := true
+	defer func() {
+		if reservationOwned {
+			reservation.Release()
+		}
+	}()
 	execution := owner.pin(t, reservation)
+	executionOwned := true
+	defer func() {
+		if executionOwned {
+			execution.Leave()
+		}
+	}()
 	invocations := make([]GeneratedCandidateInvocation, 0, len(componentNames))
 	identities := make([]CandidateIdentity, 0, len(componentNames))
 	for index, name := range componentNames {
@@ -4956,6 +4968,8 @@ func prepareGeneratedRouteSequentialCandidates(t *testing.T, owner *candidateOwn
 	if _, err := execution.FinishHealth(); err != nil {
 		t.Fatal(err)
 	}
+	executionOwned = false
+	reservationOwned = false
 	return reservation, execution, identities
 }
 
@@ -6250,6 +6264,13 @@ func newGeneratedRouteColdAccountingPartialRetirementFixture(t *testing.T) (
 		options, 4)
 	firstReservation, firstExecution, firstIdentities := prepareGeneratedRouteSequentialCandidates(t, owner,
 		components, []string{strings.Repeat("7", 64), strings.Repeat("8", 64)})
+	firstCandidatesOwned := true
+	defer func() {
+		if firstCandidatesOwned {
+			firstExecution.Leave()
+			firstReservation.Release()
+		}
+	}()
 
 	store, err := newStateStore(identity.dataRoot)
 	if err != nil {
@@ -6271,13 +6292,15 @@ func newGeneratedRouteColdAccountingPartialRetirementFixture(t *testing.T) (
 	}
 	routeRunner := &generatedDomainTwoComponentRouteRunner{daemonID: "generated-domain-cold-partial-retirement",
 		delegate: physicalRoutes}
+	routeReadRunner := &generatedRouteColdAccountingRouteReadRunner{routes: physicalRoutes,
+		delegate: routeRunner}
 	manager, err := assembleGeneratedDomainManager(generatedDomainReservationInput{database: identity.database,
-		stores: identity.stores, runner: routeRunner, options: identity.options}, store)
+		stores: identity.stores, runner: routeReadRunner, options: identity.options}, store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	physical, _, err := inspectGeneratedDomainPhysicalIdentity(context.Background(), identity.stores,
-		routeRunner, identity.options)
+		routeReadRunner, identity.options)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6299,6 +6322,12 @@ func newGeneratedRouteColdAccountingPartialRetirementFixture(t *testing.T) (
 		t.Fatal(err)
 	}
 	_, firstRetirement, err := firstSealed.ActivateWithPredecessorRetirement(migration.guarded.context)
+	firstRetirementOwned := firstRetirement != nil
+	defer func() {
+		if firstRetirementOwned {
+			firstRetirement.Leave()
+		}
+	}()
 	if err != nil || firstRetirement == nil {
 		t.Fatalf("activate multi-component initial Current retirement=%#v error=%v", firstRetirement, err)
 	}
@@ -6318,6 +6347,13 @@ func newGeneratedRouteColdAccountingPartialRetirementFixture(t *testing.T) (
 	owner.validation = newGeneratedRouteSuccessorValidation(t, successorMigration)
 	secondReservation, secondExecution, secondIdentities := prepareGeneratedRouteSequentialCandidates(t, owner,
 		components, []string{strings.Repeat("9", 64), strings.Repeat("a", 64)})
+	secondCandidatesOwned := true
+	defer func() {
+		if secondCandidatesOwned {
+			secondExecution.Leave()
+			secondReservation.Release()
+		}
+	}()
 	currentRoute, err := manager.Observe(context.Background(), migration.guarded.appID)
 	if err != nil {
 		t.Fatalf("observe multi-component initial Current route: %v", err)
@@ -6340,8 +6376,18 @@ func newGeneratedRouteColdAccountingPartialRetirementFixture(t *testing.T) (
 	physicalRoutes.endpoint = generatedRouteEndpoint(secondIdentities[0])
 	physicalRoutes.slot = generatedidentity.Slot(secondIdentities[0].Slot)
 	_, secondRetirement, err := secondSealed.ActivateWithPredecessorRetirement(successorMigration.guarded.context)
+	secondRetirementOwned := secondRetirement != nil
+	defer func() {
+		if secondRetirementOwned {
+			secondRetirement.Leave()
+		}
+	}()
 	if err != nil || secondRetirement == nil {
 		t.Fatalf("activate multi-component successor retirement=%#v error=%v", secondRetirement, err)
+	}
+	secondActivationReceipt := secondRetirement.state.receipt
+	if secondActivationReceipt.ReceiptID == "" {
+		t.Fatal("multi-component successor activation omitted its durable receipt")
 	}
 
 	predecessorByName := generatedRouteColdAccountingIdentityMap(t, components, firstIdentities)
@@ -6360,29 +6406,33 @@ func newGeneratedRouteColdAccountingPartialRetirementFixture(t *testing.T) (
 	owner.runner.setResult(candidateOwnerStop, nil)
 	var componentRows, aggregateRows int
 	if err := identity.database.QueryRow(`SELECT COUNT(*) FROM generated_route_predecessor_retirements
-		WHERE activation_receipt_id=?`, secondRetirement.state.receipt.ReceiptID).Scan(&componentRows); err != nil {
+		WHERE activation_receipt_id=?`, secondActivationReceipt.ReceiptID).Scan(&componentRows); err != nil {
 		t.Fatal(err)
 	}
 	if err := identity.database.QueryRow(`SELECT COUNT(*) FROM generated_route_predecessor_retirement_receipts
-		WHERE activation_receipt_id=?`, secondRetirement.state.receipt.ReceiptID).Scan(&aggregateRows); err != nil {
+		WHERE activation_receipt_id=?`, secondActivationReceipt.ReceiptID).Scan(&aggregateRows); err != nil {
 		t.Fatal(err)
 	}
 	if componentRows != 1 || aggregateRows != 0 {
 		t.Fatalf("partial predecessor durable rows components=%d aggregate=%d", componentRows, aggregateRows)
 	}
 	recorded := generatedRouteColdAccountingRetirementObservation(t, identity.database,
-		secondRetirement.state.receipt.ReceiptID, "api")
+		secondActivationReceipt.ReceiptID, "api")
 	if recorded.ContainerID != predecessorByName["api"].ContainerID ||
 		recorded.CandidateReceiptID != predecessorByName["api"].ReceiptID {
 		t.Fatalf("partial predecessor observation=%#v", recorded)
 	}
 
 	secondRetirement.Leave()
+	secondRetirementOwned = false
 	secondExecution.Leave()
 	secondReservation.Release()
+	secondCandidatesOwned = false
 	firstRetirement.Leave()
+	firstRetirementOwned = false
 	firstExecution.Leave()
 	firstReservation.Release()
+	firstCandidatesOwned = false
 	if err := migration.releaseEffects(); err != nil {
 		t.Fatalf("release multi-component fixture effects before restart: %v", err)
 	}
@@ -6393,7 +6443,7 @@ func newGeneratedRouteColdAccountingPartialRetirementFixture(t *testing.T) (
 		jobs: successorMigration.jobService, process: process, routes: physicalRoutes,
 		predecessor: owner.runner, construction: construction,
 		environment:  &candidateFactoryEnvironment{path: t.TempDir()},
-		firstReceipt: secondRetirement.state.receipt, componentName: "api",
+		firstReceipt: secondActivationReceipt, componentName: "api",
 		componentReceipt:      successorByName["api"].ReceiptID,
 		predecessorReceipt:    predecessorByName["api"].ReceiptID,
 		lifecycleDeploymentID: migration.request.DeploymentID, restoresPredecessor: true,
