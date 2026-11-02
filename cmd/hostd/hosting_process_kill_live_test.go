@@ -63,8 +63,10 @@ const (
 	controllerKillAfterRetire  controllerProcessKillBoundary = "after_predecessor_retirement_before_handoff"
 	controllerKillAfterAuth    controllerProcessKillBoundary = "after_handoff_authorization_before_receipt"
 	controllerKillAfterHandoff controllerProcessKillBoundary = "after_predecessor_handoff_before_completion"
-	controllerKillAfterSuccess controllerProcessKillBoundary = "after_runtime_success"
-	controllerKillAfterMain    controllerProcessKillBoundary = "after_main_success"
+	// Generated route completion commits runtime, main deployment, route
+	// completion receipt and job success atomically. This is the sole durable
+	// post-completion process-kill boundary.
+	controllerKillAfterMain controllerProcessKillBoundary = "after_main_success"
 )
 
 // controllerProcessKillBarrier is file-backed so that the parent test can
@@ -457,11 +459,54 @@ func TestControllerProcessKillBoundaryControls(t *testing.T) {
 		}
 	}
 	for _, boundary := range []controllerProcessKillBoundary{
-		"unknown", controllerKillAfterRoute, controllerKillAfterSuccess,
+		"unknown", controllerKillAfterRoute, controllerKillAfterMain,
 	} {
 		if create, drop, ok := controllerProcessKillFaultStatements(boundary); ok || create != "" || drop != "" {
 			t.Fatalf("non-handoff boundary %q selected a fault", boundary)
 		}
+	}
+	for _, test := range []struct {
+		name     string
+		boundary controllerProcessKillBoundary
+		before   jobs.Job
+		current  jobs.Job
+		want     bool
+	}{
+		{name: "interrupted replacement increments attempt", boundary: controllerKillBeforeDrain,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Running), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 2, Input: json.RawMessage(`{"release":"one"}`)}, want: true},
+		{name: "retirement prefix uses two recovery attempts", boundary: controllerKillAfterRetire,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Running), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 3, Input: json.RawMessage(`{"release":"one"}`)}, want: true},
+		{name: "atomic completion preserves terminal attempt", boundary: controllerKillAfterMain,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)}, want: true},
+		{name: "atomic completion refuses running precondition", boundary: controllerKillAfterMain,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Running), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)}},
+		{name: "atomic completion refuses requeue", boundary: controllerKillAfterMain,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 2, Input: json.RawMessage(`{"release":"one"}`)}},
+		{name: "atomic completion refuses terminal metadata drift", boundary: controllerKillAfterMain,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Succeeded), Phase: "succeeded", Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "job", Status: string(jobs.Succeeded), Phase: "changed", Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)}},
+		{name: "interrupted replacement refuses terminal precondition", boundary: controllerKillBeforeDrain,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 2, Input: json.RawMessage(`{"release":"one"}`)}},
+		{name: "restart refuses crossed job", boundary: controllerKillBeforeDrain,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Running), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "other", Status: string(jobs.Succeeded), Attempt: 2, Input: json.RawMessage(`{"release":"one"}`)}},
+		{name: "restart refuses crossed input", boundary: controllerKillAfterMain,
+			before:  jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 1, Input: json.RawMessage(`{"release":"one"}`)},
+			current: jobs.Job{ID: "job", Status: string(jobs.Succeeded), Attempt: 1, Input: json.RawMessage(`{"release":"two"}`)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := controllerProcessKillJobAtBoundaryMatches(test.boundary, test.before) &&
+				controllerProcessKillCompletedJobMatches(test.boundary, test.before, test.current)
+			if got != test.want {
+				t.Fatalf("job boundary match=%t want=%t", got, test.want)
+			}
+		})
 	}
 	for _, reason := range []string{
 		"cold_retained_gateway_final_identity",
@@ -589,6 +634,31 @@ func TestControllerProcessKillBoundaryControls(t *testing.T) {
 	}
 }
 
+func controllerProcessKillJobAtBoundaryMatches(boundary controllerProcessKillBoundary, job jobs.Job) bool {
+	if job.ID == "" || len(job.Input) == 0 || job.Attempt != 1 {
+		return false
+	}
+	if boundary == controllerKillAfterMain {
+		return job.Status == string(jobs.Succeeded)
+	}
+	return job.Status == string(jobs.Running)
+}
+
+func controllerProcessKillCompletedJobMatches(boundary controllerProcessKillBoundary, before, current jobs.Job) bool {
+	if !controllerProcessKillJobAtBoundaryMatches(boundary, before) || current.Status != string(jobs.Succeeded) ||
+		current.ID != before.ID || !bytes.Equal(current.Input, before.Input) {
+		return false
+	}
+	wantAttempt := before.Attempt + 1
+	if boundary == controllerKillAfterRetire {
+		wantAttempt = before.Attempt + 2
+	}
+	if boundary == controllerKillAfterMain {
+		return reflect.DeepEqual(before, current)
+	}
+	return current.Attempt == wantAttempt
+}
+
 type controllerProcessKillExecutor struct {
 	delegate jobs.Executor
 	barrier  *controllerProcessKillBarrier
@@ -601,7 +671,7 @@ func (e controllerProcessKillExecutor) Execute(ctx context.Context, job jobs.Job
 	if e.barrier != nil && (e.barrier.boundary == controllerKillAfterRetire ||
 		e.barrier.boundary == controllerKillAfterAuth || e.barrier.boundary == controllerKillAfterHandoff) {
 		result, err := controllerProcessKillExecuteWithFixedFault(ctx, e.delegate, job,
-			controllerProcessKillReporter{delegate: reporter, barrier: e.barrier}, e.barrier)
+			reporter, e.barrier)
 		wantAuthorization, wantHandoff := 0, 0
 		if e.barrier.boundary == controllerKillAfterAuth {
 			wantAuthorization = 1
@@ -622,12 +692,16 @@ func (e controllerProcessKillExecutor) Execute(ctx context.Context, job jobs.Job
 		}
 		return result, nil
 	}
-	result, err := e.delegate.Execute(ctx, job, controllerProcessKillReporter{delegate: reporter, barrier: e.barrier})
+	result, err := e.delegate.Execute(ctx, job, reporter)
 	if err == nil && e.barrier != nil && e.barrier.boundary == controllerKillAfterMain && result.Disposition == jobs.ExecutionCompleted {
-		var status string
-		queryErr := e.barrier.db.QueryRowContext(ctx, `SELECT status FROM deployments WHERE app_id=? AND job_id=?`, e.barrier.appID, e.barrier.jobID).Scan(&status)
-		if queryErr != nil || status != "succeeded" {
-			return jobs.ExecutionResult{}, errors.New("process-kill main completion is not durable")
+		var deploymentStatus, jobStatus string
+		deploymentErr := e.barrier.db.QueryRowContext(ctx, `SELECT status FROM deployments WHERE app_id=? AND job_id=?`, e.barrier.appID, e.barrier.jobID).Scan(&deploymentStatus)
+		jobErr := e.barrier.db.QueryRowContext(ctx, `SELECT status FROM jobs WHERE id=?`, e.barrier.jobID).Scan(&jobStatus)
+		if deploymentErr != nil || deploymentStatus != "succeeded" || jobErr != nil || jobStatus != string(jobs.Succeeded) {
+			return jobs.ExecutionResult{}, errors.New("process-kill atomic completion is not durable")
+		}
+		if _, ok := e.barrier.accountingHandoffPrefix(ctx, 1, 1, 1); !ok {
+			return jobs.ExecutionResult{}, errors.New("process-kill atomic route completion prefix is not durable")
 		}
 		if waitErr := e.barrier.wait(ctx, generatedruntimestate.PhaseSucceeded, func(generatedruntimestate.Deployment) bool { return true }); waitErr != nil {
 			return jobs.ExecutionResult{}, waitErr
@@ -684,6 +758,7 @@ func controllerProcessKillFaultStatements(boundary controllerProcessKillBoundary
 
 type controllerProcessKillAccountingPrefix struct {
 	activation generatedruntimestate.GeneratedDomainStartupRouteActivation
+	intents    []generatedruntimestate.GeneratedDomainStartupCandidateIntent
 	components []generatedruntimestate.PredecessorRetirementObservation
 	retirement generatedruntimestate.PredecessorRetirementReceipt
 	authorize  []generatedruntimestate.RouteAccountingHandoffAuthorization
@@ -732,6 +807,31 @@ func (b *controllerProcessKillBarrier) accountingHandoffPrefix(ctx context.Conte
 	}
 	if successorComponents == 0 {
 		return controllerProcessKillAccountingPrefix{}, false
+	}
+	for _, value := range snapshot.CandidateIntents {
+		if value.DeploymentID == result.activation.SuccessorDeploymentID {
+			result.intents = append(result.intents, value)
+		}
+	}
+	if len(result.intents) != successorComponents {
+		return controllerProcessKillAccountingPrefix{}, false
+	}
+	seenIntentComponents := make(map[string]struct{}, len(result.intents))
+	seenIntentReceipts := make(map[string]struct{}, len(result.intents))
+	for _, value := range result.intents {
+		if value.ReceiptID == "" || value.ComponentName == "" || value.CreatorJobID != result.activation.CreatorJobID ||
+			value.CreatorWorkerAttempt < result.activation.CreatorWorkerAttempt ||
+			value.CreatorWorkerAttempt > result.activation.WriterWorkerAttempt {
+			return controllerProcessKillAccountingPrefix{}, false
+		}
+		if _, duplicate := seenIntentComponents[value.ComponentName]; duplicate {
+			return controllerProcessKillAccountingPrefix{}, false
+		}
+		if _, duplicate := seenIntentReceipts[value.ReceiptID]; duplicate {
+			return controllerProcessKillAccountingPrefix{}, false
+		}
+		seenIntentComponents[value.ComponentName] = struct{}{}
+		seenIntentReceipts[value.ReceiptID] = struct{}{}
 	}
 	for _, value := range snapshot.PredecessorRetirementComponents {
 		if value.ActivationReceiptID == result.activation.ReceiptID {
@@ -823,21 +923,6 @@ func (b *controllerProcessKillBarrier) accountingHandoffPrefix(ctx context.Conte
 	runtime, err := b.state.Get(ctx, b.appID, deploymentID)
 	return result, err == nil && ((wantCompletion == 0 && runtime.Phase == generatedruntimestate.PhaseDraining) ||
 		(wantCompletion == 1 && runtime.Phase == generatedruntimestate.PhaseSucceeded))
-}
-
-type controllerProcessKillReporter struct {
-	delegate jobs.ProgressReporter
-	barrier  *controllerProcessKillBarrier
-}
-
-func (r controllerProcessKillReporter) Report(update jobs.ProgressUpdate) error {
-	if err := r.delegate.Report(update); err != nil {
-		return err
-	}
-	if r.barrier != nil && r.barrier.boundary == controllerKillAfterSuccess && update.Status == jobs.Running && update.Phase == "finalize" {
-		return r.barrier.wait(context.Background(), generatedruntimestate.PhaseSucceeded, func(generatedruntimestate.Deployment) bool { return true })
-	}
-	return nil
 }
 
 func controllerProcessKillMarker(path string, boundary controllerProcessKillBoundary) error {
@@ -1259,7 +1344,7 @@ func controllerProcessKillMatrix(
 	previousMarker := "controller-journey"
 	for index, boundary := range []controllerProcessKillBoundary{
 		controllerKillBeforeDrain, controllerKillAfterRetire, controllerKillBeforeBuild, controllerKillBeforeStart,
-		controllerKillAfterRoute, controllerKillAfterHandoff, controllerKillAfterSuccess, controllerKillAfterMain,
+		controllerKillAfterRoute, controllerKillAfterHandoff, controllerKillAfterMain,
 	} {
 		if !t.Run(string(boundary), func(t *testing.T) {
 			if index > 0 {
@@ -1338,6 +1423,8 @@ func controllerProcessKillMatrix(
 			}
 			var firstPrefix controllerProcessKillAccountingPrefix
 			var authorizedPrefix controllerProcessKillAccountingPrefix
+			var completedPrefix controllerProcessKillAccountingPrefix
+			var completedHead generatedruntimestate.ActiveHead
 			if boundary == controllerKillAfterRetire {
 				var ok bool
 				firstPrefix, ok = prefixBarrier.accountingHandoffPrefix(ctx, 0, 0, 0)
@@ -1351,8 +1438,8 @@ func controllerProcessKillMatrix(
 				}
 			}
 			before, err := jobStore.Get(mutation.Job.ID)
-			if err != nil || before.Status != string(jobs.Running) || before.Attempt != 1 {
-				t.Fatal("original deployment job was not running at kill boundary")
+			if err != nil || !controllerProcessKillJobAtBoundaryMatches(boundary, before) {
+				t.Fatal("original deployment job did not match its exact kill boundary")
 			}
 			pinned := controllerProcessKillPinsForJob(t, db, appID, mutation.Job.ID)
 			if pinned.PlanID != plan.RevisionID || pinned.PlanNumber != plan.RevisionNumber ||
@@ -1372,6 +1459,28 @@ func controllerProcessKillMatrix(
 			oldRuntime, err := state.Get(ctx, appID, previous.DeploymentID)
 			if err != nil {
 				t.Fatal("read previous serving runtime before controller kill")
+			}
+			if boundary == controllerKillAfterMain {
+				var ok bool
+				completedPrefix, ok = prefixBarrier.accountingHandoffPrefix(ctx, 1, 1, 1)
+				completedHead, err = state.Active(ctx, appID)
+				if !ok || err != nil || phase.Phase != generatedruntimestate.PhaseSucceeded ||
+					completedHead.DeploymentID != pinned.DeploymentID || completedHead.ReleaseID != pinned.ReleaseID ||
+					completedHead.Generation != previous.Generation+1 {
+					t.Fatal("post-atomic boundary omitted the exact completed route history or active head")
+				}
+				for _, component := range oldRuntime.Components {
+					if component.State != generatedruntimestate.ComponentStopped ||
+						controllerJourneyExists(t, ctx, docker, "container", component.ContainerName) {
+						t.Fatal("post-atomic boundary retained a predecessor physical identity")
+					}
+				}
+				for _, component := range phase.Components {
+					if component.State != generatedruntimestate.ComponentActive || component.ContainerID == "" {
+						t.Fatal("post-atomic boundary lost an active candidate identity")
+					}
+					controllerProcessKillAssertRunningContainer(t, ctx, docker, component)
+				}
 			}
 			if boundary == controllerKillAfterRoute && !prefixBarrier.routeCommitPrefix(ctx) {
 				t.Fatal("route-commit process-kill boundary omitted its exact protected Pending and pre-042 SQL prefix")
@@ -1497,12 +1606,11 @@ func controllerProcessKillMatrix(
 				if getErr != nil {
 					t.Fatal("read original job during process restart")
 				}
+				if boundary == controllerKillAfterMain && current.Status != string(jobs.Succeeded) {
+					t.Fatal("post-atomic restart requeued a completed deployment job")
+				}
 				if current.Status == string(jobs.Succeeded) {
-					wantAttempt := before.Attempt + 1
-					if boundary == controllerKillAfterRetire {
-						wantAttempt = before.Attempt + 2
-					}
-					if current.Attempt != wantAttempt || string(current.Input) != string(before.Input) || current.ID != before.ID {
+					if !controllerProcessKillCompletedJobMatches(boundary, before, current) {
 						t.Fatal("restart changed the original immutable job or attempt")
 					}
 					break
@@ -1558,6 +1666,13 @@ func controllerProcessKillMatrix(
 					finalPrefix.completion[0].CurrentJobID != before.ID ||
 					finalPrefix.completion[0].CurrentWorkerAttempt != wantWriterAttempt {
 					t.Fatal("route-commit recovery changed the immutable creator or final writer lineage")
+				}
+			}
+			if boundary == controllerKillAfterMain {
+				finalPrefix, ok := prefixBarrier.accountingHandoffPrefix(ctx, 1, 1, 1)
+				if !ok || !reflect.DeepEqual(completedPrefix, finalPrefix) ||
+					!reflect.DeepEqual(completedHead, finalHead) {
+					t.Fatal("post-atomic restart changed the completed route history or active head")
 				}
 			}
 			for _, component := range finalRuntime.Components {

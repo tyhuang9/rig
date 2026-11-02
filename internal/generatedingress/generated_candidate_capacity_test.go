@@ -182,6 +182,47 @@ func TestCandidateCapacityRestoredDebtRequiresExactPublishedTokenGraph(t *testin
 			})
 		}
 	})
+
+	t.Run("starting prefix foreign receipt refuses atomically", func(t *testing.T) {
+		ledger, coordinator, tokens, spec := newLedger(t, "api", "frontend")
+		rows := map[string]candidateColdReceiptSeed{
+			"api":     {id: "receipt-api", physical: candidatePhysicalPresent},
+			"foreign": {id: "receipt-foreign", physical: candidatePhysicalPresent},
+		}
+		if err := ledger.seedColdStartingCandidateOwnershipWithDebt(spec, rows, tokens); !errors.Is(err, errCandidateCapacityInvalid) {
+			t.Fatalf("foreign starting-prefix receipt error=%v", err)
+		}
+		ledger.mu.Lock()
+		groups := len(ledger.groups)
+		ledger.mu.Unlock()
+		coordinator.mu.Lock()
+		memory, disk, tokenCount := coordinator.memory, coordinator.disk, len(coordinator.tokens)
+		coordinator.mu.Unlock()
+		if groups != 0 || memory != 20 || disk != 20 || tokenCount != 2 {
+			t.Fatalf("foreign starting-prefix refusal mutated graph: groups=%d memory=%d disk=%d tokens=%d",
+				groups, memory, disk, tokenCount)
+		}
+	})
+
+	t.Run("starting prefix noncontiguous receipt refuses atomically", func(t *testing.T) {
+		ledger, coordinator, tokens, spec := newLedger(t, "api", "frontend")
+		rows := map[string]candidateColdReceiptSeed{
+			"frontend": {id: "receipt-frontend", physical: candidatePhysicalPresent},
+		}
+		if err := ledger.seedColdStartingCandidateOwnershipWithDebt(spec, rows, tokens); !errors.Is(err, errCandidateCapacityInvalid) {
+			t.Fatalf("noncontiguous starting-prefix receipt error=%v", err)
+		}
+		ledger.mu.Lock()
+		groups := len(ledger.groups)
+		ledger.mu.Unlock()
+		coordinator.mu.Lock()
+		memory, disk, tokenCount := coordinator.memory, coordinator.disk, len(coordinator.tokens)
+		coordinator.mu.Unlock()
+		if groups != 0 || memory != 20 || disk != 20 || tokenCount != 2 {
+			t.Fatalf("noncontiguous starting-prefix refusal mutated graph: groups=%d memory=%d disk=%d tokens=%d",
+				groups, memory, disk, tokenCount)
+		}
+	})
 }
 
 func TestCandidateCapacityRestoredPredecessorReleasesExactDebtAndKeepsSuccessorCharge(t *testing.T) {
