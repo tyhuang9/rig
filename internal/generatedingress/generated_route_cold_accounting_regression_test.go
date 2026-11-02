@@ -1091,9 +1091,6 @@ func generatedRouteColdAccountingAssertPreviousExactAuthorityCompleted(t *testin
 }
 
 func TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	for _, row := range []string{
 		"post-clear lost reply retries exact Before",
 		"pre-persist clear failure with crossed attempt refuses retry",
@@ -1104,6 +1101,9 @@ func TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls(t *
 		"post-clear crossed attempt refuses begin then same construction fresh worker completes",
 	} {
 		t.Run(row, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				testGeneratedDomainRestartAccountingPreviousExactClearAuthorityControl(t, row)
 			})
@@ -1926,9 +1926,6 @@ func TestGeneratedDomainRestartAccountingPostActivationPendingCompletesWithoutSe
 }
 
 func TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	for _, test := range []struct {
 		name   string
 		mutate func(*testing.T, generatedRouteColdAccountingFixture, deploymentexecution.Claim) deploymentexecution.Claim
@@ -1975,6 +1972,9 @@ func TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending(t *te
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture, result, ctx, claim, transition, activation :=
 					generatedRouteColdAccountingPendingCompletionClaimFixture(t)
@@ -2005,6 +2005,9 @@ func TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending(t *te
 		{name: "caller cancellation reconciles Pending before later fresh worker", cancelCaller: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				fixture, result, ctx, claim, _, _ := generatedRouteColdAccountingPendingCompletionClaimFixture(t)
 				before := generatedRouteColdAccountingPendingCompletionBoundary(t, fixture)
@@ -2851,9 +2854,6 @@ const generatedRouteColdAccountingSwitchingRoutePhysicalProposedReloads = 2
 const generatedRouteColdAccountingInitialSwitchingRoutePhysicalProposedReloads = 1
 
 func TestGeneratedDomainRecoveredRetirementFailureBoundariesPreserveDebt(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	for _, mode := range []string{
 		"wait cancellation releases the exact dual hold",
 		"post-wait predecessor drift refuses before effects",
@@ -2861,6 +2861,9 @@ func TestGeneratedDomainRecoveredRetirementFailureBoundariesPreserveDebt(t *test
 		"termination failure latches the exact predecessor debt",
 	} {
 		t.Run(mode, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				testGeneratedDomainRecoveredRetirementFailureBoundary(t, mode)
 			})

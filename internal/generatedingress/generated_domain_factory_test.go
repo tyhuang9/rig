@@ -173,10 +173,10 @@ func newGeneratedDomainStableConstructionFixture(t *testing.T) generatedDomainCo
 }
 
 func TestGeneratedDomainConstructionCanonicalInputsAndStickyClassification(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	t.Run("canonical_inputs_and_captured_bundle", func(t *testing.T) {
+		if !generatedDomainRegistryIsolated(t) {
+			return
+		}
 		generatedDomainConstructionCase(t, func(t *testing.T) {
 			fixture := newGeneratedDomainStableConstructionFixture(t)
 			if _, err := newGeneratedDomainConstruction(context.Background(), nil, fixture.runner,
@@ -205,6 +205,9 @@ func TestGeneratedDomainConstructionCanonicalInputsAndStickyClassification(t *te
 	})
 
 	t.Run("refusal_is_sticky_after_Docker_ambiguity", func(t *testing.T) {
+		if !generatedDomainRegistryIsolated(t) {
+			return
+		}
 		generatedDomainConstructionCase(t, func(t *testing.T) {
 			fixture := newGeneratedDomainStableConstructionFixture(t)
 			fixture.runner.delegate.objects = append(fixture.runner.delegate.objects, generatedDomainDockerObject{
@@ -232,6 +235,9 @@ func TestGeneratedDomainConstructionCanonicalInputsAndStickyClassification(t *te
 	})
 
 	t.Run("typed_recovery_is_sticky", func(t *testing.T) {
+		if !generatedDomainRegistryIsolated(t) {
+			return
+		}
 		generatedDomainConstructionCase(t, func(t *testing.T) {
 			identity, runner, environment := newGeneratedDomainPreparedRecoveryConstructionFixture(t)
 			result, firstErr := newGeneratedDomainConstruction(context.Background(), identity.stores, runner,
@@ -251,6 +257,9 @@ func TestGeneratedDomainConstructionCanonicalInputsAndStickyClassification(t *te
 	})
 
 	t.Run("owner_cancellation_is_sticky", func(t *testing.T) {
+		if !generatedDomainRegistryIsolated(t) {
+			return
+		}
 		generatedDomainConstructionCase(t, func(t *testing.T) {
 			fixture := newGeneratedDomainStableConstructionFixture(t)
 			started := make(chan struct{})
