@@ -243,9 +243,15 @@ func seedGeneratedRouteActivationFixture(t *testing.T, db *sql.DB, name string) 
 }
 
 func seedGeneratedRouteActivationFixtureAtAttempt(t *testing.T, db *sql.DB, name string, creatorAttempt int) generatedRouteActivationFixture {
+	return seedGeneratedRouteActivationFixtureAtAttempts(t, db, name, creatorAttempt, 0)
+}
+
+func seedGeneratedRouteActivationFixtureAtAttempts(t *testing.T, db *sql.DB, name string,
+	creatorAttempt, frontendAttempt int,
+) generatedRouteActivationFixture {
 	t.Helper()
-	if creatorAttempt < 1 {
-		t.Fatalf("creator attempt=%d", creatorAttempt)
+	if creatorAttempt < 1 || frontendAttempt != -1 && frontendAttempt != 0 && frontendAttempt <= creatorAttempt {
+		t.Fatalf("creator attempts=%d/%d", creatorAttempt, frontendAttempt)
 	}
 	ids := map[string][2]string{
 		"primary": {"10000000-0000-4000-8000-000000000001", "10000000-0000-4000-8000-000000000002"},
@@ -269,6 +275,10 @@ func seedGeneratedRouteActivationFixtureAtAttempt(t *testing.T, db *sql.DB, name
 		stamp:          time.Now().UTC().Format(time.RFC3339Nano),
 		creatorAttempt: creatorAttempt,
 	}
+	componentCount := 1
+	if frontendAttempt != 0 {
+		componentCount = 2
+	}
 	mustExec := func(query string, args ...any) {
 		t.Helper()
 		if _, err := db.Exec(query, args...); err != nil {
@@ -283,9 +293,9 @@ func seedGeneratedRouteActivationFixtureAtAttempt(t *testing.T, db *sql.DB, name
 		id,app_id,revision_number,bundle_ref,strategy,detector,detector_version,source_structural_fingerprint,
 		analyzed_source_provider,analyzed_repository_id,analyzed_resolved_digest,canonical_digest,component_count,
 		field_provenance_count,migration_evidence_digest,revised_by,revised_at,acceptance_status,accepted_by,accepted_at
-	) VALUES(?,?,1,?,'generated_node','test','1',?,'local',0,?,?,1,1,'',?,?, 'accepted',?,?)`,
+	) VALUES(?,?,1,?,'generated_node','test','1',?,'local',0,?,?,?,1,'',?,?, 'accepted',?,?)`,
 		fixture.planID, fixture.appID, "route-plan:"+fixture.planID, strings.Repeat("a", 64), strings.Repeat("b", 64), strings.Repeat("c", 64),
-		"route-activation-"+name+"-owner", fixture.stamp, "route-activation-"+name+"-owner", fixture.stamp)
+		componentCount, "route-activation-"+name+"-owner", fixture.stamp, "route-activation-"+name+"-owner", fixture.stamp)
 	mustExec(`INSERT INTO application_configuration_revisions(
 		id,app_id,revision_number,bundle_ref,created_by,created_at,variable_count,secret_count,
 		bundle_version,deployment_plan_revision_id,deployment_plan_revision_number
@@ -319,33 +329,59 @@ func seedGeneratedRouteActivationFixtureAtAttempt(t *testing.T, db *sql.DB, name
 		candidate_slot,phase,migration_state,created_at,updated_at
 	) VALUES(?,?,?,?,1,'blue','preflight','not_required',?,?)`,
 		fixture.deploymentID, fixture.appID, fixture.releaseID, fixture.planID, fixture.stamp, fixture.stamp)
-	mustExec(`INSERT INTO generated_image_artifacts(
-		id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,
-		compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at
-	) VALUES(?,?,?,1,?,'route-test',?,1,?,'ready',?,?,?)`,
-		fixture.artifactID, fixture.releaseID, fixture.planID, "api", strings.Repeat("f", 64), "sha256:"+strings.Repeat("1", 64), fixture.stamp, fixture.stamp, fixture.stamp)
-	mustExec(`INSERT INTO generated_runtime_components(
-		deployment_id,component_name,slot,image_artifact_id,state,created_at,updated_at
-	) VALUES(?,'api','blue',?,'image_ready',?,?)`,
-		fixture.deploymentID, fixture.artifactID, fixture.stamp, fixture.stamp)
+	type componentCreator struct {
+		name, artifactID, intentID, containerID, policyDigest string
+		attempt                                               int
+	}
+	components := []componentCreator{{name: "api", artifactID: fixture.artifactID,
+		intentID: fixture.intentID, containerID: strings.Repeat("1", 64),
+		policyDigest: strings.Repeat("d", 64), attempt: creatorAttempt}}
+	if frontendAttempt != 0 {
+		components = append(components, componentCreator{name: "frontend",
+			artifactID:  fixture.artifactID + "-frontend",
+			intentID:    strings.TrimSuffix(fixture.intentID, "2") + "3",
+			containerID: strings.Repeat("2", 64), policyDigest: strings.Repeat("e", 64), attempt: frontendAttempt})
+	}
+	for index, component := range components {
+		mustExec(`INSERT INTO generated_image_artifacts(
+			id,release_id,deployment_plan_revision_id,deployment_plan_revision_number,component_id,
+			compiler_version,build_definition_digest,attempt_number,image_content_id,state,created_at,updated_at,finished_at
+		) VALUES(?,?,?,1,?,'route-test',?,1,?,'ready',?,?,?)`,
+			component.artifactID, fixture.releaseID, fixture.planID, component.name,
+			strings.Repeat(string(rune('f'-index)), 64), "sha256:"+strings.Repeat(string(rune('1'+index)), 64),
+			fixture.stamp, fixture.stamp, fixture.stamp)
+		mustExec(`INSERT INTO generated_runtime_components(
+			deployment_id,component_name,slot,image_artifact_id,state,created_at,updated_at
+		) VALUES(?,?,'blue',?,'image_ready',?,?)`, fixture.deploymentID, component.name,
+			component.artifactID, fixture.stamp, fixture.stamp)
+	}
 	mustExec(`UPDATE generated_runtime_deployments SET phase='building',updated_at=? WHERE deployment_id=?`, fixture.stamp, fixture.deploymentID)
 	mustExec(`UPDATE generated_runtime_deployments SET phase='starting_candidate',updated_at=? WHERE deployment_id=?`, fixture.stamp, fixture.deploymentID)
-	mustExec(`INSERT INTO generated_candidate_intents(
-		id,deployment_id,component_name,creator_job_id,creator_worker_attempt,
-		configuration_revision_id,configuration_revision_number,image_artifact_id,image_artifact_attempt,
-		environment_operation_id,environment_staging_attempt,candidate_policy_version,candidate_policy_digest,created_at
-	) VALUES(?,?, 'api', ?,?, ?,1, ?,1, ?,?,'generated-candidate-v1',?,?)`,
-		fixture.intentID, fixture.deploymentID, fixture.jobID, fixture.creatorAttempt, fixture.configID, fixture.artifactID, fixture.artifactID,
-		fixture.creatorAttempt,
-		strings.Repeat("d", 64), fixture.stamp)
-	mustExec(`UPDATE generated_runtime_components
-		SET state='starting',container_name=?,updated_at=? WHERE deployment_id=? AND component_name='api'`,
-		"rig-route-"+name+"-api", fixture.stamp, fixture.deploymentID)
-	mustExec(`UPDATE generated_runtime_components
-		SET state='running',container_id=?,updated_at=? WHERE deployment_id=? AND component_name='api'`,
-		strings.Repeat("1", 64), fixture.stamp, fixture.deploymentID)
-	mustExec(`UPDATE generated_runtime_components SET state='healthy',updated_at=? WHERE deployment_id=? AND component_name='api'`,
-		fixture.stamp, fixture.deploymentID)
+	currentAttempt := creatorAttempt
+	for _, component := range components {
+		if component.attempt > 0 && component.attempt != currentAttempt {
+			mustExec(`UPDATE jobs SET attempt=?,updated_at=? WHERE id=? AND status='running' AND attempt=?`,
+				component.attempt, fixture.stamp, fixture.jobID, currentAttempt)
+			currentAttempt = component.attempt
+		}
+		if component.attempt > 0 {
+			mustExec(`INSERT INTO generated_candidate_intents(
+			id,deployment_id,component_name,creator_job_id,creator_worker_attempt,
+			configuration_revision_id,configuration_revision_number,image_artifact_id,image_artifact_attempt,
+			environment_operation_id,environment_staging_attempt,candidate_policy_version,candidate_policy_digest,created_at
+		) VALUES(?,?,?,?,?,?,1,?,1,?,?,'generated-candidate-v1',?,?)`, component.intentID,
+				fixture.deploymentID, component.name, fixture.jobID, component.attempt, fixture.configID,
+				component.artifactID, component.artifactID, component.attempt, component.policyDigest, fixture.stamp)
+		}
+		mustExec(`UPDATE generated_runtime_components
+			SET state='starting',container_name=?,updated_at=? WHERE deployment_id=? AND component_name=?`,
+			"rig-route-"+name+"-"+component.name, fixture.stamp, fixture.deploymentID, component.name)
+		mustExec(`UPDATE generated_runtime_components
+			SET state='running',container_id=?,updated_at=? WHERE deployment_id=? AND component_name=?`,
+			component.containerID, fixture.stamp, fixture.deploymentID, component.name)
+		mustExec(`UPDATE generated_runtime_components SET state='healthy',updated_at=?
+			WHERE deployment_id=? AND component_name=?`, fixture.stamp, fixture.deploymentID, component.name)
+	}
 	mustExec(`UPDATE generated_runtime_deployments SET phase='waiting_health',updated_at=? WHERE deployment_id=?`, fixture.stamp, fixture.deploymentID)
 	mustExec(`UPDATE generated_runtime_deployments SET phase='switching_route',updated_at=? WHERE deployment_id=?`, fixture.stamp, fixture.deploymentID)
 	mustExec(`UPDATE deployments SET status='waiting_health' WHERE id=?`, fixture.deploymentID)
