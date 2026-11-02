@@ -16,6 +16,23 @@ cat > "$temp/bin/go" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$@" > "$RIG_INGRESS_SELECTOR_ARGS"
+emit_anchor() {
+  local name="$1" action=pass package='github.com/hostd/hostd/internal/generatedingress' copies=1 index
+  if [[ "$name" == "${RIG_INGRESS_SELECTOR_MUTATE_ANCHOR:-}" ]]; then
+    case "${RIG_INGRESS_SELECTOR_MUTATION:-}" in
+      omit) return ;;
+      child) name+='/child' ;;
+      skip) action=skip ;;
+      fail) action=fail ;;
+      wrong-package) package='example.invalid/other' ;;
+      duplicate) copies=2 ;;
+      *) exit 34 ;;
+    esac
+  fi
+  for ((index=0; index<copies; index++)); do
+    printf '{"Action":"%s","Package":"%s","Test":"%s"}\n' "$action" "$package" "$name"
+  done
+}
 case "${RIG_INGRESS_SELECTOR_OUTPUT:-parent}" in
   parent)
     run_pattern=''
@@ -27,6 +44,15 @@ case "${RIG_INGRESS_SELECTOR_OUTPUT:-parent}" in
     done
     count=1
     case "$run_pattern" in
+      '^TestGeneratedDomain')
+        emit_anchor TestGeneratedDomainEmptyBootstrapEffectBoundaries
+        emit_anchor TestGeneratedDomainConstructionCanonicalInputsAndStickyClassification
+        ;;
+      '^TestGeneratedDomain(RestartAccounting|Recovered)')
+        emit_anchor TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls
+        emit_anchor TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending
+        emit_anchor TestGeneratedDomainRecoveredRetirementFailureBoundariesPreserveDebt
+        ;;
       *TestGeneratedDomainA0*) count=4 ;;
       *TestGeneratedDomainCold*) count=19 ;;
     esac
@@ -36,8 +62,16 @@ case "${RIG_INGRESS_SELECTOR_OUTPUT:-parent}" in
     ;;
   child) printf '{"Action":"pass","Test":"TestSelectorControl/child"}\n' ;;
   empty) : ;;
+  malformed) printf '{not-json}\n' ;;
 esac
-printf '{"Action":"pass","Package":"github.com/hostd/hostd/internal/generatedingress"}\n'
+case "${RIG_INGRESS_SELECTOR_PACKAGE:-pass}" in
+  omit) : ;;
+  duplicate)
+    printf '{"Action":"pass","Package":"github.com/hostd/hostd/internal/generatedingress"}\n'
+    printf '{"Action":"pass","Package":"github.com/hostd/hostd/internal/generatedingress"}\n'
+    ;;
+  *) printf '{"Action":"%s","Package":"github.com/hostd/hostd/internal/generatedingress"}\n' "${RIG_INGRESS_SELECTOR_PACKAGE:-pass}" ;;
+esac
 if [[ "${RIG_INGRESS_SELECTOR_FAIL_GO:-}" == 1 ]]; then exit 32; fi
 EOF
 cat > "$temp/bin/tee" <<'EOF'
@@ -69,6 +103,7 @@ completed='^TestGatewayRebindTyped(Completed|Committed|Recovery|Undurable)'
 handover='^TestGatewayRebindTypedHandover'
 rebind_history_heavy='^Test(GatewayRebindCommitReplayRequiresUniqueExactReviewedHistory|GatewayRebindAbortedTerminalProofCoreIsFreshAndReadOnly|GatewayRebindRollbackTerminalObserverBindsCheckpointRoutesDigest|GatewayRebindHistoricalTerminalWithNewActiveReturnsUnavailableProofs|GatewayRebindAbortedTerminalExportedWrapperRejectsMissingPredecessorInventory|GatewayRebindTerminalAttestationWithdrawsOnlyRetainedOwner|GatewayRebindAdmissionCurrentPredecessorRejectsClosingConfigDrift)$'
 domain='^TestGeneratedDomain'
+domain_recovery='^TestGeneratedDomain(RestartAccounting|Recovered)'
 domain_all_cold='^TestGeneratedDomainCold'
 domain_retained='^TestGeneratedDomainCold.*Retained'
 domain_startup='^TestGeneratedDomain(Startup|ProtectedStartup)'
@@ -82,7 +117,7 @@ remainder_skip="$old_remainder_skip|$domain|$capacity|$gateway_operations"
 typed_suites=(rebind-typed-withdrawal rebind-typed-completed rebind-typed-handover rebind-typed-runtime)
 composition_suites=(rebind-composition-native rebind-composition-startup rebind-composition-transferred rebind-composition-second-generation rebind-composition-legacy-source)
 history_suites=(rebind-history-heavy rebind-history)
-remainder_suites=(domain-construction domain-cold-retained domain-cold-remainder domain-a0 domain-cold domain-startup-stable domain-startup ingress-capacity gateway-operations ingress-remainder)
+remainder_suites=(domain-construction domain-recovery-accounting domain-cold-retained domain-cold-remainder domain-a0 domain-cold domain-startup-stable domain-startup ingress-capacity gateway-operations ingress-remainder)
 suites=("${history_suites[@]}" "${typed_suites[@]}" "${composition_suites[@]}" "${remainder_suites[@]}")
 runtime_packages=(
   ./internal/projectanalysis
@@ -125,6 +160,7 @@ ingress_suites=(
   current-serving-predecessor
   current-serving
   domain-construction
+  domain-recovery-accounting
   domain-cold-retained
   domain-cold-remainder
   domain-a0
@@ -188,7 +224,8 @@ for mode in default race plain; do
       rebind-composition-transferred) expected+=("$transferred") ;;
       rebind-composition-second-generation) expected+=("$second") ;;
       rebind-composition-legacy-source) expected+=("$legacy") ;;
-      domain-construction) expected+=("$domain" -skip "$domain_startup|$domain_a0|$domain_all_cold") ;;
+      domain-construction) expected+=("$domain" -skip "$domain_startup|$domain_a0|$domain_all_cold|$domain_recovery") ;;
+      domain-recovery-accounting) expected+=("$domain_recovery") ;;
       domain-cold-retained) expected+=("$domain_retained" -skip "$domain_cold") ;;
       domain-cold-remainder) expected+=("$domain_all_cold" -skip "$domain_cold|$domain_retained") ;;
       domain-a0) expected+=("$domain_a0") ;;
@@ -251,6 +288,19 @@ TestInspectGatewayRebindFutureControl rebind-history
 TestGeneratedDomainEmptyBootstrapEffectBoundaries domain-construction
 TestGeneratedDomainConstructionReconstructsColdAccounting domain-construction
 TestGeneratedDomainRegistryFutureControl domain-construction
+TestGeneratedDomainConstructionCanonicalInputsAndStickyClassification domain-construction
+TestGeneratedDomainRegistryFutureControl/child domain-construction
+TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls domain-recovery-accounting
+TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending domain-recovery-accounting
+TestGeneratedDomainRecoveredRetirementFailureBoundariesPreserveDebt domain-recovery-accounting
+TestGeneratedDomainRestartAccountingFutureControl domain-recovery-accounting
+TestGeneratedDomainRecoveredFutureControl domain-recovery-accounting
+TestGeneratedDomainRestartAccountingFutureControl/child domain-recovery-accounting
+TestGeneratedDomainRecoveredFutureControl/child domain-recovery-accounting
+TestGeneratedDomainConstructionFutureRecoveredControl domain-construction
+TestGeneratedDomainConstructionFutureRestartAccountingControl domain-construction
+TestGeneratedDomainColdRecoveredFutureControl domain-cold-remainder
+TestGeneratedDomainStartupRecoveredFutureControl domain-startup
 TestGeneratedDomainColdBuilderContainerProjectionHonorsDockerTypedAndRawFallbackFields domain-cold-remainder
 TestGeneratedDomainColdAcceptsCompleteRetainedV1UnderRebindOrigin domain-cold-retained
 TestGeneratedDomainColdRejectsCompleteRetainedV1UnderRebindOrigin domain-cold-retained
@@ -413,10 +463,16 @@ assert_matrix windows-controller-ci.yml windows-ingress "$temp/ingress-matrix"
 # runner keeps the race and 32-minute Go timeout assertions above.
 workflow_job_has_line generated-runtime-lifecycle-ci.yml generated-runtime-race-gate '    needs: generated-runtime-race'
 workflow_job_has_line generated-runtime-lifecycle-ci.yml generated-runtime-race '        timeout-minutes: 34'
+workflow_job_has_line generated-runtime-lifecycle-ci.yml generated-runtime-race '    timeout-minutes: 42'
+workflow_job_has_line generated-runtime-lifecycle-ci.yml generated-runtime-race '        run: bash scripts/check-generated-runtime-race.sh "$RACE_SUITE"'
 workflow_job_has_line github-deployment-ci.yml postgres-race-gate '    needs: [postgres-race, repository-race, ingress-race]'
 workflow_job_has_line github-deployment-ci.yml ingress-race '        timeout-minutes: 34'
+workflow_job_has_line github-deployment-ci.yml ingress-race '    timeout-minutes: 42'
+workflow_job_has_line github-deployment-ci.yml ingress-race '        run: bash scripts/check-generated-runtime-race.sh "$RACE_SUITE"'
 workflow_job_has_line windows-controller-ci.yml windows-controller '    needs: [windows-controller-core, windows-ingress]'
 workflow_job_has_line windows-controller-ci.yml windows-ingress '        timeout-minutes: 34'
+workflow_job_has_line windows-controller-ci.yml windows-ingress '    timeout-minutes: 42'
+workflow_job_has_line windows-controller-ci.yml windows-ingress '        run: bash scripts/check-generated-runtime-race.sh "$TEST_SUITE" plain'
 
 must_fail() {
   if "$@" > /dev/null 2>&1; then
@@ -430,7 +486,7 @@ must_fail run rebind-composition-native invalid
 must_fail run rebind-composition-native race extra
 must_fail run rebind-typed-handover invalid
 must_fail run rebind-typed-runtime race extra
-for output in empty child; do
+for output in empty child malformed; do
   export RIG_INGRESS_SELECTOR_OUTPUT="$output"
   must_fail run runtime-packages
   must_fail run rebind-composition-startup
@@ -439,6 +495,30 @@ for output in empty child; do
   for suite in "${partition_suites[@]}"; do must_fail run "$suite"; done
 done
 unset RIG_INGRESS_SELECTOR_OUTPUT
+# Other passing parents and a package pass must not hide a missing required
+# parent. Check each anchor independently in both hosted execution modes.
+for mode in race plain; do
+  while read -r suite anchor; do
+    export RIG_INGRESS_SELECTOR_MUTATE_ANCHOR="$anchor"
+    for mutation in omit child skip fail wrong-package duplicate; do
+      export RIG_INGRESS_SELECTOR_MUTATION="$mutation"
+      must_fail run "$suite" "$mode"
+    done
+  done <<'EOF'
+domain-construction TestGeneratedDomainEmptyBootstrapEffectBoundaries
+domain-construction TestGeneratedDomainConstructionCanonicalInputsAndStickyClassification
+domain-recovery-accounting TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls
+domain-recovery-accounting TestGeneratedDomainRecoveredCompletionClaimGateDoesNotFinalizePending
+domain-recovery-accounting TestGeneratedDomainRecoveredRetirementFailureBoundariesPreserveDebt
+EOF
+  unset RIG_INGRESS_SELECTOR_MUTATE_ANCHOR RIG_INGRESS_SELECTOR_MUTATION
+  for package_result in omit duplicate skip fail; do
+    export RIG_INGRESS_SELECTOR_PACKAGE="$package_result"
+    must_fail run domain-construction "$mode"
+    must_fail run domain-recovery-accounting "$mode"
+  done
+  unset RIG_INGRESS_SELECTOR_PACKAGE
+done
 export RIG_INGRESS_SELECTOR_FAIL_GO=1
 must_fail run rebind-composition-transferred
 for suite in "${partition_suites[@]}"; do must_fail run "$suite"; done
@@ -447,4 +527,4 @@ export RIG_INGRESS_SELECTOR_FAIL_TEE=1
 must_fail run rebind-composition-native
 for suite in "${partition_suites[@]}"; do must_fail run "$suite"; done
 unset RIG_INGRESS_SELECTOR_FAIL_TEE
-printf 'Generated runtime selector contract passed: argument, partition, three-matrix and refusal/failure controls.\n'
+printf 'Generated runtime selector contract passed: argument, partition, three-matrix, required-parent and refusal/failure controls.\n'
