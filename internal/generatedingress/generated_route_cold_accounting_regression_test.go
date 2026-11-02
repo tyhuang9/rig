@@ -1091,9 +1091,6 @@ func generatedRouteColdAccountingAssertPreviousExactAuthorityCompleted(t *testin
 }
 
 func TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls(t *testing.T) {
-	if !generatedDomainRegistryIsolated(t) {
-		return
-	}
 	for _, row := range []string{
 		"post-clear lost reply retries exact Before",
 		"pre-persist clear failure with crossed attempt refuses retry",
@@ -1104,6 +1101,9 @@ func TestGeneratedDomainRestartAccountingPreviousExactClearAuthorityControls(t *
 		"post-clear crossed attempt refuses begin then same construction fresh worker completes",
 	} {
 		t.Run(row, func(t *testing.T) {
+			if !generatedDomainRegistryIsolated(t) {
+				return
+			}
 			generatedDomainConstructionCase(t, func(t *testing.T) {
 				testGeneratedDomainRestartAccountingPreviousExactClearAuthorityControl(t, row)
 			})
