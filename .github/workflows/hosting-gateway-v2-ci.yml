@@ -59,6 +59,17 @@ jobs:
               ([$events[] | select(.Test == $name and (.Action == "fail" or .Action == "skip"))] | length) == 0)
           ' "$output" > /dev/null
 
+      - name: Require cold-restart manifest symlink refusal on Linux
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/check-cold-restart-manifest.py --self-test
+          output="$(mktemp)"
+          trap 'rm -f "$output"' EXIT
+          go test -tags live_docker -json -v -count=1 -timeout=2m ./cmd/hostd -run '^TestLiveColdRuntimeRestartManifestRejectsCrossedOrSensitiveShape$/^symlink_manifest_and_source$' | tee "$output"
+          python3 scripts/check-cold-restart-manifest.py --events "$output"
+
       - name: Verify supported hostd through third-normal readiness
         timeout-minutes: 34
         shell: bash
